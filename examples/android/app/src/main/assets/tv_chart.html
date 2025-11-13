@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      font-family: "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #chart-container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background: radial-gradient(circle at top, rgba(25, 40, 72, 0.9), rgba(5, 10, 18, 0.95));
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+    #tv-chart {
+      width: 100%;
+      height: 100%;
+    }
+    .chart-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .hud {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .hud-left {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .hud-symbol {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      color: #f5f7ff;
+      text-transform: uppercase;
+    }
+    .source-label {
+      font-size: 12px;
+      color: #9fb3d9;
+    }
+    .latency-pill {
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: rgba(41, 181, 125, 0.2);
+      color: #2ebd85;
+      border: 1px solid rgba(46, 189, 133, 0.35);
+    }
+    .ohcl-readout {
+      padding: 10px 14px;
+      border-radius: 12px;
+      background: rgba(7, 12, 22, 0.8);
+      color: #d8e2ff;
+      font-size: 12px;
+      letter-spacing: 0.05em;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+    }
+    .stream-status {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      padding: 6px 16px 6px 30px;
+      border-radius: 999px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      background: rgba(0, 0, 0, 0.55);
+      color: #e0e0e0;
+      text-transform: uppercase;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      z-index: 3;
+    }
+    .stream-status::before {
+      content: "";
+      position: absolute;
+      left: 12px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ff7043;
+      box-shadow: 0 0 8px rgba(255, 112, 67, 0.9);
+    }
+    .stream-status.ok::before {
+      background: #2ebd85;
+      box-shadow: 0 0 8px rgba(46, 189, 133, 0.9);
+    }
+    .stream-status.warn::before {
+      background: #ff7043;
+    }
+  </style>
+</head>
+<body>
+  <div id="chart-container">
+    <div class="chart-overlay">
+      <div class="hud">
+        <div class="hud-left">
+          <div class="hud-symbol">BTC/USDC · PRO</div>
+          <div id="source-label" class="source-label">Auto source</div>
+        </div>
+        <div id="latency-pill" class="latency-pill">--</div>
+      </div>
+      <div id="ohcl-readout" class="ohcl-readout">O -- · H -- · L -- · C -- · V --</div>
+    </div>
+    <div id="tv-chart"></div>
+    <div id="stream-status" class="stream-status warn">CONNECTING…</div>
+  </div>
+  <script src="lightweight-charts.standalone.production.js"></script>
+  <script>
+    const container = document.getElementById('tv-chart');
+    const statusBadge = document.getElementById('stream-status');
+    const sourceLabelEl = document.getElementById('source-label');
+    const latencyPill = document.getElementById('latency-pill');
+    const ohclReadout = document.getElementById('ohcl-readout');
+    const chart = LightweightCharts.createChart(container, {
+      layout: {
+        background: { type: 'solid', color: 'transparent' },
+        textColor: '#b0b6c3',
+        fontSize: 12,
+      },
+      grid: {
+        vertLines: { color: 'rgba(134, 151, 168, 0.12)' },
+        horzLines: { color: 'rgba(134, 151, 168, 0.12)' },
+      },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: {
+          color: 'rgba(134, 151, 168, 0.45)',
+          width: 1,
+          style: LightweightCharts.LineStyle.Solid,
+          labelBackgroundColor: '#1f262f',
+        },
+        horzLine: {
+          color: 'rgba(134, 151, 168, 0.45)',
+          labelBackgroundColor: '#1f262f',
+        },
+      },
+      rightPriceScale: {
+        borderColor: 'rgba(134, 151, 168, 0.35)',
+      },
+      timeScale: {
+        borderColor: 'rgba(134, 151, 168, 0.35)',
+        rightOffset: 8,
+        fixLeftEdge: true,
+        timeVisible: true,
+        secondsVisible: false,
+      },
+    });
+
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#21c87a',
+      downColor: '#ef5350',
+      borderUpColor: '#21c87a',
+      borderDownColor: '#ef5350',
+      wickUpColor: '#21c87a',
+      wickDownColor: '#ef5350',
+    });
+
+    const volumeSeries = chart.addHistogramSeries({
+      priceScaleId: '',
+      priceFormat: { type: 'volume' },
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+    volumeSeries.priceScale().applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+
+    const emaFastSeries = chart.addLineSeries({
+      color: 'rgba(255, 193, 7, 0.9)',
+      lineWidth: 2,
+      priceLineVisible: false,
+    });
+
+    const emaSlowSeries = chart.addLineSeries({
+      color: 'rgba(0, 188, 212, 0.9)',
+      lineWidth: 2,
+      priceLineVisible: false,
+    });
+
+    let lastPriceLine = null;
+    let latestCandle = null;
+    const volumeByTime = new Map();
+
+    function toNumber(value) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function toCandlePoint(item) {
+      return {
+        time: item.time,
+        open: toNumber(item.open),
+        high: toNumber(item.high),
+        low: toNumber(item.low),
+        close: toNumber(item.close),
+      };
+    }
+
+    function toVolumePoint(item) {
+      const open = toNumber(item.open);
+      const close = toNumber(item.close);
+      const value = toNumber(item.volume);
+      volumeByTime.set(item.time, value);
+      return {
+        time: item.time,
+        value,
+        color: close >= open ? 'rgba(46, 189, 133, 0.55)' : 'rgba(239, 83, 80, 0.55)',
+      };
+    }
+
+    function calculateEma(candles, period) {
+      if (!candles.length) return [];
+      const k = 2 / (period + 1);
+      const results = [];
+      let prev = candles[0].close;
+      for (let i = 0; i < candles.length; i += 1) {
+        const close = candles[i].close;
+        if (i === 0) {
+          prev = close;
+        } else {
+          prev = close * k + prev * (1 - k);
+        }
+        results.push({ time: candles[i].time, value: Number(prev.toFixed(2)) });
+      }
+      return results;
+    }
+
+    function updatePriceLine(latest) {
+      if (!latest) return;
+      if (lastPriceLine) {
+        candleSeries.removePriceLine(lastPriceLine);
+      }
+      lastPriceLine = candleSeries.createPriceLine({
+        price: latest.close,
+        color: '#21c87a',
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `Last ${latest.close.toFixed(2)}`,
+      });
+    }
+
+    function formatNumber(value, digits = 2) {
+      return Number.isFinite(value) ? value.toFixed(digits) : '--';
+    }
+
+    function updateHud(candle) {
+      if (!ohclReadout) return;
+      if (!candle) {
+        ohclReadout.textContent = 'O -- · H -- · L -- · C -- · V --';
+        return;
+      }
+      const volume = volumeByTime.get(candle.time);
+      const text = [
+        `O ${formatNumber(candle.open)}`,
+        `H ${formatNumber(candle.high)}`,
+        `L ${formatNumber(candle.low)}`,
+        `C ${formatNumber(candle.close)}`,
+        `V ${volume ? formatNumber(volume, 3) : '--'}`,
+      ].join(' · ');
+      ohclReadout.textContent = text;
+    }
+
+    chart.subscribeCrosshairMove((param) => {
+      if (!param || param.time === undefined) {
+        updateHud(latestCandle);
+        return;
+      }
+      const seriesMap = param.seriesData;
+      const dataPoint = seriesMap ? seriesMap.get(candleSeries) : null;
+      updateHud(dataPoint || latestCandle);
+    });
+
+    window.renderCandles = function renderCandles(jsonData) {
+      try {
+        const parsed = JSON.parse(jsonData);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+          candleSeries.setData([]);
+          volumeSeries.setData([]);
+          emaFastSeries.setData([]);
+          emaSlowSeries.setData([]);
+          latestCandle = null;
+          volumeByTime.clear();
+          updateHud(null);
+          return;
+        }
+        volumeByTime.clear();
+        const candles = parsed.map(toCandlePoint);
+        candleSeries.setData(candles);
+        const volumes = parsed.map(toVolumePoint);
+        volumeSeries.setData(volumes);
+        emaFastSeries.setData(calculateEma(candles, 9));
+        emaSlowSeries.setData(calculateEma(candles, 21));
+        chart.timeScale().fitContent();
+        latestCandle = candles[candles.length - 1];
+        updateHud(latestCandle);
+        updatePriceLine(latestCandle);
+      } catch (err) {
+        console.error('renderCandles error', err);
+      }
+    };
+
+    window.updateStreamStatus = function updateStreamStatus(connected, lastUpdateMs, sourceLabel, latencyMs) {
+      if (!statusBadge) return;
+      const label = connected ? 'LIVE' : 'RECONNECTING';
+      const latencyText = latencyMs > 0 ? `${latencyMs} ms` : '--';
+      const timeText = lastUpdateMs > 0 ? new Date(lastUpdateMs).toLocaleTimeString() : '--:--:--';
+      statusBadge.textContent = `${label} · ${(sourceLabel || 'AUTO').toUpperCase()} · ${latencyText} · ${timeText}`;
+      statusBadge.classList.toggle('ok', Boolean(connected));
+      statusBadge.classList.toggle('warn', !connected);
+      if (sourceLabelEl) {
+        sourceLabelEl.textContent = sourceLabel || 'Auto source';
+      }
+      if (latencyPill) {
+        latencyPill.textContent = latencyText;
+      }
+    };
+
+    window.addEventListener('resize', () => {
+      const rect = container.getBoundingClientRect();
+      chart.resize(rect.width, rect.height);
+    });
+
+    window.updateStreamStatus(false, 0, '初始化', -1);
+  </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+import ./quic/testIntegrationUsecase
+import ./quic/testPerf
+import ./quic/testApi
+import ./quic/testStreams
+import ./quic/testStreamQueue
+import ./quic/testListener
+import ./quic/testQuicConnection
+import ./quic/testTimeout
+import ./quic/testParseDatagram
+import ./quic/testNgtcp2TransportParameters
+import ./quic/testConnectionId
+import ./quic/testConnection
+import ./quic/testBits
+import ./quic/testPacketNumber
+import ./quic/testPacketWriting
+import ./quic/testPacketReading
+import ./quic/testPacketLength
+import ./quic/testPackets
+import ./quic/testVarInts
+
+{.warning[UnusedImport]: off.}
