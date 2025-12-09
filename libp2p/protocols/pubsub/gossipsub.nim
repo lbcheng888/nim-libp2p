@@ -74,6 +74,12 @@ when defined(libp2p_expensive_metrics):
     labels = ["id", "topic"],
   )
 
+when not defined(libp2p_privacy_gossip):
+  const
+    DefaultPrivacyStemDuration = 3.seconds
+    DefaultPrivacyFluffDuration = 6.seconds
+    DefaultPrivacyRouteTtl = 30.seconds
+
 proc init*(
     _: type[GossipSubParams],
     pruneBackoff = 1.minutes,
@@ -123,14 +129,13 @@ proc init*(
     pxPromiseTTL = 2.minutes,
     pxSuccessReward = 0.0,
     pxFailurePenalty = 0.0,
-    when defined(libp2p_privacy_gossip):
-      privacyDandelion = false,
-      privacyStemDuration = DefaultPrivacyStemDuration,
-      privacyFluffDuration = DefaultPrivacyFluffDuration,
-      privacyRouteTTL = DefaultPrivacyRouteTtl,
-      privacyStemFanout = 1,
+    privacyDandelion = false,
+    privacyStemDuration = DefaultPrivacyStemDuration,
+    privacyFluffDuration = DefaultPrivacyFluffDuration,
+    privacyRouteTTL = DefaultPrivacyRouteTtl,
+    privacyStemFanout = 1,
 ): GossipSubParams =
-  GossipSubParams(
+  result = GossipSubParams(
     explicit: true,
     pruneBackoff: pruneBackoff,
     unsubscribeBackoff: unsubscribeBackoff,
@@ -179,13 +184,13 @@ proc init*(
     pxPromiseTTL: pxPromiseTTL,
     pxSuccessReward: pxSuccessReward,
     pxFailurePenalty: pxFailurePenalty,
-    when defined(libp2p_privacy_gossip):
-      privacyDandelion: privacyDandelion,
-      privacyStemDuration: privacyStemDuration,
-      privacyFluffDuration: privacyFluffDuration,
-      privacyRouteTTL: privacyRouteTTL,
-      privacyStemFanout: privacyStemFanout,
   )
+  when defined(libp2p_privacy_gossip):
+    result.privacyDandelion = privacyDandelion
+    result.privacyStemDuration = privacyStemDuration
+    result.privacyFluffDuration = privacyFluffDuration
+    result.privacyRouteTTL = privacyRouteTTL
+    result.privacyStemFanout = privacyStemFanout
 
 proc validateParameters*(parameters: GossipSubParams): Result[void, cstring] =
   if (parameters.dOut >= parameters.dLow) or (parameters.dOut > (parameters.d div 2)):
@@ -247,19 +252,22 @@ proc validateParameters*(parameters: GossipSubParams): Result[void, cstring] =
     err("gossipsub: pxSuccessReward parameter error, Must be >= 0")
   elif parameters.pxFailurePenalty < 0:
     err("gossipsub: pxFailurePenalty parameter error, Must be >= 0")
-  when defined(libp2p_privacy_gossip):
-    elif parameters.privacyDandelion and
-        parameters.privacyStemDuration <= chronos.ZeroDuration:
-      err("gossipsub: privacyStemDuration parameter error, Must be > 0")
-    elif parameters.privacyDandelion and
-        parameters.privacyFluffDuration <= chronos.ZeroDuration:
-      err("gossipsub: privacyFluffDuration parameter error, Must be > 0")
-    elif parameters.privacyDandelion and parameters.privacyRouteTTL <= chronos.ZeroDuration:
-      err("gossipsub: privacyRouteTTL parameter error, Must be > 0")
-    elif parameters.privacyDandelion and parameters.privacyStemFanout <= 0:
-      err("gossipsub: privacyStemFanout parameter error, Must be > 0")
   else:
-    ok()
+    when defined(libp2p_privacy_gossip):
+      if parameters.privacyDandelion and
+          parameters.privacyStemDuration <= chronos.ZeroDuration:
+        err("gossipsub: privacyStemDuration parameter error, Must be > 0")
+      elif parameters.privacyDandelion and
+          parameters.privacyFluffDuration <= chronos.ZeroDuration:
+        err("gossipsub: privacyFluffDuration parameter error, Must be > 0")
+      elif parameters.privacyDandelion and parameters.privacyRouteTTL <= chronos.ZeroDuration:
+        err("gossipsub: privacyRouteTTL parameter error, Must be > 0")
+      elif parameters.privacyDandelion and parameters.privacyStemFanout <= 0:
+        err("gossipsub: privacyStemFanout parameter error, Must be > 0")
+      else:
+        ok()
+    else:
+      ok()
 
 proc validateParameters*(parameters: TopicParams): Result[void, cstring] =
   if parameters.timeInMeshWeight <= 0.0 or parameters.timeInMeshWeight > 1.0:

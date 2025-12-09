@@ -218,3 +218,10 @@ func `==`*(a, b: SkSignature): bool =
   secp256k1.SkSignature(a) == secp256k1.SkSignature(b)
 func `==`*(a, b: SkKeyPair): bool =
   secp256k1.SkKeyPair(a) == secp256k1.SkKeyPair(b)
+
+proc ecdh*(seckey: SkPrivateKey, pubkey: SkPublicKey): SkResult[seq[byte]] =
+  let sk = secp256k1.SkSecretKey(seckey)
+  let pk = secp256k1.SkPublicKey(pubkey)
+  # secp256k1.ecdh returns SkEcdhSecret object, accessing .data gives array
+  let secret = secp256k1.ecdh(sk, pk)
+  ok(@(secret.data))

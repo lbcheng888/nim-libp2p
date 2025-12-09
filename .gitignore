@@ -50,3 +50,8 @@ libp2p/protocols/onionpay
 *.py
 examples/mobile_ffi/runtime
 .idea
+test_secp
+.kotlin
+*.png
+*.txt
+*.log

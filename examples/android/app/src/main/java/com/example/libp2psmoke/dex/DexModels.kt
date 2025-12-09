@@ -115,3 +115,20 @@ data class OrderBookEntry(
     val quantity: BigDecimal,
     val cumulativeQuantity: BigDecimal
 )
+
+fun List<DexKlineBucket>.toTradingViewJson(): String {
+    if (isEmpty()) return "[]"
+    val ordered = this.distinctBy { it.windowStartMs }.sortedBy { it.windowStartMs }
+    val builder = StringBuilder("[")
+    ordered.forEachIndexed { index, bucket ->
+        if (index > 0) builder.append(',')
+        builder.append("{\"time\":").append(bucket.windowStartMs / 1000)
+        builder.append(",\"open\":").append(bucket.open)
+        builder.append(",\"high\":").append(bucket.high)
+        builder.append(",\"low\":").append(bucket.low)
+        builder.append(",\"close\":").append(bucket.close)
+        builder.append(",\"volume\":").append(bucket.volumeBase).append("}")
+    }
+    builder.append(']')
+    return builder.toString()
+}

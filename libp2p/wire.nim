@@ -78,7 +78,8 @@ proc connect*(
   if not (TRANSPMA.match(ma)):
     raise newException(MaInvalidAddress, "Incorrect or unsupported address!")
 
-  let transportAddress = initTAddress(ma).tryGet()
+  let transportAddress = initTAddress(ma).valueOr:
+    raise newException(LPError, "Failed to initialize TransportAddress: " & error)
 
   compilesOr:
     return await connect(
@@ -86,7 +87,8 @@ proc connect*(
       bufferSize,
       child,
       if localAddress.isSome():
-        initTAddress(localAddress.expect("just checked")).tryGet()
+        initTAddress(localAddress.expect("just checked")).valueOr:
+          raise newException(LPError, "Failed to init local TransportAddress: " & error)
       else:
         TransportAddress(),
       flags,
@@ -113,8 +115,12 @@ proc createStreamServer*[T](
     )
 
   try:
+    let addrRes = initTAddress(ma)
+    if addrRes.isErr:
+      raise newException(LPError, "Failed to init TransportAddress: " & $addrRes.error)
+    
     return createStreamServer(
-      initTAddress(ma).tryGet(),
+      addrRes.get(),
       cbproc,
       flags,
       udata,
@@ -144,8 +150,13 @@ proc createStreamServer*[T](
     raise newException(MaInvalidAddress, "Incorrect or unsupported address!")
 
   try:
+    let addrRes = initTAddress(ma)
+    if addrRes.isErr:
+      raise newException(LPError, "Failed to init TransportAddress: " & $addrRes.error)
+
     return createStreamServer(
-      initTAddress(ma).tryGet(), flags, udata, sock, backlog, bufferSize, child, init
+      addrRes.get(),
+      flags, udata, sock, backlog, bufferSize, child, init
     )
   except CatchableError as exc:
     raise newException(LPError, "failed simpler createStreamServer: " & exc.msg, exc)

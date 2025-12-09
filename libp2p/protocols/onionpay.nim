@@ -43,6 +43,7 @@ type
   OnionPacket* = object
     ## Encapsulated payload routed through the network.
     routeId*: OnionRouteId
+    ephemeralPk*: array[33, byte] # Added for ECDH
     payload*: seq[byte]
 
   OnionLayerResult* = object
@@ -200,6 +201,7 @@ proc decodeHeader(
 
 proc buildOnionPacket*(
     route: OnionRoute,
+    ephemeralPk: array[33, byte],
     payload: seq[byte],
     rng: ref HmacDrbgContext = nil
 ): OnionResult[OnionPacket] =
@@ -223,7 +225,7 @@ proc buildOnionPacket*(
     envelope = sealLayer(hop.secret, layer, rngRef)
     downstream = Opt.some(hop.peer)
 
-  ok(OnionPacket(routeId: route.id, payload: envelope))
+  ok(OnionPacket(routeId: route.id, ephemeralPk: ephemeralPk, payload: envelope))
 
 proc peelOnionLayer*(
     packet: var OnionPacket,

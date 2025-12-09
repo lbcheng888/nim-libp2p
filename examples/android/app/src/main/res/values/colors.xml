@@ -1,5 +1,45 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Primary Brand Colors -->
+    <color name="dex_primary">#FF00A3FF</color>
+    <color name="dex_primary_light">#FF5CC7FF</color>
+    <color name="dex_primary_dark">#FF0077CC</color>
+    
+    <!-- Trading Colors -->
+    <color name="dex_green">#FF00D68F</color>
+    <color name="dex_green_light">#FF4FFFC3</color>
+    <color name="dex_red">#FFFF4757</color>
+    <color name="dex_red_light">#FFFF6B7A</color>
+    
+    <!-- Accent Colors -->
+    <color name="dex_accent">#FFBB86FC</color>
+    <color name="dex_accent_secondary">#FF03DAC6</color>
+    <color name="dex_yellow">#FFFFCC00</color>
+    <color name="dex_orange">#FFFF9500</color>
+    
+    <!-- Dark Theme -->
+    <color name="dex_dark_bg">#FF0D0F14</color>
+    <color name="dex_surface">#FF161B26</color>
+    <color name="dex_surface_highlight">#FF1E2636</color>
+    <color name="dex_elevated">#FF252D40</color>
+    
+    <!-- Light Theme -->
+    <color name="dex_light_bg">#FFF8FAFC</color>
+    <color name="dex_light_surface">#FFFFFFFF</color>
+    
+    <!-- Text Colors -->
+    <color name="text_primary">#FFF1F5F9</color>
+    <color name="text_secondary">#FF8896AB</color>
+    <color name="text_primary_light">#FF0F172A</color>
+    <color name="text_secondary_light">#FF64748B</color>
+    
+    <!-- Chain Colors -->
+    <color name="chain_btc">#FFF7931A</color>
+    <color name="chain_eth">#FF627EEA</color>
+    <color name="chain_bsc">#FFF3BA2F</color>
+    <color name="chain_sol">#FF00FFA3</color>
+    
+    <!-- Legacy -->
     <color name="purple_200">#FFBB86FC</color>
     <color name="purple_500">#FF6200EE</color>
     <color name="purple_700">#FF3700B3</color>

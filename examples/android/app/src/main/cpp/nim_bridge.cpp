@@ -49,6 +49,24 @@ void nim_bridge_emit_event(const char *topic, const char *payload);
 
 bool libp2p_initialize_conn_events(void *handle);
 
+bool libp2p_dex_init(void *handle, const char *configJson);
+bool libp2p_dex_submit_order(void *handle, const char *orderJson);
+bool libp2p_dex_submit_mixer_intent(void *handle, const char *intentJson);
+const char *libp2p_dex_get_market_data(void *handle, const char *asset);
+
+// Adapter Signatures
+const char *libp2p_adapter_generate_secret();
+const char *libp2p_adapter_compute_payment_point(const char *secret);
+const char *libp2p_adapter_sign(const char *msg, const char *privKey, const char *point);
+    const char* libp2p_adapter_complete_sig(const char* adaptorSig, const char* secret);
+    const char* libp2p_adapter_extract_secret(const char* adaptorSig, const char* validSig);
+    
+    const char* libp2p_mpc_keygen_init();
+    const char* libp2p_mpc_keygen_finalize(const char* localPub, const char* remotePub);
+    const char* libp2p_mpc_sign_init();
+    const char* libp2p_mpc_sign_partial(const char* msg, const char* secret, const char* nonce, const char* jointPub, const char* jointNoncePub);
+    const char* libp2p_mpc_sign_combine(const char* s1, const char* s2, const char* jointNoncePub);
+
 } // extern "C"
 
 namespace {
@@ -110,11 +128,48 @@ inline void *toHandle(jlong handle) {
 
 } // namespace
 
+
+static JavaVM *g_vm = nullptr;
+
 extern "C" void nim_bridge_emit_event(const char *topic, const char *payload) {
-  if (topic == nullptr || payload == nullptr) {
+  if (topic == nullptr || payload == nullptr || g_vm == nullptr) {
     return;
   }
-  __android_log_print(ANDROID_LOG_DEBUG, kLogTag, "[event] %s %s", topic, payload);
+
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  int status = g_vm->GetEnv((void **)&env, JNI_VERSION_1_6);
+  if (status == JNI_EDETACHED) {
+    if (g_vm->AttachCurrentThread(&env, nullptr) != 0) {
+      __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Failed to attach thread for event");
+      return;
+    }
+    attached = true;
+  } else if (status != JNI_OK) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Failed to get JNIEnv");
+    return;
+  }
+
+  jclass bridgeClass = env->FindClass("com/example/libp2psmoke/native/NimBridge");
+  if (bridgeClass != nullptr) {
+    jmethodID methodId = env->GetStaticMethodID(bridgeClass, "onNativeEvent", "(Ljava/lang/String;Ljava/lang/String;)V");
+    if (methodId != nullptr) {
+      jstring jTopic = env->NewStringUTF(topic);
+      jstring jPayload = env->NewStringUTF(payload);
+      env->CallStaticVoidMethod(bridgeClass, methodId, jTopic, jPayload);
+      env->DeleteLocalRef(jTopic);
+      env->DeleteLocalRef(jPayload);
+    } else {
+       __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Failed to find onNativeEvent method");
+    }
+    env->DeleteLocalRef(bridgeClass);
+  } else {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Failed to find NimBridge class");
+  }
+
+  if (attached) {
+    g_vm->DetachCurrentThread();
+  }
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -443,13 +498,142 @@ Java_com_example_libp2psmoke_native_NimBridge_nativeGetLastInitError(JNIEnv *env
   return copyAndFree(env, raw);
 }
 
+extern "C" void NimMain();
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+  g_vm = vm;
   JNIEnv *env = nullptr;
   if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
     logError("Failed to get JNI environment");
     return JNI_ERR;
   }
   logInfo("nimbridge JNI loaded");
+  
+  // Initialize Nim Main (Global Init)
+  NimMain();
+  
   ensureThreadAttached();
   return JNI_VERSION_1_6;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeDexInit(JNIEnv *env,
+                                                            jclass,
+                                                            jlong handle,
+                                                            jstring configJson) {
+  ensureThreadAttached();
+  const std::string config = jstringToUtf8(env, configJson);
+  return static_cast<jboolean>(
+      libp2p_dex_init(toHandle(handle), config.empty() ? nullptr : config.c_str()));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeDexSubmitOrder(JNIEnv *env,
+                                                                   jclass,
+                                                                   jlong handle,
+                                                                   jstring orderJson) {
+  ensureThreadAttached();
+  const std::string order = jstringToUtf8(env, orderJson);
+  return static_cast<jboolean>(
+      libp2p_dex_submit_order(toHandle(handle), order.empty() ? nullptr : order.c_str()));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeDexSubmitMixerIntent(JNIEnv *env,
+                                                                         jclass,
+                                                                         jlong handle,
+                                                                         jstring intentJson) {
+  ensureThreadAttached();
+  const std::string intent = jstringToUtf8(env, intentJson);
+  return static_cast<jboolean>(
+      libp2p_dex_submit_mixer_intent(toHandle(handle), intent.empty() ? nullptr : intent.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeDexGetMarketData(JNIEnv *env,
+                                                                     jclass,
+                                                                     jlong handle,
+                                                                     jstring asset) {
+  ensureThreadAttached();
+  const std::string assetStr = jstringToUtf8(env, asset);
+  const char *raw = libp2p_dex_get_market_data(toHandle(handle), assetStr.empty() ? nullptr : assetStr.c_str());
+  return copyAndFree(env, raw);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeAdapterGenerateSecret(JNIEnv *env, jclass) {
+  ensureThreadAttached();
+  return copyAndFree(env, libp2p_adapter_generate_secret());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeAdapterComputePaymentPoint(JNIEnv *env, jclass, jstring secret) {
+  ensureThreadAttached();
+  const std::string s = jstringToUtf8(env, secret);
+  return copyAndFree(env, libp2p_adapter_compute_payment_point(s.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeAdapterSign(JNIEnv *env, jclass, jstring msg, jstring privKey, jstring point) {
+  ensureThreadAttached();
+  const std::string m = jstringToUtf8(env, msg);
+  const std::string k = jstringToUtf8(env, privKey);
+  const std::string p = jstringToUtf8(env, point);
+  return copyAndFree(env, libp2p_adapter_sign(m.c_str(), k.c_str(), p.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeAdapterCompleteSig(JNIEnv *env, jclass, jstring adaptorSig, jstring secret) {
+  ensureThreadAttached();
+  const std::string a = jstringToUtf8(env, adaptorSig);
+  const std::string s = jstringToUtf8(env, secret);
+  return copyAndFree(env, libp2p_adapter_complete_sig(a.c_str(), s.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeAdapterExtractSecret(JNIEnv *env, jclass, jstring adaptorSig, jstring validSig) {
+  ensureThreadAttached();
+  const std::string a = jstringToUtf8(env, adaptorSig);
+  const std::string v = jstringToUtf8(env, validSig);
+  return copyAndFree(env, libp2p_adapter_extract_secret(a.c_str(), v.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeMpcKeygenInit(JNIEnv *env, jclass) {
+  ensureThreadAttached();
+  return copyAndFree(env, libp2p_mpc_keygen_init());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeMpcKeygenFinalize(JNIEnv *env, jclass, jstring localPub, jstring remotePub) {
+  ensureThreadAttached();
+  const std::string l = jstringToUtf8(env, localPub);
+  const std::string r = jstringToUtf8(env, remotePub);
+  return copyAndFree(env, libp2p_mpc_keygen_finalize(l.c_str(), r.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeMpcSignInit(JNIEnv *env, jclass) {
+  ensureThreadAttached();
+  return copyAndFree(env, libp2p_mpc_sign_init());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeMpcSignPartial(JNIEnv *env, jclass, jstring msg, jstring secret, jstring nonce, jstring jointPub, jstring jointNoncePub) {
+  ensureThreadAttached();
+  const std::string m = jstringToUtf8(env, msg);
+  const std::string s = jstringToUtf8(env, secret);
+  const std::string n = jstringToUtf8(env, nonce);
+  const std::string jp = jstringToUtf8(env, jointPub);
+  const std::string jnp = jstringToUtf8(env, jointNoncePub);
+  return copyAndFree(env, libp2p_mpc_sign_partial(m.c_str(), s.c_str(), n.c_str(), jp.c_str(), jnp.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeMpcSignCombine(JNIEnv *env, jclass, jstring s1, jstring s2, jstring jointNoncePub) {
+  ensureThreadAttached();
+  const std::string sig1 = jstringToUtf8(env, s1);
+  const std::string sig2 = jstringToUtf8(env, s2);
+  const std::string jnp = jstringToUtf8(env, jointNoncePub);
+  return copyAndFree(env, libp2p_mpc_sign_combine(sig1.c_str(), sig2.c_str(), jnp.c_str()));
 }

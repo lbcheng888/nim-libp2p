@@ -77,6 +77,8 @@ OUT_PATH="$OUT_DIR/$LIB_NAME"
 
 OPENSSL_VERSION_HEX="${OPENSSL_VERSION_HEX:-0x40000000L}"
 
+SECP_PATH="$REPO_ROOT/vendor/secp256k1"
+
 NIM_FLAGS=(
   "c"
   "--app:lib"
@@ -90,7 +92,10 @@ NIM_FLAGS=(
   "--path:examples/mobile_ffi/compat/chronicles_stub"
   "--path:."
   "--path:examples/mobile_ffi"
+  "--path:examples/dex"
+  "--path:examples/dex/compat"
   "--path:${REPO_ROOT}/nimbledeps/pkgs2"
+  "--path:${SECP_PATH}"
   "--passC:-Iexamples/mobile_ffi/compat"
   "--passC:-I${NIM_LIBP2P_DIR}"
   "--passC:-I$REPO_ROOT/compat"
@@ -115,9 +120,11 @@ NIM_FLAGS=(
   "--out:${OUT_PATH}"
 )
 
-# Optionally disable QUIC via NIM_ANDROID_ENABLE_QUIC=0. Default is enabled.
-if [[ "${NIM_ANDROID_ENABLE_QUIC:-1}" == "1" ]]; then
-  NIM_FLAGS+=("--define:libp2p_quic_support")
+# Optionally disable QUIC via NIM_ANDROID_ENABLE_QUIC=0. Default is disabled to prevent crashes.
+# Set to 1 to enable QUIC (Experimental MsQuic support)
+# WARNING: Requires libmsquic.so for Android ARM64 to be present in jniLibs.
+if [[ "${NIM_ANDROID_ENABLE_QUIC:-0}" == "1" ]]; then
+  # NIM_FLAGS+=("--define:libp2p_quic_support")
   NIM_FLAGS+=("--define:libp2p_msquic_experimental")
 fi
 
@@ -138,6 +145,10 @@ if [[ "$MODE" == "release" ]]; then
 else
   NIM_FLAGS+=("--define:debug")
 fi
+
+# Fix for potential Android SIGSEGV with nimcrypto ASM and ART signal handlers
+NIM_FLAGS+=("--define:nimcrypto_disable_asm")
+NIM_FLAGS+=("--define:noSignalHandler")
 
 echo "[nim-android] Building Nim libp2p -> $OUT_PATH"
 (

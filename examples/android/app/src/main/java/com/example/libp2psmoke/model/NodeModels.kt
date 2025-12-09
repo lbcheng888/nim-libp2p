@@ -4,6 +4,7 @@ import com.example.libp2psmoke.dex.BinanceTicker
 import com.example.libp2psmoke.dex.OrderBookEntry
 import com.example.libp2psmoke.dex.DexKlineBucket
 import com.example.libp2psmoke.dex.DexSwapResult
+import com.example.libp2psmoke.dex.AtomicSwapState
 import java.math.BigDecimal
 
 data class LanEndpoint(
@@ -48,9 +49,19 @@ data class LivestreamFrame(
     val timestampMs: Long
 )
 
+// Extended for Multi-Chain Wallets
+data class ChainWallet(
+    val chainId: String,      // ETH, BSC, SOL, TRX, BTC
+    val address: String,
+    val balance: BigDecimal,  // Native currency
+    val usdcBalance: BigDecimal = BigDecimal.ZERO, // USDC on this chain
+    val symbol: String        // ETH, BNB, SOL, TRX, BTC
+)
+
 data class NodeUiState(
     val running: Boolean = false,
     val localPeerId: String? = null,
+    val peerCount: Int = 0,
     val ipv4Addresses: List<String> = emptyList(),
     val ipv6Addresses: List<String> = emptyList(),
     val lanEndpoints: List<LanEndpoint> = emptyList(),
@@ -62,6 +73,7 @@ data class NodeUiState(
     val dexKlines: List<DexKlineBucket> = emptyList(),
     val binanceTicker: BinanceTicker? = null,
     val binanceKlines: List<DexKlineBucket> = emptyList(),
+    val binanceKlinesJson: String = "[]",
     val binanceInterval: String = "1m",
     val binanceLoading: Boolean = false,
     val binanceBids: List<OrderBookEntry> = emptyList(),
@@ -72,9 +84,23 @@ data class NodeUiState(
     val marketSource: String = "Binance",
     val marketLatencyMs: Long = 0L,
     val marketLatencies: List<MarketSourceLatency> = emptyList(),
+    
+    // Legacy fields (kept for compat, but prefer multiChainWallets)
     val btcBalance: BigDecimal = BigDecimal.ZERO,
     val bscWalletAddress: String? = null,
-    val lastError: String? = null
+    
+    // New Multi-Chain Support
+    val multiChainWallets: Map<String, ChainWallet> = emptyMap(),
+    
+    val lastError: String? = null,
+    val successMessage: String? = null,
+    
+    // UI 专用状态 (计算结果)
+    val swapEstimation: String = "0",
+    val bridgeLoading: Boolean = false,
+    
+    // Atomic Swap State
+    val activeSwap: com.example.libp2psmoke.dex.AtomicSwapState? = null
 )
 
 data class MarketSourceLatency(

@@ -94,6 +94,17 @@ proc initSigning*(cfg: SigningConfig): SigningContext =
   if pidRes.isOk():
     result.peerId = some(pidRes.get())
 
+proc canonicalOrderPayload*(order: OrderMessage): string =
+  # Canonical representation for signing:
+  # id|traderPeer|baseAssetChain/Symbol|quoteAssetChain/Symbol|side|price|amount|ttlMs|timestamp
+  # Note: Adjust fields as necessary to match strictly what needs to be signed.
+  &"{order.id}|{order.traderPeer}|{order.baseAsset.toString()}|{order.quoteAsset.toString()}|{order.side}|{order.price}|{order.amount}|{order.ttlMs}|{order.timestamp}"
+
+proc canonicalMatchPayload*(match: MatchMessage): string =
+  # Canonical representation for signing:
+  # orderId|matcherPeer|baseAssetChain/Symbol|quoteAssetChain/Symbol|price|amount|note
+  &"{match.orderId}|{match.matcherPeer}|{match.baseAsset.toString()}|{match.quoteAsset.toString()}|{match.price}|{match.amount}|{match.note}"
+
 proc signBytes(ctx: SigningContext; data: openArray[byte]): Option[string] =
   if ctx.isNil() or ctx.privKey.isNone():
     return none(string)

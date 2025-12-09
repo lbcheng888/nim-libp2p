@@ -191,52 +191,35 @@ proc tryLoadFromPath(path: string; options: MsQuicLoadOptions): MsQuicLoadResult
   )
 
 proc loadMsQuic*(options: MsQuicLoadOptions = MsQuicLoadOptions()): MsQuicLoadResult =
-  var attempts: seq[string] = @[]
-  var errors: seq[string] = @[]
-  var lastStatus: MsQuicStatus = 0
-  for cand in candidatePaths(options):
-    let loadRes = tryLoadFromPath(cand, options)
-    if loadRes.attemptedPaths.len > 0:
-      attempts.add(loadRes.attemptedPaths[0])
-    if loadRes.success:
-      return loadRes
-    if loadRes.error.len > 0:
-      errors.add(loadRes.error)
-    lastStatus = loadRes.status
-  if options.allowFallback:
-    var tablePtr: QuicApiTablePtr = nil
-    let rawStatus = builtin_api.MsQuicOpenVersion(options.requestedVersion, addr tablePtr)
-    let status = MsQuicStatus(int32(rawStatus))
-    attempts.add("builtin-nim")
-    if rawStatus == builtin_api.QUIC_STATUS_SUCCESS and not tablePtr.isNil:
-      return MsQuicLoadResult(
-        success: true,
-        runtime: MsQuicRuntime(
-          handle: nil,
-          path: "builtin-nim",
-          apiTable: tablePtr,
-          closeProc: builtin_api.MsQuicClose,
-          status: status,
-          openSymbol: "builtin",
-          versionRequested: options.requestedVersion,
-          versionNegotiated: options.requestedVersion
-        ),
+  # UniMaker Pure Nim Skeleton Mode:
+  # Bypass all dynamic library loading. Directly use the internal Nim API stubs.
+  var tablePtr: QuicApiTablePtr = nil
+  let rawStatus = builtin_api.MsQuicOpenVersion(options.requestedVersion, addr tablePtr)
+  let status = MsQuicStatus(int32(rawStatus))
+  
+  if rawStatus == builtin_api.QUIC_STATUS_SUCCESS and not tablePtr.isNil:
+    return MsQuicLoadResult(
+      success: true,
+      runtime: MsQuicRuntime(
+        handle: nil,
+        path: "builtin-nim-pure-skeleton",
+        apiTable: tablePtr,
+        closeProc: builtin_api.MsQuicClose,
         status: status,
-        attemptedPaths: attempts,
-        openSymbol: "builtin"
-      )
-    errors.add(
-      if rawStatus == builtin_api.QUIC_STATUS_SUCCESS:
-        "builtin: 未返回有效 QUIC_API_TABLE"
-      else:
-        "builtin: 状态 " & $rawStatus
+        openSymbol: "MsQuicOpenVersion",
+        versionRequested: options.requestedVersion,
+        versionNegotiated: options.requestedVersion
+      ),
+      status: status,
+      attemptedPaths: @["builtin-nim-pure-skeleton"],
+      openSymbol: "MsQuicOpenVersion"
     )
-    lastStatus = status
+  
   MsQuicLoadResult(
     success: false,
-    status: lastStatus,
-    attemptedPaths: attempts,
-    error: errors.join("; ")
+    status: status,
+    attemptedPaths: @["builtin-nim-pure-skeleton"],
+    error: "Failed to initialize Pure Nim Skeleton: " & $rawStatus
   )
 
 proc unloadMsQuic*(runtime: var MsQuicRuntime) =

@@ -24,13 +24,17 @@ import
   stream/connection,
   multiaddress,
   crypto/crypto,
-  transports/[transport, tcptransport, wstransport, memorytransport],
+  transports/[transport, tcptransport, memorytransport],
   muxers/[muxer, mplex/mplex, yamux/yamux],
   protocols/[
     identify,
     secure/secure,
     secure/noise,
-    secure/tls,
+  ]
+when not defined(libp2p_no_tls):
+  import protocols/secure/tls
+  import transports/wstransport
+import protocols/[
     rendezvous,
     datatransfer/datatransfer,
     datatransfer/channelmanager,
@@ -87,8 +91,16 @@ let defaultHttpNotFoundHandler*: lpHttp.HttpHandler =
     fut
 
 export
-  switch, peerid, peerinfo, connection, multiaddress, crypto, errors, TLSPrivateKey,
-  TLSCertificate, TLSFlags, ServerFlags, PrivateNetworkKey, loadPrivateNetworkKey
+  switch, peerid, peerinfo, connection, multiaddress, crypto, errors, ServerFlags, PrivateNetworkKey, loadPrivateNetworkKey
+when not defined(libp2p_no_tls):
+  export TLSPrivateKey, TLSCertificate, TLSFlags
+else:
+  type
+    TLSPrivateKey* = ref object
+    TLSCertificate* = ref object
+    TLSFlags* = enum
+      NoVerifyHost
+      NoVerifyServerName
 
 logScope:
   topics = "libp2p builder"
@@ -298,10 +310,11 @@ proc withNoise*(b: SwitchBuilder): SwitchBuilder {.public.} =
     b.secureManagers.add(SecureProtocol.Noise)
   b
 
-proc withTls*(b: SwitchBuilder): SwitchBuilder {.public.} =
-  if SecureProtocol.Tls notin b.secureManagers:
-    b.secureManagers.add(SecureProtocol.Tls)
-  b
+when not defined(libp2p_no_tls):
+  proc withTls*(b: SwitchBuilder): SwitchBuilder {.public.} =
+    if SecureProtocol.Tls notin b.secureManagers:
+      b.secureManagers.add(SecureProtocol.Tls)
+    b
 
 proc withSecureManagers*(
     b: SwitchBuilder, managers: openArray[SecureProtocol]
@@ -394,19 +407,20 @@ proc withTcpTransport*(
       TcpTransport.new(flags, config.upgr)
   )
 
-proc withWsTransport*(
-    b: SwitchBuilder,
-    tlsPrivateKey: TLSPrivateKey = nil,
-    tlsCertificate: TLSCertificate = nil,
-    tlsFlags: set[TLSFlags] = {},
-    flags: set[ServerFlags] = {},
-): SwitchBuilder =
-  b.withTransport(
-    proc(config: TransportConfig): Transport =
-      WsTransport.new(
-        config.upgr, tlsPrivateKey, tlsCertificate, config.autotls, tlsFlags, flags
-      )
-  )
+when not defined(libp2p_no_tls):
+  proc withWsTransport*(
+      b: SwitchBuilder,
+      tlsPrivateKey: TLSPrivateKey = nil,
+      tlsCertificate: TLSCertificate = nil,
+      tlsFlags: set[TLSFlags] = {},
+      flags: set[ServerFlags] = {},
+  ): SwitchBuilder =
+    b.withTransport(
+      proc(config: TransportConfig): Transport =
+        WsTransport.new(
+          config.upgr, tlsPrivateKey, tlsCertificate, config.autotls, tlsFlags, flags
+        )
+    )
 
 when defined(libp2p_msquic_experimental):
   import transports/msquictransport
@@ -1123,18 +1137,20 @@ proc build*(b: SwitchBuilder): Switch {.raises: [LPError], public.} =
       Noise.new(b.rng, seckey, supportedMuxers = muxerCodecs).Secure
     )
   if SecureProtocol.Tls in b.secureManagers:
-    secureManagerInstances.add(TLS.new(b.rng, seckey).Secure)
+    when not defined(libp2p_no_tls):
+      secureManagerInstances.add(TLS.new(b.rng, seckey).Secure)
 
   if b.muxers.len > 0:
     let alpnMuxers = b.muxers.mapIt(it.codec).filterIt(it.len > 0)
     if alpnMuxers.len > 0:
       for secureInstance in secureManagerInstances.mitems():
-        if secureInstance of TLS:
-          let tls = TLS(secureInstance)
-          var alpnList = alpnMuxers
-          if Libp2pAlpn notin alpnList:
-            alpnList.add(Libp2pAlpn)
-          tls.setAlpn(alpnList)
+        when not defined(libp2p_no_tls):
+          if secureInstance of TLS:
+            let tls = TLS(secureInstance)
+            var alpnList = alpnMuxers
+            if Libp2pAlpn notin alpnList:
+              alpnList.add(Libp2pAlpn)
+            tls.setAlpn(alpnList)
 
   let peerInfo = PeerInfo.new(
     seckey, b.addresses, protoVersion = b.protoVersion, agentVersion = b.agentVersion

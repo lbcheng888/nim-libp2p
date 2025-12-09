@@ -10,7 +10,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class OkxMarketClient(
-    private val httpClient: OkHttpClient = OkHttpClient()
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 ) {
     suspend fun fetchTicker(instId: String = OKX_SPOT_INST): BinanceTicker =
         withContext(Dispatchers.IO) {

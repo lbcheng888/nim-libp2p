@@ -77,7 +77,8 @@ proc orderToJson(order: OrderMessage): JsonNode =
   %*{
     "id": order.id,
     "traderPeer": order.traderPeer,
-    "asset": order.asset,
+    "baseAsset": encodeAssetDef(order.baseAsset),
+    "quoteAsset": encodeAssetDef(order.quoteAsset),
     "side": order.side,
     "price": order.price,
     "amount": order.amount,
@@ -100,7 +101,8 @@ proc jsonToOrder(node: JsonNode): Option[OrderMessage] =
     OrderMessage(
       id: node["id"].getStr(),
       traderPeer: node["traderPeer"].getStr(),
-      asset: node["asset"].getStr(),
+      baseAsset: decodeAssetDef(node["baseAsset"]),
+      quoteAsset: decodeAssetDef(node["quoteAsset"]),
       side: node["side"].getStr(),
       price: node["price"].getFloat(),
       amount: node["amount"].getFloat(),
@@ -150,33 +152,34 @@ proc appendWal(store: OrderStore; event: WalEvent) =
   discard store.wal.append(($node).toBytes())
 
 proc updateExposure(store: OrderStore; order: OrderMessage; delta: float; matchedDelta: float = 0.0) =
-  var exposure = store.exposure.getOrDefault(order.asset, AssetExposure())
-  if order.side == "buy":
-    exposure.buyVolume = max(0.0, exposure.buyVolume + delta)
-  else:
-    exposure.sellVolume = max(0.0, exposure.sellVolume + delta)
-  if matchedDelta != 0.0:
-    exposure.matchedVolume = max(0.0, exposure.matchedVolume + matchedDelta)
-  store.exposure[order.asset] = exposure
+    let assetKey = order.baseAsset.symbol # Use symbol as key for simplicity
+    var exposure = store.exposure.getOrDefault(assetKey, AssetExposure())
+    if order.side == "buy":
+      exposure.buyVolume = max(0.0, exposure.buyVolume + delta)
+    else:
+      exposure.sellVolume = max(0.0, exposure.sellVolume + delta)
+    if matchedDelta != 0.0:
+      exposure.matchedVolume = max(0.0, exposure.matchedVolume + matchedDelta)
+    store.exposure[assetKey] = exposure
 
 proc applyOrder(store: OrderStore; order: OrderMessage; tsMs: int64; persist = true) =
-  if store.orders.hasKey(order.id):
-    return
-  let expires = tsMs + int64(order.ttlMs)
-  let record = OrderRecord(
-    order: order,
-    status: osPending,
-    createdMs: tsMs,
-    updatedMs: tsMs,
-    expiresMs: expires,
-    lastMatch: none(MatchMessage),
-  )
-  store.orders[order.id] = record
-  let delta = order.amount
-  store.updateExposure(order, delta)
-  if persist:
-    let payload = orderToJson(order)
-    store.appendWal(WalEvent(kind: wekOrder, payload: payload, timestampMs: tsMs))
+    if store.orders.hasKey(order.id):
+      return
+    let expires = tsMs + int64(order.ttlMs)
+    let record = OrderRecord(
+      order: order,
+      status: osPending,
+      createdMs: tsMs,
+      updatedMs: tsMs,
+      expiresMs: expires,
+      lastMatch: none(MatchMessage),
+    )
+    store.orders[order.id] = record
+    let delta = order.amount
+    store.updateExposure(order, delta)
+    if persist:
+      let payload = orderToJson(order)
+      store.appendWal(WalEvent(kind: wekOrder, payload: payload, timestampMs: tsMs))
 
 proc applyMatch(store: OrderStore; match: MatchMessage; tsMs: int64; persist = true) =
   let orderOpt = store.orders.getOrDefault(match.orderId, OrderRecord())
@@ -353,13 +356,14 @@ proc purgeExpired*(store: OrderStore; nowMs: int64): Future[int] {.async: (raise
       return 0
     for key in expired:
       let record = store.orders.getOrDefault(key, OrderRecord())
-      if record.order.asset.len > 0:
-        var exposure = store.exposure.getOrDefault(record.order.asset, AssetExposure())
+      if record.order.baseAsset.symbol.len > 0:
+        let assetKey = record.order.baseAsset.symbol
+        var exposure = store.exposure.getOrDefault(assetKey, AssetExposure())
         if record.order.side.toLowerAscii() == "buy":
           exposure.buyVolume = max(0.0, exposure.buyVolume - record.order.amount)
         else:
           exposure.sellVolume = max(0.0, exposure.sellVolume - record.order.amount)
-        store.exposure[record.order.asset] = exposure
+        store.exposure[assetKey] = exposure
       store.orders.del(key)
     expired.len
   finally:

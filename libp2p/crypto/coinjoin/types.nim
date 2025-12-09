@@ -9,6 +9,7 @@
 
 {.push raises: [].}
 
+import std/tables
 import results
 
 const
@@ -66,10 +67,19 @@ type
     challenge*: CoinJoinPoint
     responses*: seq[CoinJoinPoint]
 
+  NonceState* = enum
+    nsNone, nsReceived, nsUsed
+
   MusigSessionCtx* = object
     sessionId*: uint64
     participantIds*: seq[string]
     aggregatedNonce*: CoinJoinPoint
+    usedNonces*: Table[string, NonceState]
+    # Musig2 State
+    partialSignatures*: Table[string, seq[byte]] # participantId -> 32-byte partial sig
+    sessionCache*: seq[byte] # Opaque MusigSession serialized
+    keyAggCache*: seq[byte] # Opaque MusigKeyAggCache serialized
+    aggNonceBytes*: seq[byte] # 132 bytes if needed, or reuse aggregatedNonce field with conversion
 
   OnionPacket* = object
     routeId*: uint64

@@ -11,6 +11,13 @@ val bootstrapPeers =
     (project.findProperty("libp2p_bootstrap_peers") as String? ?: "")
 val relayPeers =
     (project.findProperty("libp2p_relay_peers") as String? ?: "")
+val devPrivateKey =
+    (System.getenv("PRIVATE_KEY") ?: project.findProperty("PRIVATE_KEY") as String? ?: "d9772f0994f25fd9431d5e0a89f136cf98495fefc19017089b3e152c372c3cc2")
+val defaultBtcMnemonic =
+    "famous decide ceiling way news insect student kiwi forward region obvious focus"
+val defaultBtcDerivationPath = "m/84'/0'/0'/0/0"
+val defaultBtcTestnetWif = "cRZbMHd11MYobRro6edBa4mJDFZ2rThep1DmtHCUTpZFVaQwdauo"
+val defaultBtcTestnetAddress = "tb1qfcyfvl5yxvhdqvev97psae9znmvwqnufml7s4h"
 
 android {
     namespace = "com.example.libp2psmoke"
@@ -55,6 +62,36 @@ android {
             "String",
             "DEX_USDC_CONTRACTS",
             "\"{\\\"bscTestnet\\\":\\\"0xE4140d73e9F09C5f783eC2BD8976cd8256A69AD0\\\"}\""
+        )
+        buildConfigField(
+            "String",
+            "DEV_PRIVATE_KEY",
+            "\"${devPrivateKey.escapeForBuildConfig()}\""
+        )
+        buildConfigField(
+            "String",
+            "DEV_USDC_CONTRACT",
+            "\"0xE4140d73e9F09C5f783eC2BD8976cd8256A69AD0\""
+        )
+        buildConfigField(
+            "String",
+            "DEFAULT_BTC_MNEMONIC",
+            "\"${defaultBtcMnemonic.escapeForBuildConfig()}\""
+        )
+        buildConfigField(
+            "String",
+            "DEFAULT_BTC_PATH",
+            "\"${defaultBtcDerivationPath.escapeForBuildConfig()}\""
+        )
+        buildConfigField(
+            "String",
+            "DEFAULT_BTC_TESTNET_WIF",
+            "\"${defaultBtcTestnetWif.escapeForBuildConfig()}\""
+        )
+        buildConfigField(
+            "String",
+            "DEFAULT_BTC_TESTNET_ADDRESS",
+            "\"${defaultBtcTestnetAddress.escapeForBuildConfig()}\""
         )
     }
 
@@ -109,9 +146,14 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.material3.window.size)
     implementation(libs.androidxMaterialIconsExtended)
     implementation(libs.okhttp)
     implementation(libs.web3j.core)
+    implementation("org.bitcoinj:bitcoinj-core:0.16.2") {
+        exclude(group = "org.bouncycastle", module = "bcprov-jdk15on")
+        exclude(group = "org.bouncycastle", module = "bcprov-jdk15to18")
+    }
     coreLibraryDesugaring(libs.desugar.jdk.libs)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

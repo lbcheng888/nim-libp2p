@@ -3,6 +3,7 @@ package com.example.libp2psmoke.dex
 import java.io.IOException
 import java.math.BigDecimal
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -10,14 +11,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class BinanceApiClient(
-    private val httpClient: OkHttpClient = OkHttpClient()
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 ) {
     private val endpoints = listOf(
+        "https://data-api.binance.vision",
         "https://api.binance.com",
         "https://api1.binance.com",
         "https://api2.binance.com",
-        "https://api3.binance.com",
-        "https://data-api.binance.vision"
+        "https://api3.binance.com"
     )
 
     suspend fun fetchTicker(symbol: String = BINANCE_SPOT_SYMBOL): BinanceTicker =
@@ -120,15 +124,28 @@ class BinanceApiClient(
         return results
     }
 
-    private suspend fun <T> callWithFallback(block: suspend (String) -> T): T {
-        var lastError: Throwable? = null
-        for (endpoint in endpoints) {
-            try {
-                return block(endpoint)
-            } catch (err: Throwable) {
-                lastError = err
+    private suspend fun <T> callWithFallback(block: suspend (String) -> T): T = kotlinx.coroutines.coroutineScope {
+        val channel = kotlinx.coroutines.channels.Channel<T>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val jobs = endpoints.map { endpoint ->
+            launch {
+                try {
+                    val result = block(endpoint)
+                    channel.send(result)
+                } catch (e: Throwable) {
+                    // Ignore individual failures
+                }
             }
         }
-        throw lastError ?: IOException("All Binance endpoints failed")
+
+        try {
+            // Return the first successful result
+            val result = channel.receive()
+            jobs.forEach { it.cancel() }
+            return@coroutineScope result
+        } catch (e: kotlinx.coroutines.channels.ClosedReceiveChannelException) {
+            throw IOException("All Binance endpoints failed")
+        } finally {
+            jobs.forEach { it.cancel() }
+        }
     }
 }

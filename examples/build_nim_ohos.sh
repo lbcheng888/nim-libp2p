@@ -109,7 +109,9 @@ NIM_FLAGS=(
   "--path:."
   "--path:examples/mobile_ffi"
   "--path:examples/mobile_ffi/compat/chronicles_stub"
+  "--path:examples/mobile_ffi/compat/chronicles_stub"
   "--path:${REPO_ROOT}/nimbledeps/pkgs2"
+  $(for d in "${REPO_ROOT}/nimbledeps/pkgs2"/*; do if [ -d "$d" ]; then echo "--path:$d"; fi; done)
   "--passC:-Iexamples/mobile_ffi/compat"
   "--passC:-I${NIM_LIBP2P_DIR}"
   "--passC:-I$REPO_ROOT/compat"
@@ -129,7 +131,7 @@ NIM_FLAGS=(
 "--passL:-lssl"
 "--passL:-lcrypto"
 "--define:libp2p_autotls_support"
-"--define:libp2p_quic_support"
+
 "--define:libp2p_msquic_experimental"
 "--out:${OUT_PATH}"
 )
@@ -161,6 +163,11 @@ fi
 if [[ "${NIM_OHOS_USE_HILOG:-0}" != "1" ]]; then
   NIM_FLAGS+=("--define:nimlibp2p_no_hilog")
 fi
+
+echo "[nim-ohos] Validated Paths:"
+for d in "${REPO_ROOT}/nimbledeps/pkgs2"/*; do
+  if [ -d "$d" ]; then echo "Found dep: $d"; fi
+done
 
 echo "[nim-ohos] Building Nim libp2p -> ${OUT_PATH}"
 (

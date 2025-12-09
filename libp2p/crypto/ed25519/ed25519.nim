@@ -14,6 +14,7 @@
 {.push raises: [].}
 
 import bearssl/rand
+import bearssl/hash as bhash
 import constants
 import nimcrypto/[hash, sha2]
 # We use `ncrutils` for constant-time hexadecimal encoding/decoding procedures.
@@ -2193,7 +2194,14 @@ proc random*(t: typedesc[EdPrivateKey], rng: var HmacDrbgContext): EdPrivateKey 
 
   hmacDrbgGenerate(rng, res.data.toOpenArray(0, 31))
 
-  var hh = sha512.digest(res.data.toOpenArray(0, 31))
+  var
+    hh: MDigest[512]
+    ctx: bhash.Sha512Context
+  
+  bhash.sha512Init(ctx)
+  bhash.sha512Update(ctx, unsafeAddr res.data[0], 32)
+  bhash.sha512Out(ctx, addr hh.data[0])
+
   hh.data[0] = hh.data[0] and 0xF8'u8
   hh.data[31] = hh.data[31] and 0x3F'u8
   hh.data[31] = hh.data[31] or 0x40'u8
@@ -2212,7 +2220,14 @@ proc random*(t: typedesc[EdKeyPair], rng: var HmacDrbgContext): EdKeyPair =
 
   hmacDrbgGenerate(rng, res.seckey.data.toOpenArray(0, 31))
 
-  var hh = sha512.digest(res.seckey.data.toOpenArray(0, 31))
+  var
+    hh: MDigest[512]
+    ctx: bhash.Sha512Context
+  
+  bhash.sha512Init(ctx)
+  bhash.sha512Update(ctx, unsafeAddr res.seckey.data[0], 32)
+  bhash.sha512Out(ctx, addr hh.data[0])
+
   hh.data[0] = hh.data[0] and 0xF8'u8
   hh.data[31] = hh.data[31] and 0x3F'u8
   hh.data[31] = hh.data[31] or 0x40'u8
@@ -2421,32 +2436,37 @@ proc sign*[T: byte | char](
     key: EdPrivateKey, message: openArray[T]
 ): EdSignature {.gcsafe, noinit.} =
   ## Create ED25519 signature of data ``message`` using private key ``key``.
-  var ctx: sha512
-  var r: GeP3
+  var
+    ctx: bhash.Sha512Context
+    r: GeP3
+    hash: MDigest[512]
+    nonce: MDigest[512]
+    hram: MDigest[512]
 
-  ctx.init()
-  ctx.update(key.data.toOpenArray(0, 31))
-  var hash = ctx.finish()
+  bhash.sha512Init(ctx)
+  bhash.sha512Update(ctx, unsafeAddr key.data[0], 32)
+  bhash.sha512Out(ctx, addr hash.data[0])
 
   hash.data[0] = hash.data[0] and 0xF8'u8
   hash.data[31] = hash.data[31] and 0x3F'u8
   hash.data[31] = hash.data[31] or 0x40'u8
 
-  ctx.init()
-  ctx.update(hash.data.toOpenArray(32, 63))
-  ctx.update(message)
-  var nonce = ctx.finish()
+  bhash.sha512Init(ctx)
+  bhash.sha512Update(ctx, unsafeAddr hash.data[32], 32)
+  if message.len > 0:
+    bhash.sha512Update(ctx, unsafeAddr message[0], uint(message.len))
+  bhash.sha512Out(ctx, addr nonce.data[0])
 
   scReduce(nonce.data)
   geScalarMultBase(r, nonce.data)
   geP3ToBytes(result.data.toOpenArray(0, 31), r)
 
-  ctx.init()
-  ctx.update(result.data.toOpenArray(0, 31))
-  ctx.update(key.data.toOpenArray(32, 63))
-  ctx.update(message)
-  var hram = ctx.finish()
-  ctx.clear()
+  bhash.sha512Init(ctx)
+  bhash.sha512Update(ctx, unsafeAddr result.data[0], 32)
+  bhash.sha512Update(ctx, unsafeAddr key.data[32], 32)
+  if message.len > 0:
+    bhash.sha512Update(ctx, unsafeAddr message[0], uint(message.len))
+  bhash.sha512Out(ctx, addr hram.data[0])
 
   scReduce(hram.data)
   scMulAdd(
@@ -2464,10 +2484,13 @@ proc verify*[T: byte | char](
   ##
   ## Return ``true`` if message verification succeeded, ``false`` if
   ## verification failed.
-  var ctx: sha512
-  var rcheck: array[32, byte]
-  var a: GeP3
-  var r: GeP2
+  var
+    ctx: bhash.Sha512Context
+    rcheck: array[32, byte]
+    a: GeP3
+    r: GeP2
+    hash: MDigest[512]
+
   if (sig.data[63] and 0xE0'u8) != 0:
     return false
 
@@ -2476,11 +2499,12 @@ proc verify*[T: byte | char](
   if geFromBytesNegateVartime(a, key.data.toOpenArray(0, 31)) != 0:
     return false
 
-  ctx.init()
-  ctx.update(sig.data.toOpenArray(0, 31))
-  ctx.update(key.data.toOpenArray(0, 31))
-  ctx.update(message)
-  var hash = ctx.finish()
+  bhash.sha512Init(ctx)
+  bhash.sha512Update(ctx, unsafeAddr sig.data[0], 32)
+  bhash.sha512Update(ctx, unsafeAddr key.data[0], 32)
+  if message.len > 0:
+    bhash.sha512Update(ctx, unsafeAddr message[0], uint(message.len))
+  bhash.sha512Out(ctx, addr hash.data[0])
   scReduce(hash.data)
 
   geDoubleScalarMultVartime(

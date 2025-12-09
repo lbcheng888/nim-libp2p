@@ -8,9 +8,9 @@ import libp2p/peerid
 import libp2p/peerinfo
 import libp2p/peerstore
 import libp2p/multiaddress
-import libp2p/pnet
-import libp2p/services/metricsservice
-import libp2p/services/hpservice
+import ../../libp2p/pnet
+import ../../libp2p/services/metricsservice
+import ../../libp2p/services/hpservice
 import stew/byteutils
 
 const DexIdentityCodec = "/nim-libp2p/dex/identity/1.0.0"

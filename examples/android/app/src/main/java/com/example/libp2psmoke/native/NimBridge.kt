@@ -7,6 +7,7 @@ object NimBridge {
     private const val LIB_NIM = "nimlibp2p"
     private const val LIB_BRIDGE = "nimbridge"
     private var librariesLoaded = false
+    private var eventListener: ((String, String) -> Unit)? = null
 
     @Synchronized
     private fun ensureLoaded() {
@@ -133,6 +134,48 @@ object NimBridge {
         return nativeIdentityFromSeed(seed)
     }
 
+    fun dexInit(handle: Long, configJson: String): Boolean = nativeDexInit(handle, configJson)
+    fun dexSubmitOrder(handle: Long, orderJson: String): Boolean = nativeDexSubmitOrder(handle, orderJson)
+    fun dexSubmitMixerIntent(handle: Long, intentJson: String): Boolean = nativeDexSubmitMixerIntent(handle, intentJson)
+    fun dexGetMarketData(handle: Long, asset: String): String? = nativeDexGetMarketData(handle, asset)
+    fun dexGetWallets(handle: Long): String? = nativeDexGetWallets(handle)
+
+    // Adapter Signatures
+    fun adapterGenerateSecret(): String? {
+        ensureLoaded()
+        return nativeAdapterGenerateSecret()
+    }
+    
+    fun adapterComputePaymentPoint(secret: String): String? {
+        ensureLoaded()
+        return nativeAdapterComputePaymentPoint(secret)
+    }
+    
+    fun adapterSign(msg: String, privKey: String, point: String): String? {
+        ensureLoaded()
+        return nativeAdapterSign(msg, privKey, point)
+    }
+    
+    fun adapterCompleteSig(adaptorSig: String, secret: String): String? {
+        ensureLoaded()
+        return nativeAdapterCompleteSig(adaptorSig, secret)
+    }
+    
+    fun adapterExtractSecret(adaptorSig: String, validSig: String): String? {
+        ensureLoaded()
+        return nativeAdapterExtractSecret(adaptorSig, validSig)
+    }
+
+    fun setEventListener(listener: (String, String) -> Unit) {
+        eventListener = listener
+    }
+
+    @JvmStatic
+    fun onNativeEvent(topic: String, payload: String) {
+        Log.d("NimBridge", "onNativeEvent: $topic, payload length=${payload.length}")
+        eventListener?.invoke(topic, payload)
+    }
+
     private external fun nativeInit(configJson: String?): Long
     private external fun nativeStart(handle: Long): Int
     private external fun nativeStop(handle: Long): Int
@@ -164,4 +207,49 @@ object NimBridge {
     private external fun nativeIsPeerConnected(handle: Long, peerId: String?): Boolean
     private external fun nativeSubmitBtcSwap(handle: Long, orderId: String?, rpcUrl: String?, username: String?, password: String?, amountSats: Long, address: String?): Boolean
     private external fun nativeSubmitBscTransfer(handle: Long, orderId: String?, rpcUrl: String?, contract: String?, privateKey: String?, toAddress: String?, amount: String?): Boolean
+    private external fun nativeDexInit(handle: Long, configJson: String?): Boolean
+    private external fun nativeDexSubmitOrder(handle: Long, orderJson: String?): Boolean
+    private external fun nativeDexSubmitMixerIntent(handle: Long, intentJson: String?): Boolean
+    private external fun nativeDexGetMarketData(handle: Long, asset: String?): String?
+    private external fun nativeDexGetWallets(handle: Long): String?
+    
+    // Adapter Signatures
+    private external fun nativeAdapterGenerateSecret(): String?
+    private external fun nativeAdapterComputePaymentPoint(secret: String?): String?
+    private external fun nativeAdapterSign(msg: String?, privKey: String?, point: String?): String?
+    private external fun nativeAdapterCompleteSig(adaptorSig: String?, secret: String?): String?
+    private external fun nativeAdapterExtractSecret(adaptorSig: String, validSig: String): String
+    
+    // MPC
+    fun mpcKeygenInit(): String {
+        ensureLoaded()
+        return nativeMpcKeygenInit()
+    }
+    
+    fun mpcKeygenFinalize(localPub: String, remotePub: String): String {
+        ensureLoaded()
+        return nativeMpcKeygenFinalize(localPub, remotePub)
+    }
+    
+    fun mpcSignInit(): String {
+        ensureLoaded()
+        return nativeMpcSignInit()
+    }
+    
+    fun mpcSignPartial(msg: String, secret: String, nonce: String, jointPub: String, jointNoncePub: String): String {
+        ensureLoaded()
+        return nativeMpcSignPartial(msg, secret, nonce, jointPub, jointNoncePub)
+    }
+    
+    fun mpcSignCombine(s1: String, s2: String, jointNoncePub: String): String? {
+        ensureLoaded()
+        return nativeMpcSignCombine(s1, s2, jointNoncePub)
+    }
+
+    // MPC Native
+    private external fun nativeMpcKeygenInit(): String
+    private external fun nativeMpcKeygenFinalize(localPub: String, remotePub: String): String
+    private external fun nativeMpcSignInit(): String
+    private external fun nativeMpcSignPartial(msg: String, secret: String, nonce: String, jointPub: String, jointNoncePub: String): String
+    private external fun nativeMpcSignCombine(s1: String, s2: String, jointNoncePub: String): String?
 }

@@ -168,7 +168,8 @@ proc newRng*(): ref HmacDrbgContext =
     return nil
 
   var rng = (ref HmacDrbgContext)()
-  hmacDrbgInit(rng[], addr sha256Vtable, nil, 0)
+  # Use BearSSL's SHA256 vtable to avoid potential issues with nimcrypto
+  hmacDrbgInit(rng[], addr bhash.sha256Vtable, nil, 0)
   if seeder(addr rng.vtable) == 0:
     return nil
   rng

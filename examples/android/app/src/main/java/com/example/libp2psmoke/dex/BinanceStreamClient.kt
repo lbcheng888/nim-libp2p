@@ -10,6 +10,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 
 class BinanceStreamClient(
@@ -19,6 +20,7 @@ class BinanceStreamClient(
     interface Listener {
         fun onOpen()
         fun onKline(bucket: DexKlineBucket, isFinal: Boolean, eventTimeMs: Long)
+        fun onDepth(bids: List<OrderBookEntry>, asks: List<OrderBookEntry>)
         fun onClosed()
         fun onFailure(throwable: Throwable)
     }
@@ -60,10 +62,29 @@ class BinanceStreamClient(
                 listener?.onFailure(IOException("Binance stream endpoints exhausted"))
                 return
             }
-        val stream = "${ctx.symbol.lowercase(Locale.US)}@kline_${ctx.interval.lowercase(Locale.US)}"
-        val url = endpoint.trimEnd('/') + "/$stream"
+        
+        // Use Combined Streams: /stream?streams=<stream1>/<stream2>
+        val baseStreamName = ctx.symbol.lowercase(Locale.US)
+        val klineStream = "$baseStreamName@kline_${ctx.interval.lowercase(Locale.US)}"
+        val depthStream = "$baseStreamName@depth20@100ms" // 20 levels, 100ms updates
+        
+        val streams = "$klineStream/$depthStream"
+        
+        // Determine base URL. If endpoint ends with /ws, we usually need to change it to /stream
+        // Endpoints in DEFAULT are like .../ws. 
+        // e.g. wss://stream.binance.com:9443/ws -> wss://stream.binance.com:9443/stream
+        
+        val baseUrl = if (endpoint.endsWith("/ws")) {
+            endpoint.removeSuffix("/ws") + "/stream"
+        } else {
+            endpoint // Assuming user knows what they are doing if they provide custom
+        }
+
+        val url = "$baseUrl?streams=$streams"
+        
         val request = Request.Builder().url(url).build()
-        Log.i(TAG, "Connecting Binance WS endpoint=$url")
+        Log.i(TAG, "Connecting Binance WS (Combined): $url")
+        
         webSocket = client.newWebSocket(
             request,
             object : WebSocketListener() {
@@ -74,24 +95,20 @@ class BinanceStreamClient(
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     try {
                         val payload = JSONObject(text)
-                        if (payload.optString("e") != "kline") {
+                        // Combined stream format: { "stream": "...", "data": { ... } }
+                        if (!payload.has("stream") || !payload.has("data")) {
+                            // Fallback for single stream if ever used, or ignore
                             return
                         }
-                        val kline = payload.getJSONObject("k")
-                        val bucket = DexKlineBucket(
-                            symbol = DEFAULT_DEX_SYMBOL,
-                            scale = DexKlineScale.fromLabel(kline.getString("i")),
-                            windowStartMs = kline.getLong("t"),
-                            open = kline.getBigDecimal("o"),
-                            high = kline.getBigDecimal("h"),
-                            low = kline.getBigDecimal("l"),
-                            close = kline.getBigDecimal("c"),
-                            volumeBase = kline.getBigDecimal("v"),
-                            tradeCount = kline.optInt("n", 0)
-                        )
-                        val eventTime = payload.optLong("E", System.currentTimeMillis())
-                        val isFinal = kline.optBoolean("x", false)
-                        listener?.onKline(bucket, isFinal, eventTime)
+                        
+                        val streamName = payload.getString("stream")
+                        val data = payload.getJSONObject("data")
+                        
+                        if (streamName.contains("@kline")) {
+                            handleKline(data)
+                        } else if (streamName.contains("@depth")) {
+                            handleDepth(data)
+                        }
                     } catch (err: Throwable) {
                         Log.w(TAG, "Failed to parse Binance stream payload", err)
                     }
@@ -115,6 +132,53 @@ class BinanceStreamClient(
                 }
             }
         )
+    }
+    
+    private fun handleKline(data: JSONObject) {
+        if (data.optString("e") != "kline") return
+        val kline = data.getJSONObject("k")
+        val bucket = DexKlineBucket(
+            symbol = DEFAULT_DEX_SYMBOL,
+            scale = DexKlineScale.fromLabel(kline.getString("i")),
+            windowStartMs = kline.getLong("t"),
+            open = kline.getBigDecimal("o"),
+            high = kline.getBigDecimal("h"),
+            low = kline.getBigDecimal("l"),
+            close = kline.getBigDecimal("c"),
+            volumeBase = kline.getBigDecimal("v"),
+            tradeCount = kline.optInt("n", 0)
+        )
+        val eventTime = data.optLong("E", System.currentTimeMillis())
+        val isFinal = kline.optBoolean("x", false)
+        listener?.onKline(bucket, isFinal, eventTime)
+    }
+    
+    private fun handleDepth(data: JSONObject) {
+        // @depth20 payload: { "lastUpdateId": ..., "bids": [[price, qty], ...], "asks": ... }
+        val bidsJson = data.optJSONArray("bids")
+        val asksJson = data.optJSONArray("asks")
+        
+        val bids = parseOrderBook(bidsJson)
+        val asks = parseOrderBook(asksJson)
+        
+        if (bids.isNotEmpty() || asks.isNotEmpty()) {
+            listener?.onDepth(bids, asks)
+        }
+    }
+    
+    private fun parseOrderBook(array: JSONArray?): List<OrderBookEntry> {
+        if (array == null || array.length() == 0) return emptyList()
+        val list = mutableListOf<OrderBookEntry>()
+        var runningTotal = BigDecimal.ZERO
+        
+        for (i in 0 until array.length()) {
+            val entry = array.getJSONArray(i)
+            val price = BigDecimal(entry.getString(0))
+            val qty = BigDecimal(entry.getString(1))
+            runningTotal = runningTotal.add(qty)
+            list.add(OrderBookEntry(price, qty, runningTotal))
+        }
+        return list
     }
 
     companion object {

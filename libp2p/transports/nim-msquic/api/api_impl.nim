@@ -2,6 +2,9 @@
 
 import std/tables
 import std/sequtils
+import std/endians
+import chronos
+import chronicles
 
 from "../core/mod" import ConnectionId, QuicConnection, QuicVersion,
     initConnectionId, newConnection, ConnectionRole, crClient
@@ -12,6 +15,9 @@ import ./event_model
 import ./diagnostics_model
 import ./settings_model
 import ./param_catalog
+import ../protocol/protocol_core except ConnectionId
+from ../protocol/protocol_core as proto import nil
+import ../protocol/tls_core
 
 when compiles((proc () {.noGc.} = discard)):
   {.pragma: quicApiHot, inline, noGc.}
@@ -153,6 +159,7 @@ const
   QUIC_STATUS_INVALID_PARAMETER* = QUIC_STATUS(22)      ## 对应 `EINVAL`
   QUIC_STATUS_NOT_SUPPORTED* = QUIC_STATUS(95)          ## 对应 `EOPNOTSUPP`
   QUIC_STATUS_INVALID_STATE* = QUIC_STATUS(200)         ## 近似 `ENOTRECOVERABLE`
+  QUIC_STATUS_INTERNAL_ERROR* = QUIC_STATUS(201)        ## Generic internal error
   QUIC_TLS_ALERT_CODE_SUCCESS* = QUIC_TLS_ALERT_CODES(0xFFFF)
   QUIC_CONNECTION_EVENT_CONNECTED* = 0'u32
 
@@ -245,6 +252,7 @@ type
     callbackContext: pointer
     started: bool
     stopped: bool
+    transport: DatagramTransport
 
   ConnectionState = ref object of QuicHandleState
     registration: RegistrationState
@@ -265,6 +273,9 @@ type
     congestionAlgorithm: CongestionAlgorithm
     closeReason: string
     disable1RttEncryption: bool
+    transport: DatagramTransport
+    remoteAddress: TransportAddress
+    initialSecrets: InitialSecrets
 
 const
   DatagramReceiveNotes = ["receive=false", "receive=true"]
@@ -875,6 +886,7 @@ proc msquicConfigurationLoadCredential(configuration: HQUIC;
 
 proc msquicListenerOpen(registration: HQUIC; handler: pointer;
     context: pointer; listener: ptr HQUIC): QUIC_STATUS {.cdecl.} =
+  warn "msquicListenerOpen entry"
   if listener.isNil:
     return QUIC_STATUS_INVALID_PARAMETER
   let reg = toRegistration(registration)
@@ -897,27 +909,91 @@ proc msquicListenerOpen(registration: HQUIC; handler: pointer;
 
 proc msquicListenerClose(listener: HQUIC) {.cdecl.} =
   let state = toListener(listener)
-  if not state.isNil and not state.stopped:
-    listenerEmitEvent(state, QUIC_LISTENER_EVENT_STOP_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
-      var payload = QuicListenerEventStopCompletePayload(
-        Flags: 0'u8,
-        Reserved: [uint8(0), 0, 0, 0, 0, 0, 0]
+  if not state.isNil:
+    if not state.transport.isNil:
+      asyncCheck state.transport.closeWait()
+      state.transport = nil
+    if not state.stopped:
+      listenerEmitEvent(state, QUIC_LISTENER_EVENT_STOP_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
+        var payload = QuicListenerEventStopCompletePayload(
+          Flags: 0'u8,
+          Reserved: [uint8(0), 0, 0, 0, 0, 0, 0]
+        )
+        system.copyMem(buf, unsafeAddr payload, sizeof(payload))
       )
-      system.copyMem(buf, unsafeAddr payload, sizeof(payload))
-    )
-    state.stopped = true
+      state.stopped = true
   releaseHandle(listener)
+
+proc listenerOnReceive(transp: DatagramTransport, remote: TransportAddress,
+                         local: TransportAddress, data: seq[byte]) {.async.} =
+  try:
+    let packet = proto.decodePacket(data)
+    if packet.isLongHeader:
+      {.cast(gcsafe).}:
+        emitDiagnostics(DiagnosticsEvent(
+          kind: diagRegistrationOpened,
+          handle: cast[HQUIC](nil), # No handle context easily avail here yet
+          note: "RX Core: Long Header Pkt Type=" & $packet.longHeader.packetType & " Len=" & $data.len))
+    else:
+       {.cast(gcsafe).}:
+         emitDiagnostics(DiagnosticsEvent(
+          kind: diagRegistrationOpened,
+          handle: cast[HQUIC](nil),
+          note: "RX Core: Short Header Pkt Len=" & $data.len))
+  except Exception:
+    discard
 
 proc msquicListenerStart(listener: HQUIC; alpn: ptr QuicBuffer;
     alpnCount: uint32; address: pointer): QUIC_STATUS {.cdecl.} =
   let state = toListener(listener)
   if state.isNil:
     return QUIC_STATUS_INVALID_PARAMETER
-  discard alpn
-  discard alpnCount
-  discard address
-  state.started = true
-  QUIC_STATUS_SUCCESS
+  warn "msquicListenerStart entry", addressNil=address.isNil
+  
+  # Decode address (assume pointer to QuicAddr/SockAddr)
+  # For now, we hardcode binding to 0.0.0.0:0 or a known port for testing if address is nil
+  # In MsQuic, address is pointer to QUIC_ADDR
+  echo "[api_impl] msquicListenerStart entry. Address nil? ", address.isNil
+  var bindPort = 0
+  if not address.isNil:
+    # TODO: Proper sockaddr parsing. For now assuming IPv4 port at offset 2 (sin_port)
+    # This is a HACK for Phase 1.
+    let family = cast[ptr uint16](address)[]
+    echo "[api_impl] Address family: ", family
+    if family == 2: # AF_INET
+      let portPtr = cast[ptr uint16](cast[uint](address) + 2)
+      var netPort: uint16
+      bigEndian16(addr netPort, portPtr)
+      bindPort = int(netPort)
+      echo "[api_impl] Parsed IPv4 port: ", bindPort
+    else:
+      warn "Unknown family, ignoring port"
+  
+  try:
+    warn "Attempting to bind 0.0.0.0", port=bindPort
+    state.transport = newDatagramTransport(
+      (proc (transp: DatagramTransport, remote: TransportAddress) {.async.} =
+        let data = transp.getMessage()
+        asyncCheck listenerOnReceive(transp, remote, transp.localAddress, data)),
+      local = initTAddress("0.0.0.0", Port(bindPort))
+    )
+    warn "Bind success!"
+    state.started = true
+    # Log successful binding
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagRegistrationOpened,
+      handle: listener,
+      note: "Bound to port " & $bindPort))
+      
+    QUIC_STATUS_SUCCESS
+  except CatchableError as exc:
+    echo "[api_impl] Bind FAILED: ", exc.msg
+    state.transport = nil
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagRegistrationOpened,
+      handle: listener,
+      note: "Bind failed: " & exc.msg))
+    QUIC_STATUS_INTERNAL_ERROR
 
 proc msquicListenerStop(listener: HQUIC) {.cdecl.} =
   let state = toListener(listener)
@@ -960,6 +1036,9 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
 proc msquicConnectionClose(connection: HQUIC) {.cdecl.} =
   let state = toConnection(connection)
   if not state.isNil:
+    if not state.transport.isNil:
+      asyncCheck state.transport.closeWait()
+      state.transport = nil
     var ev = ConnectionEvent(kind: ceShutdownComplete, note: state.closeReason)
     emitConnectionEvent(state, ev)
     state.eventHandlers.setLen(0)
@@ -1034,6 +1113,191 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
   discard family
   state.started = true
   state.datagramReceiveEnabled = state.settingsOverlay.datagramReceiveEnabled
+  
+  # Initialize Transport (Client)
+  try:
+    # Resolve remote address
+    # For Phase 1, we assume serverName is an IP string. DNS resolution is skipped for now/handled by caller if needed
+    var remoteAddr: TransportAddress
+    try:
+      # Try parsing as IP
+      remoteAddr = initTAddress(state.serverName, Port(state.serverPort))
+    except CatchableError:
+       # Fallback or error - simplistic handling
+       emitDiagnostics(DiagnosticsEvent(
+         kind: diagConnectionStarted,
+         handle: connection,
+         note: "Failed to parse IP: " & state.serverName))
+       return QUIC_STATUS_INVALID_PARAMETER
+
+    state.remoteAddress = remoteAddr
+    
+    state.transport = newDatagramTransport(
+      (proc (transp: DatagramTransport, remote: TransportAddress) {.async.} =
+        # Client receive loop
+        let data = transp.getMessage()
+        if data.len == 0: return
+        
+        try:
+          # Phase 4: Receiver Logic
+          # 1. Parse Unprotected Header
+          var header = proto.parseUnprotectedHeader(data)
+          # Ensure it's Long Header Initial
+          if (header.firstByte and 0x80) != 0 and data.len > header.payloadOffset + 4:
+             # 2. Get Keys (We use the same initialSecrets derived from our original Destination CID?
+             # Actually, Server Initial uses keys derived from Client's Original DCID.
+             # Which IS stored in `state.initialSecrets`.
+             # CAUTION: Server encrypts with Server Key/IV. Client decrypts with Server Key/IV.
+             
+             # 3. Remove Header Protection
+             # Sample offset: 4 bytes after PN offset. 
+             # PN is at `header.payloadOffset`.
+             # We need to act on a copy of data to not mutate original buffer if needed later (though we discard it)
+             var packetBuf = data # Copy
+             
+             if packetBuf.len >= header.payloadOffset + 4 + 16:
+               let pnOffset = header.payloadOffset
+               let sample = packetBuf[pnOffset + 4 ..< pnOffset + 4 + 16]
+               var pnSlice: array[4, byte]
+               for i in 0..3: pnSlice[i] = packetBuf[pnOffset+i]
+               
+               removeHeaderProtection(state.initialSecrets.serverHp, sample, packetBuf[0], pnSlice)
+               
+               # 4. Decrypt Packet
+               # Recover Packet Number (assuming 4 bytes for skeleton)
+               # In Full QUIC, we decode variable length PN. Here we assume 4 bytes logic from sender.
+               var pn: uint64 = 0
+               # Little endian load for now? No, PN is Big Endian on wire? 
+               # removeHeaderProtection results in raw bytes.
+               # Let's interpret as BigEndian uint32
+               var pn32: uint32
+               for i in 0..3: 
+                  # pnSlice is now unprotected.
+                  pn = (pn shl 8) or uint64(pnSlice[i])
+               
+               # Decrypt Payload
+               # Header Length for AAD: includes the unprotected PN!
+               # Reconstruct Header for AAD from `packetBuf` (modified first byte and PN) components?
+               # NO. RFC 9001: "The AAD for AEAD is the entire header... after removing header protection"
+               # So we use `packetBuf[0 ..< pnOffset + 4]` as Header AAD.
+               let aadLen = pnOffset + 4
+               let aad = packetBuf[0 ..< aadLen]
+               let ciphertext = packetBuf[aadLen ..< packetBuf.len - 16] # Exclude Tag
+               let tag = packetBuf[packetBuf.len - 16 ..< packetBuf.len]
+               
+               let plaintext = decryptPacket(state.initialSecrets.serverKey, state.initialSecrets.serverIv,
+                                             pn, aad, ciphertext, tag)
+                                             
+               if plaintext.len > 0:
+                 {.cast(gcsafe).}:
+                   emitDiagnostics(DiagnosticsEvent(
+                     kind: diagConnectionEvent,
+                     handle: connection,
+                     note: "RX Client: Decrypted Server Initial! Len=" & $plaintext.len & " PN=" & $pn))
+               else:
+                 {.cast(gcsafe).}:
+                   emitDiagnostics(DiagnosticsEvent(
+                     kind: diagConnectionEvent,
+                     handle: connection,
+                     note: "RX Client: Decryption Failed"))
+             
+          else:
+             # Pass-through / Fallback
+             let packet = proto.decodePacket(data)
+             {.cast(gcsafe).}:
+               emitDiagnostics(DiagnosticsEvent(
+                 kind: diagConnectionEvent,
+                 handle: connection,
+                 note: "RX Client: Raw Pkt Len=" & $data.len & " IsLong=" & $packet.isLongHeader))
+                 
+        except Exception:
+          discard),
+      local = initTAddress("0.0.0.0", Port(0)) # Ephemeral port
+    )
+
+    # Phase 3: Send Encrypted RFC 9000 Initial Packet
+    # 1. Derive Keys
+    let destCid = @(state.peerCid.bytes)[0 ..< int(state.peerCid.length)] 
+    let srcCid = @(state.localCid.bytes)[0 ..< int(state.localCid.length)]
+    
+    # Store keys in state for later use (e.g. re-sends or decoding server response)
+    # RFC 9001: Initial keys derived from Destination Connection ID of the first Initial packet from client.
+    state.initialSecrets = deriveInitialSecrets(destCid)
+    
+    # 2. Encode Payload (Crypto Frame)
+    # Generate Key Share
+    let keyShare = generateKeyShare()
+    let clientHello = encodeClientHello(destCid, keyShare)
+    
+    # Construct CRYPTO Frame (Type=0x06)
+    var payload: seq[byte] = @[]
+    payload.add(0x06'u8)
+    proto.writeVarInt(payload, 0'u64) # Offset 0
+    proto.writeVarInt(payload, uint64(clientHello.len))
+    payload.add(clientHello)
+    
+    # PADDING Frame (Type=0x00) to reach 1200 bytes
+    # Current len so far + Header Len + Tag Len
+    # Basic Header Len ~ 20 bytes. Tag = 16.
+    # Safe bet: Pad payload to 1200 - (HeaderEstimate + Tag)
+    # Or just pad payload itself to 1160? (1200 - 40 margin)
+    let currentLen = payload.len
+    let targetPayloadLen = 1162 # Arbitrary to ensure packet > 1200
+    if currentLen < targetPayloadLen:
+      for i in 1 .. (targetPayloadLen - currentLen):
+        payload.add(0x00'u8)
+    
+    # 3. Construct Packet Header (Unprotected)
+    var headerBuf: seq[byte] = @[]
+    # Type: Initial (0xC0 | 0x3 for 4-byte PN) -> 0xC3
+    headerBuf.add(0xC3'u8) 
+    headerBuf.add([0x00'u8, 0x00, 0x00, 0x01]) # Version 1
+    headerBuf.add(byte(destCid.len)); headerBuf.add(destCid)
+    headerBuf.add(byte(srcCid.len)); headerBuf.add(srcCid)
+    headerBuf.add(0x00'u8) # Token Len 0
+    # Length: PN Len (4) + Payload Len + Tag Len (16)
+    let lengthField = 4 + payload.len + 16
+    var lenTmp: seq[byte] = @[]
+    proto.writeVarInt(lenTmp, uint64(lengthField))
+    headerBuf.add(lenTmp)
+    let pnOffset = headerBuf.len
+    headerBuf.add([0x00'u8, 0x00, 0x00, 0x00]) # PN = 0 (4 bytes)
+    
+    # 4. Encrypt Payload
+    let pn: uint64 = 0
+    var tag: array[16, byte]
+    let ciphertext = encryptPacket(state.initialSecrets.clientKey, state.initialSecrets.clientIv, 
+                                   pn, headerBuf, payload, tag)
+    
+    # 5. Assemble Packet
+    var packet = headerBuf & ciphertext # Ciphertext includes encrypted payload
+    packet.add(tag) # Tag appended
+    
+    # 6. Header Protection
+    # RFC: sample is 16 bytes from ciphertext starting at offset 4 (assuming 4 byte PN)
+    # Ciphertext starts at `pnOffset + 4`.
+    # Sample = packet[pnOffset+4 .. pnOffset+4+15]
+    if packet.len >= pnOffset + 4 + 16:
+      let sample = packet[pnOffset + 4 ..< pnOffset + 4 + 16]
+      # Apply to First Byte (packet[0]) and PN (packet[pnOffset ..< pnOffset+4])
+      var pnSlice: array[4, byte] # Copy PN to array
+      for i in 0..3: pnSlice[i] = packet[pnOffset+i]
+      
+      applyHeaderProtection(state.initialSecrets.clientHp, sample, packet[0], pnSlice)
+      
+      # Write protected PN back
+      for i in 0..3: packet[pnOffset+i] = pnSlice[i]
+
+    asyncCheck state.transport.sendTo(state.remoteAddress, packet)
+
+  except CatchableError as exc:
+    state.transport = nil
+    emitDiagnostics(DiagnosticsEvent(
+       kind: diagConnectionStarted,
+       handle: connection,
+       note: "Transport init failed: " & exc.msg))
+    return QUIC_STATUS_INTERNAL_ERROR
+
   if not state.callback.isNil:
     let negotiatedAlpn =
       if state.configuration.alpns.len == 0: "" else: state.configuration.alpns[0]
@@ -1310,14 +1574,23 @@ proc initApiTable() =
   )
 
 proc MsQuicOpenVersion*(version: uint32; apiTable: ptr pointer): QUIC_STATUS {.exportc, cdecl.} =
+  warn "MsQuicOpenVersion entry", version=version
   if apiTable.isNil:
+    warn "MsQuicOpenVersion invalid param"
     return QUIC_STATUS_INVALID_PARAMETER
   if version < 2'u32:
+    warn "MsQuicOpenVersion unsupported version", version=version
     return QUIC_STATUS_NOT_SUPPORTED
   if gApiTableInstance.SetContext.isNil:
-    initApiTable()
+    warn "MsQuicOpenVersion initializing api table"
+    try:
+      initApiTable()
+    except Exception as exc:
+      warn "MsQuicOpenVersion initApiTable raised", msg=exc.msg
+      return QUIC_STATUS_INVALID_STATE
   inc gApiTableRefCount
   apiTable[] = cast[pointer](addr gApiTableInstance)
+  warn "MsQuicOpenVersion success"
   QUIC_STATUS_SUCCESS
 
 proc MsQuicClose*(table: pointer) {.exportc, cdecl.} =

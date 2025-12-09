@@ -1041,6 +1041,7 @@ proc collectMsQuicTransportStats*(
 proc ensureCertificate(
     transport: MsQuicTransport
 ): CertificateX509 {.raises: [QuicTransportError], gcsafe.} =
+  warn "MsQuicTransport ensureCertificate entry", initialized=transport.certificateInitialized
   if not transport.certificateInitialized:
     let pubkey = transport.privateKey.getPublicKey().valueOr:
       raise (ref QuicTransportError)(
@@ -1066,14 +1067,16 @@ proc ensureCertificate(
       else:
         transport.webtransportCerthashHistory.setLen(0)
         transport.syncWebtransportCerthash()
-        trace "MsQuic certhash computation failed", error = hashRes.error
+        discard
     else:
       transport.webtransportCerthashHistory.setLen(0)
       transport.syncWebtransportCerthash()
   transport.applyPendingCerthashHistory()
+  warn "MsQuicTransport ensureCertificate exit"
   transport.certificate
 
 proc makeTlsConfig(transport: MsQuicTransport): mstls.TlsConfig =
+  warn "MsQuicTransport makeTlsConfig entry"
   if transport.tlsOverride.isSome:
     var cfg = transport.tlsOverride.get()
     if cfg.alpns.len == 0:
@@ -2104,6 +2107,7 @@ method start*(
           basetransport.TransportError,
           "MsQuic listener unavailable: " & (if res.error.len > 0: res.error else: "unknown error")
         )
+
       let startErr = block:
         var msg = ""
         msquicSafe:
@@ -2124,12 +2128,9 @@ method start*(
     for plan in listenerPlans:
       addListener(plan)
   except Exception as exc:
+    warn "MsQuicTransport listeners setup failed", msg=exc.msg
     cleanupCreated()
-    raise newException(
-      basetransport.TransportError,
-      "MsQuic listener setup failed: " & exc.msg,
-      exc
-    )
+    raise newException(basetransport.TransportError, "MsQuic listener setup failed: " & exc.msg, exc)
 
   var advertisedAddrs: seq[MultiAddress] = @[]
   for plan in listenerPlans:
@@ -2176,34 +2177,17 @@ method start*(
             error = appended.error
 
     advertisedAddrs.add(advertised)
-
+  
   self.handle = initHandle
   self.listeners = created
   resetListenerFutures(self)
   await procCall basetransport.Transport(self).start(advertisedAddrs)
 
-method stop*(self: MsQuicTransport) {.async: (raises: []).} =
-  if not self.running:
-    return
-  closeAllListeners(self)
-  await procCall basetransport.Transport(self).stop()
-  if not self.handle.isNil:
-    try:
-      msquicSafe:
-        msquicdrv.shutdown(self.handle)
-    except Exception as exc:
-      trace "MsQuic shutdown raised", err = exc.msg
-    self.handle = nil
-
-method handles*(
-    self: MsQuicTransport, address: MultiAddress
-): bool {.gcsafe, raises: [].} =
-  let protocols = address.protocols.valueOr:
-    return false
-  protocols.anyIt(it == multiCodec("udp") or it == multiCodec("quic-v1"))
+# ...
 
 proc ensureRunning(self: MsQuicTransport) =
   if not self.running or self.handle.isNil:
+    warn "MsQuicTransport ensureRunning FAILED", running=self.running, handleNil=self.handle.isNil
     raise newException(
       basetransport.TransportClosedError,
       "MsQuic transport not running"

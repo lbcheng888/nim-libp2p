@@ -51,6 +51,75 @@ proc ensureDir(path: string) =
   if dir.len > 0 and not dirExists(dir):
     createDir(dir)
 
+proc alignWindow(ts: int64, scale: Timescale): int64 =
+  let s = scale.int.int64 * 1000
+  (ts div s) * s
+
+proc bucketKey(asset: string, scale: Timescale, startMs: int64): TimeBucketKey =
+  &"{asset}:{scale}:{startMs}"
+
+proc initBucket(asset: string, scale: Timescale, ts: int64, trade: TradeEvent): KlineBucket =
+  let start = alignWindow(ts, scale)
+  KlineBucket(
+    asset: asset,
+    scale: scale,
+    windowStartMs: start,
+    open: trade.price,
+    high: trade.price,
+    low: trade.price,
+    close: trade.price,
+    volume: trade.amount,
+    trades: 1,
+    closed: false,
+    publishSeq: trade.sequence
+  )
+
+proc updateBucket(bucket: var KlineBucket, trade: TradeEvent) =
+  bucket.high = max(bucket.high, trade.price)
+  bucket.low = min(bucket.low, trade.price)
+  bucket.close = trade.price
+  bucket.volume += trade.amount
+  inc bucket.trades
+  bucket.publishSeq = max(bucket.publishSeq, trade.sequence)
+
+proc decodeBucket(data: seq[byte]): Option[KlineBucket] =
+  try:
+    let node = parseJson(string.fromBytes(data))
+    some(KlineBucket(
+      asset: node["asset"].getStr(),
+      scale: Timescale(node["scale"].getInt()),
+      windowStartMs: node["windowStartMs"].getBiggestInt(),
+      open: node["open"].getFloat(),
+      high: node["high"].getFloat(),
+      low: node["low"].getFloat(),
+      close: node["close"].getFloat(),
+      volume: node["volume"].getFloat(),
+      trades: node["trades"].getInt(),
+      closed: node["closed"].getBool(),
+      publishSeq: node["publishSeq"].getBiggestInt()
+    ))
+  except:
+    none(KlineBucket)
+
+proc decodeTrade(data: seq[byte]): Option[TradeEvent] =
+  try:
+    let node = parseJson(string.fromBytes(data))
+    some(TradeEvent(
+      matchId: node["matchId"].getStr(),
+      orderId: node["orderId"].getStr(),
+      takerSide: node["takerSide"].getStr(),
+      price: node["price"].getFloat(),
+      amount: node["amount"].getFloat(),
+      baseAsset: decodeAssetDef(node["baseAsset"]),
+      quoteAsset: decodeAssetDef(node["quoteAsset"]),
+      matcherPeer: node["matcherPeer"].getStr(),
+      makerPeer: node["makerPeer"].getStr(),
+      createdAt: node["createdAt"].getBiggestInt(),
+      sequence: node["sequence"].getBiggestInt()
+    ))
+  except:
+    none(TradeEvent)
+
 proc walEventToJson(event: KlineWalEvent): JsonNode =
   %*{
     "version": KlineWalVersion,
@@ -106,7 +175,8 @@ proc tradeToJson(trade: TradeEvent): JsonNode =
     "takerSide": trade.takerSide,
     "price": trade.price,
     "amount": trade.amount,
-    "asset": trade.asset,
+    "baseAsset": encodeAssetDef(trade.baseAsset),
+    "quoteAsset": encodeAssetDef(trade.quoteAsset),
     "matcherPeer": trade.matcherPeer,
     "makerPeer": trade.makerPeer,
     "createdAt": trade.createdAt,
@@ -114,29 +184,29 @@ proc tradeToJson(trade: TradeEvent): JsonNode =
   }
 
 proc applyTrade(store: KlineStore; trade: TradeEvent; scales: seq[Timescale]) =
-  if trade.asset.len == 0 or trade.price <= 0 or trade.amount <= 0:
+  let assetSymbol = trade.baseAsset.symbol
+  if assetSymbol.len == 0 or trade.price <= 0 or trade.amount <= 0:
     inc store.stats.droppedTrades
     return
   if trade.sequence > store.latestSeq:
     store.latestSeq = trade.sequence
   for scale in scales:
     let windowStart = alignWindow(trade.createdAt, scale)
-    let key = bucketKey(trade.asset, scale, windowStart)
+    let key = bucketKey(assetSymbol, scale, windowStart)
     if not store.buckets.hasKey(key):
-      store.buckets[key] = initBucket(trade.asset, scale, trade.createdAt, trade)
+      store.buckets[key] = initBucket(assetSymbol, scale, trade.createdAt, trade)
     else:
       var bucket = store.buckets[key]
       if trade.createdAt < bucket.windowStartMs or trade.createdAt >= bucket.windowStartMs + scale.int.int64 * 1000:
         ## 延迟成交落入旧窗口，重新对齐。
         inc store.stats.reopenWindows
-        let newKey = bucketKey(trade.asset, scale, alignWindow(trade.createdAt, scale))
-        var delayed = initBucket(trade.asset, scale, trade.createdAt, trade)
+        let newKey = bucketKey(assetSymbol, scale, alignWindow(trade.createdAt, scale))
+        var delayed = initBucket(assetSymbol, scale, trade.createdAt, trade)
         store.buckets[newKey] = delayed
         continue
       bucket.updateBucket(trade)
       store.buckets[key] = bucket
-    store.stats.published = max(store.stats.published, store.buckets[key].publishSeq)
-  store.stats.buckets = store.buckets.len
+    store.stats.buckets = store.buckets.len
 
 proc pruneClosed(store: KlineStore; horizonMs: int64) =
   let cutoff = nowMs() - horizonMs

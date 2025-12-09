@@ -4,7 +4,8 @@
 
 import std/locks
 import secp256k1, secp256k1/abi
-import nimcrypto/[sha2, hkdf]
+import nimcrypto/sha2
+import ../hkdf
 import results
 
 import ../secp
@@ -14,9 +15,9 @@ const
   pedersenLabel = "coinjoin-blind"
 
 var
-  pedersenBaseCached: SkPublicKey
+  pedersenBaseCached: secp.SkPublicKey
   pedersenBaseInit = false
-  pedersenBaseLock: TLock
+  pedersenBaseLock: Lock
 
 initLock(pedersenBaseLock)
 
@@ -37,18 +38,18 @@ let emptySalt: array[0, byte] = []
 proc toCoinJoinError(err: cstring, kind = cjInvalidInput): CoinJoinError =
   newCoinJoinError(kind, $err)
 
-proc serializePoint*(pk: SkPublicKey): CoinJoinPoint =
+proc serializePoint*(pk: secp.SkPublicKey): CoinJoinPoint =
   let raw = secp256k1.SkPublicKey(pk).toRawCompressed()
   CoinJoinPoint(raw)
 
-proc deserializePoint*(point: CoinJoinPoint): CoinJoinResult[SkPublicKey] =
-  let res = SkPublicKey.init(point)
+proc deserializePoint*(point: CoinJoinPoint): CoinJoinResult[secp.SkPublicKey] =
+  let res = secp.SkPublicKey.init(point)
   if res.isErr:
     err(newCoinJoinError(cjInvalidInput, $res.error))
   else:
     ok(res.get)
 
-proc scalarToPub*(scalar: CoinJoinAmount): CoinJoinResult[SkPublicKey] =
+proc scalarToPub*(scalar: CoinJoinAmount): CoinJoinResult[secp.SkPublicKey] =
   let privRes = SkPrivateKey.init(scalar)
   if privRes.isErr:
     return err(toCoinJoinError(privRes.error))
@@ -57,7 +58,7 @@ proc scalarToPub*(scalar: CoinJoinAmount): CoinJoinResult[SkPublicKey] =
   priv.clear()
   ok(pub)
 
-proc getPedersenBase(): CoinJoinResult[SkPublicKey] =
+proc getPedersenBase(): CoinJoinResult[secp.SkPublicKey] =
   pedersenBaseLock.acquire()
   defer:
     pedersenBaseLock.release()
@@ -80,51 +81,59 @@ proc getPedersenBase(): CoinJoinResult[SkPublicKey] =
     inc counter
   err(newCoinJoinError(cjInternal, "unable to derive pedersen base"))
 
-proc publicKeyNegate(pk: SkPublicKey): CoinJoinResult[SkPublicKey] =
+proc publicKeyNegate(pk: secp.SkPublicKey): CoinJoinResult[secp.SkPublicKey] =
   var raw = secp256k1.SkPublicKey(pk)
-  if secp256k1_ec_pubkey_negate(secp256k1_context_no_precomp, addr raw.data) != 1:
+  if secp256k1_ec_pubkey_negate(secp256k1_context_no_precomp, cast[ptr secp256k1_pubkey](addr raw)) != 1:
     err(newCoinJoinError(cjInternal, "pubkey negate failed"))
   else:
-    ok(SkPublicKey(raw))
+    ok(secp.SkPublicKey(raw))
 
-proc publicKeyTweakMul(base: SkPublicKey, scalar: CoinJoinBlind): CoinJoinResult[SkPublicKey] =
+proc publicKeyTweakMul(base: secp.SkPublicKey, scalar: CoinJoinBlind): CoinJoinResult[secp.SkPublicKey] =
   var raw = secp256k1.SkPublicKey(base)
   var tweak = scalar
-  if secp256k1_ec_pubkey_tweak_mul(secp256k1_context_no_precomp, addr raw.data, tweak.baseAddr) != 1:
+  if secp256k1_ec_pubkey_tweak_mul(secp256k1_context_no_precomp, cast[ptr secp256k1_pubkey](addr raw), addr tweak[0]) != 1:
     err(newCoinJoinError(cjInvalidInput, "invalid tweak for pubkey"))
   else:
-    ok(SkPublicKey(raw))
+    ok(secp.SkPublicKey(raw))
 
-proc publicKeyCombine(keys: openArray[SkPublicKey]): CoinJoinResult[SkPublicKey] =
+proc publicKeyCombine(keys: openArray[secp.SkPublicKey]): CoinJoinResult[secp.SkPublicKey] =
   if keys.len == 0:
     return err(newCoinJoinError(cjInvalidInput, "no pubkeys to combine"))
   var rawKeys = newSeq[secp256k1.SkPublicKey](keys.len)
   var ptrs = newSeq[ptr secp256k1_pubkey](keys.len)
   for i, key in keys:
     rawKeys[i] = secp256k1.SkPublicKey(key)
-    ptrs[i] = addr rawKeys[i].data
-  var out {.noinit.}: secp256k1_pubkey
+    ptrs[i] = cast[ptr secp256k1_pubkey](addr rawKeys[i])
+  var outKey {.noinit.}: secp256k1_pubkey
   if secp256k1_ec_pubkey_combine(
       secp256k1_context_no_precomp,
-      addr out,
+      addr outKey,
       cast[ptr ptr secp256k1_pubkey](ptrs[0].unsafeAddr),
       csize_t(keys.len)
     ) != 1:
     err(newCoinJoinError(cjInternal, "pubkey combine failed"))
   else:
-    ok(SkPublicKey(secp256k1.SkPublicKey(data: out)))
+    ok(secp.SkPublicKey(cast[secp256k1.SkPublicKey](outKey)))
 
 proc scalarAdd(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
   var acc = a
   var tweak = b
-  if secp256k1_ec_privkey_tweak_add(secp256k1_context_no_precomp, acc.baseAddr, tweak.baseAddr) != 1:
+  if secp256k1_ec_privkey_tweak_add(secp256k1_context_no_precomp, addr acc[0], addr tweak[0]) != 1:
     err(newCoinJoinError(cjInvalidInput, "blind addition overflows"))
+  else:
+    ok(acc)
+
+proc scalarMul*(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
+  var acc = a
+  var tweak = b
+  if secp256k1_ec_privkey_tweak_mul(secp256k1_context_no_precomp, addr acc[0], addr tweak[0]) != 1:
+    err(newCoinJoinError(cjInvalidInput, "blind multiplication failed"))
   else:
     ok(acc)
 
 proc scalarNegate(value: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
   var data = value
-  if secp256k1_ec_privkey_negate(secp256k1_context_no_precomp, data.baseAddr) != 1:
+  if secp256k1_ec_privkey_negate(secp256k1_context_no_precomp, addr data[0]) != 1:
     err(newCoinJoinError(cjInternal, "blind negate failed"))
   else:
     ok(data)
@@ -140,17 +149,17 @@ proc hkdfBlind*(masterSeed: openArray[byte], sessionId, nonce: uint64): CoinJoin
   info.appendString(pedersenLabel)
   info.appendUint64(sessionId)
   info.appendUint64(nonce)
-  var out: array[1, CoinJoinBlind]
-  sha256.hkdf(emptySalt, masterSeed, info, out)
+  var outBlind: array[1, CoinJoinBlind]
+  sha256.hkdf(emptySalt, masterSeed, info, outBlind)
   var zero = true
-  for b in out[0]:
+  for b in outBlind[0]:
     if b != 0:
       zero = false
       break
   if zero:
     err(newCoinJoinError(cjInternal, "hkdf produced zero blind"))
   else:
-    ok(out[0])
+    ok(outBlind[0])
 
 proc encodeAmount*(value: uint64): CoinJoinAmount =
   var data: CoinJoinAmount
@@ -160,27 +169,28 @@ proc encodeAmount*(value: uint64): CoinJoinAmount =
 
 proc amountScalar*(amount: CoinJoinAmount): CoinJoinAmount = amount
 
-proc commitmentPoint*(pub: SkPublicKey): CoinJoinPoint = serializePoint(pub)
+proc commitmentPoint*(pub: secp.SkPublicKey): CoinJoinPoint = serializePoint(pub)
 
-proc commitmentPub*(commitment: CoinJoinCommitment): CoinJoinResult[SkPublicKey] =
+proc commitmentPub*(commitment: CoinJoinCommitment): CoinJoinResult[secp.SkPublicKey] =
   deserializePoint(commitment.point)
 
-proc pedersenBase*(): CoinJoinResult[SkPublicKey] = getPedersenBase()
+proc pedersenBase*(): CoinJoinResult[secp.SkPublicKey] = getPedersenBase()
 
-proc pedersenGeneratorMul*(blind: CoinJoinBlind): CoinJoinResult[SkPublicKey] =
+proc pedersenGeneratorMul*(blind: CoinJoinBlind): CoinJoinResult[secp.SkPublicKey] =
   let base = ?getPedersenBase()
   publicKeyTweakMul(base, blind)
 
-proc generatorMul*(amount: CoinJoinAmount): CoinJoinResult[SkPublicKey] =
+proc generatorMul*(amount: CoinJoinAmount): CoinJoinResult[secp.SkPublicKey] =
   scalarToPub(amount)
 
 proc addBlinds*(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] = scalarAdd(a, b)
 
 proc subBlinds*(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] = scalarSub(a, b)
 
-proc combineKeys*(keys: openArray[SkPublicKey]): CoinJoinResult[SkPublicKey] =
+proc combineKeys*(keys: openArray[secp.SkPublicKey]): CoinJoinResult[secp.SkPublicKey] =
   publicKeyCombine(keys)
 
-proc negateKey*(key: SkPublicKey): CoinJoinResult[SkPublicKey] =
+proc mulScalars*(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] = scalarMul(a, b)
+
+proc negateKey*(key: secp.SkPublicKey): CoinJoinResult[secp.SkPublicKey] =
   publicKeyNegate(key)
-*** End File

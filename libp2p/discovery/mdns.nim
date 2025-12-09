@@ -48,12 +48,16 @@ import ./discoverymngr
 export discoverymngr
 
 when defined(ohos):
-  proc OH_LOG_Print(logType: cint, level: cint, domain: cint, tag: cstring, fmt: cstring): cint {.cdecl, importc: "OH_LOG_Print", header: "<hilog/log.h>", varargs, raises: [].}
+  # Force no HiLog
+  proc OH_LOG_Print(logType: cint, level: cint, domain: cint, tag: cstring, fmt: cstring): cint {.cdecl, varargs, raises: [].} =
+    discard
   const
     HILOG_TYPE_APP = cint(0)
     HILOG_LEVEL_INFO = cint(4)
     MDNS_LOG_DOMAIN = cint(0xD0B0)
   let MdnsLogTag: cstring = "nimlibp2p"
+
+when defined(ohos) or defined(android):
   {.emit: """
   #include <arpa/inet.h>
   #include <errno.h>
@@ -110,7 +114,8 @@ when defined(ohos):
   proc libp2p_get_iface_ipv4(iface: cstring, outBuf: cstring, bufLen: csize_t): cint {.importc, nodecl, raises: [].}
   proc libp2p_get_iface_ipv6(iface: cstring, outBuf: cstring, bufLen: csize_t): cint {.importc, nodecl, raises: [].}
   const CandidateIfaces = ["wlan0", "ancowlan0", "eth0", "rmnet_data0", "rmnet0", "lan0", "p2p0"]
-elif defined(android):
+
+when defined(android):
   const
     ANDROID_LOG_INFO = cint(4)
   proc android_log_print(prio: cint, tag: cstring, fmt: cstring): cint {.cdecl, importc: "__android_log_print", header: "<android/log.h>", varargs, raises: [].}
@@ -139,7 +144,7 @@ proc mdnsLog(msg: string) {.raises: [].} =
     except IOError:
       discard
 
-when defined(ohos):
+when defined(ohos) or defined(android):
   proc getInterfaceIpv4(iface: string): string {.raises: [].} =
     var buf: array[16, char]
     zeroMem(addr buf[0], buf.len)
@@ -232,12 +237,19 @@ proc enumerateLanIpv4*(preferred: string = ""): seq[string] {.raises: [].} =
             let sin = cast[ptr Sockaddr_in](addrPtr)
             let raw = posix.inet_ntoa(sin.sin_addr)
             if raw != nil:
+              mdnsLog("enumerateLanIpv4 candidate iface=" & $cursor.ifa_name & " ip=" & $raw)
               addIp($raw)
+            else:
+              mdnsLog("enumerateLanIpv4 candidate iface=" & $cursor.ifa_name & " ip=nil")
+          else:
+             mdnsLog("enumerateLanIpv4 skip iface=" & (if cursor.ifa_name != nil: $cursor.ifa_name else: "nil") & " family=" & (if addrPtr != nil: $addrPtr.sa_family else: "-1"))
           cursor = cursor.ifa_next
+      else:
+        mdnsLog("enumerateLanIpv4 getifaddrs failed errno=" & $errno)
     except Exception:
       discard
 
-  when defined(ohos):
+  when defined(ohos) or defined(android):
     for candidate in CandidateIfaces:
       let ip = getInterfaceIpv4(candidate)
       addIp(ip)
@@ -248,7 +260,7 @@ proc detectPrimaryIpv4*(): string {.raises: [].} =
     let ip = candidates[0]
     if ip.len > 0:
       return ip
-  when defined(ohos):
+  when defined(ohos) or defined(android):
     for candidate in CandidateIfaces:
       let ip = getInterfaceIpv4(candidate)
       if ip.len > 0 and ip != "0.0.0.0" and ip != "127.0.0.1":
@@ -256,7 +268,7 @@ proc detectPrimaryIpv4*(): string {.raises: [].} =
         return ip
   "0.0.0.0"
 
-when defined(ohos):
+when defined(ohos) or defined(android):
   proc detectPrimaryIpv6*(): string {.raises: [].} =
     for candidate in CandidateIfaces:
       let ip = getInterfaceIpv6(candidate)
