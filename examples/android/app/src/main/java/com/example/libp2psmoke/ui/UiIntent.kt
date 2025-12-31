@@ -60,6 +60,21 @@ sealed interface UiIntent {
         val amount: String,
         val hops: String
     ) : UiIntent
+
+    data class SubmitDexOrder(
+        val side: String,
+        val price: String,
+        val amountBase: String
+    ) : UiIntent
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Settings / Runtime Config
+    // ═══════════════════════════════════════════════════════════════════
+    data class UpdateBootstrapPeers(val raw: String) : UiIntent
+    data class UpdateRelayPeers(val raw: String) : UiIntent
+    object ApplyNetworkConfig : UiIntent
+    data class SetMarketEnabled(val enabled: Boolean) : UiIntent
+    object ResetNodeData : UiIntent
     
     // ═══════════════════════════════════════════════════════════════════
     // 导航与系统

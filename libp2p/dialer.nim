@@ -56,9 +56,13 @@ method dialAndUpgrade*(
     hostname: string,
     addrs: MultiAddress,
     dir = Direction.Out,
-): Future[Muxer] {.async: (raises: [CancelledError]).} =
+): Future[Muxer] {.async: (raises: [CancelledError, DialFailedError]).} =
+  var lastErr: ref CatchableError = nil
+  var lastMsg = ""
+  var transportMatched = false
   for transport in self.transports: # for each transport
     if transport.handles(addrs): # check if it can dial it
+      transportMatched = true
       if not self.allowsDial(peerId, addrs):
         trace "Dial blocked by connection gater",
           addrs, peerId = peerId.get(default(PeerId))
@@ -76,7 +80,9 @@ method dialAndUpgrade*(
           debug "Dialing failed",
             description = exc.msg, peerId = peerId.get(default(PeerId))
           libp2p_failed_dials.inc()
-          return nil # Try the next address
+          lastErr = exc
+          lastMsg = "dial failed: " & exc.msg
+          continue
 
       libp2p_successful_dials.inc()
 
@@ -102,8 +108,9 @@ method dialAndUpgrade*(
           else:
             libp2p_failed_upgrades_incoming.inc()
 
-          # Try other address
-          return nil
+          lastErr = exc
+          lastMsg = "upgrade failed: " & exc.msg
+          continue
 
       if mux.isNil:
         debug "Dial upgrade returned nil, treating as failure",
@@ -120,10 +127,15 @@ method dialAndUpgrade*(
           libp2p_failed_upgrades_outgoing.inc()
         else:
           libp2p_failed_upgrades_incoming.inc()
-        return nil
+        lastMsg = "upgrade returned nil for address=" & $addrs
+        continue
       debug "Dial successful", peerId = mux.connection.peerId
       return mux
-  return nil
+  if not transportMatched:
+    raise newException(DialFailedError, "no transport handles address: " & $addrs)
+  if lastMsg.len == 0:
+    raise newException(DialFailedError, "dial failed without error details for address=" & $addrs)
+  raise newException(DialFailedError, lastMsg, lastErr)
 
 proc expandDnsAddr(
     self: Dialer, peerId: Opt[PeerId], address: MultiAddress
@@ -152,25 +164,37 @@ proc expandDnsAddr(
     originalAddresses = toResolve, resolvedAddresses = resolved
 
   for resolvedAddress in resolved:
-    let lastPart = resolvedAddress[^1].tryGet()
-    if lastPart.protoCode == Result[MultiCodec, string].ok(multiCodec("p2p")):
-      var peerIdBytes: seq[byte]
-      try:
-        peerIdBytes = lastPart.protoArgument().tryGet()
-      except ResultError[string] as e:
-        raiseAssert "expandDnsAddr failed in expandDnsAddr protoArgument: " & e.msg
+    let lastPartRes = resolvedAddress[^1]
+    if lastPartRes.isErr:
+      continue
+    let lastPart = lastPartRes.get()
 
-      let addrPeerId = PeerId.init(peerIdBytes).tryGet()
-      result.add((resolvedAddress[0 ..^ 2].tryGet(), Opt.some(addrPeerId)))
-    else:
+    if lastPart.protoCode != Result[MultiCodec, string].ok(multiCodec("p2p")):
       result.add((resolvedAddress, peerId))
+      continue
+
+    let peerIdBytesRes = lastPart.protoArgument()
+    if peerIdBytesRes.isErr:
+      continue
+
+    let addrPeerIdRes = PeerId.init(peerIdBytesRes.get())
+    if addrPeerIdRes.isErr:
+      continue
+
+    let baseAddrRes = resolvedAddress[0 ..^ 2]
+    if baseAddrRes.isErr:
+      continue
+
+    result.add((baseAddrRes.get(), Opt.some(addrPeerIdRes.get())))
 
 method dialAndUpgrade*(
     self: Dialer, peerId: Opt[PeerId], addrs: seq[MultiAddress], dir = Direction.Out
 ): Future[Muxer] {.
-    async: (raises: [CancelledError, MaError, TransportAddressError, LPError])
+    async: (raises: [CancelledError, DialFailedError, MaError, TransportAddressError, LPError])
 .} =
   debug "Dialing peer", peerId = peerId.get(default(PeerId)), addrs
+  var lastErr: ref CatchableError = nil
+  var lastMsg = ""
 
   for rawAddress in addrs:
     # resolve potential dnsaddr
@@ -195,9 +219,19 @@ method dialAndUpgrade*(
           trace "Dial blocked by connection gater",
             resolvedAddress, peerId = addrPeerId.get(default(PeerId))
           continue
-        result = await self.dialAndUpgrade(addrPeerId, hostname, resolvedAddress, dir)
-        if not isNil(result):
-          return result
+        try:
+          result = await self.dialAndUpgrade(addrPeerId, hostname, resolvedAddress, dir)
+          if not isNil(result):
+            return result
+        except CancelledError as exc:
+          raise exc
+        except CatchableError as exc:
+          lastErr = exc
+          lastMsg = exc.msg
+          continue
+
+  if lastMsg.len > 0:
+    raise newException(DialFailedError, "all dial attempts failed: " & lastMsg, lastErr)
 
 proc tryReusingConnection(self: Dialer, peerId: PeerId): Opt[Muxer] =
   let muxer = self.connManager.selectMuxer(peerId)

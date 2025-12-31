@@ -15,3 +15,28 @@ fun formatVolumeOrDash(value: BigDecimal?): String {
         else -> value.stripTrailingZeros().toPlainString()
     }
 }
+
+fun sanitizeDecimalInput(raw: String, maxDecimals: Int? = null): String {
+    if (raw.isEmpty()) return ""
+    val sb = StringBuilder(raw.length)
+    var hasDot = false
+    for (ch in raw) {
+        when {
+            ch in '0'..'9' -> sb.append(ch)
+            ch == '.' && !hasDot -> {
+                sb.append(ch)
+                hasDot = true
+            }
+        }
+    }
+    var filtered = sb.toString()
+    if (filtered.startsWith(".")) filtered = "0$filtered"
+    if (maxDecimals != null && maxDecimals >= 0) {
+        val dot = filtered.indexOf('.')
+        if (dot >= 0) {
+            val end = minOf(filtered.length, dot + 1 + maxDecimals)
+            filtered = filtered.substring(0, end)
+        }
+    }
+    return filtered
+}

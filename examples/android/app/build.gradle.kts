@@ -18,6 +18,16 @@ val defaultBtcMnemonic =
 val defaultBtcDerivationPath = "m/84'/0'/0'/0/0"
 val defaultBtcTestnetWif = "cRZbMHd11MYobRro6edBa4mJDFZ2rThep1DmtHCUTpZFVaQwdauo"
 val defaultBtcTestnetAddress = "tb1qfcyfvl5yxvhdqvev97psae9znmvwqnufml7s4h"
+val dexMode = (project.findProperty("dex_mode") as String? ?: "trader")
+val dexAutoTrade = (project.findProperty("dex_auto_trade") as String? ?: "false")
+val dexEnableSigning = (project.findProperty("dex_enable_signing") as String? ?: "true")
+val dexAllowUnsigned = (project.findProperty("dex_allow_unsigned") as String? ?: "false")
+val dexSelfTest = (project.findProperty("dex_self_test") as String? ?: "false")
+val p2pAutostart = (project.findProperty("p2p_autostart") as String? ?: "true")
+val p2pEnableMdns = (project.findProperty("p2p_enable_mdns") as String? ?: "false")
+val marketAutostart = (project.findProperty("market_autostart") as String? ?: "true")
+val walletAutostart = (project.findProperty("wallet_autostart") as String? ?: "true")
+val uiEnableChart = (project.findProperty("ui_enable_chart") as String? ?: "true")
 
 android {
     namespace = "com.example.libp2psmoke"
@@ -66,7 +76,7 @@ android {
         buildConfigField(
             "String",
             "DEV_PRIVATE_KEY",
-            "\"${devPrivateKey.escapeForBuildConfig()}\""
+            "\"\""
         )
         buildConfigField(
             "String",
@@ -76,26 +86,105 @@ android {
         buildConfigField(
             "String",
             "DEFAULT_BTC_MNEMONIC",
-            "\"${defaultBtcMnemonic.escapeForBuildConfig()}\""
+            "\"\""
         )
         buildConfigField(
             "String",
             "DEFAULT_BTC_PATH",
-            "\"${defaultBtcDerivationPath.escapeForBuildConfig()}\""
+            "\"\""
         )
         buildConfigField(
             "String",
             "DEFAULT_BTC_TESTNET_WIF",
-            "\"${defaultBtcTestnetWif.escapeForBuildConfig()}\""
+            "\"\""
         )
         buildConfigField(
             "String",
             "DEFAULT_BTC_TESTNET_ADDRESS",
-            "\"${defaultBtcTestnetAddress.escapeForBuildConfig()}\""
+            "\"\""
+        )
+
+        buildConfigField(
+            "String",
+            "DEX_MODE",
+            "\"${dexMode.escapeForBuildConfig()}\""
+        )
+        buildConfigField(
+            "boolean",
+            "DEX_AUTO_TRADE",
+            dexAutoTrade
+        )
+        buildConfigField(
+            "boolean",
+            "DEX_ENABLE_SIGNING",
+            dexEnableSigning
+        )
+        buildConfigField(
+            "boolean",
+            "DEX_ALLOW_UNSIGNED",
+            dexAllowUnsigned
+        )
+        buildConfigField(
+            "boolean",
+            "DEX_SELF_TEST",
+            dexSelfTest
+        )
+
+        buildConfigField(
+            "boolean",
+            "P2P_AUTOSTART",
+            p2pAutostart
+        )
+        buildConfigField(
+            "boolean",
+            "P2P_ENABLE_MDNS",
+            p2pEnableMdns
+        )
+        buildConfigField(
+            "boolean",
+            "MARKET_AUTOSTART",
+            marketAutostart
+        )
+        buildConfigField(
+            "boolean",
+            "WALLET_AUTOSTART",
+            walletAutostart
+        )
+        buildConfigField(
+            "boolean",
+            "UI_ENABLE_CHART",
+            uiEnableChart
         )
     }
 
     buildTypes {
+        debug {
+            buildConfigField(
+                "String",
+                "DEV_PRIVATE_KEY",
+                "\"${devPrivateKey.escapeForBuildConfig()}\""
+            )
+            buildConfigField(
+                "String",
+                "DEFAULT_BTC_MNEMONIC",
+                "\"${defaultBtcMnemonic.escapeForBuildConfig()}\""
+            )
+            buildConfigField(
+                "String",
+                "DEFAULT_BTC_PATH",
+                "\"${defaultBtcDerivationPath.escapeForBuildConfig()}\""
+            )
+            buildConfigField(
+                "String",
+                "DEFAULT_BTC_TESTNET_WIF",
+                "\"${defaultBtcTestnetWif.escapeForBuildConfig()}\""
+            )
+            buildConfigField(
+                "String",
+                "DEFAULT_BTC_TESTNET_ADDRESS",
+                "\"${defaultBtcTestnetAddress.escapeForBuildConfig()}\""
+            )
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(

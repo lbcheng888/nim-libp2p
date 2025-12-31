@@ -31,6 +31,7 @@ when defined(libp2p_msquic_experimental):
 import examples/dex/dex_node as dex_node
 import examples/dex/mixer_service as mixer_service
 import examples/dex/types as dex_types
+import examples/dex/marketdata/kline_store as dex_kline_store
 import examples/dex/storage/order_store as dex_store
 import examples/dex/security/signing as dex_signing
 import examples/mpc_crypto
@@ -116,6 +117,7 @@ logScope:
 when defined(android):
   proc android_log_write(prio: cint; tag: cstring; text: cstring): cint {.cdecl, importc: "__android_log_write", header: "<android/log.h>".}
   const AndroidLogError = cint(6)
+  const AndroidLogDebug = cint(3)
 
 when defined(ohos):
   when defined(nimlibp2p_no_hilog):
@@ -134,7 +136,7 @@ proc debugLog(msg: string) =
   except IOError:
     discard
   when defined(android):
-    discard android_log_write(AndroidLogError, "nim-libp2p", msg.cstring)
+    discard android_log_write(AndroidLogDebug, "nim-libp2p", msg.cstring)
   when defined(ohos):
     discard OH_LOG_Print(HILOG_TYPE_APP, HILOG_LEVEL_INFO, HILOG_DOMAIN, HilogTag, "%{public}s", msg.cstring)
 
@@ -308,11 +310,16 @@ type
     switchInstance: Switch
     gossip: GossipSub
     signal: ThreadSignalPtr
+    ## Keep the signal loop future alive; otherwise GC may collect it and break
+    ## command dispatch while the event loop is idle.
+    signalLoopTask: Future[void]
+    ## Periodic wake-up task to prevent `chronos.poll()` from blocking forever
+    ## when there are no timers/IO events (commands are submitted from other threads).
+    idleWakeTask: Future[void]
     readySignal: ThreadSignalPtr
     shutdownSignal: ThreadSignalPtr
     commandQueueHead: Atomic[Command]
     commandQueueTail: Atomic[Command]
-    queueStub: Command
     queuedCommands: Atomic[int]
     thread: Thread[pointer]
     dexNode: DexNode
@@ -396,13 +403,13 @@ proc resetCommandFields(cmd: Command) =
   cmd.streamKey = ""
   cmd.requestLimit = 0
   cmd.boolParam = false
-  cmd.next.store(nil, moRelease)
 
 proc acquireCommand(kind: CommandKind): Command =
   new(result)
   resetCommandFields(result)
   result.kind = kind
   result.completion = nil
+  result.next.store(nil, moRelease)
   debugLog("[nimlibp2p] makeCommand kind=" & $kind)
 
 proc makeCommand(kind: CommandKind): Command =
@@ -422,7 +429,6 @@ proc initCommandQueue(n: NimNode) =
   let stub = acquireCommand(cmdNone)
   stub.completion = nil
   stub.next.store(nil, moRelease)
-  n.queueStub = stub
   n.commandQueueHead.store(stub, moRelease)
   n.commandQueueTail.store(stub, moRelease)
   n.queuedCommands.store(0, moRelease)
@@ -1345,12 +1351,13 @@ proc extractPreferredIpv4(cfg: NodeConfig): string =
     if value.len > 0:
       debugLog("[nimlibp2p] extractPreferredIpv4 preferredLanIpv4=" & value)
       return value
-  let mdnsNode = cfg.extra.getOrDefault("mdns")
-  if mdnsNode.kind == JObject:
-    let nested = jsonGetStr(mdnsNode, "preferredIpv4")
-    if nested.len > 0:
-      debugLog("[nimlibp2p] extractPreferredIpv4 mdns.preferredIpv4=" & nested)
-      return nested
+  if cfg.extra.hasKey("mdns"):
+    let mdnsNode = cfg.extra["mdns"]
+    if mdnsNode.kind == JObject:
+      let nested = jsonGetStr(mdnsNode, "preferredIpv4")
+      if nested.len > 0:
+        debugLog("[nimlibp2p] extractPreferredIpv4 mdns.preferredIpv4=" & nested)
+        return nested
   ""
 
 proc computeMdnsServiceName(n: NimNode): string =
@@ -1977,6 +1984,7 @@ proc scheduleStartMdns(n: NimNode) =
     return
   n.mdnsStarting = true
   proc safeStart() {.async.} =
+    await sleepAsync(chronos.milliseconds(200))
     try:
       await doStartMdns(n)
     except CatchableError as exc:
@@ -2110,23 +2118,32 @@ proc refreshPeerConnections(n: NimNode) {.async.} =
 proc boostConnectivity(n: NimNode): Future[void] {.async.} =
   for peerId, addresses in n.peerHints.pairs:
     let peerRes = PeerId.init(peerId)
-    if peerRes.isErr():
-      continue
     var parsed: seq[MultiAddress] = @[]
     for addrStr in addresses:
       let ma = MultiAddress.init(addrStr)
       if ma.isOk():
-        parsed.add(ma.get())
+        let maAddr = ma.get()
+        parsed.add(maAddr)
+        try:
+          discard await n.switchInstance.connect(maAddr, allowUnknownPeerId = true)
+        except CatchableError as exc:
+          warn "boostConnectivity: connect via multiaddr failed", peer = peerId, address = addrStr, err = exc.msg
+          debugLog(
+            "[nimlibp2p] boostConnectivity connect multiaddr failed peer=" & peerId &
+            " addr=" & addrStr &
+            " err=" & exc.msg
+          )
     if parsed.len == 0:
       continue
-    try:
-      await n.switchInstance.connect(peerRes.get(), parsed, forceDial = true)
-    except CatchableError as exc:
-      warn "boostConnectivity dial failed", peer = peerId, err = exc.msg
-      debugLog(
-        "[nimlibp2p] boostConnectivity dial failed peer=" & peerId &
-        " err=" & exc.msg
-      )
+    if peerRes.isOk():
+      try:
+        await n.switchInstance.connect(peerRes.get(), parsed, forceDial = true)
+      except CatchableError as exc:
+        warn "boostConnectivity dial failed", peer = peerId, err = exc.msg
+        debugLog(
+          "[nimlibp2p] boostConnectivity dial failed peer=" & peerId &
+          " err=" & exc.msg
+        )
 
 proc reserveOnRelayAsync(n: NimNode, relayAddr: string): Future[int] {.async.} =
   if n.switchInstance.isNil or n.switchInstance.peerInfo.isNil:
@@ -2512,12 +2529,30 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     when defined(libp2p_quic_support):
       builder = builder.withQuicTransport()
       debugLog("[nimlibp2p] buildSwitch applied QUIC transport")
+  # Support both Mplex (default in newStandardSwitch) and Yamux for interop.
+  builder = builder.withMplex()
+  debugLog("[nimlibp2p] buildSwitch applied Mplex")
   builder = builder.withYamux()
   debugLog("[nimlibp2p] buildSwitch applied Yamux")
   builder = builder.withNoise()
   debugLog("[nimlibp2p] buildSwitch applied Noise")
-  builder = builder.withTls()
-  debugLog("[nimlibp2p] buildSwitch applied TLS")
+  var enableTls = true
+  when defined(android):
+    enableTls = false
+  if cfg.extra.kind == JObject:
+    if cfg.extra.hasKey("enableTls"):
+      let node = cfg.extra["enableTls"]
+      if node.kind == JBool:
+        enableTls = node.getBool()
+    elif cfg.extra.hasKey("disableTls"):
+      let node = cfg.extra["disableTls"]
+      if node.kind == JBool:
+        enableTls = not node.getBool()
+  if enableTls:
+    builder = builder.withTls()
+    debugLog("[nimlibp2p] buildSwitch applied TLS")
+  else:
+    debugLog("[nimlibp2p] buildSwitch TLS disabled")
   builder = builder.withBandwidthLimits(BandwidthLimitConfig.init())
   debugLog("[nimlibp2p] buildSwitch applied bandwidth manager")
   builder = builder.withMemoryLimits(MemoryLimitConfig.init())
@@ -2638,7 +2673,6 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       else:
         n.stopRequested.store(false, moRelease)
         debugLog("[nimlibp2p] cmdStart: starting switch")
-        prepareMdns(n)
         try:
           await n.switchInstance.start()
           n.started = true
@@ -2647,12 +2681,17 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           debugLog("[nimlibp2p] cmdStart: switch started")
           await setupDefaultTopics(n)
           debugLog("[nimlibp2p] cmdStart: default topics configured")
-          await startMdns(n)
-          debugLog("[nimlibp2p] cmdStart: mdns started")
+          if n.peerHints.len > 0:
+            proc delayedBoost() {.async.} =
+              await sleepAsync(chronos.seconds(1))
+              await boostConnectivity(n)
+            asyncSpawn(delayedBoost())
+          scheduleStartMdns(n)
+          debugLog("[nimlibp2p] cmdStart: mdns start scheduled")
           if n.mdnsRestartPending:
             info "cmdStart: applying deferred mdns restart", ipv4 = n.mdnsPreferredIpv4
-            await restartMdns(n)
-            debugLog("[nimlibp2p] cmdStart: mdns restart applied")
+            asyncSpawn(restartMdnsSafe(n, "cmdStart"))
+            debugLog("[nimlibp2p] cmdStart: mdns restart scheduled")
           asyncSpawn(logMemoryLoop(n))
           debugLog(
             "[nimlibp2p] cmdStart: marking success node=" & $cast[int](n)
@@ -2665,10 +2704,10 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             debugLog("[nimlibp2p] cmdStart: treating discovery advertise failure as non-fatal")
             n.started = true
             await setupDefaultTopics(n)
-            await startMdns(n)
+            scheduleStartMdns(n)
             if n.mdnsRestartPending:
               info "cmdStart: applying deferred mdns restart", ipv4 = n.mdnsPreferredIpv4
-              await restartMdns(n)
+              asyncSpawn(restartMdnsSafe(n, "cmdStart:advertise"))
             asyncSpawn(logMemoryLoop(n))
             command.resultCode = NimResultOk
             command.errorMsg = "WARN_DISCOVERY_ADVERTISE"
@@ -2851,16 +2890,43 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.errorMsg = "invalid multiaddr"
           n.lastDirectError = command.errorMsg
           return
-        try:
-          discard await n.switchInstance.connect(ma, allowUnknownPeerId = true)
+        let timeoutMs = if command.timeoutMs > 0: command.timeoutMs else: 10_000
+        let maxAttempts = 3
+        var attempt = 0
+        var success = false
+        var lastError = ""
+        while attempt < maxAttempts and not success:
+          let attemptNum = attempt + 1
+          try:
+            let fut = n.switchInstance.connect(ma, allowUnknownPeerId = true)
+            let completed = await withTimeout(fut, chronos.milliseconds(timeoutMs))
+            if not completed:
+              fut.cancelSoon()
+              lastError = "connect timeout"
+              warn "cmdConnectMultiaddr timeout", addr = command.multiaddr, attempt = attemptNum
+            else:
+              discard await fut
+              success = true
+              break
+          except CancelledError as exc:
+            lastError = exc.msg
+            break
+          except CatchableError as exc:
+            lastError = if exc.msg.len > 0: exc.msg else: $exc.name
+            warn "cmdConnectMultiaddr dial failed", addr = command.multiaddr, attempt = attemptNum, err = lastError
+          attempt.inc()
+          if attempt < maxAttempts:
+            let delayMs = min(800, 200 * attempt)
+            await sleepAsync(chronos.milliseconds(delayMs))
+        if success:
           command.resultCode = NimResultOk
           command.errorMsg = ""
           n.lastDirectError = ""
           let successMsg = "[nimlibp2p] cmdConnectMultiaddr success addr=" & command.multiaddr
           info "cmdConnectMultiaddr success", addr = command.multiaddr
           debugLog(successMsg)
-        except CatchableError as exc:
-          let errMsg = if exc.msg.len > 0: exc.msg else: $exc.name
+        else:
+          let errMsg = if lastError.len > 0: lastError else: "connect failed"
           command.resultCode = NimResultError
           command.errorMsg = errMsg
           n.lastDirectError = errMsg
@@ -2869,8 +2935,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             discard android_log_write(
               AndroidLogError,
               "nim-libp2p",
-              ("cmdConnectMultiaddr failed addr=" & command.multiaddr & " err=" &
-                  errMsg).cstring,
+              ("cmdConnectMultiaddr failed addr=" & command.multiaddr & " err=" & errMsg).cstring,
             )
     of cmdDisconnectPeer:
       if not n.started:
@@ -3704,33 +3769,55 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
 
         cfg.enableMixer = true
         cfg.metricsInterval = 10
+        cfg.enableAutoMatch = false
+        cfg.enableAutoTrade = false
+        # Production defaults: require signatures.
+        var allowUnsigned = false
+        var enableSigning = true
         
         if command.jsonString.len > 0:
           try:
              let j = parseJson(command.jsonString)
+             if j.hasKey("mode") and j["mode"].kind == JString:
+               case j["mode"].getStr().toLowerAscii()
+               of "matcher":
+                 cfg.mode = dex_types.DexMode.dmMatcher
+               of "observer":
+                 cfg.mode = dex_types.DexMode.dmObserver
+               of "kline":
+                 cfg.mode = dex_types.DexMode.dmKline
+               else:
+                 cfg.mode = dex_types.DexMode.dmTrader
              if j.hasKey("enableMixer"):
                cfg.enableMixer = j["enableMixer"].getBool()
+             if j.hasKey("enableAutoMatch"):
+               cfg.enableAutoMatch = j["enableAutoMatch"].getBool()
+             if j.hasKey("enableAutoTrade"):
+               cfg.enableAutoTrade = j["enableAutoTrade"].getBool()
+             if j.hasKey("allowUnsigned"):
+               allowUnsigned = j["allowUnsigned"].getBool()
+             if j.hasKey("enableSigning"):
+               enableSigning = j["enableSigning"].getBool()
           except CatchableError:
              debugLog("[nimlibp2p] cmdDexInit failed to parse json config")
 
         let store = dex_store.initOrderStore(cfg.dataDir)
+        let keyPath = cfg.dataDir / dex_signing.DefaultKeyFile
         let signingCfg = dex_signing.SigningConfig(
-            mode: dex_signing.smDisabled,
-            keyPath: "",
+            mode: if enableSigning: dex_signing.smEnabled else: dex_signing.smDisabled,
+            keyPath: keyPath,
             requireRemoteSignature: false,
-            allowUnsigned: true
+            allowUnsigned: allowUnsigned
         )
         let signingCtx = dex_signing.initSigning(signingCfg)
         
         n.dexNode = await dex_node.initDexNode(n.switchInstance, n.gossip, cfg, store, signingCtx)
+        n.dexNode.onEvent = proc(topic: string, payload: string) {.gcsafe, raises: [].} =
+          recordEvent(n, topic, payload)
         
         if n.dexNode.mixerCtx != nil:
           n.dexNode.mixerCtx.onEvent = proc(payload: string) {.gcsafe.} =
-            n.eventLogLock.acquire()
-            try:
-              n.eventLog.add(%*{"type": "dex.mixer", "payload": payload})
-            finally:
-              n.eventLogLock.release()
+            recordEvent(n, "dex.mixer", payload)
         
         dex_node.handleOrders(n.dexNode)
         dex_node.handleMatches(n.dexNode)
@@ -3778,11 +3865,135 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
              command.resultCode = NimResultError
 
     of cmdDexSubmitOrder:
-      command.resultCode = NimResultOk
+      if n.dexNode.isNil:
+        command.errorMsg = "DEX not initialized"
+        command.resultCode = NimResultInvalidState
+      else:
+        proc jsonFloat(node: JsonNode, key: string, fallback: float): float =
+          if node.kind != JObject or not node.hasKey(key):
+            return fallback
+          let value = node[key]
+          case value.kind
+          of JFloat, JInt:
+            value.getFloat()
+          of JString:
+            try:
+              parseFloat(value.getStr())
+            except ValueError:
+              fallback
+          else:
+            fallback
+
+        proc jsonInt(node: JsonNode, key: string, fallback: int): int =
+          if node.kind != JObject or not node.hasKey(key):
+            return fallback
+          let value = node[key]
+          case value.kind
+          of JInt, JFloat:
+            value.getInt()
+          of JString:
+            try:
+              parseInt(value.getStr())
+            except ValueError:
+              fallback
+          else:
+            fallback
+
+        proc jsonStr(node: JsonNode, key: string, fallback = ""): string =
+          if node.kind == JObject and node.hasKey(key) and node[key].kind == JString:
+            node[key].getStr()
+          else:
+            fallback
+
+        try:
+          var order: dex_types.OrderMessage
+          if command.jsonString.len > 0:
+            let json = parseJson(command.jsonString)
+            order = dex_types.OrderMessage(
+              id: jsonStr(json, "id"),
+              traderPeer: jsonStr(json, "traderPeer"),
+              baseAsset:
+                if json.kind == JObject and json.hasKey("baseAsset"):
+                  dex_types.decodeAssetDef(json["baseAsset"])
+                else:
+                  dex_types.AssetDef(chainId: dex_types.ChainBTC, symbol: "BTC", decimals: 8, assetType: dex_types.AssetNative),
+              quoteAsset:
+                if json.kind == JObject and json.hasKey("quoteAsset"):
+                  dex_types.decodeAssetDef(json["quoteAsset"])
+                else:
+                  dex_types.AssetDef(chainId: dex_types.ChainBSC, symbol: "USDC", decimals: 6, assetType: dex_types.AssetERC20),
+              side: jsonStr(json, "side", "buy"),
+              price: jsonFloat(json, "price", 0.0),
+              amount: jsonFloat(json, "amount", 0.0),
+              ttlMs: jsonInt(json, "ttlMs", 60_000),
+              timestamp: jsonInt(json, "timestamp", 0).int64,
+              signature: jsonStr(json, "signature"),
+              signerPubKey: jsonStr(json, "signerPubKey"),
+              signatureVersion: jsonInt(json, "signatureVersion", 0),
+              onionPath: @[]
+            )
+          else:
+            order = dex_types.OrderMessage(
+              id: "",
+              traderPeer: "",
+              baseAsset: dex_types.AssetDef(chainId: dex_types.ChainBTC, symbol: "BTC", decimals: 8, assetType: dex_types.AssetNative),
+              quoteAsset: dex_types.AssetDef(chainId: dex_types.ChainBSC, symbol: "USDC", decimals: 6, assetType: dex_types.AssetERC20),
+              side: "buy",
+              price: 65_000.0,
+              amount: 0.01,
+              ttlMs: 60_000,
+              timestamp: nowMillis(),
+              signature: "",
+              signerPubKey: "",
+              signatureVersion: 0,
+              onionPath: @[]
+            )
+
+          let localPeer = $n.switchInstance.peerInfo.peerId
+          let signingPeer = dex_signing.peerIdStr(n.dexNode.signing)
+          order.traderPeer = if signingPeer.len > 0: signingPeer else: localPeer
+          if order.id.len == 0:
+            order.id = $n.dexNode.rng[].generate(uint64)
+          if order.timestamp <= 0:
+            order.timestamp = nowMillis()
+          if order.ttlMs <= 0:
+            order.ttlMs = 60_000
+          if order.price <= 0:
+            order.price = 65_000.0
+          if order.amount <= 0:
+            order.amount = 0.01
+          if order.side.len == 0:
+            order.side = "buy"
+
+          dex_signing.signOrder(n.dexNode.signing, order)
+          discard await n.dexNode.publishOrder(order)
+          recordEvent(n, "dex.order_submitted", $(%*{
+            "id": order.id,
+            "side": order.side,
+            "price": order.price,
+            "amount": order.amount,
+            "base": order.baseAsset.toString(),
+            "quote": order.quoteAsset.toString(),
+          }))
+          command.resultCode = NimResultOk
+        except CatchableError as exc:
+          command.errorMsg = exc.msg
+          command.resultCode = NimResultError
 
     of cmdDexGetMarketData:
-      command.stringResult = "{}"
-      command.resultCode = NimResultOk
+      if n.dexNode.isNil or n.dexNode.klineStore.isNil:
+        command.stringResult = "[]"
+        command.resultCode = NimResultOk
+      else:
+        let filter = command.textPayload.strip()
+        let buckets = await dex_kline_store.snapshot(n.dexNode.klineStore)
+        var resultArr = newJArray()
+        for bucket in buckets:
+          if filter.len > 0 and bucket.asset != filter and filter != "*":
+            continue
+          resultArr.add(dex_types.klineBucketToJson(bucket))
+        command.stringResult = $resultArr
+        command.resultCode = NimResultOk
 
     of cmdDexGetWallets:
       if n.dexNode.isNil or n.dexNode.wallet.isNil:
@@ -3872,6 +4083,16 @@ proc signalLoop(n: NimNode) {.async.} =
     except CatchableError as exc:
       warn "signal loop error", err = exc.msg
 
+proc idleWakeLoop(n: NimNode) {.async.} =
+  ## Keep the Chronos dispatcher from blocking indefinitely when idle.
+  ## Commands are submitted from foreign threads via `submitCommand`, so we need
+  ## the event loop to periodically wake and drain the command queue.
+  while not n.stopRequested.load(moAcquire):
+    try:
+      await sleepAsync(chronos.milliseconds(250))
+    except CancelledError:
+      break
+
 proc eventLoop(handlePtr: pointer) {.thread.} =
   let handle = cast[NodeHandle](handlePtr)
   if handle.isNil or handle[].node.isNil:
@@ -3879,10 +4100,14 @@ proc eventLoop(handlePtr: pointer) {.thread.} =
     return
   let node = handle[].node
   let nodeAddr = cast[int](node)
+  let debugEventLoop = getEnv("LIBP2P_DEBUG_EVENTLOOP").len > 0
   debugLog("[nimlibp2p] event loop entering node=" & $nodeAddr)
   info "event loop entering", nodeAddr = nodeAddr
   chronos.setThreadDispatcher(newDispatcher())
-  asyncSpawn(signalLoop(node))
+  node.signalLoopTask = signalLoop(node)
+  asyncSpawn(node.signalLoopTask)
+  node.idleWakeTask = idleWakeLoop(node)
+  asyncSpawn(node.idleWakeTask)
   node.ready.store(true, moRelease)
   if not node.readySignal.isNil:
     discard node.readySignal.fireSync()
@@ -3893,9 +4118,11 @@ proc eventLoop(handlePtr: pointer) {.thread.} =
     if shouldStop and pending == 0:
       break
     try:
-      debugLog("[nimlibp2p] event loop polling node=" & $nodeAddr)
+      if debugEventLoop:
+        debugLog("[nimlibp2p] event loop polling node=" & $nodeAddr)
       poll()
-      debugLog("[nimlibp2p] event loop poll completed node=" & $nodeAddr)
+      if debugEventLoop:
+        debugLog("[nimlibp2p] event loop poll completed node=" & $nodeAddr)
     except CatchableError as exc:
       warn "event loop poll error", err = exc.msg
       debugLog("[nimlibp2p] event loop poll exception node=" & $nodeAddr & " " & exc.msg)
@@ -3906,7 +4133,7 @@ proc eventLoop(handlePtr: pointer) {.thread.} =
       continue
     processCommandQueue(node)
     let remaining = node.pendingCommands.load(moAcquire)
-    if remaining > 0:
+    if remaining > 0 and debugEventLoop:
       debugLog(
         "[nimlibp2p] event loop processed queue node=" & $nodeAddr &
         " pending=" & $remaining
@@ -4134,6 +4361,8 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       switchInstance: sw,
       gossip: gossip,
       signal: signalPtr,
+      signalLoopTask: nil,
+      idleWakeTask: nil,
       readySignal: readySignalPtr,
       shutdownSignal: shutdownSignalPtr,
       subscriptions: initTable[pointer, Subscription](),
@@ -4199,9 +4428,6 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       closeThreadSignal(node.shutdownSignal, "init:createThread failed")
       closeThreadSignal(node.readySignal, "init:createThread failed")
       closeThreadSignal(node.signal, "init:createThread failed")
-      if not node.queueStub.isNil:
-        destroyCommand(node.queueStub)
-        node.queueStub = nil
       GC_unref(node)
       freeNodeHandle(handlePtr)
       return nil
@@ -4286,9 +4512,6 @@ proc libp2p_node_free*(handle: pointer) {.exportc, cdecl, dynlib.} =
   closeThreadSignal(node.signal, "node_free")
   closeThreadSignal(node.readySignal, "node_free")
   closeThreadSignal(node.shutdownSignal, "node_free")
-  if not node.queueStub.isNil:
-    destroyCommand(node.queueStub)
-    node.queueStub = nil
   deinitLock(node.eventLogLock)
   GC_unref(node)
   debugLog(

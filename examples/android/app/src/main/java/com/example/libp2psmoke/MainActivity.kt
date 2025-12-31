@@ -204,20 +204,19 @@ private fun ProLibp2pApp(
                     },
                     modifier = Modifier.padding(padding).fillMaxSize(),
                     label = "tabContent"
-                ) { tab ->
-                    when (tab) {
-                        0 -> ProDexScreen(uiState, viewModel, snackbarHostState)
-                        1 -> SwapScreen(uiState, viewModel)
-                        2 -> WalletScreen(uiState)
-                        3 -> MixerTab(viewModel, snackbarHostState)
-                        4 -> SettingsScreen(uiState)
+                    ) { tab ->
+                        when (tab) {
+                            0 -> ProDexScreen(uiState, viewModel, snackbarHostState)
+                            1 -> SwapScreen(uiState, viewModel)
+                            2 -> WalletScreen(uiState)
+                            3 -> MixerTab(viewModel, snackbarHostState)
+                            4 -> SettingsScreen(uiState, viewModel)
+                        }
                     }
                 }
             }
-        }
     }
 }
 
 data class NavTab(val title: String, val selectedIcon: ImageVector, val icon: ImageVector)
-
 

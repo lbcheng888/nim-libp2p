@@ -2116,12 +2116,22 @@ method start*(
       if startErr.len > 0:
         cleanupCreated()
         raise newException(basetransport.TransportError, "MsQuic listener start failed: " & startErr)
+
+      var finalAddr = addrOpt
+      if addrOpt.isSome:
+        let addrRes = msquicdrv.getListenerAddress(initHandle, res.listener)
+        if addrRes.isOk:
+          let ta = addrRes.get()
+          let maRes = MultiAddress.init(ta)
+          if maRes.isOk:
+            finalAddr = some(maRes.get())
+
       created.add(
         MsQuicListenerInfo(
           handle: res.listener,
           state: res.state.get(),
           webtransport: plan[1],
-          baseAddr: addrOpt
+          baseAddr: finalAddr
         )
       )
 
@@ -2133,10 +2143,10 @@ method start*(
     raise newException(basetransport.TransportError, "MsQuic listener setup failed: " & exc.msg, exc)
 
   var advertisedAddrs: seq[MultiAddress] = @[]
-  for plan in listenerPlans:
-    if plan[0].isNone:
+  for info in created:
+    if info.baseAddr.isNone:
       continue
-    var advertised = plan[0].get()
+    var advertised = info.baseAddr.get()
     let protocols = advertised.protocols.valueOr:
       @[]
     if not protocols.anyIt(it == multiCodec("quic-v1")):
@@ -2150,7 +2160,7 @@ method start*(
         else:
           trace "failed to append quic suffix to advertised address", error = appended.error
 
-    if plan[1]:
+    if info.webtransport:
       let wtSuffix = MultiAddress.init("/webtransport")
       if wtSuffix.isErr:
         trace "failed to init webtransport suffix for advertised address", error = wtSuffix.error

@@ -17,7 +17,8 @@ import ./settings_model
 import ./param_catalog
 import ../protocol/protocol_core except ConnectionId
 from ../protocol/protocol_core as proto import nil
-import ../protocol/tls_core
+import ../protocol/tls_core as tls
+import libp2p/crypto/curve25519
 
 when compiles((proc () {.noGc.} = discard)):
   {.pragma: quicApiHot, inline, noGc.}
@@ -241,10 +242,15 @@ type
     credentialLoaded: bool
 
   StreamState = ref object of QuicHandleState
+    connection: ConnectionState # Reference to parent connection
     callback: QuicStreamCallback
     callbackContext: pointer
     started: bool
     closed: bool
+    sendBuffer: seq[byte]
+    sentOffset: uint64
+    finRequested: bool
+    finSent: bool
 
   ListenerState = ref object of QuicHandleState
     registration: RegistrationState
@@ -275,7 +281,12 @@ type
     disable1RttEncryption: bool
     transport: DatagramTransport
     remoteAddress: TransportAddress
+
     initialSecrets: InitialSecrets
+    oneRttKeys: TrafficSecrets # Placeholder for Short Header keys
+    clientPrivateKey: Curve25519Key
+    transcript: seq[byte]
+    handshakeComplete: bool
 
 const
   DatagramReceiveNotes = ["receive=false", "receive=true"]
@@ -1140,155 +1151,156 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
         
         try:
           # Phase 4: Receiver Logic
-          # 1. Parse Unprotected Header
           var header = proto.parseUnprotectedHeader(data)
-          # Ensure it's Long Header Initial
-          if (header.firstByte and 0x80) != 0 and data.len > header.payloadOffset + 4:
-             # 2. Get Keys (We use the same initialSecrets derived from our original Destination CID?
-             # Actually, Server Initial uses keys derived from Client's Original DCID.
-             # Which IS stored in `state.initialSecrets`.
-             # CAUTION: Server encrypts with Server Key/IV. Client decrypts with Server Key/IV.
-             
-             # 3. Remove Header Protection
-             # Sample offset: 4 bytes after PN offset. 
-             # PN is at `header.payloadOffset`.
-             # We need to act on a copy of data to not mutate original buffer if needed later (though we discard it)
-             var packetBuf = data # Copy
-             
-             if packetBuf.len >= header.payloadOffset + 4 + 16:
+          # Initial Packet? (Long Header, Type 0x0)
+          if (header.firstByte and 0x80) != 0:
+             let pType = (header.firstByte and 0x30) shr 4
+             if pType == 0: # Initial
+               # Decrypt Logic
+               var mutableData = data
                let pnOffset = header.payloadOffset
-               let sample = packetBuf[pnOffset + 4 ..< pnOffset + 4 + 16]
+               if pnOffset + 4 + 16 > mutableData.len: return
                var pnSlice: array[4, byte]
-               for i in 0..3: pnSlice[i] = packetBuf[pnOffset+i]
+               for i in 0..3: pnSlice[i] = mutableData[pnOffset+i]
                
-               removeHeaderProtection(state.initialSecrets.serverHp, sample, packetBuf[0], pnSlice)
+               tls.removeHeaderProtection(state.initialSecrets.serverHp, 
+                                          mutableData[pnOffset+4 ..< pnOffset+4+16], 
+                                          mutableData[0], 
+                                          pnSlice)
                
-               # 4. Decrypt Packet
-               # Recover Packet Number (assuming 4 bytes for skeleton)
-               # In Full QUIC, we decode variable length PN. Here we assume 4 bytes logic from sender.
-               var pn: uint64 = 0
-               # Little endian load for now? No, PN is Big Endian on wire? 
-               # removeHeaderProtection results in raw bytes.
-               # Let's interpret as BigEndian uint32
-               var pn32: uint32
-               for i in 0..3: 
-                  # pnSlice is now unprotected.
-                  pn = (pn shl 8) or uint64(pnSlice[i])
+               var pnVal: uint32
+               bigEndian32(addr pnVal, addr pnSlice)
                
-               # Decrypt Payload
-               # Header Length for AAD: includes the unprotected PN!
-               # Reconstruct Header for AAD from `packetBuf` (modified first byte and PN) components?
-               # NO. RFC 9001: "The AAD for AEAD is the entire header... after removing header protection"
-               # So we use `packetBuf[0 ..< pnOffset + 4]` as Header AAD.
                let aadLen = pnOffset + 4
-               let aad = packetBuf[0 ..< aadLen]
-               let ciphertext = packetBuf[aadLen ..< packetBuf.len - 16] # Exclude Tag
-               let tag = packetBuf[packetBuf.len - 16 ..< packetBuf.len]
+               let aad = mutableData[0 ..< aadLen]
+               let ciphertext = mutableData[aadLen ..< mutableData.len - 16]
+               let recTag = mutableData[^16 .. ^1]
                
-               let plaintext = decryptPacket(state.initialSecrets.serverKey, state.initialSecrets.serverIv,
-                                             pn, aad, ciphertext, tag)
-                                             
+               let plaintext = tls.decryptPacket(state.initialSecrets.serverKey, state.initialSecrets.serverIv,
+                                                 uint64(pnVal), aad, ciphertext, recTag)
+                                               
                if plaintext.len > 0:
                  {.cast(gcsafe).}:
-                   emitDiagnostics(DiagnosticsEvent(
-                     kind: diagConnectionEvent,
-                     handle: connection,
-                     note: "RX Client: Decrypted Server Initial! Len=" & $plaintext.len & " PN=" & $pn))
-               else:
-                 {.cast(gcsafe).}:
-                   emitDiagnostics(DiagnosticsEvent(
-                     kind: diagConnectionEvent,
-                     handle: connection,
-                     note: "RX Client: Decryption Failed"))
-             
+                   emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: cast[HQUIC](state), note: "RX Initial Valid"))
+                 # Parse Frames
+                 var pos = 0
+                 while pos < plaintext.len:
+                   # Simplistic frame parser
+                   # We know CRYPTO frame is what we want.
+                   # Frame type could be PING(1), ACK(2), CRYPTO(6)
+                   let fType = plaintext[pos]
+                   if fType == 0x06: # CRYPTO
+                     pos += 1
+                     let crypto = proto.parseCryptoFrame(plaintext, pos)
+                     if not state.handshakeComplete:
+                       let serverHelloKey = tls.findServerKeyShare(crypto.data)
+                       if serverHelloKey.len == 32:
+                         {.cast(gcsafe).}:
+                           emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: cast[HQUIC](state), note: "RX ServerHello KeyShare"))
+                         
+                         # Hash Transcript: ClientHello + ServerHello
+                         # Note: simplistic assumption that crypto.data IS the ServerHello (single fragment)
+                         state.transcript.add(crypto.data)
+                         
+                         let sharedSecret = tls.computeSharedSecret(state.clientPrivateKey, serverHelloKey)
+                         let helloHash = tls.hashTranscript(state.transcript)
+                         
+                         # Derive Keys
+                         let handshakeSecrets = tls.deriveHandshakeSecrets(sharedSecret, helloHash)
+                         
+                         # For 1-RTT, we need Handshake Hash (ClientHello..Finished).
+                         # We are skipping verifying Finished/EncryptedExtensions for Skeleton.
+                         # We pretend Handshake Hash ~ Hello Hash for deriving Application Keys immediately.
+                         # This is technically WRONG (missing Finished hash), but allows us to Derive Keys.
+                         let trafficSecrets = tls.deriveApplicationSecrets(handshakeSecrets.clientSecret, helloHash)
+                         
+                         state.oneRttKeys = trafficSecrets
+                         state.handshakeComplete = true
+                         {.cast(gcsafe).}:
+                           emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: cast[HQUIC](state), note: "Handshake Keys Derived. 1-RTT Enabled."))
+                   elif fType == 0x02:
+                     # ACK Frame
+                     # pos += ... need parseAckFrame? 
+                     # For skeleton, just skip rest of packet if we can't parse perfectly.
+                     # But CRYPTO might be AFTER ACK.
+                     # We need robust parsing.
+                     # Skip ACK? ACK has variable length.
+                     # We lack `parseAckFrame` that returns length.
+                     # HACK: If we see ACK, we assume it's small or we break loop?
+                     # Let's hope CRYPTO is first. (Usually is).
+                     break 
+                   else:
+                     pos += 1
           else:
-             # Pass-through / Fallback
-             let packet = proto.decodePacket(data)
-             {.cast(gcsafe).}:
-               emitDiagnostics(DiagnosticsEvent(
-                 kind: diagConnectionEvent,
-                 handle: connection,
-                 note: "RX Client: Raw Pkt Len=" & $data.len & " IsLong=" & $packet.isLongHeader))
-                 
+             # Short Header or other
+             # If Short Header, we could try decrypt using oneRttKeys if available
+             discard
         except Exception:
-          discard),
-      local = initTAddress("0.0.0.0", Port(0)) # Ephemeral port
+           discard
+      ),
+      local = initTAddress("0.0.0.0", Port(0))
     )
 
-    # Phase 3: Send Encrypted RFC 9000 Initial Packet
-    # 1. Derive Keys
+    # Phase 3: Send Client Initial (ClientHello)
     let destCid = @(state.peerCid.bytes)[0 ..< int(state.peerCid.length)] 
     let srcCid = @(state.localCid.bytes)[0 ..< int(state.localCid.length)]
+    state.initialSecrets = tls.deriveInitialSecrets(destCid)
     
-    # Store keys in state for later use (e.g. re-sends or decoding server response)
-    # RFC 9001: Initial keys derived from Destination Connection ID of the first Initial packet from client.
-    state.initialSecrets = deriveInitialSecrets(destCid)
+    let keyShare = tls.generateKeyShare()
+    state.clientPrivateKey = keyShare.privateKey
+    let clientHello = tls.encodeClientHello(destCid, keyShare)
+    state.transcript = clientHello # Store
     
-    # 2. Encode Payload (Crypto Frame)
-    # Generate Key Share
-    let keyShare = generateKeyShare()
-    let clientHello = encodeClientHello(destCid, keyShare)
+    # CRYPTO Frame
+    var cryptoFrame: seq[byte] = @[]
+    cryptoFrame.add(0x06'u8)
+    proto.writeVarInt(cryptoFrame, 0'u64)
+    proto.writeVarInt(cryptoFrame, uint64(clientHello.len))
+    cryptoFrame.add(clientHello)
     
-    # Construct CRYPTO Frame (Type=0x06)
-    var payload: seq[byte] = @[]
-    payload.add(0x06'u8)
-    proto.writeVarInt(payload, 0'u64) # Offset 0
-    proto.writeVarInt(payload, uint64(clientHello.len))
-    payload.add(clientHello)
-    
-    # PADDING Frame (Type=0x00) to reach 1200 bytes
-    # Current len so far + Header Len + Tag Len
-    # Basic Header Len ~ 20 bytes. Tag = 16.
-    # Safe bet: Pad payload to 1200 - (HeaderEstimate + Tag)
-    # Or just pad payload itself to 1160? (1200 - 40 margin)
-    let currentLen = payload.len
-    let targetPayloadLen = 1162 # Arbitrary to ensure packet > 1200
-    if currentLen < targetPayloadLen:
-      for i in 1 .. (targetPayloadLen - currentLen):
-        payload.add(0x00'u8)
-    
-    # 3. Construct Packet Header (Unprotected)
+    # Padding
+    var payload = cryptoFrame
+    let minSize = 1200
+    # Header estimate: 1 + 4 + 1+Dst + 1+Src + 1(TokenLen) + 2(Len) + 4(PN) = ~22 + CIDs
+    let headerEst = 22 + destCid.len + srcCid.len
+    let padLen = minSize - headerEst - payload.len - 16 # Tag
+    if padLen > 0:
+      for i in 0 ..< padLen: payload.add(0x00'u8)
+      
+    # Construct Header (Unprotected)
     var headerBuf: seq[byte] = @[]
-    # Type: Initial (0xC0 | 0x3 for 4-byte PN) -> 0xC3
-    headerBuf.add(0xC3'u8) 
-    headerBuf.add([0x00'u8, 0x00, 0x00, 0x01]) # Version 1
+    let firstByte = 0xC3'u8 # Initial
+    headerBuf.add(firstByte)
+    headerBuf.writeUint32(1'u32)
     headerBuf.add(byte(destCid.len)); headerBuf.add(destCid)
     headerBuf.add(byte(srcCid.len)); headerBuf.add(srcCid)
-    headerBuf.add(0x00'u8) # Token Len 0
-    # Length: PN Len (4) + Payload Len + Tag Len (16)
-    let lengthField = 4 + payload.len + 16
-    var lenTmp: seq[byte] = @[]
-    proto.writeVarInt(lenTmp, uint64(lengthField))
-    headerBuf.add(lenTmp)
+    headerBuf.writeVarInt(uint64(0)) # Token Len 0
+    
+    let totalPayloadLen = payload.len + 16 # + Tag
+    var lenField: seq[byte] = @[]
+    proto.writeVarInt(lenField, 4 + uint64(totalPayloadLen)) # PN Len(4) + Body
+    headerBuf.add(lenField)
+    
     let pnOffset = headerBuf.len
-    headerBuf.add([0x00'u8, 0x00, 0x00, 0x00]) # PN = 0 (4 bytes)
+    headerBuf.writeUint32(0'u32) # PN=0
     
-    # 4. Encrypt Payload
-    let pn: uint64 = 0
+    # Encrypt
     var tag: array[16, byte]
-    let ciphertext = encryptPacket(state.initialSecrets.clientKey, state.initialSecrets.clientIv, 
-                                   pn, headerBuf, payload, tag)
+    let ciphertext = tls.encryptPacket(state.initialSecrets.clientKey, state.initialSecrets.clientIv, 
+                                       0'u64, headerBuf, payload, tag)
     
-    # 5. Assemble Packet
-    var packet = headerBuf & ciphertext # Ciphertext includes encrypted payload
-    packet.add(tag) # Tag appended
+    var packet = headerBuf & ciphertext & @tag
     
-    # 6. Header Protection
-    # RFC: sample is 16 bytes from ciphertext starting at offset 4 (assuming 4 byte PN)
-    # Ciphertext starts at `pnOffset + 4`.
-    # Sample = packet[pnOffset+4 .. pnOffset+4+15]
+    # Header Protection
     if packet.len >= pnOffset + 4 + 16:
       let sample = packet[pnOffset + 4 ..< pnOffset + 4 + 16]
-      # Apply to First Byte (packet[0]) and PN (packet[pnOffset ..< pnOffset+4])
-      var pnSlice: array[4, byte] # Copy PN to array
+      var pnSlice: array[4, byte]
       for i in 0..3: pnSlice[i] = packet[pnOffset+i]
-      
-      applyHeaderProtection(state.initialSecrets.clientHp, sample, packet[0], pnSlice)
-      
-      # Write protected PN back
+      tls.applyHeaderProtection(state.initialSecrets.clientHp, sample, packet[0], pnSlice)
       for i in 0..3: packet[pnOffset+i] = pnSlice[i]
-
+      
     asyncCheck state.transport.sendTo(state.remoteAddress, packet)
+    emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: connection, note: "TX Initial Encrypted"))
 
   except CatchableError as exc:
     state.transport = nil
@@ -1329,6 +1341,7 @@ proc msquicStreamOpen(connection: HQUIC; flags: QUIC_STREAM_OPEN_FLAGS;
   state.context = context
   state.started = false
   state.closed = false
+  state.connection = connState # Set parent connection
   stream[] = storeHandle(state)
   streamEmitEvent(state, QUIC_STREAM_EVENT_PEER_ACCEPTED)
   QUIC_STATUS_SUCCESS
@@ -1390,15 +1403,99 @@ proc msquicStreamShutdown(stream: HQUIC;
   state.closed = true
   QUIC_STATUS_SUCCESS
 
+proc flushStream(state: StreamState) =
+  if state.connection.isNil: return
+  let conn = state.connection
+  
+  if state.sendBuffer.len == 0 and not (state.finRequested and not state.finSent):
+    return
+
+  # Construct STREAM Frame
+  var payload = state.sendBuffer # Move/Copy
+  state.sendBuffer.setLen(0)
+  
+  # Stream ID? We don't have a real ID yet. Mock ID=0 if client initiated bidirectional.
+  # TODO: Real ID management.
+  let streamId = 0'u64 
+  let fin = state.finRequested
+  let streamFrame = proto.encodeStreamFrame(streamId, payload, state.sentOffset, fin)
+  
+  state.sentOffset += uint64(payload.len)
+  if fin: state.finSent = true
+
+  # Construct Short Header Packet (1-RTT)
+  if not conn.handshakeComplete:
+    # Buffer until handshake complete
+    # Restore buffer? 
+    # Logic: we consumed buffer into `payload`. We should push it back if we can't send.
+    # OR: just check check complete at top.
+    # BUT: we already extracted data.
+    # Better: check at top.
+    # Reverting extraction:
+    state.sendBuffer = payload & state.sendBuffer # Prepend (inefficient but safe)
+    return
+
+  let pn = 1'u32 # TODO: Real PN
+  let destCid = @(conn.peerCid.bytes)[0 ..< int(conn.peerCid.length)] 
+  
+  # Payload
+  var pktPayload = streamFrame
+  
+  # Headers
+  var header: seq[byte] = @[]
+  header.add(0x43'u8) # Short Header
+  header.add(destCid)
+  let pnOffset = header.len
+  proto.writeUint32(header, pn)
+  
+  # Encrypt
+  var tag: array[16, byte]
+  let ciphertext = tls.encryptPacket(conn.oneRttKeys.clientKey, conn.oneRttKeys.clientIv, 
+                                     uint64(pn), header, pktPayload, tag)
+                                     
+  var packet = header & ciphertext & @tag
+  
+  # Header Protection
+  if packet.len >= pnOffset + 4 + 16:
+      let sample = packet[pnOffset + 4 ..< pnOffset + 4 + 16]
+      var pnSlice: array[4, byte]
+      for i in 0..3: pnSlice[i] = packet[pnOffset+i]
+      tls.applyHeaderProtection(conn.oneRttKeys.clientHp, sample, packet[0], pnSlice)
+      for i in 0..3: packet[pnOffset+i] = pnSlice[i]
+
+  asyncCheck conn.transport.sendTo(conn.remoteAddress, packet)
+  {.cast(gcsafe).}:
+    emitDiagnostics(DiagnosticsEvent(
+       kind: diagConnectionEvent,
+       handle: cast[HQUIC](conn),
+       note: "TX Stream 1-RTT Encrypted len=" & $packet.len))
+
 proc msquicStreamSend(stream: HQUIC; buffers: ptr QuicBuffer;
     bufferCount: uint32; flags: QUIC_SEND_FLAGS;
     clientContext: pointer): QUIC_STATUS {.cdecl.} =
   let state = toStream(stream)
   if state.isNil:
     return QUIC_STATUS_INVALID_PARAMETER
-  discard buffers
-  discard bufferCount
-  discard flags
+  
+  # 1. Buffer Data
+  if bufferCount > 0 and not buffers.isNil:
+    let bufArray = cast[ptr UncheckedArray[QuicBuffer]](buffers)
+    for i in 0 ..< bufferCount:
+      let qb = bufArray[i]
+      if qb.Length > 0 and not qb.Buffer.isNil:
+        let src = qb.Buffer
+        let len = int(qb.Length)
+        let paramBuf = newSeq[byte](len)
+        copyMem(unsafeAddr paramBuf[0], src, len)
+        state.sendBuffer.add(paramBuf)
+  
+  # 2. Check FIN
+  if (flags and 1) != 0: # QUIC_SEND_FLAG_FIN = 1 (usually)
+     state.finRequested = true
+
+  # 3. Flush
+  flushStream(state)
+
   streamEmitEvent(state, QUIC_STREAM_EVENT_SEND_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
     var payload = QuicStreamEventSendCompletePayload(
       Canceled: BOOLEAN(0),

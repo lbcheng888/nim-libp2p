@@ -3,7 +3,6 @@ package com.example.libp2psmoke.dex
 import java.io.IOException
 import java.math.BigDecimal
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -31,6 +30,9 @@ class BinanceApiClient(
                 val request = Request.Builder().url(url).get().build()
                 httpClient.newCall(request).execute().use { response ->
                     val body = response.body?.string() ?: throw IOException("Empty ticker response")
+                    if (!response.isSuccessful) {
+                        throw IOException("HTTP ${response.code}: $body")
+                    }
                     val json = JSONObject(body)
                     BinanceTicker(
                         lastPrice = json.getBigDecimal("lastPrice"),
@@ -55,6 +57,9 @@ class BinanceApiClient(
             val request = Request.Builder().url(url).get().build()
             httpClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: throw IOException("Empty kline response")
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code}: $body")
+                }
                 val json = JSONArray(body)
                 val buckets = mutableListOf<DexKlineBucket>()
                 val scale = DexKlineScale.fromLabel(interval)
@@ -94,6 +99,9 @@ class BinanceApiClient(
             val request = Request.Builder().url(url).get().build()
             httpClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: throw IOException("Empty depth response")
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code}: $body")
+                }
                 val json = JSONObject(body)
                 val bids = parseDepthArray(json.getJSONArray("bids"))
                 val asks = parseDepthArray(json.getJSONArray("asks"))
@@ -124,28 +132,17 @@ class BinanceApiClient(
         return results
     }
 
-    private suspend fun <T> callWithFallback(block: suspend (String) -> T): T = kotlinx.coroutines.coroutineScope {
-        val channel = kotlinx.coroutines.channels.Channel<T>(kotlinx.coroutines.channels.Channel.UNLIMITED)
-        val jobs = endpoints.map { endpoint ->
-            launch {
-                try {
-                    val result = block(endpoint)
-                    channel.send(result)
-                } catch (e: Throwable) {
-                    // Ignore individual failures
-                }
+    private suspend fun <T> callWithFallback(block: suspend (String) -> T): T {
+        var lastError: Throwable? = null
+        for (endpoint in endpoints) {
+            try {
+                return block(endpoint)
+            } catch (err: kotlinx.coroutines.CancellationException) {
+                throw err
+            } catch (err: Throwable) {
+                lastError = err
             }
         }
-
-        try {
-            // Return the first successful result
-            val result = channel.receive()
-            jobs.forEach { it.cancel() }
-            return@coroutineScope result
-        } catch (e: kotlinx.coroutines.channels.ClosedReceiveChannelException) {
-            throw IOException("All Binance endpoints failed")
-        } finally {
-            jobs.forEach { it.cancel() }
-        }
+        throw IOException("All Binance endpoints failed", lastError)
     }
 }

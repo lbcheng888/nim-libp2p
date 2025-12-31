@@ -5,7 +5,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.web3j.crypto.RawTransaction
 import org.web3j.crypto.Sign
-import org.web3j.crypto.SignedRawTransaction
 import org.web3j.crypto.TransactionEncoder
 import org.web3j.protocol.Web3j
 import org.web3j.protocol.core.DefaultBlockParameterName
@@ -32,7 +31,7 @@ class BscMpcService {
         amountWei: BigInteger
     ): Pair<ByteArray, RawTransaction> = withContext(Dispatchers.IO) {
         val ethGetTransactionCount = web3j.ethGetTransactionCount(
-            fromAddress, DefaultBlockParameterName.LATEST
+            fromAddress, DefaultBlockParameterName.PENDING
         ).send()
         val nonce = ethGetTransactionCount.transactionCount
 
@@ -102,8 +101,11 @@ class BscMpcService {
             .add(BigInteger.valueOf(35))
             .add(BigInteger.valueOf(recoveryId.toLong()))
             
-        // Use the byte[] constructor for v to handle values > 127 securely
-        val signatureData = Sign.SignatureData(eip155V.toByteArray(), r, canonicalS.toByteArray())
+        val vInt = eip155V.toInt()
+        val vByte = byteArrayOf(vInt.toByte())
+        val rPadded = Numeric.toBytesPadded(BigInteger(1, r), 32)
+        val sPadded = Numeric.toBytesPadded(canonicalS, 32)
+        val signatureData = Sign.SignatureData(vByte, rPadded, sPadded)
         val signedMessage = TransactionEncoder.encode(rawTransaction, signatureData)
         return Numeric.toHexString(signedMessage)
     }

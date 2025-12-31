@@ -95,6 +95,10 @@ when not defined(libp2p_msquic_experimental):
   proc stopListener*(handle: MsQuicTransportHandle; listener: pointer): string =
     "MsQuic experimental runtime disabled"
 
+  proc getListenerAddress*(handle: MsQuicTransportHandle; listener: pointer):
+      Result[TransportAddress, string] =
+    err("MsQuic experimental runtime disabled")
+
   proc nextListenerEvent*(state: MsQuicListenerState): Future[msevents.ListenerEvent] =
     let fut = Future[msevents.ListenerEvent].Raising(
       [CancelledError, MsQuicEventQueueClosed]

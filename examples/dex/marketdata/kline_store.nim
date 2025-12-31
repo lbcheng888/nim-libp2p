@@ -101,25 +101,6 @@ proc decodeBucket(data: seq[byte]): Option[KlineBucket] =
   except:
     none(KlineBucket)
 
-proc decodeTrade(data: seq[byte]): Option[TradeEvent] =
-  try:
-    let node = parseJson(string.fromBytes(data))
-    some(TradeEvent(
-      matchId: node["matchId"].getStr(),
-      orderId: node["orderId"].getStr(),
-      takerSide: node["takerSide"].getStr(),
-      price: node["price"].getFloat(),
-      amount: node["amount"].getFloat(),
-      baseAsset: decodeAssetDef(node["baseAsset"]),
-      quoteAsset: decodeAssetDef(node["quoteAsset"]),
-      matcherPeer: node["matcherPeer"].getStr(),
-      makerPeer: node["makerPeer"].getStr(),
-      createdAt: node["createdAt"].getBiggestInt(),
-      sequence: node["sequence"].getBiggestInt()
-    ))
-  except:
-    none(TradeEvent)
-
 proc walEventToJson(event: KlineWalEvent): JsonNode =
   %*{
     "version": KlineWalVersion,
@@ -154,37 +135,19 @@ proc appendWal(store: KlineStore; kind: KlineWalEventKind; payload: JsonNode) {.
     raise newException(CatchableError, exc.msg)
 
 proc bucketToJson(bucket: KlineBucket): JsonNode =
-  %*{
-    "asset": bucket.asset,
-    "scale": bucket.scale.int,
-    "windowStartMs": bucket.windowStartMs,
-    "open": bucket.open,
-    "high": bucket.high,
-    "low": bucket.low,
-    "close": bucket.close,
-    "volume": bucket.volume,
-    "trades": bucket.trades,
-    "closed": bucket.closed,
-    "publishSeq": bucket.publishSeq,
-  }
+  klineBucketToJson(bucket)
 
 proc tradeToJson(trade: TradeEvent): JsonNode =
-  %*{
-    "matchId": trade.matchId,
-    "orderId": trade.orderId,
-    "takerSide": trade.takerSide,
-    "price": trade.price,
-    "amount": trade.amount,
-    "baseAsset": encodeAssetDef(trade.baseAsset),
-    "quoteAsset": encodeAssetDef(trade.quoteAsset),
-    "matcherPeer": trade.matcherPeer,
-    "makerPeer": trade.makerPeer,
-    "createdAt": trade.createdAt,
-    "sequence": trade.sequence,
-  }
+  tradeEventToJson(trade)
 
 proc applyTrade(store: KlineStore; trade: TradeEvent; scales: seq[Timescale]) =
-  let assetSymbol = trade.baseAsset.symbol
+  let baseSymbol = trade.baseAsset.symbol
+  let quoteSymbol = trade.quoteAsset.symbol
+  let assetSymbol =
+    if baseSymbol.len > 0 and quoteSymbol.len > 0:
+      baseSymbol & "/" & quoteSymbol
+    else:
+      baseSymbol
   if assetSymbol.len == 0 or trade.price <= 0 or trade.amount <= 0:
     inc store.stats.droppedTrades
     return

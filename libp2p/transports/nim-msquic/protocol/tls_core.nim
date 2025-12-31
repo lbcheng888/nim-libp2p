@@ -30,6 +30,18 @@ type
     serverIv*: Iv
     serverHp*: HpKey
 
+  TrafficSecrets* = object
+    clientSecret*: Secret
+    serverSecret*: Secret
+    clientKey*: Key
+    clientIv*: Iv
+    clientHp*: HpKey
+    serverKey*: Key
+    serverIv*: Iv
+    serverHp*: HpKey
+
+
+
 const
   # RFC 9001 Section 5.2. Initial Salt for QUIC v1
   InitialSaltV1 = [0x38'u8, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a]
@@ -394,3 +406,206 @@ proc encodeClientHello*(destCid: openArray[byte], keyShare: ClientKeyShare): seq
   buf[3] = byte(msgLen and 0xff)
   
   return buf
+
+# --- Handshake Parsing & Secrets ---
+
+proc computeSharedSecret*(privateKey: Curve25519Key, peerPublicKeyBytes: openArray[byte]): Secret =
+  var peerPub: Curve25519Key
+  peerPub = intoCurve25519Key(peerPublicKeyBytes)
+  # libp2p/crypto/curve25519 `dh` returns internal array, map to seq
+  var sharedPoint = peerPub
+  Curve25519.mul(sharedPoint, privateKey)
+  let rawSecret = sharedPoint
+  result = @rawSecret
+
+proc deriveHandshakeSecrets*(sharedSecret: Secret, helloHash: openArray[byte]): InitialSecrets =
+  # RFC 8446 / 9001
+  # 1. Early Secret = HKDF-Extract(0, 0) -> derived from PSK if check (none here)
+  # Actually standard TLS 1.3 schedule:
+  # Early Secret = HKDF-Extract(0, 0)
+  # Derived Secret = HKDF-Expand-Label(Early Secret, "derived", EmptyHash, HashLen)
+  # Handshake Secret = HKDF-Extract(Derived Secret, Shared Secret)
+  
+  # For Clean Skeleton: We approximate or use correct steps if libraries allow.
+  # Simplification: Assume standard schedule constants.
+  
+  # A. Start with Zero Salt?
+  # The salt for the first extract is 0 (since no PSK).
+  let zeroArr = [0'u8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+  # Early Secret
+  let earlySecretDigest = hmacSha256(zeroArr, zeroArr) # salt=0, ikm=0
+  let earlySecret = earlySecretDigest.data
+
+  # B. Derived Secret
+  # emptyHash = SHA256("")
+  let emptyHash = [0xe3'u8, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55]
+  
+  # deriveSecret uses LabelPrefix="tls13 ". 
+  # HKDF-Expand-Label(Secret, Label, Context, Len)
+  # Context = HASH
+  # For "derived": Context is EmptyHash (32 bytes)
+  
+  # We need a `deriveSecretWithContext` helper effectively.
+  # existing `deriveSecret` passes EMPTY context.
+  # We need one that takes context.
+  
+  proc deriveSecretWithContext[Len: static int](secret: openArray[byte], label: string, context: openArray[byte]): array[Len, byte] =
+    var hkdfLabel: seq[byte] = @[]
+    var lenNet: uint16
+    var lenHost = uint16(Len)
+    bigEndian16(addr lenNet, addr lenHost)
+    hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
+    
+    let fullLabel = LabelPrefix & label
+    hkdfLabel.add(byte(fullLabel.len))
+    for c in fullLabel: hkdfLabel.add(byte(c))
+    
+    hkdfLabel.add(byte(context.len))
+    hkdfLabel.add(context)
+    
+    return hkdfExpand[Len](secret, hkdfLabel)
+
+  let derivedSecretArr = deriveSecretWithContext[32](earlySecret, "derived", emptyHash)
+  let derivedSecret = @derivedSecretArr
+  
+  # C. Handshake Secret = HKDF-Extract(Derived, SharedSecret)
+  let handshakeSecretDigest = hmacSha256(derivedSecret, sharedSecret)
+  let handshakeSecret = handshakeSecretDigest.data
+  
+  # D. Client/Server Handshake Traffic Secret
+  # Client HTS = HKDF-Expand-Label(Handshake Secret, "c hs traffic", HelloHash, 32)
+  # Server HTS = HKDF-Expand-Label(Handshake Secret, "s hs traffic", HelloHash, 32)
+  
+  let cHtsArr = deriveSecretWithContext[32](handshakeSecret, "c hs traffic", helloHash)
+  let sHtsArr = deriveSecretWithContext[32](handshakeSecret, "s hs traffic", helloHash)
+  
+  # E. Derive Keys/IVs (same "quic key", "quic iv", "quic hp" labels)
+  # Client Keys
+  let cKey = deriveSecret[16](cHtsArr, "quic key")
+  let cIv = deriveSecret[12](cHtsArr, "quic iv")
+  let cHp = deriveSecret[16](cHtsArr, "quic hp")
+  
+  # Server Keys
+  let sKey = deriveSecret[16](sHtsArr, "quic key")
+  let sIv = deriveSecret[12](sHtsArr, "quic iv")
+  let sHp = deriveSecret[16](sHtsArr, "quic hp")
+  
+  result.clientSecret = @cHtsArr
+  result.serverSecret = @sHtsArr
+  result.clientKey = @cKey
+  result.clientIv = @cIv
+  result.clientHp = @cHp
+  result.serverKey = @sKey
+  result.serverIv = @sIv
+  result.serverHp = @sHp
+
+proc deriveApplicationSecrets*(handshakeSecret: Secret, handshakeHash: openArray[byte]): TrafficSecrets =
+  # RFC 8446
+  # 1. Derived Secret = HKDF-Expand-Label(Handshake Secret, "derived", EmptyHash, 32)
+  # 2. Master Secret = HKDF-Extract(Derived Secret, 0)
+  
+  let emptyHash = [0xe3'u8, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55]
+
+  proc deriveSecretWithContext[Len: static int](secret: openArray[byte], label: string, context: openArray[byte]): array[Len, byte] =
+    var hkdfLabel: seq[byte] = @[]
+    var lenNet: uint16
+    var lenHost = uint16(Len)
+    bigEndian16(addr lenNet, addr lenHost)
+    hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
+    
+    let fullLabel = LabelPrefix & label
+    hkdfLabel.add(byte(fullLabel.len))
+    for c in fullLabel: hkdfLabel.add(byte(c))
+    
+    hkdfLabel.add(byte(context.len))
+    hkdfLabel.add(context)
+    
+    return hkdfExpand[Len](secret, hkdfLabel)
+
+  let derivedSecretArr = deriveSecretWithContext[32](handshakeSecret, "derived", emptyHash)
+  let derivedSecret = @derivedSecretArr
+  
+  let zeroArr = [0'u8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+  let masterSecretDigest = hmacSha256(derivedSecret, zeroArr)
+  let masterSecret = masterSecretDigest.data
+  
+  # Client/Server Application Traffic Secret 0
+  # c ap traffic = Expand-Label(Master, "c ap traffic", HandshakeHash, 32) 
+  # s ap traffic = ... "s ap traffic" ...
+  
+  let cAtsArr = deriveSecretWithContext[32](masterSecret, "c ap traffic", handshakeHash)
+  let sAtsArr = deriveSecretWithContext[32](masterSecret, "s ap traffic", handshakeHash)
+  
+  # Keys
+  let cKey = deriveSecret[16](cAtsArr, "quic key")
+  let cIv = deriveSecret[12](cAtsArr, "quic iv")
+  let cHp = deriveSecret[16](cAtsArr, "quic hp")
+
+  let sKey = deriveSecret[16](sAtsArr, "quic key")
+  let sIv = deriveSecret[12](sAtsArr, "quic iv")
+  let sHp = deriveSecret[16](sAtsArr, "quic hp")
+  
+  result.clientSecret = @cAtsArr
+  result.serverSecret = @sAtsArr
+  result.clientKey = @cKey
+  result.clientIv = @cIv
+  result.clientHp = @cHp
+  result.serverKey = @sKey
+  result.serverIv = @sIv
+  result.serverHp = @sHp
+
+proc findServerKeyShare*(handshakeBytes: openArray[byte]): seq[byte] =
+  # Very basic parser to find Extension 0x0033 (Key Share)
+  # ServerHello Structure:
+  # Type(1) | Len(3) | Ver(2) | Rand(32) | SessIDLen(1) | SessID(var) | Cipher(2) | Comp(1) | ExtLen(2) | Exts...
+  
+  var idx = 0
+  if handshakeBytes.len < 4: return @[]
+  
+  let msgType = handshakeBytes[0]
+  if msgType != 2: return @[] # Not ServerHello
+  
+  # Length (3 bytes)
+  idx += 4
+  
+  # Version (2) + Random (32) = 34
+  idx += 34
+  
+  if idx >= handshakeBytes.len: return @[]
+  let sessIdLen = int(handshakeBytes[idx])
+  idx += 1 + sessIdLen
+  
+  # Cipher (2) + Comp (1) = 3
+  idx += 3
+  
+  # Extensions Length (2)
+  if idx + 2 > handshakeBytes.len: return @[]
+  let extLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx+1])
+  idx += 2
+  
+  let limit = idx + extLen
+  while idx < limit - 4:
+    let extType = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx+1])
+    let length = (int(handshakeBytes[idx+2]) shl 8) or int(handshakeBytes[idx+3])
+    idx += 4
+    
+    if extType == 0x0033: # Key Share
+      # ServerKeyShare: Group(2) | KeyLen(2) | Key
+      if length > 4 and idx + length <= handshakeBytes.len:
+        # Check Group (should be x25519 = 0x001d)
+        let group = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx+1])
+        if group == 0x001d:
+           let keyLen = (int(handshakeBytes[idx+2]) shl 8) or int(handshakeBytes[idx+3])
+           if keyLen == 32 and idx + 4 + 32 <= handshakeBytes.len:
+             result = newSeq[byte](32)
+             for i in 0..<32: result[i] = handshakeBytes[idx+4+i]
+             return result
+      
+    idx += length
+    
+  return @[]
+
+proc hashTranscript*(data: openArray[byte]): seq[byte] =
+  let d = sha256.digest(data)
+  result = @(d.data)
+

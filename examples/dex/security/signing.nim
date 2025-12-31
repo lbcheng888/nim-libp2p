@@ -29,6 +29,11 @@ type
     pubKey: Option[PublicKey]
     peerId: Option[PeerId]
 
+proc peerIdStr*(ctx: SigningContext): string =
+  if ctx.isNil() or ctx.peerId.isNone():
+    return ""
+  $ctx.peerId.get()
+
 proc ensureDir(path: string) =
   let (dir, _) = splitPath(path)
   if dir.len > 0 and not dirExists(dir):
@@ -50,14 +55,23 @@ proc loadKey(path: string): Option[(PrivateKey, PublicKey)] =
     let parsed = parseJson(raw)
     if parsed.kind != JObject or not parsed.hasKey("privateKey"):
       return none((PrivateKey, PublicKey))
-    let privateRaw = base64.decode(parsed["privateKey"].getStr())
-    let privKey = PrivateKey.init(privateRaw).expect("load private key")
+    let privateRaw = base64.decode(parsed["privateKey"].getStr()).toBytes()
+    let privRes = PrivateKey.init(privateRaw)
+    if privRes.isErr():
+      return none((PrivateKey, PublicKey))
+    let privKey = privRes.get()
     var pubKey: PublicKey
     if parsed.hasKey("publicKey"):
-      let publicRaw = base64.decode(parsed["publicKey"].getStr())
-      pubKey = PublicKey.init(publicRaw).expect("load public key")
+      let publicRaw = base64.decode(parsed["publicKey"].getStr()).toBytes()
+      let pubRes = PublicKey.init(publicRaw)
+      if pubRes.isErr():
+        return none((PrivateKey, PublicKey))
+      pubKey = pubRes.get()
     else:
-      pubKey = privKey.getPublicKey().expect("derive public key")
+      let pubRes = privKey.getPublicKey()
+      if pubRes.isErr():
+        return none((PrivateKey, PublicKey))
+      pubKey = pubRes.get()
     some((privKey, pubKey))
   except CatchableError:
     none((PrivateKey, PublicKey))
@@ -98,12 +112,16 @@ proc canonicalOrderPayload*(order: OrderMessage): string =
   # Canonical representation for signing:
   # id|traderPeer|baseAssetChain/Symbol|quoteAssetChain/Symbol|side|price|amount|ttlMs|timestamp
   # Note: Adjust fields as necessary to match strictly what needs to be signed.
-  &"{order.id}|{order.traderPeer}|{order.baseAsset.toString()}|{order.quoteAsset.toString()}|{order.side}|{order.price}|{order.amount}|{order.ttlMs}|{order.timestamp}"
+  let price = formatFloat(order.price, ffDecimal, 8)
+  let amount = formatFloat(order.amount, ffDecimal, 8)
+  &"{order.id}|{order.traderPeer}|{order.baseAsset.toString()}|{order.quoteAsset.toString()}|{order.side}|{price}|{amount}|{order.ttlMs}|{order.timestamp}"
 
 proc canonicalMatchPayload*(match: MatchMessage): string =
   # Canonical representation for signing:
   # orderId|matcherPeer|baseAssetChain/Symbol|quoteAssetChain/Symbol|price|amount|note
-  &"{match.orderId}|{match.matcherPeer}|{match.baseAsset.toString()}|{match.quoteAsset.toString()}|{match.price}|{match.amount}|{match.note}"
+  let price = formatFloat(match.price, ffDecimal, 8)
+  let amount = formatFloat(match.amount, ffDecimal, 8)
+  &"{match.orderId}|{match.matcherPeer}|{match.baseAsset.toString()}|{match.quoteAsset.toString()}|{price}|{amount}|{match.note}"
 
 proc signBytes(ctx: SigningContext; data: openArray[byte]): Option[string] =
   if ctx.isNil() or ctx.privKey.isNone():
@@ -141,8 +159,11 @@ proc decodePublicKey(encoded: string): Option[PublicKey] =
   if encoded.len == 0:
     return none(PublicKey)
   try:
-    let raw = base64.decode(encoded)
-    some(PublicKey.init(raw).expect("public key init"))
+    let raw = base64.decode(encoded).toBytes()
+    let pubRes = PublicKey.init(raw)
+    if pubRes.isErr():
+      return none(PublicKey)
+    some(pubRes.get())
   except CatchableError:
     none(PublicKey)
 
@@ -152,9 +173,11 @@ proc verifySignature(
   if signature.len == 0:
     return false
   try:
-    let sigBytes = base64.decode(signature)
-    let sig = Signature.init(sigBytes).expect("signature init")
-    sig.verify(payload.toBytes(), pubKey)
+    let sigBytes = base64.decode(signature).toBytes()
+    let sigRes = Signature.init(sigBytes)
+    if sigRes.isErr():
+      return false
+    sigRes.get().verify(payload.toBytes(), pubKey)
   except CatchableError:
     false
 

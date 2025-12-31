@@ -46,11 +46,15 @@ import com.example.libp2psmoke.ui.theme.*
 import com.example.libp2psmoke.ui.utils.formatDecimal
 import com.example.libp2psmoke.ui.utils.formatDecimalOrDash
 import com.example.libp2psmoke.ui.utils.formatVolumeOrDash
+import com.example.libp2psmoke.ui.utils.sanitizeDecimalInput
 import com.example.libp2psmoke.viewmodel.NimNodeViewModel
 import com.example.libp2psmoke.dex.BtcAddressType
 import java.math.BigDecimal
 import java.math.RoundingMode
 import androidx.compose.ui.draw.rotate
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 
 @Composable
 fun ProDexScreen(
@@ -60,8 +64,8 @@ fun ProDexScreen(
 ) {
     var showTradeDialog by remember { mutableStateOf(false) }
     var initialTradeSide by remember { mutableStateOf("Buy") }
-    val defaultWif = BuildConfig.DEFAULT_BTC_TESTNET_WIF
-    val defaultAddress = BuildConfig.DEFAULT_BTC_TESTNET_ADDRESS
+    val defaultWif = if (BuildConfig.DEBUG) BuildConfig.DEFAULT_BTC_TESTNET_WIF else ""
+    val defaultAddress = if (BuildConfig.DEBUG) BuildConfig.DEFAULT_BTC_TESTNET_ADDRESS else ""
 
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Column(
@@ -168,6 +172,7 @@ fun ProDexScreen(
             // ═══════════════════════════════════════════════════════════════════
             // 价格信息区域
             // ═══════════════════════════════════════════════════════════════════
+            val lastPrice = resolveLastPrice(uiState)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -175,12 +180,12 @@ fun ProDexScreen(
             ) {
                 Column {
                     Text(
-                        formatDecimalOrDash(uiState.binanceTicker?.lastPrice), 
+                        formatDecimalOrDash(lastPrice),
                         style = PriceTextStyle, 
                         color = DexGreen
                     )
                     Text(
-                        "≈ $${formatDecimalOrDash(uiState.binanceTicker?.lastPrice)}", 
+                        "≈ $${formatDecimalOrDash(lastPrice)}",
                         style = MaterialTheme.typography.bodySmall, 
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -256,9 +261,11 @@ fun ProDexScreen(
                     .padding(horizontal = 8.dp)
                     .clip(RoundedCornerShape(12.dp))
             ) {
+                val chartCandles = uiState.binanceKlines.ifEmpty { uiState.dexKlines }
+                val chartCandlesJson = if (uiState.binanceKlines.isNotEmpty()) uiState.binanceKlinesJson else "[]"
                 TradingViewChart(
-                    candles = uiState.binanceKlines.ifEmpty { uiState.dexKlines },
-                    candlesJson = uiState.binanceKlinesJson,
+                    candles = chartCandles,
+                    candlesJson = chartCandlesJson,
                     interval = uiState.binanceInterval,
                     streamConnected = uiState.binanceStreamConnected,
                     lastUpdateMs = uiState.binanceLastUpdateMs,
@@ -315,7 +322,7 @@ fun ProDexScreen(
                     ) {
                         Spacer(Modifier.height(16.dp))
                         Text(
-                            formatDecimalOrDash(uiState.binanceTicker?.lastPrice),
+                            formatDecimalOrDash(lastPrice),
                             fontFamily = MonoFontFamily,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
@@ -562,17 +569,30 @@ fun TradeDialog(
     var amountText by remember { mutableStateOf("") }
     var privateKey by remember(selectedSide) { 
         mutableStateOf(
-            if (selectedSide == "Sell") BuildConfig.DEFAULT_BTC_TESTNET_WIF
+            if (!BuildConfig.DEBUG) ""
+            else if (selectedSide == "Sell") BuildConfig.DEFAULT_BTC_TESTNET_WIF
             else BuildConfig.DEV_PRIVATE_KEY.ifBlank { "" }
         ) 
     }
-    var targetAddress by remember { mutableStateOf(BuildConfig.DEFAULT_BTC_TESTNET_ADDRESS) }
+    var targetAddress by remember {
+        mutableStateOf(if (BuildConfig.DEBUG) BuildConfig.DEFAULT_BTC_TESTNET_ADDRESS else "")
+    }
     var addressType by remember { mutableStateOf(BtcAddressType.P2WPKH) }
     
     val isBuy = selectedSide == "Buy"
     val primaryColor = if (isBuy) DexGreen else DexRed
     
-    val price = uiState.binanceTicker?.lastPrice ?: BigDecimal.ZERO
+    val marketPrice = resolveLastPrice(uiState)
+    val marketPriceText = remember(marketPrice) { marketPrice?.stripTrailingZeros()?.toPlainString().orEmpty() }
+    var priceText by remember { mutableStateOf(marketPriceText) }
+    LaunchedEffect(marketPriceText) {
+        if (priceText.isBlank() && marketPriceText.isNotBlank()) {
+            priceText = marketPriceText
+        }
+    }
+
+    val price = priceText.toBigDecimalOrNull() ?: marketPrice ?: BigDecimal.ZERO
+    val amountMaxDecimals = if (isBuy) 6 else 8
     val estimatedOutput = remember(amountText, price, isBuy) {
         if (price <= BigDecimal.ZERO) return@remember "0"
         val input = amountText.toBigDecimalOrNull() ?: BigDecimal.ZERO
@@ -583,6 +603,12 @@ fun TradeDialog(
         } else {
             input.multiply(price).setScale(2, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString() + " USDC"
         }
+    }
+    val dexOrderAmountBase = remember(amountText, price, isBuy) {
+        if (price <= BigDecimal.ZERO) return@remember BigDecimal.ZERO
+        val input = amountText.toBigDecimalOrNull() ?: BigDecimal.ZERO
+        if (input <= BigDecimal.ZERO) return@remember BigDecimal.ZERO
+        if (isBuy) input.divide(price, 8, RoundingMode.HALF_UP) else input
     }
 
     ModalBottomSheet(
@@ -600,7 +626,14 @@ fun TradeDialog(
         },
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
     ) {
-        Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 8.dp)
+        ) {
             // 标题
             Text(
                 text = "Trade BTC/USDC",
@@ -651,11 +684,15 @@ fun TradeDialog(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(
                         value = amountText,
-                        onValueChange = { amountText = it },
+                        onValueChange = { amountText = sanitizeDecimalInput(it, maxDecimals = amountMaxDecimals) },
                         placeholder = { Text("0.00") },
                         modifier = Modifier.weight(1f),
                         textStyle = PriceTextStyle.copy(fontSize = 24.sp),
                         singleLine = true,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Decimal,
+                            imeAction = ImeAction.Done
+                        ),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = Color.Transparent,
                             unfocusedBorderColor = Color.Transparent,
@@ -669,6 +706,56 @@ fun TradeDialog(
                         if (isBuy) "USDC" else "BTC",
                         fontWeight = FontWeight.Bold,
                         fontSize = 16.sp
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // Limit price (editable) - enables DEX order broadcast even when market data is unavailable
+            DexGlassCard(
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp)
+            ) {
+                Text(
+                    "Limit price",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = priceText,
+                        onValueChange = { priceText = sanitizeDecimalInput(it, maxDecimals = 8) },
+                        placeholder = { Text(if (marketPriceText.isNotBlank()) marketPriceText else "0.00") },
+                        modifier = Modifier.weight(1f),
+                        textStyle = PriceTextStyle.copy(fontSize = 20.sp),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Decimal,
+                            imeAction = ImeAction.Done
+                        ),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color.Transparent,
+                            unfocusedBorderColor = Color.Transparent,
+                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface
+                        )
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "USDC",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                }
+                if (marketPriceText.isNotBlank() && marketPriceText != priceText) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Market: $marketPriceText",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontFamily = MonoFontFamily
                     )
                 }
             }
@@ -822,6 +909,42 @@ fun TradeDialog(
             }
             
             Spacer(Modifier.height(24.dp))
+
+            // DEX 订单广播 (P2P) - Demo Path
+            val dexOrderEnabled = uiState.running && price > BigDecimal.ZERO && dexOrderAmountBase > BigDecimal.ZERO
+            if (isBuy) {
+                DexBuyButton(
+                    text = "Broadcast DEX Order (P2P)",
+                    onClick = {
+                        viewModel.onEvent(
+                            UiIntent.SubmitDexOrder(
+                                side = "buy",
+                                price = price.stripTrailingZeros().toPlainString(),
+                                amountBase = dexOrderAmountBase.stripTrailingZeros().toPlainString()
+                            )
+                        )
+                        onDismiss()
+                    },
+                    enabled = dexOrderEnabled,
+                    modifier = Modifier.fillMaxWidth().height(52.dp)
+                )
+            } else {
+                DexSellButton(
+                    text = "Broadcast DEX Order (P2P)",
+                    onClick = {
+                        viewModel.onEvent(
+                            UiIntent.SubmitDexOrder(
+                                side = "sell",
+                                price = price.stripTrailingZeros().toPlainString(),
+                                amountBase = dexOrderAmountBase.stripTrailingZeros().toPlainString()
+                            )
+                        )
+                        onDismiss()
+                    },
+                    enabled = dexOrderEnabled,
+                    modifier = Modifier.fillMaxWidth().height(52.dp)
+                )
+            }
             
             // 确认按钮
             if (isBuy) {
@@ -986,6 +1109,26 @@ fun TransactionHistory(swaps: List<com.example.libp2psmoke.dex.DexSwapResult>) {
 
         }
     }
+}
+
+private fun resolveLastPrice(uiState: NodeUiState): BigDecimal? {
+    val fromTicker =
+        uiState.binanceTicker
+            ?.lastPrice
+            ?.takeIf { it > BigDecimal.ZERO }
+    if (fromTicker != null) return fromTicker
+
+    val fromMarketKline =
+        uiState.binanceKlines
+            .firstOrNull()
+            ?.close
+            ?.takeIf { it > BigDecimal.ZERO }
+    if (fromMarketKline != null) return fromMarketKline
+
+    return uiState.dexKlines
+        .firstOrNull()
+        ?.close
+        ?.takeIf { it > BigDecimal.ZERO }
 }
 
 @Composable

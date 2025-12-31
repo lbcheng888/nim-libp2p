@@ -2,6 +2,7 @@ package com.example.libp2psmoke.ui.components
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
@@ -92,7 +93,6 @@ fun TradingViewChart(
             }
         },
         update = {
-            Log.d("TradingViewChart", "updateState: payload len=${escapedJson.length} connected=$streamConnected interval=$interval")
             bridge.updateState(escapedJson, streamConnected, lastUpdateMs, marketSource, latencyMs, interval)
             
             val view = it
@@ -231,23 +231,54 @@ private class TradingViewBridge {
     private var payload: String? = null
     private var currentInterval: String? = null
     private var shouldReset: Boolean = false
+    private var dirty: Boolean = false
+    private var flushScheduled: Boolean = false
+    private var lastFlushAtMs: Long = 0L
+    private val minFlushIntervalMs: Long = 250L
     
     fun attachWebView(view: WebView) { webView = view }
     fun onPageReady() { pageReady = true; flush() }
     fun updateState(payload: String, connected: Boolean, time: Long, source: String, latency: Long, interval: String) {
-        this.payload = payload
+        if (this.payload !== payload) {
+            this.payload = payload
+            this.dirty = true
+        }
         if (this.currentInterval != interval) {
             this.currentInterval = interval
             this.shouldReset = true
+            this.dirty = true
         }
     }
     fun flush() {
-        if (pageReady && payload != null) {
+        val view = webView ?: return
+        if (!pageReady) return
+        if (!dirty && !shouldReset) return
+        if (flushScheduled) return
+
+        val now = SystemClock.uptimeMillis()
+        val dueAt = lastFlushAtMs + minFlushIntervalMs
+        val delayMs = (dueAt - now).coerceAtLeast(0L)
+        flushScheduled = true
+
+        val runnable = Runnable {
+            flushScheduled = false
+            if (!pageReady) return@Runnable
+            val currentPayload = payload ?: run {
+                dirty = false
+                return@Runnable
+            }
             val reset = shouldReset
             shouldReset = false
-            webView?.post {
-                webView?.evaluateJavascript("window.renderCandles('$payload', $reset);", null)
-            }
+            dirty = false
+            lastFlushAtMs = SystemClock.uptimeMillis()
+            view.evaluateJavascript("window.renderCandles('$currentPayload', $reset);", null)
+            if (dirty || shouldReset) flush()
+        }
+
+        if (delayMs == 0L) {
+            view.post(runnable)
+        } else {
+            view.postDelayed(runnable, delayMs)
         }
     }
 }

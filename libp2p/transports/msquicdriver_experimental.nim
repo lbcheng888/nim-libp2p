@@ -1,4 +1,4 @@
-import std/[deques, locks, options, sequtils, strformat]
+import std/[deques, locks, options, sequtils, strformat, strutils]
 
 import chronos
 import chronos/threadsync
@@ -11,6 +11,8 @@ import "nim-msquic/api/api_impl" as msapi
 import "nim-msquic/api/event_model" as msevents
 import "nim-msquic/api/tls_bridge" as mstls
 import "nim-msquic/tls/common" as mstlstypes
+import "nim-msquic/api/param_catalog" as msparams
+import std/[posix]
 
 export msquicruntime.MsQuicLoadOptions
 
@@ -1408,6 +1410,57 @@ proc stopListener*(handle: MsQuicTransportHandle; listener: pointer): string {.r
   if status != msapi.QUIC_STATUS_SUCCESS:
     return fmt"MsQuic ListenerStop failed: 0x{status:08x}"
   ""
+
+proc getListenerAddress*(handle: MsQuicTransportHandle; listener: pointer):
+    Result[TransportAddress, string] {.raises: [].} =
+  if handle.isNil or handle.bridge.isNil or listener.isNil:
+    return err("MsQuic transport handle unavailable")
+
+  var addrStorage: SockAddr_storage
+  var addrLen = uint32(sizeof(SockAddr_storage))
+
+  let status =
+    try:
+      msruntime.getListenerParam(
+        handle.bridge,
+        cast[msapi.HQUIC](listener),
+        msparams.QUIC_PARAM_LISTENER_LOCAL_ADDRESS,
+        addr addrStorage,
+        addrLen
+      )
+    except Exception as exc:
+      return err("MsQuic ListenerGetParam raised: " & exc.msg)
+
+  if status != msapi.QUIC_STATUS_SUCCESS:
+    return err(fmt"MsQuic ListenerGetParam failed: 0x{status:08x}")
+  
+  if addrLen == 0:
+    return err("MsQuic returned empty address length")
+
+  try:
+    var ta: TransportAddress
+    let sa = cast[ptr SockAddr](addr addrStorage)
+    
+    var hostBuf: array[1025, char] # NI_MAXHOST usually 1025
+    var servBuf: array[32, char]
+    
+    if getnameinfo(sa, SockLen(addrLen), 
+                   cast[cstring](addr hostBuf), SockLen(hostBuf.len), 
+                   cast[cstring](addr servBuf), SockLen(servBuf.len), 
+                   NI_NUMERICHOST or NI_NUMERICSERV) != 0:
+       return err("getnameinfo failed")
+
+    let host = $cast[cstring](addr hostBuf)
+    let portStr = $cast[cstring](addr servBuf)
+    
+    try:
+      let port = parseInt(portStr)
+      ta = initTAddress(host, Port(port))
+      ok(ta)
+    except ValueError:
+      return err("Invalid port string: " & portStr)
+  except Exception as exc:
+    err("Failed to convert SockAddr: " & exc.msg)
 
 proc startStream*(handle: MsQuicTransportHandle; stream: pointer;
     flags: uint32 = 0'u32): string {.raises: [].} =

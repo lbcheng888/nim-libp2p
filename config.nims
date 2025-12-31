@@ -1,4 +1,5 @@
 # to allow locking
+switch("path", thisDir())
 if dirExists("nimbledeps/pkgs"):
   switch("NimblePath", "nimbledeps/pkgs")
 if dirExists("nimbledeps/pkgs2"):
@@ -12,7 +13,10 @@ switch("path", "vendor/NimYAML")
 switch("path", "vendor/jsonschema/src")
 switch("path", "nim-pebble")
 switch("passC", "-I" & thisDir())
-switch("define", "chronicles_enabled=true")
+when defined(android) or defined(ohos):
+  switch("define", "chronicles_enabled=false")
+else:
+  switch("define", "chronicles_enabled=true")
 when not defined(chronicles_streams):
   switch("define", "chronicles_streams=defaultChroniclesStream[textlines]")
 

@@ -1,5 +1,7 @@
 import std/macros
 
+const chronicles_enabled* {.booldefine.} = false
+
 type
   LogLevel* = enum
     NONE,
@@ -16,7 +18,11 @@ type LogFormat* = enum
   textLines,
   textBlocks
 
-const enabledLogLevel* = LogLevel.TRACE
+const enabledLogLevel* =
+  if chronicles_enabled:
+    LogLevel.TRACE
+  else:
+    LogLevel.WARN
 
 var globalLogLevel* = enabledLogLevel
 template activeChroniclesStream*(): pointer = nil
@@ -107,42 +113,105 @@ template chroniclesToString(x: untyped): string =
   else:
     repr(x)
 
-proc chroniclesReport(level: LogLevel) =
-  if not levelEnabled(level):
-    return
-  chroniclesPlatformLog(level, "[" & $level & "]")
+template safeEvalToString(expr: untyped): string =
+  ## Evaluate and stringify `expr` without leaking exceptions into callers that
+  ## are annotated with `raises: []`.
+  try:
+    chroniclesToString(expr)
+  except CatchableError:
+    "<error>"
 
-macro logImpl(level: static[LogLevel], args: varargs[untyped]): untyped =
+proc buildLogImpl(level: LogLevel, args: NimNode): NimNode =
   let levelLit = newLit(level)
+  when defined(chroniclestub_debug_args):
+    echo "[chronicles_stub] level=", level, " rawKind=", $args.kind, " rawLen=", $args.len, " rawRepr=", args.repr
+    for i in 0 ..< args.len:
+      echo "  raw[", i, "] kind=", $args[i].kind, " repr=", args[i].repr
+  var argList = args
+  # Some call paths (eg. templates forwarding varargs) can wrap the real
+  # arguments in a single nnkArgList/nnkPar node. Flatten those wrappers.
+  while argList.len == 1 and argList[0].kind in {nnkArgList, nnkPar}:
+    argList = argList[0]
+
+  # Some chronicles-style helpers can still nest the real args as the first
+  # element; merge it into a single arg list.
+  if argList.len > 0 and argList[0].kind in {nnkArgList, nnkPar}:
+    var merged = newNimNode(nnkArgList)
+    for j in 0 ..< argList[0].len:
+      merged.add(argList[0][j])
+    for i in 1 ..< argList.len:
+      merged.add(argList[i])
+    argList = merged
+
+  when defined(chroniclestub_debug_args):
+    echo "[chronicles_stub] normalized kind=", $argList.kind, " len=", $argList.len, " repr=", argList.repr
+    for i in 0 ..< argList.len:
+      echo "  norm[", i, "] kind=", $argList[i].kind, " repr=", argList[i].repr
+
+  var msgIdx = -1
+  for i in 0 ..< argList.len:
+    if argList[i].kind != nnkExprEqExpr:
+      msgIdx = i
+      break
+
+  when defined(chroniclestub_debug_args):
+    echo "[chronicles_stub] msgIdx=", msgIdx
+
+  var lineExpr: NimNode = quote do:
+    "[" & $`levelLit` & "]"
+
+  if msgIdx >= 0:
+    let msgNode = argList[msgIdx]
+    lineExpr = quote do:
+      "[" & $`levelLit` & "] " & safeEvalToString(`msgNode`)
+
+  when defined(chroniclestub_debug_args):
+    echo "[chronicles_stub] lineExpr=", lineExpr.repr
+
+  for i in 0 ..< argList.len:
+    if i == msgIdx:
+      continue
+    let arg = argList[i]
+    if arg.kind == nnkExprEqExpr and arg.len == 2:
+      let keyStr = newLit(arg[0].repr)
+      let valNode = arg[1]
+      let valExpr = quote do: safeEvalToString(`valNode`)
+      lineExpr = quote do: `lineExpr` & " " & `keyStr` & "=" & `valExpr`
+    else:
+      let extraNode = arg
+      let extraExpr = quote do: safeEvalToString(`extraNode`)
+      lineExpr = quote do: `lineExpr` & " " & `extraExpr`
+
   result = quote do:
     when nimvm:
       discard
     else:
-      chroniclesReport(`levelLit`)
+      if levelEnabled(`levelLit`):
+        chroniclesPlatformLog(`levelLit`, `lineExpr`)
 
-template log*(args: varargs[untyped]) =
-  logImpl(INFO, args)
+macro log*(args: varargs[untyped]): untyped =
+  buildLogImpl(INFO, args)
 
-template trace*(args: varargs[untyped]) =
-  logImpl(TRACE, args)
+macro trace*(args: varargs[untyped]): untyped =
+  buildLogImpl(TRACE, args)
 
-template debug*(args: varargs[untyped]) =
-  logImpl(DEBUG, args)
+macro debug*(args: varargs[untyped]): untyped =
+  buildLogImpl(DEBUG, args)
 
-template info*(args: varargs[untyped]) =
-  logImpl(INFO, args)
+macro info*(args: varargs[untyped]): untyped =
+  buildLogImpl(INFO, args)
 
-template notice*(args: varargs[untyped]) =
-  logImpl(NOTICE, args)
+macro notice*(args: varargs[untyped]): untyped =
+  buildLogImpl(NOTICE, args)
 
-template warn*(args: varargs[untyped]) =
-  logImpl(WARN, args)
+macro warn*(args: varargs[untyped]): untyped =
+  buildLogImpl(WARN, args)
 
-template error*(args: varargs[untyped]) =
-  logImpl(ERROR, args)
+macro error*(args: varargs[untyped]): untyped =
+  buildLogImpl(ERROR, args)
 
-template fatal*(args: varargs[untyped]) =
-  logImpl(FATAL, args)
+macro fatal*(args: varargs[untyped]): untyped =
+  buildLogImpl(FATAL, args)
 
 template logScope*(args: varargs[untyped]) =
   discard
@@ -158,12 +227,15 @@ template dynamicLogScope*(stream: typedesc, args: varargs[untyped]) =
 
 proc setLogLevel*(name: string, level: LogLevel) =
   discard name
-  globalLogLevel = level
+  if ord(level) < ord(enabledLogLevel):
+    globalLogLevel = enabledLogLevel
+  else:
+    globalLogLevel = level
 
 proc setLogEnabled*(name: string, enabled: bool) =
   discard name
   if enabled:
-    globalLogLevel = TRACE
+    globalLogLevel = enabledLogLevel
   else:
     globalLogLevel = FATAL
 

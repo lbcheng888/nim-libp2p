@@ -1,28 +1,28 @@
 package com.example.libp2psmoke.domain
 
-import android.util.Log
+import com.example.libp2psmoke.BuildConfig
 import com.example.libp2psmoke.core.Constants
 import com.example.libp2psmoke.core.DexError
 import com.example.libp2psmoke.core.SecureLogger
 import com.example.libp2psmoke.dex.DexRepositoryV2
 import com.example.libp2psmoke.model.DirectMessage
 import com.example.libp2psmoke.mixer.MixerSessionStatus
-import com.example.libp2psmoke.model.NodeUiState
 import com.example.libp2psmoke.native.NimBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.math.BigDecimal
+import java.util.concurrent.ConcurrentHashMap
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * P2P 网络业务用例
@@ -37,7 +37,6 @@ class P2PUseCase(
     }
     
     private var handle: Long = 0L
-    private var pollJob: Job? = null
     
     // 状态流
     private val _p2pState = MutableStateFlow(P2PState())
@@ -48,6 +47,11 @@ class P2PUseCase(
     
     private val _mixerSessions = MutableStateFlow<List<MixerSessionStatus>>(emptyList())
     val mixerSessions: StateFlow<List<MixerSessionStatus>> = _mixerSessions
+
+    // Avoid calling back into native synchronously from the native event thread.
+    // We track connected peers purely from events to prevent re-entrancy deadlocks.
+    private val connectedPeerIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val dexInitialized = AtomicBoolean(false)
     
     /**
      * 启动节点
@@ -57,43 +61,125 @@ class P2PUseCase(
         relayPeers: List<String>
     ) {
         if (handle != 0L) return
+        dexInitialized.set(false)
         
         SecureLogger.i(TAG, "Starting P2P Node...")
         
         try {
             // 配置生成
+            val extra = JSONObject().apply {
+                put("bootstrapMultiaddrs", JSONArray(bootstrapPeers))
+                put("relayMultiaddrs", JSONArray(relayPeers))
+            }
             val config = JSONObject().apply {
                 put("dataDir", dataDir.absolutePath)
-                put("bootstrap", JSONArray(bootstrapPeers))
-                put("relays", JSONArray(relayPeers))
-                // 更多配置...
+                put("extra", extra)
             }
             
             handle = NimBridge.initNode(config.toString())
             if (handle == 0L) {
                 throw DexError.NodeNotReady
             }
+
+            // Register event listener as early as possible to avoid missing startup events.
+            NimBridge.setEventListener { topic, payload ->
+                handleNativeEvent(topic, payload)
+            }
+
+            // Huawei/Android: mDNS has shown severe native memory growth on some builds.
+            // Keep it disabled by default; use explicit bootstrap/relay multiaddrs instead.
+            runCatching {
+                val enabled = BuildConfig.DEBUG && BuildConfig.P2P_ENABLE_MDNS
+                val ok = NimBridge.setMdnsEnabled(handle, enabled)
+                SecureLogger.i(TAG, "mdns enabled=$enabled -> $ok")
+            }.onFailure { e ->
+                SecureLogger.w(TAG, "mdns toggle failed", e)
+            }
             
             val result = NimBridge.startNode(handle)
-            if (result != 0) { // assuming 0 is success, fix based on native code
-                // handle error
+            if (result != 0) {
+                val lastError = NimBridge.lastInitError().orEmpty().ifBlank { "start failed ($result)" }
+                throw IllegalStateException(lastError)
             }
             
             // 更新本地 Peer ID
             val localPeerId = NimBridge.localPeerId(handle)
             _p2pState.update { it.copy(localPeerId = localPeerId, isRunning = true) }
-            
-            // 设置事件监听
-            NimBridge.setEventListener { topic, payload ->
-                handleNativeEvent(topic, payload)
-            }
-            
-            // 启动轮询
-            startPolling()
+            connectedPeerIds.clear()
+
+            // Enable connection events for observability (best-effort)
+            NimBridge.initializeConnectionEvents(handle)
+
+            // Best-effort: explicitly dial bootstrap/relay multiaddrs (native side also tries).
+            // This helps device bootstrapping when peer hints / mDNS are unstable.
+            (bootstrapPeers + relayPeers)
+                .map { it.trim() }
+                .filter { it.startsWith("/") }
+                .distinct()
+                .forEach { addr ->
+                    if (!addr.contains("/p2p/")) {
+                        SecureLogger.w(TAG, "connectMultiaddr skipped (missing /p2p/ peerId) addr=$addr")
+                        return@forEach
+                    }
+                    val rc = NimBridge.connectMultiaddr(handle, addr)
+                    SecureLogger.i(TAG, "connectMultiaddr rc=$rc addr=$addr")
+                }
+
+            // Start DEX subsystem (orders/matches/trades)
+            startDex()
             
         } catch (e: Exception) {
             SecureLogger.e(TAG, "Failed to start node", e)
             _p2pState.update { it.copy(error = e.message) }
+            dexInitialized.set(false)
+            if (handle != 0L) {
+                try {
+                    NimBridge.stopNode(handle)
+                } catch (_: Exception) {
+                }
+                try {
+                    NimBridge.freeNode(handle)
+                } catch (_: Exception) {
+                }
+                handle = 0L
+            }
+        }
+    }
+
+    private fun startDex() {
+        if (handle == 0L) return
+        try {
+            val enableSigning = if (BuildConfig.DEBUG) BuildConfig.DEX_ENABLE_SIGNING else true
+            val allowUnsigned = if (BuildConfig.DEBUG) BuildConfig.DEX_ALLOW_UNSIGNED else false
+            val config = JSONObject().apply {
+                put("mode", BuildConfig.DEX_MODE)
+                put("enableMixer", true)
+                put("enableAutoTrade", BuildConfig.DEX_AUTO_TRADE)
+                put("enableAutoMatch", BuildConfig.DEX_MODE.equals("matcher", ignoreCase = true))
+                put("allowUnsigned", allowUnsigned)
+                put("enableSigning", enableSigning)
+            }
+            val ok = NimBridge.dexInit(handle, config.toString())
+            dexInitialized.set(ok)
+            SecureLogger.i(TAG, "dexInit(mode=${BuildConfig.DEX_MODE}) -> $ok")
+            if (ok && BuildConfig.DEBUG && BuildConfig.DEX_SELF_TEST) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    delay(1500)
+                    runCatching {
+                        submitDexOrder(
+                            side = "buy",
+                            price = BigDecimal("65000"),
+                            amountBase = BigDecimal("0.001"),
+                            ttlMs = 60_000
+                        )
+                    }.onFailure { e ->
+                        SecureLogger.w(TAG, "DEX self-test order failed", e)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            SecureLogger.e(TAG, "dexInit failed", e)
+            dexInitialized.set(false)
         }
     }
     
@@ -106,9 +192,9 @@ class P2PUseCase(
             NimBridge.freeNode(handle)
             handle = 0L
         }
-        pollJob?.cancel()
-        pollJob = null
-        _p2pState.update { it.copy(isRunning = false) }
+        connectedPeerIds.clear()
+        dexInitialized.set(false)
+        _p2pState.update { it.copy(isRunning = false, localPeerId = null, connectedPeers = 0, error = null) }
     }
     
     /**
@@ -169,50 +255,151 @@ class P2PUseCase(
         _mixerSessions.update { it + pending }
     }
     
-    // 内部处理
-    private fun startPolling() {
-        pollJob?.cancel()
-        pollJob = CoroutineScope(Dispatchers.IO).launch {
-            while (isActive && handle != 0L) {
-                try {
-                    val eventsJson = NimBridge.pollEvents(handle, 50)
-                    if (!eventsJson.isNullOrEmpty() && eventsJson != "[]") {
-                        val events = JSONArray(eventsJson)
-                        for (i in 0 until events.length()) {
-                            val event = events.getJSONObject(i)
-                            val topic = event.optString("topic")
-                            val payload = event.optString("payload")
-                            if (topic.isNotEmpty()) {
-                                handleNativeEvent(topic, payload)
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    SecureLogger.e(TAG, "Polling error", e)
-                }
-                delay(100) // Poll interval
-            }
-        }
-    }
-    
     private fun handleNativeEvent(topic: String, payload: String) {
         when (topic) {
             "dex.match" -> handleDexMatch(payload)
+            "dex.trade" -> handleDexTrade(payload)
             "dex.mixer" -> handleMixerEvent(payload)
             "p2p.peer" -> handlePeerEvent(payload)
+            "network_event" -> handleNetworkEvent(payload)
+        }
+    }
+
+    private fun handleNetworkEvent(payload: String) {
+        if (handle == 0L) return
+        val trimmed = payload.trim()
+        if (!trimmed.startsWith("{")) return
+        try {
+            val json = JSONObject(trimmed)
+            when (json.optString("type")) {
+                "ConnectionEstablished" -> {
+                    val peerId = json.optString("peer_id")
+                    if (peerId.isNotBlank()) {
+                        connectedPeerIds.add(peerId)
+                        _p2pState.update { it.copy(connectedPeers = connectedPeerIds.size) }
+                    }
+                }
+                "ConnectionClosed" -> {
+                    val peerId = json.optString("peer_id")
+                    if (peerId.isNotBlank()) {
+                        connectedPeerIds.remove(peerId)
+                        _p2pState.update { it.copy(connectedPeers = connectedPeerIds.size) }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // ignore
         }
     }
     
     private fun handleDexMatch(payload: String) {
-        // match|orderId|matcherPeer|asset|price|amount
+        val trimmed = payload.trim()
+        if (trimmed.startsWith("{")) {
+            try {
+                val json = JSONObject(trimmed)
+                val orderId = json.optString("orderId")
+                val baseSymbol = json.optJSONObject("baseAsset")?.optString("symbol").orEmpty()
+                val quoteSymbol = json.optJSONObject("quoteAsset")?.optString("symbol").orEmpty()
+                val asset = if (baseSymbol.isNotBlank() && quoteSymbol.isNotBlank()) {
+                    "$baseSymbol/$quoteSymbol"
+                } else {
+                    Constants.Dex.DEFAULT_SYMBOL
+                }
+                val price = json.optString("price").toBigDecimalOrNull() ?: return
+                val amount = json.optString("amount").toBigDecimalOrNull() ?: return
+                // Do not ingest as trade here; matcher also emits `dex.trade` which drives candles.
+                // Keeping this as a lightweight debug hook avoids double-counting.
+                SecureLogger.d(TAG, "dexMatch orderId=$orderId asset=$asset price=$price amount=$amount")
+            } catch (_: Exception) {
+                // fall through to legacy format
+            }
+            return
+        }
+
+        // legacy: match|orderId|matcherPeer|asset|price|amount
         val parts = payload.split("|")
         if (parts.size >= 6) {
             val orderId = parts[1]
             val asset = parts[3]
             val price = parts[4].toBigDecimalOrNull() ?: return
             val amount = parts[5].toBigDecimalOrNull() ?: return
-            dexRepository.ingestMatch(orderId, price, amount, asset)
+            SecureLogger.d(TAG, "dexMatch(legacy) orderId=$orderId asset=$asset price=$price amount=$amount")
         }
+    }
+
+    private fun handleDexTrade(payload: String) {
+        val trimmed = payload.trim()
+        if (!trimmed.startsWith("{")) return
+        try {
+            val json = JSONObject(trimmed)
+            val orderId = json.optString("orderId")
+            val baseSymbol = json.optJSONObject("baseAsset")?.optString("symbol").orEmpty()
+            val quoteSymbol = json.optJSONObject("quoteAsset")?.optString("symbol").orEmpty()
+            val asset = if (baseSymbol.isNotBlank() && quoteSymbol.isNotBlank()) {
+                "$baseSymbol/$quoteSymbol"
+            } else {
+                Constants.Dex.DEFAULT_SYMBOL
+            }
+            val price = json.optString("price").toBigDecimalOrNull() ?: return
+            val amount = json.optString("amount").toBigDecimalOrNull() ?: return
+            val timestampMs = json.optLong("createdAt", System.currentTimeMillis())
+            dexRepository.ingestTrade(
+                orderId = orderId,
+                price = price,
+                amount = amount,
+                asset = asset,
+                timestampMs = timestampMs
+            )
+        } catch (_: Exception) {
+            // ignore
+        }
+    }
+
+    suspend fun submitDexOrder(
+        side: String,
+        price: BigDecimal,
+        amountBase: BigDecimal,
+        ttlMs: Int = 60_000
+    ) = withContext(Dispatchers.IO) {
+        if (handle == 0L || !_p2pState.value.isRunning) {
+            throw DexError.NodeNotReady
+        }
+        if (!dexInitialized.get()) {
+            throw DexError.NodeNotReady
+        }
+        val json = JSONObject().apply {
+            put("side", side.lowercase())
+            put("price", price.toPlainString())
+            put("amount", amountBase.toPlainString())
+            put("ttlMs", ttlMs)
+            put("timestamp", System.currentTimeMillis())
+            put(
+                "baseAsset",
+                JSONObject().apply {
+                    put("chainId", "BTC")
+                    put("symbol", "BTC")
+                    put("decimals", 8)
+                    put("type", "AssetNative")
+                }
+            )
+            put(
+                "quoteAsset",
+                JSONObject().apply {
+                    put("chainId", "BSC")
+                    put("symbol", "USDC")
+                    put("decimals", 6)
+                    put("type", "AssetERC20")
+                }
+            )
+        }
+        val payload = json.toString()
+        val ok = NimBridge.dexSubmitOrder(handle, payload)
+        if (!ok) {
+            val err = NimBridge.lastDirectError(handle).orEmpty().ifBlank { "dexSubmitOrder failed" }
+            SecureLogger.w(TAG, "dexSubmitOrder failed err=$err payloadLen=${payload.length}")
+            throw DexError.InvalidOrder(orderId = null, reason = err)
+        }
+        SecureLogger.i(TAG, "dexSubmitOrder ok side=${side.lowercase()} price=${price.toPlainString()} amountBase=${amountBase.toPlainString()}")
     }
     
     private fun handleMixerEvent(payload: String) {
@@ -247,4 +434,3 @@ class P2PUseCase(
         val error: String? = null
     )
 }
-

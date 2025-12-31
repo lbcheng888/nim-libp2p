@@ -254,6 +254,136 @@ proc decodeOrder*(data: seq[byte]): Option[OrderMessage] =
       result.get().onionPath = parsed["onionPath"].getElems().mapIt(it.getStr())
   except: return none(OrderMessage)
 
+proc matchMessageToJson*(match: MatchMessage): JsonNode =
+  result = %*{
+    "orderId": match.orderId,
+    "matcherPeer": match.matcherPeer,
+    "price": match.price,
+    "amount": match.amount,
+    "baseAsset": encodeAssetDef(match.baseAsset),
+    "quoteAsset": encodeAssetDef(match.quoteAsset),
+    "note": match.note,
+    "signature": match.signature,
+    "signerPubKey": match.signerPubKey,
+    "signatureVersion": match.signatureVersion,
+  }
+
+proc encodeMatch*(match: MatchMessage): seq[byte] =
+  ($matchMessageToJson(match)).toBytes()
+
+proc decodeMatch*(data: seq[byte]): Option[MatchMessage] =
+  try:
+    let parsed = parseJson(string.fromBytes(data))
+    if parsed.kind != JObject:
+      return none(MatchMessage)
+    var match = MatchMessage(
+      orderId: parsed.getOrDefault("orderId").getStr(),
+      matcherPeer: parsed.getOrDefault("matcherPeer").getStr(),
+      price: parsed.getOrDefault("price").getFloat(),
+      amount: parsed.getOrDefault("amount").getFloat(),
+      baseAsset:
+        if parsed.hasKey("baseAsset"):
+          decodeAssetDef(parsed["baseAsset"])
+        else:
+          AssetDef(chainId: ChainBTC, symbol: "BTC", decimals: 8, assetType: AssetNative),
+      quoteAsset:
+        if parsed.hasKey("quoteAsset"):
+          decodeAssetDef(parsed["quoteAsset"])
+        else:
+          AssetDef(chainId: ChainETH, symbol: "USDC", decimals: 6, assetType: AssetERC20),
+      note:
+        if parsed.hasKey("note") and parsed["note"].kind == JString:
+          parsed["note"].getStr()
+        else:
+          "",
+      signature:
+        if parsed.hasKey("signature") and parsed["signature"].kind == JString:
+          parsed["signature"].getStr()
+        else:
+          "",
+      signerPubKey:
+        if parsed.hasKey("signerPubKey") and parsed["signerPubKey"].kind == JString:
+          parsed["signerPubKey"].getStr()
+        else:
+          "",
+      signatureVersion:
+        if parsed.hasKey("signatureVersion") and parsed["signatureVersion"].kind in {JInt, JFloat}:
+          parsed["signatureVersion"].getInt()
+        else:
+          0,
+    )
+    result = some(match)
+  except:
+    result = none(MatchMessage)
+
+proc tradeEventToJson*(trade: TradeEvent): JsonNode =
+  result = %*{
+    "matchId": trade.matchId,
+    "orderId": trade.orderId,
+    "takerSide": trade.takerSide,
+    "price": trade.price,
+    "amount": trade.amount,
+    "baseAsset": encodeAssetDef(trade.baseAsset),
+    "quoteAsset": encodeAssetDef(trade.quoteAsset),
+    "matcherPeer": trade.matcherPeer,
+    "makerPeer": trade.makerPeer,
+    "createdAt": trade.createdAt,
+    "sequence": trade.sequence,
+    "txHash": trade.txHash,
+  }
+
+proc encodeTrade*(trade: TradeEvent): seq[byte] =
+  ($tradeEventToJson(trade)).toBytes()
+
+proc decodeTrade*(data: seq[byte]): Option[TradeEvent] =
+  try:
+    let node = parseJson(string.fromBytes(data))
+    if node.kind != JObject:
+      return none(TradeEvent)
+    result = some(TradeEvent(
+      matchId: node.getOrDefault("matchId").getStr(),
+      orderId: node.getOrDefault("orderId").getStr(),
+      takerSide: node.getOrDefault("takerSide").getStr(),
+      price: node.getOrDefault("price").getFloat(),
+      amount: node.getOrDefault("amount").getFloat(),
+      baseAsset: decodeAssetDef(node.getOrDefault("baseAsset")),
+      quoteAsset: decodeAssetDef(node.getOrDefault("quoteAsset")),
+      matcherPeer: node.getOrDefault("matcherPeer").getStr(),
+      makerPeer: node.getOrDefault("makerPeer").getStr(),
+      createdAt:
+        if node.hasKey("createdAt") and node["createdAt"].kind in {JInt, JFloat}:
+          node["createdAt"].getBiggestInt()
+        else:
+          0'i64,
+      sequence:
+        if node.hasKey("sequence") and node["sequence"].kind in {JInt, JFloat}:
+          node["sequence"].getBiggestInt()
+        else:
+          0'i64,
+      txHash:
+        if node.hasKey("txHash") and node["txHash"].kind == JString:
+          node["txHash"].getStr()
+        else:
+          "",
+    ))
+  except:
+    result = none(TradeEvent)
+
+proc klineBucketToJson*(bucket: KlineBucket): JsonNode =
+  %*{
+    "asset": bucket.asset,
+    "scale": bucket.scale.int,
+    "windowStartMs": bucket.windowStartMs,
+    "open": bucket.open,
+    "high": bucket.high,
+    "low": bucket.low,
+    "close": bucket.close,
+    "volume": bucket.volume,
+    "trades": bucket.trades,
+    "closed": bucket.closed,
+    "publishSeq": bucket.publishSeq,
+  }
+
 proc settlementStatusToStr*(status: SettlementStatus): string =
   $status
 

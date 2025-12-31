@@ -188,6 +188,8 @@ proc isLanIpv4(ip: string): bool {.raises: [].} =
         discard
   false
 
+
+
 proc enumerateLanIpv4*(preferred: string = ""): seq[string] {.raises: [].} =
   var seen = initHashSet[string]()
   template addIp(value: string) =
@@ -416,7 +418,14 @@ proc encodeIpv4(address: string): array[4, uint8] =
       raise newException(ValueError, "invalid IPv4 segment")
     result[idx] = byte(value)
 
-when declared(getifaddrs) and not defined(ohos):
+when defined(ohos) or defined(android):
+  proc resolveInterfaceNameByIp*(address: string): string =
+    for iface in CandidateIfaces:
+      let ip = getInterfaceIpv4(iface)
+      if ip == address:
+        return iface
+    ""
+elif declared(getifaddrs):
   proc resolveInterfaceNameByIp(address: string): string =
     var ifap: ptr Ifaddrs = nil
     if getifaddrs(addr ifap) != 0:

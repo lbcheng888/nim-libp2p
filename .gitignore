@@ -55,3 +55,11 @@ test_secp
 *.png
 *.txt
 *.log
+
+# Local DEX runtime state (keys/WALs)
+dex_state/
+
+# Locally-built demo binaries
+examples/dex/dex_order_demo
+examples/nim_quic_demo
+libp2p/dialer

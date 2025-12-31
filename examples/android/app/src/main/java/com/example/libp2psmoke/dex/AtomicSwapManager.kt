@@ -66,6 +66,10 @@ class AtomicSwapManager {
     }
     
     fun getSwap(id: String): AtomicSwapState? = _activeSwaps.value[id]
+
+    fun clear() {
+        _activeSwaps.value = emptyMap()
+    }
 }
 
 enum class SwapRole {

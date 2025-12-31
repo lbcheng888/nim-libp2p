@@ -23,6 +23,7 @@ class BscHtlcService {
         private const val TAG = "BscHtlcService"
         // BSC Testnet RPC
         private const val RPC_URL = "https://bsc-testnet.publicnode.com"
+        private const val CHAIN_ID = 97L
         // HTLC Contract Address (Demo)
         private const val CONTRACT_ADDRESS = "0x0000000000000000000000000000000000000000" // Replace with real deployment
     }
@@ -107,7 +108,7 @@ class BscHtlcService {
     private fun sendTransaction(credentials: Credentials, function: Function): String {
         val encodedFunction = FunctionEncoder.encode(function)
         val ethGetTransactionCount = web3j.ethGetTransactionCount(
-            credentials.address, DefaultBlockParameterName.LATEST
+            credentials.address, DefaultBlockParameterName.PENDING
         ).send()
         val nonce = ethGetTransactionCount.transactionCount
         
@@ -123,7 +124,7 @@ class BscHtlcService {
             encodedFunction
         )
         
-        val signedMessage = TransactionEncoder.signMessage(rawTransaction, credentials)
+        val signedMessage = TransactionEncoder.signMessage(rawTransaction, CHAIN_ID, credentials)
         val hexValue = Numeric.toHexString(signedMessage)
         
         val ethSendTransaction = web3j.ethSendRawTransaction(hexValue).send()

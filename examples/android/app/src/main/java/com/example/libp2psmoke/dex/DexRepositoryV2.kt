@@ -84,6 +84,18 @@ class DexRepositoryV2(
     fun swaps(): StateFlow<List<DexSwapResult>> = _swaps
     fun klines(): StateFlow<List<DexKlineBucket>> = _klines
     fun btcBalance(): StateFlow<BigDecimal> = _btcBalance.asStateFlow()
+
+    fun resetRuntimeState() {
+        synchronized(partialLock) {
+            partials.clear()
+        }
+        aggregator.clear()
+        _klines.value = emptyList()
+        _swaps.value = emptyList()
+        _btcBalance.value = BigDecimal.ZERO
+        atomicSwapManager.clear()
+        adapterSwapManager.clear()
+    }
     
 
     /**
@@ -275,12 +287,28 @@ class DexRepositoryV2(
      * 注入撮合成交
      */
     fun ingestMatch(orderId: String, price: BigDecimal, amount: BigDecimal, asset: String) {
+        ingestTrade(
+            orderId = orderId,
+            price = price,
+            amount = amount,
+            asset = asset,
+            timestampMs = System.currentTimeMillis()
+        )
+    }
+
+    fun ingestTrade(
+        orderId: String,
+        price: BigDecimal,
+        amount: BigDecimal,
+        asset: String,
+        timestampMs: Long
+    ) {
         val trade = DexTrade(
             orderId = orderId,
             symbol = asset,
             price = price,
             amountBase = amount,
-            timestampMs = System.currentTimeMillis()
+            timestampMs = timestampMs
         )
         publishTrade(trade)
     }
@@ -334,6 +362,9 @@ class DexRepositoryV2(
         amount: String,
         counterpartyAddress: String
     ): AtomicSwapState = withContext(ioDispatcher) {
+        if (!com.example.libp2psmoke.BuildConfig.DEBUG) {
+            throw IllegalStateException("Atomic Swap demo is disabled in release builds")
+        }
         val role = if (isBuy) SwapRole.INITIATOR else SwapRole.PARTICIPANT
         val pair = if (isBuy) "USDC-BTC" else "BTC-USDC"
         
@@ -662,6 +693,9 @@ class DexRepositoryV2(
      * Claim BTC (Step 3: Reveal Secret)
      */
     suspend fun claimAtomicSwap(swapId: String): String = withContext(ioDispatcher) {
+        if (!com.example.libp2psmoke.BuildConfig.DEBUG) {
+            throw IllegalStateException("Atomic Swap demo is disabled in release builds")
+        }
         val swap = atomicSwapManager.getSwap(swapId) ?: throw Exception("Swap not found")
         
         if (swap.status != SwapStatus.BTC_LOCKED) {
@@ -790,4 +824,3 @@ class DexRepositoryV2(
         var updatedAtMs: Long = System.currentTimeMillis()
     )
 }
-

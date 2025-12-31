@@ -41,6 +41,10 @@ class DexKlineAggregator(
         snapshotLocked()
     }
 
+    fun clear() = synchronized(lock) {
+        buckets.clear()
+    }
+
     private fun snapshotLocked(): List<DexKlineBucket> =
         buckets.values
             .sortedWith(

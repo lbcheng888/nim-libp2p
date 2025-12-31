@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.math.BigDecimal
+import java.math.RoundingMode
 
 /**
  * 行情数据 UseCase
@@ -404,12 +405,18 @@ class MarketDataUseCase(
         
         for (i in 0 until 100) {
             val time = now - (100 - i) * scale.seconds * 1000
-            val change = BigDecimal(Math.random() - 0.5).multiply(BigDecimal("100"))
+            val change = BigDecimal
+                .valueOf((Math.random() - 0.5) * 100.0)
+                .setScale(2, RoundingMode.HALF_UP)
             val open = price
-            val close = price.add(change)
-            val high = open.max(close).add(BigDecimal(Math.random() * 50))
-            val low = open.min(close).subtract(BigDecimal(Math.random() * 50))
-            val volume = BigDecimal(Math.random() * 10)
+            val close = price.add(change).setScale(2, RoundingMode.HALF_UP)
+            val high = open.max(close).add(
+                BigDecimal.valueOf(Math.random() * 50.0).setScale(2, RoundingMode.HALF_UP)
+            )
+            val low = open.min(close).subtract(
+                BigDecimal.valueOf(Math.random() * 50.0).setScale(2, RoundingMode.HALF_UP)
+            )
+            val volume = BigDecimal.valueOf(Math.random() * 10.0).setScale(4, RoundingMode.HALF_UP)
             
             buckets.add(
                 DexKlineBucket(
@@ -437,7 +444,7 @@ class MarketDataUseCase(
         for (i in 0 until 10) {
             val spread = BigDecimal(i + 1).multiply(BigDecimal("10"))
             currentPrice = if (isBid) midPrice.subtract(spread) else midPrice.add(spread)
-            val qty = BigDecimal(Math.random() * 2)
+            val qty = BigDecimal.valueOf(Math.random() * 2.0).setScale(6, RoundingMode.HALF_UP)
             cumulative = cumulative.add(qty)
             entries.add(OrderBookEntry(currentPrice, qty, cumulative))
         }
@@ -454,4 +461,3 @@ private fun emptyTicker() = BinanceTicker(
     volumeQuote = BigDecimal.ZERO,
     closeTimeMs = 0
 )
-

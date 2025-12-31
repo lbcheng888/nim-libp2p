@@ -10,7 +10,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.DeleteForever
-import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Language
@@ -29,11 +28,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.libp2psmoke.model.NodeUiState
+import com.example.libp2psmoke.ui.UiIntent
 import com.example.libp2psmoke.ui.components.*
 import com.example.libp2psmoke.ui.theme.*
+import com.example.libp2psmoke.viewmodel.NimNodeViewModel
 
 @Composable
-fun SettingsScreen(uiState: NodeUiState) {
+fun SettingsScreen(uiState: NodeUiState, viewModel: NimNodeViewModel) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -48,6 +49,17 @@ fun SettingsScreen(uiState: NodeUiState) {
         )
         
         Spacer(Modifier.height(24.dp))
+
+        DexNotificationBanner(
+            message = uiState.lastError ?: "",
+            type = NotificationType.ERROR,
+            visible = uiState.lastError != null
+        )
+        DexNotificationBanner(
+            message = uiState.successMessage ?: "",
+            type = NotificationType.SUCCESS,
+            visible = uiState.successMessage != null
+        )
         
         // Node Info 卡片
         DexCard(
@@ -77,15 +89,15 @@ fun SettingsScreen(uiState: NodeUiState) {
                         fontSize = 16.sp
                     )
                     Text(
-                        if (uiState.localPeerId != null) "Connected" else "Disconnected",
-                        color = if (uiState.localPeerId != null) DexGreen else DexRed,
+                        if (uiState.running) "Running" else "Stopped",
+                        color = if (uiState.running) DexGreen else DexRed,
                         fontSize = 14.sp
                     )
                 }
             }
             
             Spacer(Modifier.height(16.dp))
-            Divider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.1f))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.1f))
             Spacer(Modifier.height(16.dp))
             
             Text(
@@ -98,6 +110,12 @@ fun SettingsScreen(uiState: NodeUiState) {
                 uiState.localPeerId ?: "Unknown",
                 style = AddressStyle,
                 color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Connected peers: ${uiState.peerCount}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
             )
         }
         
@@ -140,23 +158,52 @@ fun SettingsScreen(uiState: NodeUiState) {
         Spacer(Modifier.height(16.dp))
         
         SettingsSection(title = "Network") {
-            SettingsItem(
-                icon = Icons.Default.Dns,
-                title = "RPC Settings",
-                subtitle = "Default endpoints"
-            )
-            SettingsItem(
-                icon = Icons.Default.Speed,
-                title = "Network Stats",
-                subtitle = "Latency: ${uiState.marketLatencyMs}ms"
-            )
+            Column {
+                SettingsItem(
+                    icon = Icons.Default.Speed,
+                    title = "Market data",
+                    subtitle = if (uiState.marketEnabled) "Enabled" else "Disabled"
+                ) {
+                    viewModel.onEvent(UiIntent.SetMarketEnabled(!uiState.marketEnabled))
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.08f))
+                Column(modifier = Modifier.padding(16.dp)) {
+                    OutlinedTextField(
+                        value = uiState.bootstrapPeersRaw,
+                        onValueChange = { viewModel.onEvent(UiIntent.UpdateBootstrapPeers(it)) },
+                        label = { Text("Bootstrap peers") },
+                        placeholder = { Text("One multiaddr per line, or JSON array") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = uiState.relayPeersRaw,
+                        onValueChange = { viewModel.onEvent(UiIntent.UpdateRelayPeers(it)) },
+                        label = { Text("Relay peers (optional)") },
+                        placeholder = { Text("One multiaddr per line, or JSON array") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = { viewModel.onEvent(UiIntent.ApplyNetworkConfig) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("Apply & Restart Node")
+                    }
+                }
+            }
         }
         
         Spacer(Modifier.height(24.dp))
         
         // 危险操作
         OutlinedButton(
-            onClick = { /* Reset */ },
+            onClick = { viewModel.onEvent(UiIntent.ResetNodeData) },
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.outlinedButtonColors(
                 contentColor = DexRed

@@ -1,10 +1,16 @@
 package com.example.libp2psmoke.viewmodel
 
 import android.app.Application
+import android.content.Context
+import android.net.wifi.WifiManager
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.libp2psmoke.BuildConfig
+import com.example.libp2psmoke.core.AppPreferences
 import com.example.libp2psmoke.core.Constants
 import com.example.libp2psmoke.core.DexError
+import com.example.libp2psmoke.core.MultiaddrListParser
 import com.example.libp2psmoke.core.SecureKeyStore
 import com.example.libp2psmoke.core.SecureLogger
 import com.example.libp2psmoke.dex.DexRepositoryV2
@@ -19,7 +25,6 @@ import com.example.libp2psmoke.dex.BtcAddressType
 import com.example.libp2psmoke.dex.BtcWalletManager
 import com.example.libp2psmoke.dex.AtomicSwapState
 import com.example.libp2psmoke.model.ChainWallet
-import com.example.libp2psmoke.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -29,6 +34,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -43,12 +49,14 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     
     // 基础设施
     private val secureKeyStore = SecureKeyStore(application)
+    private val appPreferences = AppPreferences(application)
     private val dexRepository = DexRepositoryV2()
+    private val nodeDataDir = File(application.filesDir, "nimlibp2p_node")
     
     // UseCases
     private val marketDataUseCase = MarketDataUseCase()
     private val walletUseCase = WalletUseCase(dexRepository, secureKeyStore)
-    private val p2pUseCase = P2PUseCase(dexRepository, File(application.filesDir, "nimlibp2p_node"))
+    private val p2pUseCase = P2PUseCase(dexRepository, nodeDataDir)
     
     // 状态透传
     val mixerSessions = p2pUseCase.mixerSessions
@@ -60,6 +68,7 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     val activeMpcSwap = dexRepository.activeMpcSwap
     
     private var marketLoopJob: Job? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
     
     init {
         dexRepository.init(getApplication())
@@ -75,9 +84,15 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
             is UiIntent.SubmitBridgeTrade -> handleSubmitBridgeTrade(event)
             is UiIntent.SubmitMultiChainSwap -> handleSubmitMultiChainSwap(event)
             is UiIntent.SubmitMixerIntent -> handleSubmitMixer(event)
+            is UiIntent.SubmitDexOrder -> handleSubmitDexOrder(event)
             is UiIntent.ClaimAtomicSwap -> handleClaimAtomicSwap(event)
             is UiIntent.InitiateAdapterSwap -> handleInitiateAdapterSwap(event)
             is UiIntent.InitiateMpcSwap -> handleInitiateMpcSwap()
+            is UiIntent.UpdateBootstrapPeers -> handleUpdateBootstrapPeers(event.raw)
+            is UiIntent.UpdateRelayPeers -> handleUpdateRelayPeers(event.raw)
+            is UiIntent.ApplyNetworkConfig -> handleApplyNetworkConfig()
+            is UiIntent.SetMarketEnabled -> handleSetMarketEnabled(event.enabled)
+            is UiIntent.ResetNodeData -> handleResetNodeData()
             is UiIntent.ClearError -> _state.update { it.copy(lastError = null) }
             is UiIntent.ClearSuccess -> _state.update { it.copy(successMessage = null) }
         }
@@ -87,7 +102,9 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     
     private fun handleSelectInterval(interval: String) {
         if (interval == _state.value.binanceInterval) return
-        _state.update { it.copy(binanceInterval = interval, binanceLoading = true) }
+        appPreferences.setMarketInterval(interval)
+        val marketEnabled = _state.value.marketEnabled
+        _state.update { it.copy(binanceInterval = interval, binanceLoading = marketEnabled) }
         val cached = marketDataUseCase.getCachedKlines(interval)
         val cachedJson = marketDataUseCase.getCachedKlineJson(interval)
         if (cached != null && cachedJson != null) {
@@ -95,11 +112,19 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
                 it.copy(binanceKlines = cached, binanceKlinesJson = cachedJson, binanceLoading = false) 
             }
         }
-        handleRefreshMarket()
+        if (marketEnabled) {
+            handleRefreshMarket()
+        } else {
+            _state.update { it.copy(binanceLoading = false) }
+        }
     }
     
     private fun handleRefreshMarket() {
         viewModelScope.launch {
+            if (!_state.value.marketEnabled) {
+                _state.update { it.copy(binanceLoading = false, binanceStreamConnected = false) }
+                return@launch
+            }
             val interval = _state.value.binanceInterval
             val result = marketDataUseCase.fetchMarketSnapshot(BINANCE_SPOT_SYMBOL, interval)
             if (result.isSuccess) {
@@ -127,6 +152,66 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
                         binanceStreamConnected = false,
                         binanceLoading = false
                     ) 
+                }
+            }
+        }
+    }
+
+    private fun handleUpdateBootstrapPeers(raw: String) {
+        _state.update { it.copy(bootstrapPeersRaw = raw) }
+    }
+
+    private fun handleUpdateRelayPeers(raw: String) {
+        _state.update { it.copy(relayPeersRaw = raw) }
+    }
+
+    private fun handleApplyNetworkConfig() {
+        val bootstrapRaw = _state.value.bootstrapPeersRaw.trim()
+        val relayRaw = _state.value.relayPeersRaw.trim()
+        appPreferences.setBootstrapPeersRaw(bootstrapRaw)
+        appPreferences.setRelayPeersRaw(relayRaw)
+        restartP2PNode()
+        updateSuccess("Network config applied")
+    }
+
+    private fun restartP2PNode() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                p2pUseCase.stopNode()
+            }
+            startP2PNode()
+        }
+    }
+
+    private fun handleSetMarketEnabled(enabled: Boolean) {
+        appPreferences.setMarketEnabled(enabled)
+        _state.update { it.copy(marketEnabled = enabled, binanceError = null) }
+        if (enabled) {
+            startMarketDataLoop()
+            prefetchMarketData()
+            handleRefreshMarket()
+            updateSuccess("Market data enabled")
+        } else {
+            stopMarketDataLoop()
+            updateSuccess("Market data disabled")
+        }
+    }
+
+    private fun stopMarketDataLoop() {
+        marketLoopJob?.cancel()
+        marketLoopJob = null
+        _state.update { it.copy(binanceLoading = false, binanceStreamConnected = false) }
+    }
+
+    private fun handleResetNodeData() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { p2pUseCase.stopNode() }
+            runCatching { nodeDataDir.deleteRecursively() }
+            runCatching { dexRepository.resetRuntimeState() }
+            withContext(Dispatchers.Main) {
+                updateSuccess("Node data reset")
+                if (BuildConfig.P2P_AUTOSTART) {
+                    startP2PNode()
                 }
             }
         }
@@ -259,6 +344,35 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
             updateError("输入无效")
         }
     }
+
+    private fun handleSubmitDexOrder(event: UiIntent.SubmitDexOrder) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val price = event.price.toBigDecimalOrNull()
+            val amount = event.amountBase.toBigDecimalOrNull()
+            if (price == null || price <= BigDecimal.ZERO) {
+                updateError("无效价格")
+                return@launch
+            }
+            if (amount == null || amount <= BigDecimal.ZERO) {
+                updateError("无效数量")
+                return@launch
+            }
+            if (!_state.value.running) {
+                updateError("P2P 节点未启动")
+                return@launch
+            }
+            try {
+                p2pUseCase.submitDexOrder(
+                    side = event.side,
+                    price = price,
+                    amountBase = amount
+                )
+                updateSuccess("DEX 订单已广播: ${event.side} ${event.amountBase} @ ${event.price}")
+            } catch (e: Exception) {
+                handleError(e)
+            }
+        }
+    }
     
     private fun handleClaimAtomicSwap(event: UiIntent.ClaimAtomicSwap) {
         viewModelScope.launch {
@@ -307,12 +421,50 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     
     // Initialization
     private fun initialize() {
+        loadRuntimeConfig()
         collectWalletState()
+        collectDexState()
         collectP2PState()
-        startP2PNode()
-        startMarketDataLoop()
-        startWalletLoop()
-        prefetchMarketData()
+        if (BuildConfig.P2P_AUTOSTART) {
+            startP2PNode()
+        } else {
+            SecureLogger.i(TAG, "P2P autostart disabled")
+        }
+        if (_state.value.marketEnabled) {
+            startMarketDataLoop()
+            prefetchMarketData()
+        } else {
+            SecureLogger.i(TAG, "Market autostart disabled")
+        }
+        if (BuildConfig.WALLET_AUTOSTART) {
+            startWalletLoop()
+        } else {
+            SecureLogger.i(TAG, "Wallet autostart disabled")
+        }
+    }
+
+    private fun loadRuntimeConfig() {
+        val bootstrapRaw = appPreferences.getBootstrapPeersRaw()
+        val relayRaw = appPreferences.getRelayPeersRaw()
+        val marketEnabled = appPreferences.isMarketEnabled()
+        val intervalRaw = appPreferences.getMarketInterval(_state.value.binanceInterval)
+        val interval = if (BINANCE_INTERVALS.contains(intervalRaw)) intervalRaw else BINANCE_INTERVALS.first()
+        _state.update {
+            it.copy(
+                bootstrapPeersRaw = bootstrapRaw,
+                relayPeersRaw = relayRaw,
+                marketEnabled = marketEnabled,
+                binanceInterval = interval
+            )
+        }
+    }
+
+    private fun collectDexState() {
+        viewModelScope.launch {
+            dexRepository.klines().collect { klines ->
+                _state.update { it.copy(dexKlines = klines) }
+            }
+        }
     }
     
     private fun collectWalletState() {
@@ -342,12 +494,18 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
                 usdcBalance = BigDecimal.ZERO,
                 symbol = "BTC"
             )
-            val defaultBscAddress = walletUseCase.deriveBscAddress(BuildConfig.DEV_PRIVATE_KEY) ?: "0x..."
-            val defaultBscUsdc = walletUseCase.fetchBscUsdcBalance(
-                address = defaultBscAddress,
-                rpcUrl = Constants.Bsc.TESTNET_RPC_URLS.first(),
-                contract = Constants.Bsc.USDC_CONTRACT
-            )
+            val derivedBscAddress = walletUseCase.deriveBscAddress(BuildConfig.DEV_PRIVATE_KEY)
+            val defaultBscAddress = derivedBscAddress ?: "0x..."
+            val defaultBscUsdc =
+                if (derivedBscAddress != null) {
+                    walletUseCase.fetchBscUsdcBalance(
+                        address = derivedBscAddress,
+                        rpcUrl = Constants.Bsc.TESTNET_RPC_URLS.first(),
+                        contract = Constants.Bsc.USDC_CONTRACT
+                    )
+                } else {
+                    BigDecimal.ZERO
+                }
             _state.update {
                 val wallets = it.multiChainWallets.toMutableMap()
                 wallets.putIfAbsent("BTC", defaultBtc)
@@ -425,9 +583,57 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     }
     
     private fun startP2PNode() {
+        val mdnsEnabled = BuildConfig.DEBUG && BuildConfig.P2P_ENABLE_MDNS
+        if (mdnsEnabled) {
+            ensureMulticastLock()
+        } else {
+            releaseMulticastLock()
+        }
+        val bootstrapRaw = _state.value.bootstrapPeersRaw
+        val relayRaw = _state.value.relayPeersRaw
+        if (BuildConfig.DEBUG) {
+            Log.i(
+                TAG,
+                "startP2PNode: bootstrapRaw=$bootstrapRaw relayRaw=$relayRaw"
+            )
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val bootstrap = listOf("/dnsaddr/bootstrap.libp2p.io") 
-            p2pUseCase.startNode(bootstrap, emptyList())
+            try {
+                val bootstrap = MultiaddrListParser.parse(bootstrapRaw)
+                    .ifEmpty { listOf("/dnsaddr/bootstrap.libp2p.io") }
+                val relays = MultiaddrListParser.parse(relayRaw)
+                if (BuildConfig.DEBUG) {
+                    Log.i(TAG, "startP2PNode: parsed bootstrap=${bootstrap.size} relays=${relays.size}")
+                }
+                p2pUseCase.startNode(bootstrap, relays)
+            } catch (e: Exception) {
+                Log.e(TAG, "startP2PNode failed", e)
+            }
+        }
+    }
+
+    private fun ensureMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        try {
+            val wifi = getApplication<Application>()
+                .applicationContext
+                .getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifi.createMulticastLock("nimlibp2p-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            SecureLogger.i(TAG, "mDNS MulticastLock acquired")
+        } catch (e: Exception) {
+            SecureLogger.w(TAG, "mDNS MulticastLock unavailable", e)
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        val lock = multicastLock ?: return
+        multicastLock = null
+        try {
+            if (lock.isHeld) lock.release()
+        } catch (_: Exception) {
         }
     }
     
@@ -458,6 +664,7 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     override fun onCleared() {
         super.onCleared()
         p2pUseCase.stopNode()
+        releaseMulticastLock()
     }
     
     companion object {

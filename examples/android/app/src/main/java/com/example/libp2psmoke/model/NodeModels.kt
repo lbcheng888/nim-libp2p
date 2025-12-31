@@ -1,5 +1,6 @@
 package com.example.libp2psmoke.model
 
+import com.example.libp2psmoke.BuildConfig
 import com.example.libp2psmoke.dex.BinanceTicker
 import com.example.libp2psmoke.dex.OrderBookEntry
 import com.example.libp2psmoke.dex.DexKlineBucket
@@ -84,6 +85,9 @@ data class NodeUiState(
     val marketSource: String = "Binance",
     val marketLatencyMs: Long = 0L,
     val marketLatencies: List<MarketSourceLatency> = emptyList(),
+    val marketEnabled: Boolean = BuildConfig.MARKET_AUTOSTART,
+    val bootstrapPeersRaw: String = BuildConfig.LIBP2P_BOOTSTRAP_PEERS,
+    val relayPeersRaw: String = BuildConfig.LIBP2P_RELAY_PEERS,
     
     // Legacy fields (kept for compat, but prefer multiChainWallets)
     val btcBalance: BigDecimal = BigDecimal.ZERO,

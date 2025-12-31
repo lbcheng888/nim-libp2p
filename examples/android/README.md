@@ -9,6 +9,10 @@ FFI. The app bundles the following features:
 - Content feed publishing and snapshot rendering
 - Simple decentralized livestream publisher that emits raw text frames
 
+## Production baseline
+
+For the current “production delivery” hardening baseline (safe defaults + runtime-configurable connectivity), see `examples/android/PRODUCTION.md`.
+
 ## Prerequisites
 
 1. Build the shared Nim runtime and copy the native dependencies:

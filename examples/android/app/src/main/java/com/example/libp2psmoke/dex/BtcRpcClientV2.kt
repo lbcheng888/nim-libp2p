@@ -174,7 +174,7 @@ class BtcRpcClientV2(
         val result = rpcCall(config.url, "getbalance", JSONArray(), "1.0", authHeader)
         
         return when (result) {
-            is Number -> BigDecimal(result.toDouble())
+            is Number -> result.toString().toBigDecimalOrNull() ?: BigDecimal.ZERO
             is String -> result.toBigDecimalOrNull() ?: BigDecimal.ZERO
             else -> BigDecimal.ZERO
         }
@@ -224,7 +224,6 @@ class BtcRpcClientV2(
         }
     }
 }
-
 
 
 

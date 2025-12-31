@@ -179,8 +179,10 @@ proc initWallet*(seed: seq[byte]): MultiChainWallet =
 
   # 4. Derive SOL Key (Ed25519)
   let solSeed = sha256_bear(seed & "SOL".toBytes())
-  # Ed25519 Seed needs 32 bytes
-  let solSk = ed.EdPrivateKey.init(solSeed).get()
+  # `ed25519.EdPrivateKey` expects a 64-byte (seed||pubkey) encoding; use a
+  # deterministic DRBG seeded from `solSeed` to generate a valid key.
+  var solRng = HmacDrbgContext.init(solSeed)
+  let solSk = ed.EdPrivateKey.random(solRng)
   let solPk = solSk.getPublicKey()
   let solKp = KeyPair(kind: wtEd25519, skEd: solSk, pkEd: solPk)
   result.keys[ChainSOL] = solKp

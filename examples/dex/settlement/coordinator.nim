@@ -38,7 +38,15 @@ proc toUInt256(amount: float, decimals: int): UInt256 =
 
 proc newCrossChainCoordinator*(store: OrderStore, wallet: MultiChainWallet = nil): CrossChainCoordinator =
   new(result)
-  result.enabled = not getEnv("DEX_DISABLE_CROSSCHAIN").parseBool
+  let disableCrossChain = getEnv("DEX_DISABLE_CROSSCHAIN", "")
+  result.enabled =
+    if disableCrossChain.len == 0:
+      true
+    else:
+      try:
+        not disableCrossChain.parseBool
+      except ValueError:
+        true
   result.store = store
   result.wallet = wallet
   result.clients = initTable[ChainId, ChainClient]()

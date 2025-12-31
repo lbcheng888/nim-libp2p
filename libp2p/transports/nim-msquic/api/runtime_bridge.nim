@@ -645,6 +645,14 @@ proc closeStream*(bridge: RuntimeBridge; stream: HQUIC) =
     return
   bridge.api.StreamClose(stream)
 
+proc getListenerParam*(bridge: RuntimeBridge; listener: HQUIC;
+    paramId: uint32; buffer: pointer; bufferLength: var uint32): QUIC_STATUS =
+  if bridge.isNil or bridge.api.isNil or bridge.api.GetParam.isNil:
+    return QUIC_STATUS_INVALID_STATE
+  if listener.isNil:
+    return QUIC_STATUS_INVALID_PARAMETER
+  bridge.api.GetParam(listener, paramId, addr bufferLength, buffer)
+
 proc streamId*(bridge: RuntimeBridge; stream: HQUIC): Result[uint64, string] =
   if bridge.isNil or bridge.api.isNil or bridge.api.GetParam.isNil:
     return err("MsQuic runtime bridge unavailable")

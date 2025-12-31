@@ -29,7 +29,7 @@ type
 
 # --- Helpers ---
 
-proc writeUint32(buf: var seq[byte], val: uint32) =
+proc writeUint32*(buf: var seq[byte], val: uint32) =
   var tmp: uint32
   bigEndian32(addr tmp, unsafeAddr val)
   let p = cast[ptr array[4, byte]](addr tmp)
@@ -103,6 +103,80 @@ proc encodeInitialPacket*(destCid, srcCid: ConnectionId, token: seq[byte],
 
   # Payload (Frames)
   result.add(payload)
+
+proc encodeShortHeaderPacket*(destCid: ConnectionId, packetNumber: uint32, 
+                              payload: seq[byte]): seq[byte] =
+  # RFC 9000 Section 17.3.1. Short Header
+  # First Byte: 01000000 (0x40) | (Type=0 for 1-RTT? No, Fixed Bit 1)
+  # Short Header: 0 | 1 | Spin | Reserved | KeyPhase | PacketNumberLength
+  # Fixed Bit = 1 (0x40). 
+  # Spin = 0 (for now)
+  # KeyPhase = 0
+  # PN Length = 2 bytes (0x01) -> 3? No, 0=1byte, 1=2bytes, 2=3bytes, 3=4bytes.
+  # Let's use 4-byte PN (0x03).
+  # Byte: 01000011 -> 0x43
+  var firstByte = 0x43'u8
+  result.add(firstByte)
+  
+  result.add(destCid)
+  
+  # Packet Number (4 bytes)
+  result.writeUint32(packetNumber)
+  
+  # Payload
+  result.add(payload)
+
+# --- Frame Encoding ---
+
+type
+  FrameType* = enum
+    ftPadding = 0x00
+    ftPing = 0x01
+    ftAck = 0x02 # ... 0x03
+    ftResetStream = 0x04
+    ftStopSending = 0x05
+    ftCrypto = 0x06
+    ftNewToken = 0x07
+    ftStream = 0x08 # 0x08..0x0F
+    ftMaxData = 0x10
+    ftMaxStreamData = 0x11
+    # ... others omitted for brevity
+  
+  CryptoFrame* = object
+    offset*: uint64
+    length*: uint64
+    data*: seq[byte]
+
+  AckFrame* = object
+    largestAcked*: uint64
+    delay*: uint64
+    rangeCount*: uint64
+    firstRange*: uint64
+
+proc encodeStreamFrame*(streamId: uint64, data: seq[byte], offset: uint64, fin: bool): seq[byte] =
+  # STREAM Frame Layout:
+  # Type (0x08..0x0F):
+  #   0x08 | OFF=1 | LEN=1 | FIN=1
+  #   OFF (0x04): Data has offset? (If 0, offset is 0)
+  #   LEN (0x02): Length field present? (If 0, data extends to end of packet)
+  #   FIN (0x01): Unknown size? No, FIN bit.
+  
+  var typeByte = 0x08'u8
+  if offset > 0:
+    typeByte = typeByte or 0x04'u8
+  # We always include Length for safety in this implementation
+  typeByte = typeByte or 0x02'u8 
+  if fin:
+    typeByte = typeByte or 0x01'u8
+    
+  result.add(typeByte)
+  result.writeVarInt(streamId)
+  if offset > 0:
+    result.writeVarInt(offset)
+  
+  # Length
+  result.writeVarInt(uint64(data.len))
+  result.add(data)
 
 # --- Decoding ---
 
@@ -258,3 +332,36 @@ proc parseUnprotectedHeader*(data: seq[byte]): UnprotectedHeader =
     
     # Now `pos` is pointing to Packet Number (Protected)
     result.payloadOffset = pos
+
+proc parseCryptoFrame*(data: openArray[byte], pos: var int): CryptoFrame =
+  # Assumes caller checked Type == 0x06
+  # Offset (VarInt)
+  result.offset = readVarInt(data, pos)
+  # Length (VarInt)
+  result.length = readVarInt(data, pos)
+  # Data
+  if pos + int(result.length) <= data.len:
+    result.data = @(data[pos ..< pos + int(result.length)])
+    pos += int(result.length)
+
+proc encodeAckFrame*(largestAcked: uint64, delay: uint64): seq[byte] =
+  # RFC 9000 Section 19.3.1. ACK Frame
+  # Type (0x02)
+  result.add(0x02'u8)
+  
+  # Largest Acknowledged (VarInt)
+  result.writeVarInt(largestAcked)
+  
+  # ACK Delay (VarInt)
+  result.writeVarInt(delay)
+  
+  # ACK Range Count (VarInt)
+  # 0 means just the First Block
+  result.writeVarInt(0)
+  
+  # First ACK Range (VarInt)
+  # Number of packets preceding Largest Acked that are also acked.
+  # For cumulative ack from 0 to LargestAcked, Range = LargestAcked.
+  result.writeVarInt(largestAcked) 
+  # Note: This implies 0..LargestAcked are ALL received.
+
