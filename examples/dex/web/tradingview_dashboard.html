@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC/USDT 专业交易面板</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b111b;
+      --panel: #121a24;
+      --panel-elevated: #1b2635;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f5f7fb;
+      --muted: #8a98b5;
+      --bull: #2ecb7f;
+      --bear: #ff5b5b;
+      --accent: #3b82f6;
+    }
+    * {
+      box-sizing: border-box;
+      font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #142031, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      padding: 32px;
+    }
+    a {
+      color: var(--accent);
+    }
+    .app-shell {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+    }
+    .header h1 {
+      font-size: 28px;
+      margin: 0;
+    }
+    .header span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 30px 60px rgba(0, 0, 0, 0.35);
+    }
+    .panel.elevated {
+      background: var(--panel-elevated);
+    }
+    .price-line {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+    }
+    .price-line .price {
+      font-size: 42px;
+      font-weight: 600;
+    }
+    .price-line .change {
+      font-size: 18px;
+      font-weight: 500;
+    }
+    .stats {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 14px;
+    }
+    .stat label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .stat span {
+      display: block;
+      margin-top: 4px;
+      font-size: 16px;
+    }
+    .intervals {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .intervals button {
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      padding: 6px 16px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: 0.2s;
+      font-weight: 500;
+    }
+    .intervals button.active {
+      background: var(--accent);
+      color: white;
+      border-color: transparent;
+      box-shadow: 0 8px 16px rgba(59, 130, 246, 0.35);
+    }
+    .chart-panel {
+      padding: 0;
+      overflow: hidden;
+    }
+    .chart-toolbar {
+      display: flex;
+      justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .chart-toolbar span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    #chart-container {
+      width: 100%;
+      height: 520px;
+    }
+    .order-forms {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .order-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .order-card h3 {
+      margin: 0 0 12px;
+      font-size: 18px;
+    }
+    .order-card label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .order-card input {
+      width: 100%;
+      margin-top: 6px;
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--text);
+      font-size: 15px;
+    }
+    .order-card .total {
+      font-size: 14px;
+      margin-bottom: 12px;
+      color: var(--muted);
+    }
+    .order-card button {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    .order-card button.buy {
+      background: var(--bull);
+      color: #041811;
+      box-shadow: 0 10px 35px rgba(46, 203, 127, 0.35);
+    }
+    .order-card button.sell {
+      background: var(--bear);
+      color: #2b0404;
+      box-shadow: 0 10px 35px rgba(255, 91, 91, 0.35);
+    }
+    .orderbook {
+      margin-top: 20px;
+    }
+    .orderbook table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .orderbook th, .orderbook td {
+      text-align: right;
+      padding: 6px 0;
+    }
+    .orderbook th {
+      color: var(--muted);
+      font-weight: 500;
+      border-bottom: 1px solid var(--border);
+    }
+    .orderbook td.price {
+      font-weight: 600;
+    }
+    .orderbook tbody tr {
+      position: relative;
+    }
+    .orderbook tbody tr::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      opacity: 0.25;
+      pointer-events: none;
+    }
+    .orderbook tbody tr.ask::before {
+      background: var(--bear);
+    }
+    .orderbook tbody tr.bid::before {
+      background: var(--bull);
+    }
+    .orderbook tbody tr .bar {
+      position: absolute;
+      inset: 0;
+      opacity: 0.12;
+    }
+    .orderbook tbody tr .bar.ask {
+      background: var(--bear);
+    }
+    .orderbook tbody tr .bar.bid {
+      background: var(--bull);
+    }
+    .recent-trades,
+    .user-orders {
+      margin-top: 20px;
+    }
+    .recent-trades ul,
+    .user-orders ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .recent-trades li,
+    .user-orders li {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .user-orders li {
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .user-orders li span.status {
+      font-weight: 600;
+    }
+    .footer-note {
+      margin-top: 24px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+    @media (max-width: 1100px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 720px) {
+      body {
+        padding: 16px;
+      }
+      .order-forms {
+        grid-template-columns: 1fr;
+      }
+      #chart-container {
+        height: 420px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <section class="header">
+      <div>
+        <h1>BTC/USDT 交易终端</h1>
+        <span>基于 TradingView Lightweight Charts · 实时数据来源：Binance API</span>
+      </div>
+      <div>
+        <span id="last-update">最后更新：--</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="left-column">
+        <article class="panel elevated">
+          <div class="price-line">
+            <span class="price" id="ticker-price">--</span>
+            <span class="change" id="ticker-change">--</span>
+          </div>
+          <div class="stats">
+            <div class="stat">
+              <label>24H 高</label>
+              <span id="high-price">--</span>
+            </div>
+            <div class="stat">
+              <label>24H 低</label>
+              <span id="low-price">--</span>
+            </div>
+            <div class="stat">
+              <label>24H 量 (BTC)</label>
+              <span id="volume-base">--</span>
+            </div>
+            <div class="stat">
+              <label>24H 量 (USDT)</label>
+              <span id="volume-quote">--</span>
+            </div>
+          </div>
+          <div class="intervals" id="interval-buttons"></div>
+        </article>
+
+        <article class="panel chart-panel">
+          <div class="chart-toolbar">
+            <span>专业 K 线（实时刷新）</span>
+            <span id="chart-status">加载中…</span>
+          </div>
+          <div id="chart-container"></div>
+        </article>
+      </div>
+
+      <div class="right-column">
+        <article class="panel elevated">
+          <h2 style="margin-top:0">交易面板</h2>
+          <div class="order-forms">
+            <div class="order-card">
+              <h3>买入 BTC</h3>
+              <label for="buy-price">价格 (USDT)</label>
+              <input id="buy-price" type="number" step="0.1" placeholder="输入买入价格" />
+              <label for="buy-amount">数量 (BTC)</label>
+              <input id="buy-amount" type="number" step="0.0001" placeholder="输入买入数量" />
+              <div class="total" id="buy-total">总额：-- USDT</div>
+              <button class="buy" id="buy-submit">买入</button>
+            </div>
+            <div class="order-card">
+              <h3>卖出 BTC</h3>
+              <label for="sell-price">价格 (USDT)</label>
+              <input id="sell-price" type="number" step="0.1" placeholder="输入卖出价格" />
+              <label for="sell-amount">数量 (BTC)</label>
+              <input id="sell-amount" type="number" step="0.0001" placeholder="输入卖出数量" />
+              <div class="total" id="sell-total">总额：-- USDT</div>
+              <button class="sell" id="sell-submit">卖出</button>
+            </div>
+          </div>
+          <div id="order-feedback" style="margin-top:12px;font-size:13px;color:var(--muted);"></div>
+        </article>
+
+        <article class="panel elevated orderbook">
+          <h3 style="margin-top:0">盘口深度 (前 10 档)</h3>
+          <table>
+            <thead>
+              <tr>
+                <th style="text-align:left">方向</th>
+                <th>价格</th>
+                <th>数量 (BTC)</th>
+                <th>累计</th>
+              </tr>
+            </thead>
+            <tbody id="asks-body"></tbody>
+            <tbody id="bids-body"></tbody>
+          </table>
+        </article>
+
+        <article class="panel elevated recent-trades">
+          <h3 style="margin-top:0">最新成交</h3>
+          <ul id="recent-trades"></ul>
+        </article>
+
+        <article class="panel elevated user-orders">
+          <h3 style="margin-top:0">模拟撮合订单</h3>
+          <ul id="user-orders"></ul>
+        </article>
+      </div>
+    </section>
+
+    <p class="footer-note">
+      无需后端即可本地查看：直接用浏览器打开本文件即可体验。网络请求依赖 Binance 公共 REST API。
+    </p>
+  </main>
+
+  <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script>
+    const SYMBOL = 'BTCUSDT';
+    const SYMBOL_STREAM = SYMBOL.toLowerCase();
+    const BASE_URL = 'https://api.binance.com';
+    const WS_BASE = 'wss://stream.binance.com:9443';
+    const INTERVALS = ['1m','5m','15m','30m','1h','4h','1d'];
+    const state = {
+      interval: '1h',
+      chart: null,
+      candleSeries: null,
+      volumeSeries: null,
+      candles: [],
+      volumes: [],
+      socket: null,
+      reconnectTimer: null,
+      lastPrice: null,
+      recentTrades: [],
+      userOrders: [],
+    };
+
+    const dom = {
+      price: document.getElementById('ticker-price'),
+      change: document.getElementById('ticker-change'),
+      high: document.getElementById('high-price'),
+      low: document.getElementById('low-price'),
+      volBase: document.getElementById('volume-base'),
+      volQuote: document.getElementById('volume-quote'),
+      lastUpdate: document.getElementById('last-update'),
+      chartStatus: document.getElementById('chart-status'),
+      intervalButtons: document.getElementById('interval-buttons'),
+      asksBody: document.getElementById('asks-body'),
+      bidsBody: document.getElementById('bids-body'),
+      recentTrades: document.getElementById('recent-trades'),
+      buyPrice: document.getElementById('buy-price'),
+      buyAmount: document.getElementById('buy-amount'),
+      buyTotal: document.getElementById('buy-total'),
+      sellPrice: document.getElementById('sell-price'),
+      sellAmount: document.getElementById('sell-amount'),
+      sellTotal: document.getElementById('sell-total'),
+      orderFeedback: document.getElementById('order-feedback'),
+      buySubmit: document.getElementById('buy-submit'),
+      sellSubmit: document.getElementById('sell-submit'),
+      userOrders: document.getElementById('user-orders'),
+    };
+
+    class DemoMatchingApi {
+      constructor() {
+        this.sequence = 1;
+      }
+      submitOrder(order) {
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            const id = `SIM-${String(this.sequence++).padStart(4, '0')}`;
+            const price = parseFloat(order.price);
+            const amount = parseFloat(order.amount);
+            const marketPrice = state.lastPrice ?? price;
+            const crosses =
+              (order.side === 'BUY' && price >= marketPrice) ||
+              (order.side === 'SELL' && price <= marketPrice);
+            const executed = crosses ? amount : parseFloat((amount * 0.25).toFixed(4));
+            resolve({
+              id,
+              side: order.side,
+              price,
+              amount,
+              executed,
+              remaining: Math.max(0, parseFloat((amount - executed).toFixed(4))),
+              avgPrice: crosses ? marketPrice : price,
+              status: executed >= amount ? 'FILLED' : executed > 0 ? 'PARTIAL' : 'OPEN',
+              timestamp: Date.now(),
+            });
+          }, 400 + Math.random() * 400);
+        });
+      }
+    }
+    const matchingApi = new DemoMatchingApi();
+
+    function formatNumber(value, digits = 2) {
+      if (value === undefined || value === null || isNaN(value)) return '--';
+      return Number(value).toLocaleString('en-US', {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
+    }
+
+    function setLastUpdate() {
+      dom.lastUpdate.textContent = '最后更新：' + new Date().toLocaleTimeString();
+    }
+
+    function prefillPriceInputs(price) {
+      if (!price) return;
+      const formatted = Number(price).toFixed(2);
+      [dom.buyPrice, dom.sellPrice].forEach(input => {
+        if (!input) return;
+        const active = document.activeElement === input;
+        if (!active || !input.value) {
+          input.value = formatted;
+        }
+      });
+      updateTotals();
+    }
+
+    function buildIntervals() {
+      INTERVALS.forEach(interval => {
+        const btn = document.createElement('button');
+        btn.textContent = interval;
+        btn.dataset.interval = interval;
+        btn.addEventListener('click', () => handleIntervalChange(interval));
+        dom.intervalButtons.appendChild(btn);
+      });
+      syncIntervalButtons();
+    }
+
+    async function handleIntervalChange(interval) {
+      if (state.interval === interval) return;
+      state.interval = interval;
+      syncIntervalButtons();
+      await loadKlines();
+      connectStreams();
+    }
+
+    function syncIntervalButtons() {
+      dom.intervalButtons.querySelectorAll('button').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.interval === state.interval);
+      });
+    }
+
+    function initChart() {
+      state.chart = LightweightCharts.createChart(document.getElementById('chart-container'), {
+        layout: {
+          background: { color: 'transparent' },
+          textColor: '#94a3b8',
+        },
+        rightPriceScale: {
+          borderColor: 'rgba(134, 143, 160, 0.4)',
+        },
+        timeScale: {
+          borderColor: 'rgba(134, 143, 160, 0.4)',
+          timeVisible: true,
+          secondsVisible: false,
+        },
+        grid: {
+          vertLines: { color: 'rgba(134, 143, 160, 0.15)' },
+          horzLines: { color: 'rgba(134, 143, 160, 0.15)' },
+        },
+        crosshair: {
+          mode: LightweightCharts.CrosshairMode.Normal,
+        },
+        localization: {
+          priceFormatter: (p) => Number(p).toFixed(2),
+        },
+      });
+      state.candleSeries = state.chart.addCandlestickSeries({
+        upColor: '#26a69a',
+        downColor: '#ef5350',
+        borderDownColor: '#ef5350',
+        borderUpColor: '#26a69a',
+        wickDownColor: '#ef5350',
+        wickUpColor: '#26a69a',
+      });
+      state.volumeSeries = state.chart.addHistogramSeries({
+        priceFormat: { type: 'volume' },
+        priceScaleId: '',
+        color: '#3b82f6',
+        scaleMargins: {
+          top: 0.8,
+          bottom: 0,
+        },
+      });
+      state.chart.priceScale('').applyOptions({
+        scaleMargins: {
+          top: 0.8,
+          bottom: 0,
+        },
+      });
+      const handleResize = () => {
+        const container = document.getElementById('chart-container');
+        if (container && state.chart) {
+          state.chart.applyOptions({ width: container.clientWidth });
+        }
+      };
+      window.addEventListener('resize', handleResize);
+      handleResize();
+    }
+
+    async function fetchJson(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    async function loadTicker() {
+      try {
+        const data = await fetchJson(`${BASE_URL}/api/v3/ticker/24hr?symbol=${SYMBOL}`);
+        applyTickerData({
+          lastPrice: data.lastPrice,
+          changePercent: data.priceChangePercent,
+          high: data.highPrice,
+          low: data.lowPrice,
+          volume: data.volume,
+          quoteVolume: data.quoteVolume,
+        });
+        setLastUpdate();
+      } catch (err) {
+        console.error('ticker error', err);
+      }
+    }
+
+    function applyTickerData(payload) {
+      const change = parseFloat(payload.changePercent);
+      dom.price.textContent = formatNumber(payload.lastPrice, 2);
+      dom.change.textContent = `${change >= 0 ? '+' : ''}${formatNumber(change, 2)}%`;
+      dom.change.style.color = change >= 0 ? 'var(--bull)' : 'var(--bear)';
+      dom.high.textContent = formatNumber(payload.high, 2);
+      dom.low.textContent = formatNumber(payload.low, 2);
+      dom.volBase.textContent = formatNumber(payload.volume, 2);
+      dom.volQuote.textContent = formatNumber(payload.quoteVolume, 0);
+      state.lastPrice = parseFloat(payload.lastPrice);
+      prefillPriceInputs(payload.lastPrice);
+    }
+
+    async function loadKlines() {
+      dom.chartStatus.textContent = '加载中…';
+      try {
+        const klines = await fetchJson(`${BASE_URL}/api/v3/klines?symbol=${SYMBOL}&interval=${state.interval}&limit=500`);
+        state.candles = klines.map(k => ({
+          time: k[0] / 1000,
+          open: parseFloat(k[1]),
+          high: parseFloat(k[2]),
+          low: parseFloat(k[3]),
+          close: parseFloat(k[4]),
+        }));
+        state.volumes = klines.map(k => ({
+          time: k[0] / 1000,
+          value: parseFloat(k[5]),
+          color: parseFloat(k[4]) >= parseFloat(k[1]) ? '#26a69a' : '#ef5350',
+        }));
+        state.candleSeries.setData(state.candles);
+        state.volumeSeries.setData(state.volumes);
+        dom.chartStatus.textContent = `K 线：${state.interval} · ${state.candles.length} 条`;
+      } catch (err) {
+        dom.chartStatus.textContent = '加载失败，请稍后重试';
+        console.error('klines error', err);
+      }
+    }
+
+    async function loadDepth() {
+      try {
+        const depth = await fetchJson(`${BASE_URL}/api/v3/depth?symbol=${SYMBOL}&limit=20`);
+        renderDepth(dom.asksBody, depth.asks, 'ask');
+        renderDepth(dom.bidsBody, depth.bids, 'bid');
+      } catch (err) {
+        console.error('depth error', err);
+      }
+    }
+
+    function renderDepth(target, rows, type) {
+      target.innerHTML = '';
+      if (!rows || rows.length === 0) return;
+      const sanitized = rows
+        .filter(([, qty]) => parseFloat(qty) > 0)
+        .slice(0, 10);
+      let cumulative = 0;
+      const totals = sanitized.map(([, qty]) => {
+        cumulative += parseFloat(qty);
+        return cumulative;
+      });
+      const maxTotal = totals.length ? Math.max(...totals) : 0.0001;
+      cumulative = 0;
+      sanitized.forEach(([price, qty]) => {
+        const quantity = parseFloat(qty);
+        cumulative += quantity;
+        const tr = document.createElement('tr');
+        tr.classList.add(type);
+        const dir = type === 'ask' ? '卖' : '买';
+        const pct = maxTotal > 0 ? (cumulative / maxTotal) * 100 : 0;
+        tr.innerHTML = `
+          <td style="text-align:left">${dir}</td>
+          <td class="price">${formatNumber(price, 2)}</td>
+          <td>${formatNumber(quantity, 4)}</td>
+          <td>${formatNumber(cumulative, 4)}</td>
+        `;
+        const bar = document.createElement('span');
+        bar.className = 'bar ' + type;
+        bar.style.width = pct + '%';
+        tr.prepend(bar);
+        target.appendChild(tr);
+      });
+    }
+
+    async function loadRecentTrades() {
+      try {
+        const trades = await fetchJson(`${BASE_URL}/api/v3/trades?symbol=${SYMBOL}&limit=20`);
+        state.recentTrades = trades.map(trade => ({
+          side: trade.isBuyerMaker ? 'SELL' : 'BUY',
+          price: parseFloat(trade.price),
+          qty: parseFloat(trade.qty),
+        }));
+        renderRecentTrades(state.recentTrades);
+      } catch (err) {
+        console.error('trades error', err);
+      }
+    }
+
+    function renderRecentTrades(list) {
+      dom.recentTrades.innerHTML = '';
+      if (!list || list.length === 0) {
+        const li = document.createElement('li');
+        li.textContent = '暂无成交数据';
+        li.style.color = 'var(--muted)';
+        dom.recentTrades.appendChild(li);
+        return;
+      }
+      list.forEach(trade => {
+        const li = document.createElement('li');
+        li.style.color = trade.side === 'SELL' ? 'var(--bear)' : 'var(--bull)';
+        li.innerHTML = `
+          <span>${trade.side === 'SELL' ? '卖出' : '买入'}</span>
+          <span>${formatNumber(trade.price, 2)}</span>
+          <span>${formatNumber(trade.qty, 4)} BTC</span>
+        `;
+        dom.recentTrades.appendChild(li);
+      });
+    }
+
+    function renderUserOrders() {
+      dom.userOrders.innerHTML = '';
+      if (state.userOrders.length === 0) {
+        const li = document.createElement('li');
+        li.textContent = '暂无模拟订单';
+        li.style.color = 'var(--muted)';
+        dom.userOrders.appendChild(li);
+        return;
+      }
+      state.userOrders.forEach(order => {
+        const li = document.createElement('li');
+        li.style.color = order.side === 'BUY' ? 'var(--bull)' : 'var(--bear)';
+        li.innerHTML = `
+          <span>#${order.id}</span>
+          <span>${order.side === 'BUY' ? '买入' : '卖出'} ${formatNumber(order.amount, 4)} BTC @ ${formatNumber(order.price, 2)}</span>
+          <span>${new Date(order.timestamp).toLocaleTimeString()}</span>
+          <span class="status">${order.status}</span>
+        `;
+        dom.userOrders.appendChild(li);
+      });
+    }
+
+    function updateTotals() {
+      const buyPrice = parseFloat(dom.buyPrice?.value);
+      const buyAmount = parseFloat(dom.buyAmount?.value);
+      const sellPrice = parseFloat(dom.sellPrice?.value);
+      const sellAmount = parseFloat(dom.sellAmount?.value);
+      dom.buyTotal.textContent = '总额：' +
+        (isFinite(buyPrice) && isFinite(buyAmount) ? `${formatNumber(buyPrice * buyAmount, 2)} USDT` : '-- USDT');
+      dom.sellTotal.textContent = '总额：' +
+        (isFinite(sellPrice) && isFinite(sellAmount) ? `${formatNumber(sellPrice * sellAmount, 2)} USDT` : '-- USDT');
+    }
+
+    function wireOrderForms() {
+      ['buyPrice','buyAmount','sellPrice','sellAmount'].forEach(key => {
+        if (dom[key]) dom[key].addEventListener('input', updateTotals);
+      });
+      dom.buySubmit?.addEventListener('click', () => submitOrderFromForm('BUY'));
+      dom.sellSubmit?.addEventListener('click', () => submitOrderFromForm('SELL'));
+    }
+
+    function submitOrderFromForm(side) {
+      const priceInput = side === 'BUY' ? dom.buyPrice : dom.sellPrice;
+      const amountInput = side === 'BUY' ? dom.buyAmount : dom.sellAmount;
+      handleOrder(side, priceInput?.value, amountInput?.value);
+    }
+
+    async function handleOrder(side, price, amount) {
+      if (!price || !amount) {
+        dom.orderFeedback.textContent = '请填写完整价格与数量。';
+        dom.orderFeedback.style.color = 'var(--bear)';
+        return;
+      }
+      dom.orderFeedback.textContent = '撮合中…';
+      dom.orderFeedback.style.color = 'var(--muted)';
+      try {
+        const result = await matchingApi.submitOrder({ side, price, amount });
+        state.userOrders.unshift(result);
+        if (state.userOrders.length > 12) {
+          state.userOrders.pop();
+        }
+        dom.orderFeedback.textContent =
+          `订单 ${result.id} ${result.status}：成交 ${formatNumber(result.executed, 4)}/${formatNumber(result.amount, 4)} BTC @ ${formatNumber(result.avgPrice ?? result.price, 2)} USDT`;
+        dom.orderFeedback.style.color = 'var(--accent)';
+        renderUserOrders();
+        if (result.status === 'FILLED') {
+          const amountInput = side === 'BUY' ? dom.buyAmount : dom.sellAmount;
+          if (amountInput) amountInput.value = '';
+          updateTotals();
+        }
+      } catch (err) {
+        dom.orderFeedback.textContent = '撮合服务不可用';
+        dom.orderFeedback.style.color = 'var(--bear)';
+      }
+    }
+
+    function upsertSeries(collection, point, limit = 500) {
+      if (collection.length === 0) {
+        collection.push(point);
+        return;
+      }
+      const last = collection[collection.length - 1];
+      if (last.time === point.time) {
+        collection[collection.length - 1] = point;
+        return;
+      }
+      if (point.time > last.time) {
+        collection.push(point);
+        if (collection.length > limit) {
+          collection.shift();
+        }
+        return;
+      }
+      const idx = collection.findIndex(item => item.time === point.time);
+      if (idx >= 0) {
+        collection[idx] = point;
+      }
+    }
+
+    function handleKlineStream(kline) {
+      if (!kline) return;
+      const candle = {
+        time: kline.t / 1000,
+        open: parseFloat(kline.o),
+        high: parseFloat(kline.h),
+        low: parseFloat(kline.l),
+        close: parseFloat(kline.c),
+      };
+      const volume = {
+        time: candle.time,
+        value: parseFloat(kline.v),
+        color: candle.close >= candle.open ? '#26a69a' : '#ef5350',
+      };
+      upsertSeries(state.candles, candle);
+      upsertSeries(state.volumes, volume);
+      state.candleSeries.setData(state.candles);
+      state.volumeSeries.setData(state.volumes);
+      dom.chartStatus.textContent = `K 线：${state.interval} · 实时`;
+    }
+
+    function updateDepthFromStream(data) {
+      if (!data) return;
+      renderDepth(dom.asksBody, data.a || [], 'ask');
+      renderDepth(dom.bidsBody, data.b || [], 'bid');
+    }
+
+    function updateTradesFromStream(data) {
+      if (!data) return;
+      const trade = {
+        side: data.m ? 'SELL' : 'BUY',
+        price: parseFloat(data.p),
+        qty: parseFloat(data.q),
+      };
+      state.recentTrades.unshift(trade);
+      state.recentTrades = state.recentTrades.slice(0, 20);
+      renderRecentTrades(state.recentTrades);
+    }
+
+    function updateTickerFromStream(data) {
+      if (!data) return;
+      applyTickerData({
+        lastPrice: data.c,
+        changePercent: data.P,
+        high: data.h,
+        low: data.l,
+        volume: data.v,
+        quoteVolume: data.q,
+      });
+      setLastUpdate();
+    }
+
+    function handleStreamMessage(payload) {
+      if (!payload || !payload.stream || !payload.data) return;
+      const stream = payload.stream;
+      if (stream.endsWith('@ticker')) {
+        updateTickerFromStream(payload.data);
+      } else if (stream.includes('@kline_')) {
+        handleKlineStream(payload.data.k);
+      } else if (stream.includes('@depth')) {
+        updateDepthFromStream(payload.data);
+      } else if (stream.endsWith('@trade')) {
+        updateTradesFromStream(payload.data);
+      }
+    }
+
+    function connectStreams() {
+      if (state.socket) {
+        state.socket.onclose = null;
+        state.socket.close();
+      }
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
+      const streams = [
+        `${SYMBOL_STREAM}@ticker`,
+        `${SYMBOL_STREAM}@depth20@100ms`,
+        `${SYMBOL_STREAM}@trade`,
+        `${SYMBOL_STREAM}@kline_${state.interval}`,
+      ];
+      const url = `${WS_BASE}/stream?streams=${streams.join('/')}`;
+      const socket = new WebSocket(url);
+      state.socket = socket;
+      socket.onopen = () => {
+        dom.chartStatus.textContent = `K 线：${state.interval} · 已接入 WebSocket`;
+      };
+      socket.onmessage = event => {
+        try {
+          const payload = JSON.parse(event.data);
+          handleStreamMessage(payload);
+        } catch (err) {
+          console.error('ws parse error', err);
+        }
+      };
+      socket.onerror = () => socket.close();
+      socket.onclose = event => {
+        if (state.socket === socket) {
+          state.socket = null;
+        }
+        if (event.wasClean) return;
+        scheduleReconnect();
+      };
+    }
+
+    function scheduleReconnect() {
+      if (state.reconnectTimer) return;
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        connectStreams();
+      }, 2000);
+    }
+
+    async function loadInitialData() {
+      await Promise.all([loadTicker(), loadDepth(), loadRecentTrades()]);
+      await loadKlines();
+    }
+
+    async function bootstrap() {
+      buildIntervals();
+      initChart();
+      wireOrderForms();
+      renderUserOrders();
+      await loadInitialData();
+      connectStreams();
+    }
+
+    bootstrap().catch(err => console.error('bootstrap error', err));
+    window.addEventListener('beforeunload', () => {
+      state.socket?.close();
+    });
+  </script>
+</body>
+</html>

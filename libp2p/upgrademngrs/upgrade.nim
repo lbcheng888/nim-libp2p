@@ -1,0 +1,82 @@
+# Nim-LibP2P
+# Copyright (c) 2023-2024 Status Research & Development GmbH
+# Licensed under either of
+#  * Apache License, version 2.0, ([LICENSE-APACHE](LICENSE-APACHE))
+#  * MIT license ([LICENSE-MIT](LICENSE-MIT))
+# at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+{.push gcsafe.}
+{.push raises: [].}
+
+import std/[sequtils]
+import pkg/[chronos, chronicles, metrics]
+
+import
+  ../stream/connection,
+  ../protocols/secure/secure,
+  ../protocols/identify,
+  ../muxers/muxer,
+  ../multistream,
+  ../connmanager,
+  ../errors,
+  ../utility
+
+export connmanager, connection, identify, secure, multistream
+
+declarePublicCounter(
+  libp2p_failed_upgrades_incoming, "incoming connections failed upgrades"
+)
+declarePublicCounter(
+  libp2p_failed_upgrades_outgoing, "outgoing connections failed upgrades"
+)
+
+logScope:
+  topics = "libp2p upgrade"
+
+type
+  UpgradeFailedError* = object of LPError
+
+  Upgrade* = ref object of RootObj
+    ms*: MultistreamSelect
+    secureManagers*: seq[Secure]
+
+method upgrade*(
+    self: Upgrade, conn: Connection, peerId: Opt[PeerId]
+): Future[Muxer] {.async: (raises: [CancelledError, LPError], raw: true), base.} =
+  raiseAssert("[Upgrade.upgrade] abstract method not implemented!")
+
+proc secure*(
+    self: Upgrade, conn: Connection, peerId: Opt[PeerId]
+): Future[Connection] {.async: (raises: [CancelledError, LPError]).} =
+  if self.secureManagers.len <= 0:
+    raise (ref UpgradeFailedError)(msg: "No secure managers registered!")
+
+  when defined(libp2p_msquic_debug):
+    debug "Upgrade secure select begin", conn, direction = conn.dir
+  let codec =
+    if conn.dir == Out:
+      await self.ms.select(conn, self.secureManagers.mapIt(it.codec))
+    else:
+      await MultistreamSelect.handle(conn, self.secureManagers.mapIt(it.codec))
+  when defined(libp2p_msquic_debug):
+    debug "Upgrade secure select complete", conn, codec = codec
+  if codec.len == 0:
+    raise (ref UpgradeFailedError)(msg: "Unable to negotiate a secure channel!")
+
+  trace "Securing connection", conn, codec
+  let secureProtocol = self.secureManagers.filterIt(it.codec == codec)
+
+  # ms.select should deal with the correctness of this
+  # let's avoid duplicating checks but detect if it fails to do it properly
+  if secureProtocol.len == 0:
+    raise (ref UpgradeFailedError)(
+      msg: "Negotiated secure codec unavailable: " & codec
+    )
+
+  when defined(libp2p_msquic_debug):
+    debug "Upgrade secure protocol begin", conn, codec = codec
+  result = await secureProtocol[0].secure(conn, peerId)
+  when defined(libp2p_msquic_debug):
+    debug "Upgrade secure protocol complete", result, codec = codec

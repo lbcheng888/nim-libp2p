@@ -1,0 +1,95 @@
+when defined(libp2p_run_quic_handshake):
+  {.used.}
+
+  import chronos, chronicles, stew/byteutils
+  import ../libp2p/transports/quictransport
+  import ../libp2p/transports/transport
+  import ../libp2p/transports/tls/certificate
+  import ../libp2p/upgrademngrs/upgrade
+  import ../libp2p/multiaddress
+  import ../libp2p/stream/connection
+  import ../libp2p/errors
+  import ./helpers
+
+  const TestTimeout = 5.seconds
+
+  chronicles.setLogLevel(level = chronicles.LogLevel.DEBUG)
+
+  proc newTransport(isServer: bool): Future[QuicTransport] {.async.} =
+    let privateKey = PrivateKey.random(ECDSA, (newRng())[]).tryGet()
+    let transport = QuicTransport.new(Upgrade(), privateKey)
+    if isServer:
+      let listenAddr =
+        @[MultiAddress.init("/ip4/127.0.0.1/udp/0/quic-v1").tryGet()]
+      await transport.start(listenAddr)
+    return transport
+
+  proc withTimeout(fut: Future[void], label: string): Future[bool] {.async.} =
+    let completed = await chronos.withTimeout(fut, TestTimeout)
+    if completed:
+      if fut.failed():
+        raise fut.error()
+      return true
+    checkpoint(label & " timed out")
+    if not fut.finished():
+      fut.cancelSoon()
+    return false
+
+  suite "Quic handshake":
+    teardown:
+      checkTrackers()
+
+    asyncTest "client and server exchange payload":
+      let server = await newTransport(true)
+
+      let serverFuture = (
+        proc(): Future[void] =
+          proc inner() {.async.} =
+            let conn = await server.accept()
+            doAssert(conn of QuicSession, "accepted connection is not QuicSession")
+            let session = QuicSession(conn)
+            doAssert(not session.isNil, "wrapped session ref is nil")
+            let stream = await getStream(QuicSession(conn), Direction.In)
+            var payload: array[5, byte]
+            await stream.readExactly(addr payload, 5)
+            check string.fromBytes(payload) == "hello"
+            echo "server received hello"
+            await stream.write("world")
+            await stream.close()
+          inner()
+      )()
+
+      let clientFuture = (
+        proc(): Future[void] =
+          proc inner() {.async.} =
+            let client = await newTransport(false)
+            let conn = await client.dial("", server.addrs[0])
+            doAssert(not conn.isNil, "dial returned nil connection")
+            checkpoint("client dial completed")
+            let stream = await getStream(QuicSession(conn), Direction.Out)
+            await stream.write("hello")
+            echo "client wrote hello"
+            var reply: array[5, byte]
+            await stream.readExactly(addr reply, 5)
+            check string.fromBytes(reply) == "world"
+            await stream.close()
+            await client.stop()
+          inner()
+      )()
+
+      if not await withTimeout(clientFuture, "client session"):
+        serverFuture.cancelSoon()
+        await server.stop()
+        fail()
+
+      if not await withTimeout(serverFuture, "server session"):
+        await server.stop()
+        fail()
+
+      if not await withTimeout(server.stop(), "server stop"):
+        fail()
+else:
+  import ./helpers
+  suite "Quic handshake":
+    test "quic handshake test disabled":
+      skip()
