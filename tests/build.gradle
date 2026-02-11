@@ -1,0 +1,473 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.serialization'
+    id 'org.jetbrains.kotlin.kapt'
+}
+
+// 解析 ABI 选择（支持 -Pabi=arm64-v8a 或 -Pabis=arm64-v8a,x86_64 或 target triple 名字）
+ext.resolveSelectedAbis = {
+    def abiProp = project.findProperty('abi') ?: project.findProperty('abis')
+    def all = ['arm64-v8a','armeabi-v7a','x86_64']
+    // 默认仅构建 arm64（华为/HarmonyOS 主流）。如需多 ABI，请通过 -Pabis 指定。
+    if (!abiProp) return ['arm64-v8a']
+    def items = abiProp.toString().split(/[;,\s]+/).collect { it.trim() }.findAll { it }
+    def norm = items.collect { v ->
+        switch(v) {
+            case ['aarch64-linux-android','arm64','arm64-v8a']: return 'arm64-v8a'
+            case ['armv7-linux-androideabi','armeabi-v7a','armv7']: return 'armeabi-v7a'
+            case ['x86_64-linux-android','x86_64']: return 'x86_64'
+            default: return v
+        }
+    }.unique()
+    def valid = norm.findAll { all.contains(it) }
+    return valid.isEmpty() ? all : valid
+}
+
+def SELECTED_ABIS = resolveSelectedAbis()
+
+// 同步 Rust 生成的 .so 到 jniLibs，并可选调用脚本构建
+tasks.register("syncNative") {
+    group = "native"
+    description = "Build Nim libp2p shared library and sync into app/src/main/jniLibs"
+
+    doLast {
+        SELECTED_ABIS.each { abi ->
+            if (abi != 'arm64-v8a') {
+                logger.warn("ABI ${abi} is not yet supported by the Nim build scripts")
+            }
+        }
+
+        if (!SELECTED_ABIS.contains('arm64-v8a')) {
+            logger.lifecycle("No supported ABI selected; skipping Nim build")
+            return
+        }
+
+        def opensslCrypto = new File(rootDir, "build/openssl-android/android-arm64/lib/libcrypto.a")
+        if (!opensslCrypto.exists()) {
+            exec {
+                workingDir rootDir
+                commandLine "bash", "-lc", "scripts/build_openssl_android.sh 24"
+            }
+        }
+
+        exec {
+            workingDir rootDir
+            commandLine "bash", "-lc", "scripts/build_nim_android.sh"
+        }
+    }
+}
+
+// Ensure native .so is synced before building APKs (unless -Pskip_native=true)
+gradle.projectsEvaluated {
+    def skipNative = project.hasProperty('skip_native') && project.property('skip_native').toString().toBoolean()
+    if (!skipNative) {
+        tasks.matching { it.name == 'preBuild' }.all { t ->
+            t.dependsOn tasks.named('syncNative')
+        }
+    } else {
+        logger.lifecycle("skip_native=true -> do NOT depend on syncNative in preBuild")
+    }
+}
+
+    // Allow skipping native (CMake & Rust) in CI via -Pskip_native=true
+    if (project.hasProperty('skip_native') && project.property('skip_native').toString().toBoolean()) {
+        tasks.matching { t ->
+            t.name.startsWith('buildCMake') ||
+            t.name.startsWith('configureCMake') ||
+            t.name.contains('externalNativeBuild')
+        }.configureEach { t ->
+            t.enabled = false
+            logger.lifecycle("Disabled native build task ${t.path} due to -Pskip_native")
+        }
+    }
+
+
+// Environment handling: pass -Penv=dev|staging|prod (default dev)
+import java.util.Properties
+
+def envName = project.hasProperty('env') ? project.property('env') : 'dev'
+logger.lifecycle("Using env: ${envName}")
+
+def envProps = new Properties()
+def envFile = rootProject.file(".env.${envName}")
+if (envFile.exists()) {
+    envFile.withInputStream { envProps.load(it) }
+}
+
+def gradleEnvProps = new Properties()
+def gradleEnvFile = rootProject.file("gradle-${envName}.properties")
+if (gradleEnvFile.exists()) {
+    gradleEnvFile.withInputStream { gradleEnvProps.load(it) }
+}
+
+android {
+    namespace 'com.example.decentralizedapp'
+    compileSdk 34
+    testOptions {
+        unitTests.all {
+            // 可通过 -PonlyAddressTests=true 仅运行地址簿相关单测，避免受其他历史用例影响
+            if (project.hasProperty('onlyAddressTests') && project.property('onlyAddressTests').toString().toBoolean()) {
+                filter {
+                    includeTestsMatching "com.example.decentralizedapp.common.ContentManagerAddressTest"
+                }
+            }
+        }
+    }
+    ndkVersion '26.1.10909125'
+
+    defaultConfig {
+        applicationId "com.unimaker.app"
+        minSdk 24
+        targetSdk 34
+        // 支持通过 -PforceVersionCode 覆盖版本号，用于本地差分 E2E
+        versionCode (project.hasProperty('forceVersionCode') ? project.property('forceVersionCode').toInteger() : 1)
+        versionName "1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // Enable NDK for native libraries (respect -Pabi / -Pabis)
+        ndk {
+            abiFilters.clear()
+            SELECTED_ABIS.each { abiFilters += it }
+        }
+
+        // Expose env and gradle env properties to BuildConfig
+        (envProps + gradleEnvProps).each { k, v ->
+            def key = k.toString().toUpperCase().replaceAll('[^A-Z0-9_]', '_')
+            buildConfigField "String", key, '"' + v.toString().replace('"','\\"') + '"'
+        }
+        // Always provide BUILD_MANIFEST_URL with default empty string to avoid missing field at compile time
+        def manifestUrlProp = gradleEnvProps.getProperty('build_manifest_url', envProps.getProperty('build_manifest_url', ''))
+        buildConfigField "String", "BUILD_MANIFEST_URL", '"' + manifestUrlProp.replace('"','\\"') + '"'
+        // Map SDK (web) key placeholder; safe default empty
+        // AMap Web(JS) Key（用于 H5 选点）；你也可以用环境变量覆盖
+        def amapWebKey = (System.getenv('AMAP_WEB_KEY') ?: 'fb0a072dd39508c331ff429365c38b15')
+        buildConfigField "String", "AMAP_WEB_KEY", '"' + amapWebKey.replace('"','\\"') + '"'
+        buildConfigField "boolean", "LIBP2P_ONLY", "true"
+
+        // 平台积分账户（用于站内结算的收款地址/PeerId）。可通过环境变量 TREASURY_PEER_ID 或 gradle 属性 platform_treasury_peer 覆盖。
+        def treasuryPeer = (gradleEnvProps.getProperty('platform_treasury_peer', System.getenv('TREASURY_PEER_ID')) ?: 'platform_treasury')
+        buildConfigField "String", "PLATFORM_TREASURY", '"' + treasuryPeer.replace('"','\\"') + '"'
+
+        def contributionServiceUrl = envProps.getProperty('CONTRIBUTION_SERVICE_URL')
+        if (!contributionServiceUrl) {
+            contributionServiceUrl = envProps.getProperty('contribution_service_url')
+        }
+        if (!contributionServiceUrl) {
+            contributionServiceUrl = gradleEnvProps.getProperty('contribution_service_url')
+        }
+        if (!contributionServiceUrl) {
+            contributionServiceUrl = System.getenv('CONTRIBUTION_SERVICE_URL')
+        }
+        if (!contributionServiceUrl) {
+            contributionServiceUrl = "http://10.0.2.2:8137"
+        }
+        buildConfigField "String", "CONTRIBUTION_SERVICE_URL", '"' + contributionServiceUrl.replace('"','\\"') + '"'
+
+        def aiIngestUrl = gradleEnvProps.getProperty('ai_ingest_url',
+                envProps.getProperty('ai_ingest_url', System.getenv('AI_INGEST_URL')))
+        if (!aiIngestUrl) {
+            aiIngestUrl = "http://10.0.2.2:8288"
+        }
+        buildConfigField "String", "AI_INGEST_URL", '"' + aiIngestUrl.replace('"','\\"') + '"'
+
+        // Tor/arti payload 加密所需的共享密钥（可选通过 gradle-*.properties 覆盖）
+        def defaultPskSecret = '1c1b4e5bf9682412dd801c769d50b01f0bdd1221742864b47dc097460290bd25'
+        def pskSecretProp = gradleEnvProps.getProperty('network_psk_secret',
+                envProps.getProperty('network_psk_secret',
+                        System.getenv('UNIMAKER_PSK_SECRET') ?: defaultPskSecret))
+        buildConfigField "String", "NETWORK_PSK_SECRET", '"' + pskSecretProp.replace('"','\\"') + '"'
+
+        // Stablecoin bridge configuration (RPC/contract/token overrides via env or gradle properties)
+        def bridgeRpcPrimary = gradleEnvProps.getProperty('bridge_rpc_url', envProps.getProperty('bridge_rpc_url', System.getenv('BRIDGE_RPC_URL')))
+        def bridgeRpcFallbacks = gradleEnvProps.getProperty('bridge_rpc_fallbacks', envProps.getProperty('bridge_rpc_fallbacks', System.getenv('BRIDGE_RPC_FALLBACKS')))
+        def bridgeContract = gradleEnvProps.getProperty('bridge_contract_address', envProps.getProperty('bridge_contract_address', System.getenv('BRIDGE_CONTRACT_ADDRESS')))
+        def bridgeRegistry = gradleEnvProps.getProperty('bridge_registry_address', envProps.getProperty('bridge_registry_address', System.getenv('BRIDGE_REGISTRY_ADDRESS')))
+        def bridgeChainIdProp = gradleEnvProps.getProperty('bridge_chain_id', envProps.getProperty('bridge_chain_id', System.getenv('BRIDGE_CHAIN_ID')))
+        def bridgeChainId = bridgeChainIdProp ? bridgeChainIdProp.toLong() : 56L
+        def usdcAddress = gradleEnvProps.getProperty('bridge_usdc_address', envProps.getProperty('bridge_usdc_address', System.getenv('BRIDGE_USDC_ADDRESS')))
+        if (!usdcAddress) {
+            usdcAddress = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'
+        }
+        def usdtAddress = gradleEnvProps.getProperty('bridge_usdt_address', envProps.getProperty('bridge_usdt_address', System.getenv('BRIDGE_USDT_ADDRESS')))
+        if (!usdtAddress) {
+            usdtAddress = '0x55d398326f99059fF775485246999027B3197955'
+        }
+        def usdcDecimalsProp = gradleEnvProps.getProperty('bridge_usdc_decimals', envProps.getProperty('bridge_usdc_decimals', System.getenv('BRIDGE_USDC_DECIMALS')))
+        def usdtDecimalsProp = gradleEnvProps.getProperty('bridge_usdt_decimals', envProps.getProperty('bridge_usdt_decimals', System.getenv('BRIDGE_USDT_DECIMALS')))
+        def usdcDecimals = usdcDecimalsProp ? usdcDecimalsProp.toInteger() : 18
+        def usdtDecimals = usdtDecimalsProp ? usdtDecimalsProp.toInteger() : 18
+        def bridgeMinConfProp = gradleEnvProps.getProperty('bridge_min_confirmations', envProps.getProperty('bridge_min_confirmations', System.getenv('BRIDGE_MIN_CONFIRMATIONS')))
+        def bridgeMinConfirmations = bridgeMinConfProp ? bridgeMinConfProp.toInteger() : 1
+        def bridgeRouter = gradleEnvProps.getProperty('bridge_router_address', envProps.getProperty('bridge_router_address', System.getenv('BRIDGE_ROUTER_ADDRESS')))
+        def bridgeWrappedNative = gradleEnvProps.getProperty('bridge_wrapped_native_address', envProps.getProperty('bridge_wrapped_native_address', System.getenv('BRIDGE_WRAPPED_NATIVE_ADDRESS')))
+
+        def bridgeTestnetRpcPrimary = gradleEnvProps.getProperty('bridge_testnet_rpc_url', envProps.getProperty('bridge_testnet_rpc_url', System.getenv('BRIDGE_TESTNET_RPC_URL')))
+        def bridgeTestnetRpcFallbacks = gradleEnvProps.getProperty('bridge_testnet_rpc_fallbacks', envProps.getProperty('bridge_testnet_rpc_fallbacks', System.getenv('BRIDGE_TESTNET_RPC_FALLBACKS')))
+        def bridgeTestnetContract = gradleEnvProps.getProperty('bridge_testnet_contract_address', envProps.getProperty('bridge_testnet_contract_address', System.getenv('BRIDGE_TESTNET_CONTRACT_ADDRESS')))
+        def bridgeTestnetRegistry = gradleEnvProps.getProperty('bridge_testnet_registry_address', envProps.getProperty('bridge_testnet_registry_address', System.getenv('BRIDGE_TESTNET_REGISTRY_ADDRESS')))
+        def bridgeTestnetChainIdProp = gradleEnvProps.getProperty('bridge_testnet_chain_id', envProps.getProperty('bridge_testnet_chain_id', System.getenv('BRIDGE_TESTNET_CHAIN_ID')))
+        def bridgeTestnetChainId = bridgeTestnetChainIdProp ? bridgeTestnetChainIdProp.toLong() : 97L
+        def testUsdcAddress = gradleEnvProps.getProperty('bridge_testnet_usdc_address', envProps.getProperty('bridge_testnet_usdc_address', System.getenv('BRIDGE_TESTNET_USDC_ADDRESS')))
+        def testUsdtAddress = gradleEnvProps.getProperty('bridge_testnet_usdt_address', envProps.getProperty('bridge_testnet_usdt_address', System.getenv('BRIDGE_TESTNET_USDT_ADDRESS')))
+        def testUsdcDecimalsProp = gradleEnvProps.getProperty('bridge_testnet_usdc_decimals', envProps.getProperty('bridge_testnet_usdc_decimals', System.getenv('BRIDGE_TESTNET_USDC_DECIMALS')))
+        def testUsdtDecimalsProp = gradleEnvProps.getProperty('bridge_testnet_usdt_decimals', envProps.getProperty('bridge_testnet_usdt_decimals', System.getenv('BRIDGE_TESTNET_USDT_DECIMALS')))
+        def bridgeTestnetMinConfProp = gradleEnvProps.getProperty('bridge_testnet_min_confirmations', envProps.getProperty('bridge_testnet_min_confirmations', System.getenv('BRIDGE_TESTNET_MIN_CONFIRMATIONS')))
+        def bridgeTestnetMinConfirmations = bridgeTestnetMinConfProp ? bridgeTestnetMinConfProp.toInteger() : 1
+        def bridgeTestnetRouter = gradleEnvProps.getProperty('bridge_testnet_router_address', envProps.getProperty('bridge_testnet_router_address', System.getenv('BRIDGE_TESTNET_ROUTER_ADDRESS')))
+        def bridgeTestnetWrappedNative = gradleEnvProps.getProperty('bridge_testnet_wrapped_native_address', envProps.getProperty('bridge_testnet_wrapped_native_address', System.getenv('BRIDGE_TESTNET_WRAPPED_NATIVE_ADDRESS')))
+
+        def solanaMainnetRpc = gradleEnvProps.getProperty('solana_mainnet_rpc_url', envProps.getProperty('solana_mainnet_rpc_url', System.getenv('SOLANA_MAINNET_RPC_URL')))
+        def solanaTestnetRpc = gradleEnvProps.getProperty('solana_testnet_rpc_url', envProps.getProperty('solana_testnet_rpc_url', System.getenv('SOLANA_TESTNET_RPC_URL')))
+
+        buildConfigField "String", "BRIDGE_RPC_URL", '"' + (bridgeRpcPrimary ?: '').replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_RPC_FALLBACKS", '"' + (bridgeRpcFallbacks ?: '').replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_CONTRACT_ADDRESS", '"' + (bridgeContract ?: '').replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_REGISTRY_ADDRESS", '"' + (bridgeRegistry ?: '').replace('"','\\"') + '"'
+        buildConfigField "long", "BRIDGE_CHAIN_ID", "${bridgeChainId}L"
+        buildConfigField "String", "BRIDGE_USDC_ADDRESS", '"' + usdcAddress.replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_USDT_ADDRESS", '"' + usdtAddress.replace('"','\\"') + '"'
+        buildConfigField "int", "BRIDGE_USDC_DECIMALS", "${usdcDecimals}"
+        buildConfigField "int", "BRIDGE_USDT_DECIMALS", "${usdtDecimals}"
+        buildConfigField "int", "BRIDGE_MIN_CONFIRMATIONS", "${bridgeMinConfirmations}"
+        buildConfigField "String", "BRIDGE_ROUTER_ADDRESS", '"' + ((bridgeRouter ?: '') as String).replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_WRAPPED_NATIVE_ADDRESS", '"' + ((bridgeWrappedNative ?: '') as String).replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_TESTNET_RPC_URL", '"' + (bridgeTestnetRpcPrimary ?: '').replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_TESTNET_RPC_FALLBACKS", '"' + (bridgeTestnetRpcFallbacks ?: '').replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_TESTNET_CONTRACT_ADDRESS", '"' + (bridgeTestnetContract ?: '').replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_TESTNET_REGISTRY_ADDRESS", '"' + (bridgeTestnetRegistry ?: '').replace('"','\\"') + '"'
+        buildConfigField "long", "BRIDGE_TESTNET_CHAIN_ID", "${bridgeTestnetChainId}L"
+        buildConfigField "String", "BRIDGE_TESTNET_USDC_ADDRESS", '"' + ((testUsdcAddress ?: '') as String).replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_TESTNET_USDT_ADDRESS", '"' + ((testUsdtAddress ?: '') as String).replace('"','\\"') + '"'
+        buildConfigField "int", "BRIDGE_TESTNET_USDC_DECIMALS", "${testUsdcDecimalsProp ? testUsdcDecimalsProp.toInteger() : 18}"
+        buildConfigField "int", "BRIDGE_TESTNET_USDT_DECIMALS", "${testUsdtDecimalsProp ? testUsdtDecimalsProp.toInteger() : 18}"
+        buildConfigField "int", "BRIDGE_TESTNET_MIN_CONFIRMATIONS", "${bridgeTestnetMinConfirmations}"
+        buildConfigField "String", "BRIDGE_TESTNET_ROUTER_ADDRESS", '"' + ((bridgeTestnetRouter ?: '') as String).replace('"','\\"') + '"'
+        buildConfigField "String", "BRIDGE_TESTNET_WRAPPED_NATIVE_ADDRESS", '"' + ((bridgeTestnetWrappedNative ?: '') as String).replace('"','\\"') + '"'
+        buildConfigField "String", "SOLANA_MAINNET_RPC_URL", '"' + ((solanaMainnetRpc ?: "https://rpc.ankr.com/solana") as String).replace('"','\\"') + '"'
+        buildConfigField "String", "SOLANA_TESTNET_RPC_URL", '"' + ((solanaTestnetRpc ?: "https://solana-devnet-rpc.publicnode.com") as String).replace('"','\\"') + '"'
+
+        // 提供 Android 原生 SDK 的 Key 到 Manifest（可用环境变量覆盖）
+        if (project.android.defaultConfig.manifestPlaceholders == null) {
+            manifestPlaceholders = [:]
+        }
+        def amapAndroidKey = (System.getenv('AMAP_ANDROID_KEY') ?: 'fb0a072dd39508c331ff429365c38b15')
+        manifestPlaceholders.put('AMAP_ANDROID_KEY', amapAndroidKey)
+
+        buildConfigField "String", "ENVIRONMENT", '"' + envName + '"'
+        // Update policy defaults (can be overridden by env/gradle props)
+        buildConfigField "boolean", "WIFI_ONLY_UPDATES", (gradleEnvProps.getProperty('wifi_only_updates', 'true'))
+        buildConfigField "int", "MIN_BATTERY_PERCENT", (gradleEnvProps.getProperty('min_battery_percent', '20'))
+        // Feature toggles
+        buildConfigField "boolean", "USE_REAL_BALANCES", (gradleEnvProps.getProperty('use_real_balances', 'false'))
+        // Safer JNI usage on UI: default false; enable to use JSON dispatch paths guarded by health checks
+        buildConfigField "boolean", "USE_JSON_DISPATCH", (gradleEnvProps.getProperty('use_json_dispatch', 'false'))
+    }
+
+    // Configure external CMake build
+    externalNativeBuild {
+        cmake {
+            // 迁移 CMake 到 app 模块，去除对 common-ui 的依赖
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+signingConfigs {
+        release {
+            storeFile file("local-signing/local-release.keystore")
+            storePassword "123456"
+            keyAlias "local"
+            keyPassword "123456"
+        }
+    }
+
+    buildTypes {
+        debug {
+            matchingFallbacks = ['debug']
+        buildConfigField "boolean", "UPDATER_MOCK", "false"
+        }
+        staging {
+            initWith debug
+            matchingFallbacks = ['debug']
+            buildConfigField "boolean", "UPDATER_MOCK", "true"
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            buildConfigField "boolean", "UPDATER_MOCK", "false"
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        // 启用 Java 8+ desugaring（兼容低于 API 26 的 java.time 等 API）
+        coreLibraryDesugaringEnabled true
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        compose true
+        buildConfig true
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion "1.5.4"
+    }
+
+    packagingOptions {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+        jniLibs {
+            useLegacyPackaging = true
+            // 避免 CMake 产物与 jniLibs 中 lib 重复打包冲突
+            pickFirsts += ['**/libjni_bridge.so']
+            // copy_rust_lib 仅为触发复制的占位库，不需要打包进 APK
+            excludes += ['**/libcopy_rust_lib.so']
+        }
+    }
+
+    // 排除尚未接入依赖的 legacy androidTest（保留独立 E2E 模块）
+    sourceSets {
+        androidTest {
+            java {
+                exclude '**/benchmark/**'
+                exclude '**/integration/**'
+            }
+            kotlin {
+                exclude '**/benchmark/**'
+                exclude '**/integration/**'
+            }
+        }
+    }
+
+    lint {
+        // 建立基线文件，先收敛历史问题，后续只关注新增
+        baseline = file("lint-baseline.xml")
+        // 先不因 lint 错误中断构建，逐步清理自有代码后再收紧
+        abortOnError = false
+        warningsAsErrors = false
+        checkAllWarnings = false
+        // 报告配置（保留 HTML，关闭 XML）
+        htmlReport = true
+        xmlReport = false
+    }
+
+        testOptions {
+            unitTests.includeAndroidResources = true
+        }
+
+
+    // 输出版本信息供脚本使用
+    tasks.register('printVersion') {
+        doLast {
+            println("versionCode=${android.defaultConfig.versionCode}")
+            println("versionName=${android.defaultConfig.versionName}")
+            println("applicationId=${android.defaultConfig.applicationId}")
+        }
+    }
+}
+
+dependencies {
+
+    // Disabled: using in-app NimNativeInterface shim instead of :common-ui
+    
+
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.20"
+    implementation "androidx.core:core-ktx:1.12.0"
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.6.2"
+    implementation "androidx.appcompat:appcompat:1.7.0"
+    implementation "androidx.activity:activity-compose:1.8.2"
+    implementation "androidx.compose.ui:ui:1.6.0"
+    implementation "androidx.room:room-runtime:2.6.1"
+    implementation "androidx.room:room-ktx:2.6.1"
+    kapt "androidx.room:room-compiler:2.6.1"
+    implementation "androidx.compose.material3:material3:1.2.1"
+    implementation "androidx.compose.ui:ui-tooling-preview:1.6.0"
+    implementation "androidx.compose.material:material-icons-extended:1.6.0"
+    implementation "androidx.compose.material:material:1.6.0"
+    implementation "androidx.navigation:navigation-compose:2.7.6"
+
+    // Staggered Grid Layout
+    implementation "androidx.compose.foundation:foundation:1.6.0"
+
+    // Activity Result API for image picking
+    implementation "androidx.activity:activity-ktx:1.8.2"
+    implementation "androidx.documentfile:documentfile:1.0.1"
+    implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0"
+    implementation "com.jakewharton.timber:timber:5.0.1"
+    implementation "io.coil-kt:coil-compose:2.5.0"
+    implementation "io.coil-kt:coil-video:2.5.0"
+
+    // 基本库
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.6.2"
+
+    // Crypto libraries for wallet generation
+    implementation("org.bitcoinj:bitcoinj-core:0.16.2") {
+        exclude group: 'org.bouncycastle'
+    }
+
+    // Background scheduling
+    implementation "androidx.work:work-runtime-ktx:2.9.0"
+    implementation("org.web3j:core:4.10.3") {
+        exclude group: 'org.bouncycastle'
+    }
+    implementation "org.bouncycastle:bcprov-jdk15on:1.70"
+
+
+    // Koin DI
+    implementation "io.insert-koin:koin-android:3.5.6"
+    implementation "io.insert-koin:koin-androidx-compose:3.5.6"
+    implementation "io.insert-koin:koin-androidx-workmanager:3.5.6"
+
+    // Network libraries for blockchain API calls
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+    implementation "com.squareup.retrofit2:retrofit:2.9.0"
+    implementation "com.squareup.retrofit2:converter-gson:2.9.0"
+    implementation "com.google.code.gson:gson:2.10.1"
+
+    // Compression (BZip2) for bspatch
+    implementation "org.apache.commons:commons-compress:1.26.1"
+
+    // Battery optimization and background work
+    implementation "androidx.work:work-runtime-ktx:2.9.0"
+    implementation "androidx.lifecycle:lifecycle-process:2.6.2"
+
+    // Desugaring for java.time and other APIs on lower Android versions
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
+
+    // Location services with battery optimization
+    implementation "com.google.android.gms:play-services-location:21.0.1"
+
+    debugImplementation "androidx.compose.ui:ui-tooling:1.6.0"
+    debugImplementation "androidx.compose.ui:ui-test-manifest:1.6.0"
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "androidx.test:core:1.5.0"
+    testImplementation "org.robolectric:robolectric:4.11.1"
+    testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3"
+    testImplementation "androidx.work:work-testing:2.9.0"
+    testImplementation "com.squareup.okhttp3:mockwebserver:4.12.0"
+
+    // 仅在本地/CI 运行“地址簿逻辑单测”时，排除与 P2P 相关重型测试
+    // 使用 Gradle filter 执行：
+    //   ./gradlew :app:testDebugUnitTest -PonlyAddressTests=true
+    androidTestImplementation "androidx.test.ext:junit:1.1.5"
+    androidTestImplementation "androidx.test.espresso:espresso-core:3.5.1"
+    androidTestImplementation "androidx.compose.ui:ui-test-junit4:1.6.0"
+    androidTestImplementation "androidx.work:work-testing:2.9.0"
+
+    // App startup (initialize P2P + global event handler on app launch)
+    implementation "androidx.startup:startup-runtime:1.1.1"
+
+    // Media3 ExoPlayer for audio/video playback
+    implementation "androidx.media3:media3-exoplayer:1.3.1"
+    implementation "androidx.media3:media3-ui:1.3.1"
+}
