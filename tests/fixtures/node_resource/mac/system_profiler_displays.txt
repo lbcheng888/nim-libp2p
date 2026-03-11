@@ -1,0 +1,11 @@
+Graphics/Displays:
+
+    Apple M3 Max:
+
+      Chipset Model: Apple M3 Max
+      Type: GPU
+      Bus: Built-In
+      Total Number of Cores: 40
+      Vendor: Apple
+      VRAM (Total): 48 GB
+      Metal Support: Metal 3

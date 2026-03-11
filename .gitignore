@@ -54,6 +54,7 @@ test_secp
 .kotlin
 *.png
 *.txt
+!tests/fixtures/node_resource/**/*.txt
 *.log
 
 # Local DEX runtime state (keys/WALs)
@@ -63,3 +64,4 @@ dex_state/
 examples/dex/dex_order_demo
 examples/nim_quic_demo
 libp2p/dialer
+*.out

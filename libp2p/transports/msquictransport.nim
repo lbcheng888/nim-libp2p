@@ -20,7 +20,10 @@ import ./msquicdriver as msquicdrv
 import ./msquicconnection
 import ./msquicstream
 import ./webtransport_common
-import tls/certificate
+when defined(libp2p_pure_crypto):
+  import tls/certificate_pure
+else:
+  import tls/certificate
 import "nim-msquic/tls/common" as mstls
 import "nim-msquic/api/event_model" as msevents
 
@@ -407,7 +410,7 @@ proc setCertificateGenerator*(
   transport.syncWebtransportCerthash()
 
 proc ensureCertificate(
-    transport: MsQuicTransport
+    transport: MsQuicTransport, includeWebtransportCerthash = false
 ): CertificateX509 {.raises: [QuicTransportError], gcsafe.}
 
 proc updateWebtransportCerthashFromDer(
@@ -1070,7 +1073,7 @@ proc collectMsQuicTransportStats*(
   result = stats
 
 proc ensureCertificate(
-    transport: MsQuicTransport
+    transport: MsQuicTransport, includeWebtransportCerthash = false
 ): CertificateX509 {.raises: [QuicTransportError], gcsafe.} =
   warn "MsQuicTransport ensureCertificate entry", initialized=transport.certificateInitialized
   if not transport.certificateInitialized:
@@ -1090,7 +1093,7 @@ proc ensureCertificate(
     transport.certificateDer = certificateToDer(cert).valueOr:
       trace "MsQuic certificate normalization failed", error = error
       @[]
-    if transport.certificateDer.len > 0:
+    if includeWebtransportCerthash and transport.certificateDer.len > 0:
       let hashRes = computeWebtransportCerthash(transport.certificateDer)
       if hashRes.isOk:
         transport.webtransportCerthashHistory.setLen(0)
@@ -1099,6 +1102,15 @@ proc ensureCertificate(
         transport.webtransportCerthashHistory.setLen(0)
         transport.syncWebtransportCerthash()
         discard
+    elif includeWebtransportCerthash:
+      transport.webtransportCerthashHistory.setLen(0)
+      transport.syncWebtransportCerthash()
+  elif includeWebtransportCerthash and
+      transport.certificateDer.len > 0 and
+      transport.webtransportCerthashHistory.len == 0:
+    let hashRes = computeWebtransportCerthash(transport.certificateDer)
+    if hashRes.isOk:
+      transport.addWebtransportCerthash(hashRes.get())
     else:
       transport.webtransportCerthashHistory.setLen(0)
       transport.syncWebtransportCerthash()
@@ -2088,6 +2100,8 @@ method start*(
 ) {.async: (raises: [LPError, basetransport.TransportError, CancelledError]).} =
   if self.running:
     return
+  let needsWebtransportCerthash =
+    addrs.anyIt(WebTransport.match(it)) or self.webtransportCerthashHistory.len > 0
   var initHandle: msquicdrv.MsQuicTransportHandle = nil
   var initErr = ""
   try:
@@ -2109,7 +2123,7 @@ method start*(
       "MsQuic runtime unavailable: " & (if initErr.len > 0: initErr else: "unknown error")
     )
   try:
-    discard self.ensureCertificate()
+    discard self.ensureCertificate(includeWebtransportCerthash = needsWebtransportCerthash)
   except QuicTransportError as exc:
     try:
       msquicSafe:

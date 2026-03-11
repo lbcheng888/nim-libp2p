@@ -329,6 +329,7 @@ const
   DefaultQueryInterval = 5.seconds
   DefaultAnnounceInterval = 30.seconds
   DefaultRecordTtl = 120.seconds
+  MdnsAnnouncementDedupWindow = 2.seconds
   MdnsResponseFlags = 0x8400'u16
   MaxAdvertisedAddrs = 16
   MdnsMaxTxtEntryLen = 220
@@ -592,6 +593,119 @@ proc makeDnsaddrStrings(
       )
       continue
     result.add("dnsaddr=" & addrStr)
+
+proc hasZeroPortSegment(value: string): bool =
+  value.contains("/tcp/0") or value.contains("/udp/0")
+
+proc isLanIpv4ForMdns(ip: string): bool =
+  if ip.len == 0 or ip == "0.0.0.0" or ip == "127.0.0.1":
+    return false
+  if ip.startsWith("10.") or ip.startsWith("192.168.") or ip.startsWith("169.254."):
+    return true
+  if ip.startsWith("172."):
+    let octets = ip.split('.')
+    if octets.len >= 2:
+      try:
+        let second = parseInt(octets[1])
+        if second >= 16 and second <= 31:
+          return true
+      except CatchableError:
+        discard
+  if ip.startsWith("100."):
+    let octets = ip.split('.')
+    if octets.len >= 2:
+      try:
+        let second = parseInt(octets[1])
+        if second >= 64 and second <= 127:
+          return true
+      except CatchableError:
+        discard
+  false
+
+proc rewriteIpv4ForMdns(addrText: string, ip: string): Option[string] =
+  let marker = "/ip4/"
+  let idx = addrText.find(marker)
+  if idx < 0:
+    return none(string)
+  let startIdx = idx + marker.len
+  var endIdx = addrText.find('/', startIdx)
+  if endIdx < 0:
+    endIdx = addrText.len
+  let current = addrText[startIdx ..< endIdx]
+  var allowed = false
+  if current == ip:
+    allowed = true
+  elif current == "0.0.0.0" or current == "127.0.0.1" or current.len == 0:
+    allowed = true
+  if not allowed:
+    return none(string)
+  some(addrText[0 ..< startIdx] & ip & addrText[endIdx ..< addrText.len])
+
+proc synthesizeLanMdnsAddrs(
+    self: MdnsInterface, addrs: seq[MultiAddress]
+): seq[MultiAddress] =
+  var base = addrs
+  if base.len == 0:
+    base = self.peerInfo.listenAddrs
+  if base.len == 0:
+    base = self.peerInfo.addrs
+  if base.len == 0:
+    return @[]
+
+  var lanIpv4 = enumerateLanIpv4(self.boundIpv4)
+  if isLanIpv4ForMdns(self.boundIpv4) and self.boundIpv4 notin lanIpv4:
+    lanIpv4.insert(self.boundIpv4, 0)
+  elif isLanIpv4ForMdns(self.preferredIpv4) and self.preferredIpv4 notin lanIpv4:
+    lanIpv4.insert(self.preferredIpv4, 0)
+
+  var seen = initHashSet[string]()
+  for ma in base:
+    let addrText = $ma
+    if hasZeroPortSegment(addrText):
+      continue
+    var expanded = false
+    if lanIpv4.len > 0 and addrText.contains("/ip4/"):
+      for ip in lanIpv4:
+        let rewritten = rewriteIpv4ForMdns(addrText, ip)
+        if rewritten.isNone:
+          continue
+        let parsed = MultiAddress.init(rewritten.get()).valueOr:
+          continue
+        let normalized = $parsed
+        if not seen.contains(normalized):
+          result.add(parsed)
+          seen.incl(normalized)
+        expanded = true
+    if expanded:
+      continue
+    let lower = addrText.toLowerAscii()
+    if lower.contains("/ip4/0.0.0.0") or lower.contains("/ip4/127.0.0.1"):
+      continue
+    if not seen.contains(addrText):
+      result.add(ma)
+      seen.incl(addrText)
+
+proc resolveMdnsDnsaddrs*(
+    self: MdnsInterface, peerId: Opt[PeerId], addrs: seq[MultiAddress]
+): seq[string] =
+  result = makeDnsaddrStrings(peerId, addrs)
+  if result.len > 0:
+    return
+
+  let synthesized = self.synthesizeLanMdnsAddrs(addrs)
+  if synthesized.len > 0:
+    result = makeDnsaddrStrings(peerId, synthesized)
+    if result.len > 0:
+      mdnsLog(
+        "resolveMdnsDnsaddrs synthesized count=" & $result.len &
+        " bound=" & (if self.boundIpv4.len > 0: self.boundIpv4 else: "<unset>")
+      )
+      return
+
+  let fullAddrs = self.peerInfo.fullAddrs().valueOr: @[]
+  result = fullAddrs.mapIt("dnsaddr=" & $it)
+  if result.len > 0:
+    mdnsLog("resolveMdnsDnsaddrs fullAddrs count=" & $result.len)
 
 proc buildTxtRecordPayload(entries: seq[string]): seq[byte] =
   var payload = newSeq[byte]()
@@ -949,6 +1063,49 @@ proc sendMulticast(self: MdnsInterface, payload: seq[byte]) {.async.} =
     trace "mdns: failed to send datagram", error = exc.msg
     warn "mdns multicast send failed", err = exc.msg
 
+proc probeNow*(self: MdnsInterface) {.async: (raises: [CancelledError, DiscoveryError]).} =
+  mdnsLog("probeNow start preferred=" & self.preferredIpv4)
+  try:
+    ensureTransport(self)
+    mdnsLog("probeNow ensureTransport ok bound=" & self.boundIpv4)
+  except Exception as exc:
+    mdnsLog("probeNow ensureTransport failed err=" & exc.msg)
+    raise newException(DiscoveryError, "mdns ensureTransport failed: " & exc.msg)
+
+  let meta = block:
+    try:
+      buildMetaQuery()
+    except Exception as exc:
+      mdnsLog("probeNow buildMetaQuery failed err=" & exc.msg)
+      newSeq[byte]()
+  if meta.len > 0:
+    try:
+      await self.sendMulticast(meta)
+    except CatchableError as exc:
+      mdnsLog("probeNow send meta failed err=" & exc.msg)
+
+  var services: seq[string] = @[]
+  for service, count in self.pendingQueries.pairs:
+    if count > 0 and service.len > 0 and service notin services:
+      services.add(service)
+  if self.serviceName.len > 0 and self.serviceName notin services:
+    services.add(self.serviceName)
+
+  for service in services:
+    let query = block:
+      try:
+        buildQuery(service)
+      except Exception as exc:
+        mdnsLog("probeNow buildQuery failed service=" & service & " err=" & exc.msg)
+        newSeq[byte]()
+    if query.len == 0:
+      continue
+    mdnsLog("probeNow send query bytes=" & $query.len & " service=" & service & " iface=" & self.boundIpv4)
+    try:
+      await self.sendMulticast(query)
+    except CatchableError as exc:
+      mdnsLog("probeNow send query failed service=" & service & " err=" & exc.msg)
+
 proc sendUnicast(
     self: MdnsInterface, payload: seq[byte], remote: TransportAddress
   ) {.async.} =
@@ -1056,7 +1213,13 @@ proc handleQuery(
   if shouldAnnounce:
     var service = self.serviceName
     let (peerId, addrs) = self.collectAdvertisedAddrs(service)
-    let dnsAddrs = makeDnsaddrStrings(peerId, addrs)
+    let dnsAddrs = self.resolveMdnsDnsaddrs(peerId, addrs)
+    if dnsAddrs.len == 0:
+      mdnsLog(
+        "handleQuery skip announcement no dnsaddr remote=" & $remote &
+        " service=" & service
+      )
+      return
     for svc in announceServices:
       let payload = buildAnnouncement(self, svc, dnsAddrs)
       if preferUnicast:
@@ -1271,7 +1434,13 @@ proc collectAnnouncement(
       " addrCount=" & $value.addrs.len &
       " ttl=" & $value.ttl
     )
-    let expiry = now + int64(value.ttl).seconds
+    let ttlWindow = int64(value.ttl).seconds
+    let dedupeWindow =
+      if ttlWindow <= MdnsAnnouncementDedupWindow:
+        ttlWindow
+      else:
+        MdnsAnnouncementDedupWindow
+    let expiry = now + dedupeWindow
     if key in self.seenAnnouncements and self.seenAnnouncements[key] > now:
       mdnsLog(
         "collectAnnouncement skip cached peer=" & $key &
@@ -1281,7 +1450,9 @@ proc collectAnnouncement(
       continue
     var attrs: PeerAttributes
     attrs.add(key)
-    attrs.add(DiscoveryService(value.svc))
+    # DiscoveryManager matches DiscoveryService by exact string, so emit the
+    # local query service spelling instead of the raw PTR answer spelling.
+    attrs.add(DiscoveryService(self.serviceName))
     for addr in value.addrs:
       attrs.add(addr)
       mdnsLog("collectAnnouncement add addr=" & $addr)
@@ -1356,6 +1527,14 @@ method request*(
   let firstRequest = service notin self.pendingQueries
   self.pendingQueries.inc(service)
 
+  if firstRequest and self.seenAnnouncements.len > 0:
+    # The transport may receive peer announcements before the long-lived
+    # discovery query is registered during app startup. Drop the TTL cache when
+    # the first query for a service begins so the next remote announce is
+    # surfaced to DiscoveryManager/watchers instead of being suppressed.
+    self.seenAnnouncements.clear()
+    mdnsLog("request cleared seenAnnouncements service=" & service)
+
   if firstRequest:
     let meta = block:
       try:
@@ -1423,13 +1602,10 @@ method advertise*(self: MdnsInterface) {.async: (raises: [CancelledError, Advert
     var addrs = collected.addrs
     var dnsAddrs = block:
       try:
-        makeDnsaddrStrings(peerIdOpt, addrs)
+        self.resolveMdnsDnsaddrs(peerIdOpt, addrs)
       except Exception as exc:
         trace "mdns: failed to build dnsaddr strings", error = exc.msg
         @[]
-    if dnsAddrs.len == 0:
-      let fullAddrs = self.peerInfo.fullAddrs().valueOr: @[]
-      dnsAddrs = fullAddrs.mapIt("dnsaddr=" & $it)
 
     if dnsAddrs.len > 0:
       let payload = block:

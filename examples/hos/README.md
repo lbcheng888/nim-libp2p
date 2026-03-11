@@ -7,7 +7,7 @@ publishing and a lightweight livestream publisher.
 ## Prerequisites
 
 1. Install the DevEco Studio toolchain (OpenHarmony NDK, armeabi-v8a).
-2. Build the Nim runtime and copy OpenSSL artefacts:
+2. Build the pure Nim runtime and copy the single native payload:
 
    ```bash
    # From repo root
@@ -18,13 +18,11 @@ publishing and a lightweight livestream publisher.
 
    ```
    examples/hos/entry/libs/arm64-v8a/libnimlibp2p.so
-   examples/hos/entry/libs/arm64-v8a/libssl.so
-   examples/hos/entry/libs/arm64-v8a/libcrypto.so
    ```
 
-3. The module CMake target (`entry/src/main/cpp/CMakeLists.txt`) builds
-   `libnimbridge.so`, linking it with the prebuilt Nim/OpenSSL objects and
-   exposing N-API bindings.
+3. The Harmony N-API bridge is embedded into `libnimlibp2p.so`; there is no
+   separate `libnimbridge.so`, `libssl.so`, or `libcrypto.so` in the mobile
+   builtin build.
 
 ## Running
 
@@ -34,10 +32,10 @@ publishing and a lightweight livestream publisher.
 
 ## Architecture Notes
 
-- `entry/src/main/cpp/nim_bridge.cpp` wraps the Nim FFI exports in N-API
-  callables and logs `nim_bridge_emit_event` via `hilog`.
+- `entry/src/main/cpp/nim_bridge.cpp` is embedded into `libnimlibp2p.so`,
+  wraps the Nim FFI exports in N-API callables and logs via `hilog`.
 - `entry/src/main/ets/common/NimLibp2p.ts` loads the native module
-  (`libnimbridge.so`) and presents a typed façade to ArkTS.
+  (`libnimlibp2p.so`) and presents a typed façade to ArkTS.
 - `entry/src/main/ets/pages/Index.ets` manages polling, state reduction and
   renders tabs for Overview, Chat, Feed and Livestream interactions.
 

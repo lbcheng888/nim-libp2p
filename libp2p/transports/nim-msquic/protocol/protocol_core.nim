@@ -147,11 +147,50 @@ type
     length*: uint64
     data*: seq[byte]
 
+  StreamFrame* = object
+    streamId*: uint64
+    offset*: uint64
+    length*: uint64
+    fin*: bool
+    data*: seq[byte]
+
+  AckRange* = object
+    smallest*: uint64
+    largest*: uint64
+
   AckFrame* = object
     largestAcked*: uint64
     delay*: uint64
     rangeCount*: uint64
     firstRange*: uint64
+    ranges*: seq[AckRange]
+
+  ResetStreamFrame* = object
+    streamId*: uint64
+    applicationErrorCode*: uint64
+    finalSize*: uint64
+
+  StopSendingFrame* = object
+    streamId*: uint64
+    applicationErrorCode*: uint64
+
+  MaxDataFrame* = object
+    maximumData*: uint64
+
+  MaxStreamDataFrame* = object
+    streamId*: uint64
+    maximumStreamData*: uint64
+
+  DatagramFrame* = object
+    containsLength*: bool
+    length*: uint64
+    data*: seq[byte]
+
+  PathChallengeFrame* = object
+    data*: array[8, byte]
+
+  PathResponseFrame* = object
+    data*: array[8, byte]
 
 proc encodeStreamFrame*(streamId: uint64, data: seq[byte], offset: uint64, fin: bool): seq[byte] =
   # STREAM Frame Layout:
@@ -177,6 +216,45 @@ proc encodeStreamFrame*(streamId: uint64, data: seq[byte], offset: uint64, fin: 
   # Length
   result.writeVarInt(uint64(data.len))
   result.add(data)
+
+proc encodeDatagramFrame*(data: seq[byte], includeLength = true): seq[byte] =
+  if includeLength:
+    result.add(0x31'u8)
+    result.writeVarInt(uint64(data.len))
+  else:
+    result.add(0x30'u8)
+  result.add(data)
+
+proc encodeResetStreamFrame*(streamId: uint64; applicationErrorCode: uint64;
+    finalSize: uint64): seq[byte] =
+  result.add(0x04'u8)
+  result.writeVarInt(streamId)
+  result.writeVarInt(applicationErrorCode)
+  result.writeVarInt(finalSize)
+
+proc encodeStopSendingFrame*(streamId: uint64; applicationErrorCode: uint64): seq[byte] =
+  result.add(0x05'u8)
+  result.writeVarInt(streamId)
+  result.writeVarInt(applicationErrorCode)
+
+proc encodeMaxDataFrame*(maximumData: uint64): seq[byte] =
+  result.add(0x10'u8)
+  result.writeVarInt(maximumData)
+
+proc encodeMaxStreamDataFrame*(streamId: uint64; maximumStreamData: uint64): seq[byte] =
+  result.add(0x11'u8)
+  result.writeVarInt(streamId)
+  result.writeVarInt(maximumStreamData)
+
+proc encodePathChallengeFrame*(challenge: array[8, byte]): seq[byte] =
+  result.add(0x1A'u8)
+  for b in challenge:
+    result.add(b)
+
+proc encodePathResponseFrame*(response: array[8, byte]): seq[byte] =
+  result.add(0x1B'u8)
+  for b in response:
+    result.add(b)
 
 # --- Decoding ---
 
@@ -344,6 +422,139 @@ proc parseCryptoFrame*(data: openArray[byte], pos: var int): CryptoFrame =
     result.data = @(data[pos ..< pos + int(result.length)])
     pos += int(result.length)
 
+proc parseStreamFrame*(data: openArray[byte], pos: var int): StreamFrame =
+  ## Parse a STREAM frame starting at the frame type byte.
+  if pos >= data.len:
+    return
+  let typeByte = data[pos]
+  inc pos
+
+  result.fin = (typeByte and 0x01'u8) != 0
+  let hasLen = (typeByte and 0x02'u8) != 0
+  let hasOffset = (typeByte and 0x04'u8) != 0
+
+  result.streamId = readVarInt(data, pos)
+  if hasOffset:
+    result.offset = readVarInt(data, pos)
+  else:
+    result.offset = 0
+
+  if hasLen:
+    result.length = readVarInt(data, pos)
+  else:
+    result.length = uint64(max(0, data.len - pos))
+
+  if result.length == 0:
+    result.data = @[]
+    return
+
+  if pos + int(result.length) <= data.len:
+    result.data = @(data[pos ..< pos + int(result.length)])
+    pos += int(result.length)
+  else:
+    result.length = 0
+    result.data = @[]
+
+proc parseAckFrame*(data: openArray[byte], pos: var int): AckFrame =
+  ## Parse an ACK frame and materialize explicit ACK ranges.
+  if pos >= data.len:
+    return
+  let frameType = data[pos]
+  if frameType != 0x02'u8 and frameType != 0x03'u8:
+    return
+  inc pos
+  result.largestAcked = readVarInt(data, pos)
+  result.delay = readVarInt(data, pos)
+  result.rangeCount = readVarInt(data, pos)
+  result.firstRange = readVarInt(data, pos)
+  result.ranges = @[]
+  var currentLargest = result.largestAcked
+  let firstSmallest =
+    if result.firstRange > currentLargest: 0'u64
+    else: currentLargest - result.firstRange
+  result.ranges.add(AckRange(smallest: firstSmallest, largest: currentLargest))
+  if result.rangeCount > 0:
+    for _ in 0 ..< int(result.rangeCount):
+      let gap = readVarInt(data, pos)
+      let ackRangeLength = readVarInt(data, pos)
+      if currentLargest <= gap + 1:
+        break
+      currentLargest = currentLargest - gap - 2
+      let smallest =
+        if ackRangeLength > currentLargest: 0'u64
+        else: currentLargest - ackRangeLength
+      result.ranges.add(AckRange(smallest: smallest, largest: currentLargest))
+
+proc parseDatagramFrame*(data: openArray[byte], pos: var int): DatagramFrame =
+  if pos >= data.len:
+    return
+  let frameType = data[pos]
+  if frameType != 0x30'u8 and frameType != 0x31'u8:
+    return
+  inc pos
+  result.containsLength = frameType == 0x31'u8
+  if result.containsLength:
+    result.length = readVarInt(data, pos)
+  else:
+    result.length = uint64(max(0, data.len - pos))
+  if result.length == 0:
+    result.data = @[]
+    return
+  if pos + int(result.length) <= data.len:
+    result.data = @(data[pos ..< pos + int(result.length)])
+    pos += int(result.length)
+  else:
+    result.length = 0
+    result.data = @[]
+
+proc parseResetStreamFrame*(data: openArray[byte], pos: var int): ResetStreamFrame =
+  if pos >= data.len or data[pos] != 0x04'u8:
+    return
+  inc pos
+  result.streamId = readVarInt(data, pos)
+  result.applicationErrorCode = readVarInt(data, pos)
+  result.finalSize = readVarInt(data, pos)
+
+proc parseStopSendingFrame*(data: openArray[byte], pos: var int): StopSendingFrame =
+  if pos >= data.len or data[pos] != 0x05'u8:
+    return
+  inc pos
+  result.streamId = readVarInt(data, pos)
+  result.applicationErrorCode = readVarInt(data, pos)
+
+proc parseMaxDataFrame*(data: openArray[byte], pos: var int): MaxDataFrame =
+  if pos >= data.len or data[pos] != 0x10'u8:
+    return
+  inc pos
+  result.maximumData = readVarInt(data, pos)
+
+proc parseMaxStreamDataFrame*(data: openArray[byte], pos: var int): MaxStreamDataFrame =
+  if pos >= data.len or data[pos] != 0x11'u8:
+    return
+  inc pos
+  result.streamId = readVarInt(data, pos)
+  result.maximumStreamData = readVarInt(data, pos)
+
+proc parsePathChallengeFrame*(data: openArray[byte], pos: var int): PathChallengeFrame =
+  if pos >= data.len or data[pos] != 0x1A'u8:
+    return
+  inc pos
+  if pos + 8 > data.len:
+    return
+  for i in 0 .. 7:
+    result.data[i] = data[pos + i]
+  pos += 8
+
+proc parsePathResponseFrame*(data: openArray[byte], pos: var int): PathResponseFrame =
+  if pos >= data.len or data[pos] != 0x1B'u8:
+    return
+  inc pos
+  if pos + 8 > data.len:
+    return
+  for i in 0 .. 7:
+    result.data[i] = data[pos + i]
+  pos += 8
+
 proc encodeAckFrame*(largestAcked: uint64, delay: uint64): seq[byte] =
   # RFC 9000 Section 19.3.1. ACK Frame
   # Type (0x02)
@@ -364,4 +575,3 @@ proc encodeAckFrame*(largestAcked: uint64, delay: uint64): seq[byte] =
   # For cumulative ack from 0 to LargestAcked, Range = LargestAcked.
   result.writeVarInt(largestAcked) 
   # Note: This implies 0..LargestAcked are ALL received.
-

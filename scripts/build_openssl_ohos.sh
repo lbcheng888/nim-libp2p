@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # Build OpenSSL (with QUIC enabled) for HarmonyOS / OpenHarmony arm64.
-# The script prefers a local source tree (default /Users/lbcheng/openssl, i.e. OpenSSL 4.0.0-dev).
+# The script prefers a local source tree and otherwise falls back to a stable
+# upstream release tarball.
 # Usage: scripts/build_openssl_ohos.sh
 
 OPENSSL_LOCAL_SOURCE="${OPENSSL_SOURCE_DIR:-/Users/lbcheng/openssl}"
-OPENSSL_VERSION="${OPENSSL_VERSION:-4.0.0-dev}"
+OPENSSL_VERSION="${OPENSSL_VERSION:-3.6.1}"
 TARGET_TRIPLE="aarch64-linux-ohos"
 OH_SDK_ROOT=${OH_SDK_ROOT:-"/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native"}
 LLVM_DIR="${OH_SDK_ROOT}/llvm"
@@ -33,12 +34,25 @@ if [[ -d "${OPENSSL_LOCAL_SOURCE}" && -f "${OPENSSL_LOCAL_SOURCE}/Configure" ]];
   rsync -a --delete "${OPENSSL_LOCAL_SOURCE}/" "${SOURCE_DIR}/"
 else
   ARCHIVE="openssl-${OPENSSL_VERSION}.tar.gz"
-  URL="https://www.openssl.org/source/${ARCHIVE}"
+  URLS=(
+    "https://www.openssl.org/source/${ARCHIVE}"
+    "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/${ARCHIVE}"
+  )
   SOURCE_DIR="${SOURCE_ROOT}/openssl-${OPENSSL_VERSION}"
   if [[ ! -d "${SOURCE_DIR}" ]]; then
     echo "[openssl-ohos] Fetching OpenSSL ${OPENSSL_VERSION}..."
     mkdir -p "${SOURCE_ROOT}"
-    curl -fsSL "${URL}" -o "${SOURCE_ROOT}/${ARCHIVE}"
+    downloaded=0
+    for URL in "${URLS[@]}"; do
+      if curl -fsSL "${URL}" -o "${SOURCE_ROOT}/${ARCHIVE}"; then
+        downloaded=1
+        break
+      fi
+    done
+    if [[ "${downloaded}" != "1" ]]; then
+      echo "[openssl-ohos] failed to download ${ARCHIVE} from known mirrors" >&2
+      exit 1
+    fi
     tar -xzf "${SOURCE_ROOT}/${ARCHIVE}" -C "${SOURCE_ROOT}"
   fi
 fi
@@ -47,8 +61,12 @@ pushd "${SOURCE_DIR}" >/dev/null
   make distclean >/dev/null 2>&1 || true
 
   CC="${LLVM_DIR}/bin/clang --target=${TARGET_TRIPLE} --sysroot=${SYSROOT_DIR}"
+  CXX="${LLVM_DIR}/bin/clang++ --target=${TARGET_TRIPLE} --sysroot=${SYSROOT_DIR}"
   AR="${LLVM_DIR}/bin/llvm-ar"
-  export CC AR
+  NM="${LLVM_DIR}/bin/llvm-nm"
+  RANLIB="${LLVM_DIR}/bin/llvm-ranlib"
+  STRIP="${LLVM_DIR}/bin/llvm-strip"
+  export CC CXX AR NM RANLIB STRIP
 
   echo "[openssl-ohos] Configuring (target ${TARGET_TRIPLE})..."
   ./Configure linux-generic64 \
@@ -88,10 +106,12 @@ for dest in "${REPO_ROOT}/examples/hos/entry/libs/arm64-v8a" \
              "${REPO_ROOT}/examples/hos/entry/src/main/jniLibs/arm64-v8a"; do
   mkdir -p "${dest}/ossl-modules"
   rsync -a --delete "${PREFIX}/lib/ossl-modules/" "${dest}/ossl-modules/"
-  if [[ -d "${PREFIX}/lib/engines-4" ]]; then
-    mkdir -p "${dest}/engines-4"
-    rsync -a --delete "${PREFIX}/lib/engines-4/" "${dest}/engines-4/"
-  fi
+  for engines_dir in engines-3 engines-4; do
+    if [[ -d "${PREFIX}/lib/${engines_dir}" ]]; then
+      mkdir -p "${dest}/${engines_dir}"
+      rsync -a --delete "${PREFIX}/lib/${engines_dir}/" "${dest}/${engines_dir}/"
+    fi
+  done
 done
 
 echo "[openssl-ohos] Finished. Artifacts staged under ${PREFIX} and copied into the HarmonyOS project."

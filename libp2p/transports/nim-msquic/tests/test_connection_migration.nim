@@ -22,9 +22,16 @@ suite "Connection migration state":
       negotiated = 0x1)
     conn.initiatePathChallenge(1, challenge8(10))
     check conn.migration.pendingChallenges.len == 1
+    check conn.paths.len == 1
+    check conn.paths[0].challengeOutstanding
+    check conn.paths[0].responsePending
     conn.completePathValidation(1, true)
     check conn.migration.activePathId == 1
     check conn.migration.validatedPaths.contains(1)
+    check conn.paths[0].isValidated
+    check conn.paths[0].isActive
+    check not conn.paths[0].challengeOutstanding
+    check not conn.paths[0].responsePending
 
   test "stateless reset tokens are tracked":
     var conn = newConnectionModel(

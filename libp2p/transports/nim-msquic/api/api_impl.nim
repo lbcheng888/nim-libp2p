@@ -3,12 +3,20 @@
 import std/tables
 import std/sequtils
 import std/endians
+import std/times
 import chronos
 import chronicles
 
 from "../core/mod" import ConnectionId, QuicConnection, QuicVersion,
-    initConnectionId, newConnection, ConnectionRole, crClient
-from "../congestion/common" import CongestionAlgorithm, caCubic, caBbr
+    initConnectionId, newConnection, ConnectionRole, crClient, crServer,
+    CryptoEpoch, ceInitial, ceOneRtt, nextPacketNumber, recordAckedPacket,
+    initiatePathChallenge, completePathValidation, PathState
+from "../congestion/common" import CongestionAlgorithm, caCubic, caBbr,
+    AckEventSnapshot, LossEventSnapshot, ackTypeAckImmediate,
+    MaxAckDelayDefaultMs, PersistentCongestionThreshold
+import "../congestion/ack_tracker_model" as qack
+import "../congestion/loss_detection_model" as qloss
+import "../congestion/controller" as qcc
 from "./common" import QuicHandleKind, qhkRegistration, qhkConfiguration,
     qhkConnection, qhkStream
 import ./event_model
@@ -26,6 +34,43 @@ else:
   {.pragma: quicApiHot, inline.}
 
 type
+  PendingStreamChunk = object
+    offset: uint64
+    payload: seq[byte]
+    fin: bool
+    clientContext: pointer
+
+  PendingDatagram = object
+    payload: seq[byte]
+    clientContext: pointer
+
+  SentFrameKind = enum
+    sfkStream
+    sfkDatagram
+    sfkAck
+    sfkCrypto
+    sfkPathChallenge
+    sfkPathResponse
+
+  SentPacketMeta = object
+    packetNumber: uint64
+    epoch: CryptoEpoch
+    ackEliciting: bool
+    packetLength: uint16
+    sentTimeUs: uint64
+    frameKind: SentFrameKind
+    stream: pointer
+    streamOffset: uint64
+    streamPayload: seq[byte]
+    streamFin: bool
+    clientContext: pointer
+
+  BuiltinResumptionEntry = object
+    ticket: seq[byte]
+    data: seq[byte]
+    issuedAtUs: uint64
+    expiresAtUs: uint64
+
   QUIC_STATUS* = uint32
   BOOLEAN* = uint8
   QUIC_EXECUTION_PROFILE* = uint32
@@ -163,6 +208,7 @@ const
   QUIC_STATUS_INTERNAL_ERROR* = QUIC_STATUS(201)        ## Generic internal error
   QUIC_TLS_ALERT_CODE_SUCCESS* = QUIC_TLS_ALERT_CODES(0xFFFF)
   QUIC_CONNECTION_EVENT_CONNECTED* = 0'u32
+  QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED* = 6'u32
 
 type
   QuicConnectionEventConnectedPayload* {.bycopy.} = object
@@ -192,6 +238,14 @@ type
     Reserved*: array[7, uint8]
     ClientContext*: pointer
 
+  QuicStreamEventPeerAbortedPayload* {.bycopy.} = object
+    ErrorCode*: QUIC_UINT62
+    Reserved*: uint16
+
+  QuicStreamEventSendShutdownCompletePayload* {.bycopy.} = object
+    Graceful*: BOOLEAN
+    Reserved*: array[7, uint8]
+
   QuicStreamEventShutdownCompletePayload* {.bycopy.} = object
     ConnectionShutdown*: BOOLEAN
     Flags*: uint8
@@ -207,6 +261,17 @@ type
   QuicListenerEventNewConnectionPayload* {.bycopy.} = object
     Info*: pointer
     Connection*: HQUIC
+
+  QuicConnectionEventPeerStreamStartedPayload* {.bycopy.} = object
+    Stream*: HQUIC
+    Flags*: QUIC_STREAM_OPEN_FLAGS
+
+  QuicStreamEventReceivePayload* {.bycopy.} = object
+    AbsoluteOffset*: uint64
+    TotalBufferLength*: uint64
+    Buffers*: pointer
+    BufferCount*: uint32
+    Flags*: uint32
 
   QuicListenerEventStopCompletePayload* {.bycopy.} = object
     Flags*: uint8
@@ -245,12 +310,15 @@ type
     connection: ConnectionState # Reference to parent connection
     callback: QuicStreamCallback
     callbackContext: pointer
+    eventHandlers: seq[StreamEventHandler]
     started: bool
     closed: bool
     sendBuffer: seq[byte]
     sentOffset: uint64
     finRequested: bool
     finSent: bool
+    streamId: uint64
+    pendingChunks: seq[PendingStreamChunk]
 
   ListenerState = ref object of QuicHandleState
     registration: RegistrationState
@@ -259,6 +327,7 @@ type
     started: bool
     stopped: bool
     transport: DatagramTransport
+    acceptedConnections: Table[string, ConnectionState]
 
   ConnectionState = ref object of QuicHandleState
     registration: RegistrationState
@@ -287,10 +356,41 @@ type
     clientPrivateKey: Curve25519Key
     transcript: seq[byte]
     handshakeComplete: bool
+    sessionResumed: bool
+    resumptionTicket: seq[byte]
+    resumptionData: seq[byte]
+    incomingStreams: Table[uint64, StreamState]
+    ackTracker: qack.AckTrackerModel
+    lossDetection: qloss.LossDetectionModel
+    congestionController: qcc.CongestionController
+    sentPackets: seq[SentPacketMeta]
+    pendingDatagrams: seq[PendingDatagram]
+    nextLocalBidiStreamId: uint64
+    nextLocalUniStreamId: uint64
+    latestAckedPacket: uint64
+    localStreams: seq[StreamState]
+    smoothedRttUs: uint64
+    minRttUs: uint64
+    latestRttUs: uint64
+    rttVarianceUs: uint64
+    pathRemoteAddrs: Table[uint8, TransportAddress]
+    pathRemoteKeys: Table[uint8, string]
+    remotePathIds: Table[string, uint8]
+    activeRemoteKey: string
 
 const
   DatagramReceiveNotes = ["receive=false", "receive=true"]
   DatagramSendNotes = ["send=false", "send=true"]
+  DefaultCongestionDatagramBytes = 1200'u32
+  SendFlagAllowZeroRtt = 0x0001'u32
+  SendFlagFin = 0x0004'u32
+  StreamOpenFlagUnidirectional = 0x0001'u32
+  DefaultSmoothedRttUs = 100_000'u64
+  DefaultRttVarianceUs = 50_000'u64
+  MinProbeTimeoutUs = 50_000'u64
+  BuiltinResumptionTicketMagic = ['N'.byte, 'Q'.byte, 'T'.byte, 'K'.byte]
+  BuiltinResumptionTicketVersion = 1'u8
+  BuiltinResumptionTicketLifetimeUs = 10'u64 * 60'u64 * 1_000_000'u64
   QUIC_STREAM_EVENT_START_COMPLETE = 0'u32
   QUIC_STREAM_EVENT_RECEIVE = 1'u32
   QUIC_STREAM_EVENT_SEND_COMPLETE = 2'u32
@@ -306,6 +406,405 @@ const
   QUIC_LISTENER_EVENT_NEW_CONNECTION = 0'u32
   QUIC_LISTENER_EVENT_STOP_COMPLETE = 1'u32
   QUIC_LISTENER_EVENT_DOS_MODE_CHANGED = 2'u32
+  QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL* = 0x0001'u32
+  QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND* = 0x0002'u32
+  QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE* = 0x0004'u32
+
+var gBuiltinResumptionCache = initTable[string, BuiltinResumptionEntry]()
+
+proc nowMicros(): uint64 =
+  uint64(epochTime() * 1_000_000.0)
+
+proc appendUint16BE(buf: var seq[byte]; value: uint16) {.inline.} =
+  buf.add(byte((value shr 8) and 0xFF'u16))
+  buf.add(byte(value and 0xFF'u16))
+
+proc appendUint64BE(buf: var seq[byte]; value: uint64) {.inline.} =
+  for shift in countdown(56, 0, 8):
+    buf.add(byte((value shr shift) and 0xFF'u64))
+
+proc readUint16BE(data: openArray[byte]; pos: var int): uint16 {.inline.} =
+  if pos + 2 > data.len:
+    raise newException(ValueError, "short u16")
+  result = (uint16(data[pos]) shl 8) or uint16(data[pos + 1])
+  pos += 2
+
+proc readUint64BE(data: openArray[byte]; pos: var int): uint64 {.inline.} =
+  if pos + 8 > data.len:
+    raise newException(ValueError, "short u64")
+  result = 0'u64
+  for _ in 0 ..< 8:
+    result = (result shl 8) or uint64(data[pos])
+    inc pos
+
+type
+  BuiltinResumptionTicketMeta = object
+    version: uint8
+    expiresAtUs: uint64
+    serverName: string
+    serverPort: uint16
+    alpn: string
+    data: seq[byte]
+
+proc alpnForConnection(conn: ConnectionState): string {.gcsafe.} =
+  if conn.isNil or conn.configuration.isNil or conn.configuration.alpns.len == 0:
+    ""
+  else:
+    conn.configuration.alpns[0]
+
+proc resumptionCacheKey(serverName: string; serverPort: uint16; alpn: string): string {.gcsafe.} =
+  serverName & "|" & $serverPort & "|" & alpn
+
+proc resumptionCacheKey(conn: ConnectionState): string {.gcsafe.} =
+  if conn.isNil:
+    return ""
+  resumptionCacheKey(conn.serverName, conn.serverPort, alpnForConnection(conn))
+
+proc parseBuiltinResumptionTicket(ticket: openArray[byte];
+    meta: var BuiltinResumptionTicketMeta): bool {.gcsafe.} =
+  if ticket.len < 4 + 1 + 8 + 2 + 1 + 1 + 2:
+    return false
+  for i in 0 ..< BuiltinResumptionTicketMagic.len:
+    if ticket[i] != BuiltinResumptionTicketMagic[i]:
+      return false
+  var pos = BuiltinResumptionTicketMagic.len
+  try:
+    meta.version = ticket[pos]
+    inc pos
+    if meta.version != BuiltinResumptionTicketVersion:
+      return false
+    meta.expiresAtUs = readUint64BE(ticket, pos)
+    meta.serverPort = readUint16BE(ticket, pos)
+    let serverNameLen = int(ticket[pos]); inc pos
+    let alpnLen = int(ticket[pos]); inc pos
+    let dataLen = int(readUint16BE(ticket, pos))
+    if pos + serverNameLen + alpnLen + dataLen > ticket.len:
+      return false
+    meta.serverName =
+      if serverNameLen == 0: ""
+      else: cast[string](newString(serverNameLen))
+    if serverNameLen > 0:
+      meta.serverName.setLen(serverNameLen)
+      copyMem(addr meta.serverName[0], unsafeAddr ticket[pos], serverNameLen)
+      pos += serverNameLen
+    meta.alpn =
+      if alpnLen == 0: ""
+      else: cast[string](newString(alpnLen))
+    if alpnLen > 0:
+      meta.alpn.setLen(alpnLen)
+      copyMem(addr meta.alpn[0], unsafeAddr ticket[pos], alpnLen)
+      pos += alpnLen
+    meta.data = @[]
+    if dataLen > 0:
+      meta.data = newSeq[byte](dataLen)
+      copyMem(addr meta.data[0], unsafeAddr ticket[pos], dataLen)
+      pos += dataLen
+    true
+  except ValueError:
+    false
+
+proc builtinResumptionEntryValid(entry: BuiltinResumptionEntry; serverName: string;
+    serverPort: uint16; alpn: string): bool {.gcsafe.} =
+  if entry.ticket.len == 0:
+    return false
+  let nowUs = nowMicros()
+  if entry.expiresAtUs > 0 and nowUs >= entry.expiresAtUs:
+    return false
+  var meta: BuiltinResumptionTicketMeta
+  if not parseBuiltinResumptionTicket(entry.ticket, meta):
+    return false
+  if meta.expiresAtUs > 0 and nowUs >= meta.expiresAtUs:
+    return false
+  meta.serverName == serverName and meta.serverPort == serverPort and meta.alpn == alpn
+
+proc loadBuiltinResumptionEntry(serverName: string; serverPort: uint16; alpn: string): BuiltinResumptionEntry =
+  let key = resumptionCacheKey(serverName, serverPort, alpn)
+  if key.len == 0 or not gBuiltinResumptionCache.hasKey(key):
+    return
+  let entry = gBuiltinResumptionCache[key]
+  if not builtinResumptionEntryValid(entry, serverName, serverPort, alpn):
+    gBuiltinResumptionCache.del(key)
+    return
+  result = entry
+
+proc storeBuiltinResumptionEntry(conn: ConnectionState; ticket: seq[byte];
+    data: seq[byte] = @[]) =
+  if conn.isNil or ticket.len == 0:
+    return
+  let key = resumptionCacheKey(conn)
+  if key.len == 0:
+    return
+  var meta: BuiltinResumptionTicketMeta
+  let expiresAtUs =
+    if parseBuiltinResumptionTicket(ticket, meta): meta.expiresAtUs
+    else: nowMicros() + BuiltinResumptionTicketLifetimeUs
+  gBuiltinResumptionCache[key] = BuiltinResumptionEntry(
+    ticket: ticket,
+    data: data,
+    issuedAtUs: nowMicros(),
+    expiresAtUs: expiresAtUs
+  )
+
+proc initialBidiStreamId(role: ConnectionRole): uint64 =
+  if role == crClient: 0'u64 else: 1'u64
+
+proc initialUniStreamId(role: ConnectionRole): uint64 =
+  if role == crClient: 2'u64 else: 3'u64
+
+proc initLocalStreamIds(conn: ConnectionState) =
+  if conn.isNil or conn.quicConn.isNil:
+    return
+  conn.nextLocalBidiStreamId = initialBidiStreamId(conn.quicConn.role)
+  conn.nextLocalUniStreamId = initialUniStreamId(conn.quicConn.role)
+
+proc allocLocalStreamId(conn: ConnectionState; unidirectional: bool): uint64 =
+  if conn.isNil or conn.quicConn.isNil:
+    return 0'u64
+  if unidirectional:
+    result = conn.nextLocalUniStreamId
+    conn.nextLocalUniStreamId += 4'u64
+  else:
+    result = conn.nextLocalBidiStreamId
+    conn.nextLocalBidiStreamId += 4'u64
+
+proc prependPendingChunk(stream: StreamState; chunk: PendingStreamChunk) {.gcsafe.} =
+  if stream.isNil:
+    return
+  if stream.pendingChunks.len > 0:
+    let head = stream.pendingChunks[0]
+    if head.offset == chunk.offset and head.fin == chunk.fin and head.payload == chunk.payload:
+      return
+  stream.pendingChunks.insert(chunk, 0)
+
+proc recordSentPacket(conn: ConnectionState; meta: SentPacketMeta) {.gcsafe.} =
+  if conn.isNil:
+    return
+  conn.sentPackets.add(meta)
+  let packet = qloss.PacketRecord(
+    packetNumber: meta.packetNumber,
+    encryptEpoch: meta.epoch,
+    sentTimeUs: meta.sentTimeUs,
+    ackEliciting: meta.ackEliciting,
+    packetLength: meta.packetLength
+  )
+  qloss.onPacketSent(conn.lossDetection, packet)
+
+proc buildBuiltinResumptionTicket(conn: ConnectionState; data: seq[byte] = @[]): seq[byte] {.gcsafe.} =
+  if conn.isNil:
+    return @[]
+  let serverName = conn.serverName
+  let alpn = alpnForConnection(conn)
+  let nowUs = nowMicros()
+  let expiresAtUs = nowUs + BuiltinResumptionTicketLifetimeUs
+  let cappedDataLen = min(data.len, high(uint16).int)
+  let serverNameLen = min(serverName.len, 255)
+  let alpnLen = min(alpn.len, 255)
+  result = @[]
+  result.add(BuiltinResumptionTicketMagic)
+  result.add(BuiltinResumptionTicketVersion)
+  result.appendUint64BE(expiresAtUs)
+  result.appendUint16BE(conn.serverPort)
+  result.add(byte(serverNameLen))
+  result.add(byte(alpnLen))
+  result.appendUint16BE(uint16(cappedDataLen))
+  if serverNameLen > 0:
+    for i in 0 ..< serverNameLen:
+      result.add(byte(serverName[i].ord and 0xFF))
+  if alpnLen > 0:
+    for i in 0 ..< alpnLen:
+      result.add(byte(alpn[i].ord and 0xFF))
+  if cappedDataLen > 0:
+    result.add(data[0 ..< cappedDataLen])
+
+proc buildPathChallengeData(conn: ConnectionState; pathId: uint8): array[8, byte] {.gcsafe.} =
+  var seed = nowMicros() xor conn.latestAckedPacket xor uint64(pathId)
+  for i in 0 .. 7:
+    result[i] = byte((seed shr (i * 8)) and 0xFF'u64)
+
+proc remoteAddressKey(remote: TransportAddress): string {.gcsafe.}
+
+proc registerPathRemote(conn: ConnectionState; pathId: uint8;
+    remote: TransportAddress) {.gcsafe.} =
+  if conn.isNil:
+    return
+  let remoteKey = remoteAddressKey(remote)
+  if remoteKey.len == 0:
+    return
+  conn.pathRemoteAddrs[pathId] = remote
+  conn.pathRemoteKeys[pathId] = remoteKey
+  conn.remotePathIds[remoteKey] = pathId
+
+proc activateValidatedPath(conn: ConnectionState; pathId: uint8) {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil:
+    return
+  if conn.pathRemoteAddrs.hasKey(pathId):
+    conn.remoteAddress = conn.pathRemoteAddrs[pathId]
+  if conn.pathRemoteKeys.hasKey(pathId):
+    conn.activeRemoteKey = conn.pathRemoteKeys[pathId]
+  {.cast(gcsafe).}:
+    conn.quicConn.model.completePathValidation(pathId, true)
+
+proc findPathState(conn: ConnectionState; pathId: uint8;
+    path: var PathState): bool {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil:
+    return false
+  for item in conn.quicConn.model.paths:
+    if item.pathId == pathId:
+      path = item
+      return true
+  false
+
+proc nextPathId(conn: ConnectionState): uint8 {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil:
+    return 0'u8
+  var highest = -1
+  for path in conn.quicConn.model.paths:
+    if int(path.pathId) > highest:
+      highest = int(path.pathId)
+  uint8(min(highest + 1, high(uint8).int))
+
+proc sendOneRttPacket(conn: ConnectionState; payload: seq[byte];
+    frameKind: SentFrameKind; ackEliciting: bool;
+    stream: StreamState = nil; streamOffset = 0'u64;
+    streamPayload: seq[byte] = @[]; streamFin = false;
+    clientContext: pointer = nil;
+    targetRemote: ptr TransportAddress = nil): uint64 {.gcsafe.}
+
+proc markActivePathValidated(conn: ConnectionState; pathId: uint8) {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil:
+    return
+  conn.activateValidatedPath(pathId)
+
+proc maybeInitiatePathMigration(conn: ConnectionState; remote: TransportAddress) {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil or not conn.settingsOverlay.migrationEnabled:
+    return
+  let remoteKey = remoteAddressKey(remote)
+  if remoteKey.len == 0 or remoteKey == conn.activeRemoteKey:
+    return
+  if conn.remotePathIds.hasKey(remoteKey):
+    let knownPathId = conn.remotePathIds[remoteKey]
+    var knownPath: PathState
+    if conn.findPathState(knownPathId, knownPath):
+      if knownPath.isValidated:
+        conn.activateValidatedPath(knownPathId)
+        return
+      if knownPath.challengeOutstanding:
+        return
+  let pathId =
+    if conn.remotePathIds.hasKey(remoteKey): conn.remotePathIds[remoteKey]
+    else: conn.nextPathId()
+  let challenge = buildPathChallengeData(conn, pathId)
+  conn.registerPathRemote(pathId, remote)
+  {.cast(gcsafe).}:
+    conn.quicConn.model.initiatePathChallenge(pathId, challenge)
+  discard conn.sendOneRttPacket(
+    proto.encodePathChallengeFrame(challenge),
+    sfkPathChallenge,
+    true,
+    targetRemote = unsafeAddr remote
+  )
+  {.cast(gcsafe).}:
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagConnectionEvent,
+      handle: cast[pointer](conn),
+      note: "path migration challenge path=" & $pathId
+    ))
+
+proc applyPathResponse(conn: ConnectionState; response: array[8, byte]) {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil:
+    return
+  for path in conn.quicConn.model.paths:
+    if path.challengeData == response:
+      conn.activateValidatedPath(path.pathId)
+      {.cast(gcsafe).}:
+        emitDiagnostics(DiagnosticsEvent(
+          kind: diagConnectionEvent,
+          handle: cast[pointer](conn),
+          note: "path validated path=" & $path.pathId
+        ))
+      break
+
+proc findSentPacket(conn: ConnectionState; packetNumber: uint64; epoch: CryptoEpoch;
+    meta: var SentPacketMeta): bool {.gcsafe.} =
+  if conn.isNil:
+    return false
+  for sent in conn.sentPackets:
+    if sent.epoch == epoch and sent.packetNumber == packetNumber:
+      meta = sent
+      return true
+  false
+
+proc packetAckedByFrame(ack: proto.AckFrame; packetNumber: uint64): bool {.gcsafe.} =
+  if ack.ranges.len == 0:
+    return packetNumber <= ack.largestAcked
+  for ackRange in ack.ranges:
+    if packetNumber >= ackRange.smallest and packetNumber <= ackRange.largest:
+      return true
+  false
+
+proc currentProbeTimeoutUs(conn: ConnectionState): uint64 {.gcsafe.} =
+  if conn.isNil:
+    return MinProbeTimeoutUs
+  let smoothedRtt =
+    if conn.smoothedRttUs == 0: DefaultSmoothedRttUs
+    else: conn.smoothedRttUs
+  let rttVariance =
+    if conn.rttVarianceUs == 0: max(smoothedRtt div 2, DefaultRttVarianceUs)
+    else: conn.rttVarianceUs
+  let ackDelayUs = MaxAckDelayDefaultMs.uint64 * 1_000'u64
+  let timeoutUs = qloss.computeProbeTimeout(conn.lossDetection, smoothedRtt, rttVariance) + ackDelayUs
+  max(timeoutUs, MinProbeTimeoutUs)
+
+proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
+  if conn.isNil or conn.sentPackets.len == 0:
+    return
+  let nowUs = nowMicros()
+  let probeTimeoutUs = conn.currentProbeTimeoutUs()
+  var remaining: seq[SentPacketMeta] = @[]
+  var largestLost = 0'u64
+  var lostBytes = 0'u32
+  for meta in conn.sentPackets:
+    if meta.ackEliciting and nowUs > meta.sentTimeUs and
+        nowUs - meta.sentTimeUs >= probeTimeoutUs:
+      qloss.markPacketLost(conn.lossDetection, meta.packetNumber)
+      if meta.packetNumber > largestLost:
+        largestLost = meta.packetNumber
+      lostBytes = lostBytes + meta.packetLength.uint32
+      if meta.frameKind == sfkStream and not meta.stream.isNil:
+        let stream = cast[StreamState](meta.stream)
+        stream.prependPendingChunk(PendingStreamChunk(
+          offset: meta.streamOffset,
+          payload: meta.streamPayload,
+          fin: meta.streamFin,
+          clientContext: meta.clientContext
+        ))
+      {.cast(gcsafe).}:
+        emitDiagnostics(DiagnosticsEvent(
+          kind: diagConnectionEvent,
+          handle: cast[pointer](conn),
+          note: "loss timeout pn=" & $meta.packetNumber & " pto=" & $probeTimeoutUs
+        ))
+    else:
+      remaining.add(meta)
+  conn.sentPackets = remaining
+  if lostBytes > 0:
+    qloss.onProbeTimeoutFired(conn.lossDetection)
+    let loss = LossEventSnapshot(
+      largestPacketNumberLost: largestLost,
+      largestSentPacketNumber: conn.lossDetection.largestSentPacketNumber,
+      retransmittableBytesLost: lostBytes,
+      persistentCongestion: conn.lossDetection.probeCount >= PersistentCongestionThreshold.uint16
+    )
+    qcc.onLost(conn.congestionController, loss)
+    {.cast(gcsafe).}:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: cast[pointer](conn),
+        note: "pto fired lostBytes=" & $lostBytes & " probeCount=" & $conn.lossDetection.probeCount
+      ))
+
+proc flushStream(state: StreamState) {.gcsafe.}
+proc flushPendingDatagrams(conn: ConnectionState) {.gcsafe.}
 
 proc getHandleFast(handle: HQUIC): QuicHandleState {.quicApiHot.} =
   if handle.isNil:
@@ -354,6 +853,13 @@ proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) =
     handle: cast[pointer](state),
     paramId: event.paramId,
     note: diagNote))
+
+proc emitStreamEvent(state: StreamState; event: var StreamEvent) =
+  event.stream = cast[HQUIC](state)
+  if state.eventHandlers.len > 0:
+    for handler in state.eventHandlers:
+      if handler != nil:
+        handler(event)
 
 proc updateDatagramState(state: ConnectionState; param: uint32; enabled: bool;
     isReceive: bool) {.inline.} =
@@ -495,11 +1001,11 @@ proc toListener(handle: HQUIC): ListenerState =
     return nil
   ListenerState(base)
 
-proc initConnectedEvent(alpnSource: string): QuicConnectionEvent =
+proc initConnectedEvent(alpnSource: string; sessionResumed = false): QuicConnectionEvent =
   result.Type = QUIC_CONNECTION_EVENT_CONNECTED
   result.Padding = 0
   var connected: QuicConnectionEventConnectedPayload
-  connected.SessionResumed = BOOLEAN(0)
+  connected.SessionResumed = BOOLEAN(if sessionResumed: 1 else: 0)
   var negotiatedLen = alpnSource.len
   if negotiatedLen > 255:
     negotiatedLen = 255
@@ -510,6 +1016,266 @@ proc initConnectedEvent(alpnSource: string): QuicConnectionEvent =
   else:
     connected.NegotiatedAlpn = cast[ptr uint8](alpnSource.cstring)
   system.copyMem(addr result.Data[0], unsafeAddr connected, sizeof(connected))
+
+proc cidBytes(cid: ConnectionId): seq[byte] =
+  if cid.length == 0:
+    return @[]
+  result = newSeq[byte](int(cid.length))
+  for i in 0 ..< int(cid.length):
+    result[i] = cid.bytes[i]
+
+proc remoteAddressKey(remote: TransportAddress): string {.gcsafe.} =
+  $remote
+
+proc connectionSendMaterial(conn: ConnectionState): tuple[key, iv, hp: seq[byte]] =
+  if conn.isNil or conn.quicConn.isNil:
+    return (@[], @[], @[])
+  if conn.quicConn.role == crServer:
+    (conn.oneRttKeys.serverKey, conn.oneRttKeys.serverIv, conn.oneRttKeys.serverHp)
+  else:
+    (conn.oneRttKeys.clientKey, conn.oneRttKeys.clientIv, conn.oneRttKeys.clientHp)
+
+proc connectionReceiveMaterial(conn: ConnectionState): tuple[key, iv, hp: seq[byte]] =
+  if conn.isNil or conn.quicConn.isNil:
+    return (@[], @[], @[])
+  if conn.quicConn.role == crServer:
+    (conn.oneRttKeys.clientKey, conn.oneRttKeys.clientIv, conn.oneRttKeys.clientHp)
+  else:
+    (conn.oneRttKeys.serverKey, conn.oneRttKeys.serverIv, conn.oneRttKeys.serverHp)
+
+proc emitNativeConnected(state: ConnectionState) =
+  if state.isNil or state.callback.isNil:
+    return
+  let negotiatedAlpn =
+    if state.configuration.isNil or state.configuration.alpns.len == 0: ""
+    else: state.configuration.alpns[0]
+  var event = initConnectedEvent(negotiatedAlpn, state.sessionResumed)
+  discard state.callback(cast[HQUIC](state), state.callbackContext, addr event)
+
+proc emitListenerNewConnection(state: ListenerState; connection: HQUIC) =
+  if state.isNil or state.callback.isNil or connection.isNil:
+    return
+  var native = QuicListenerEvent(Type: QUIC_LISTENER_EVENT_NEW_CONNECTION, Padding: 0)
+  var payload = QuicListenerEventNewConnectionPayload(
+    Info: nil,
+    Connection: connection
+  )
+  copyMem(addr native.Data[0], addr payload, sizeof(payload))
+  discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
+
+proc emitPeerStreamStarted(state: ConnectionState; stream: StreamState) =
+  if state.isNil or stream.isNil:
+    return
+  let streamHandle = cast[HQUIC](stream)
+  if not state.callback.isNil:
+    var native = QuicConnectionEvent(Type: QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED, Padding: 0)
+    var payload = QuicConnectionEventPeerStreamStartedPayload(
+      Stream: streamHandle,
+      Flags: QUIC_STREAM_OPEN_FLAGS(0)
+    )
+    copyMem(addr native.Data[0], addr payload, sizeof(payload))
+    discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
+  var ev = ConnectionEvent(
+    kind: cePeerStreamStarted,
+    stream: streamHandle,
+    streamFlags: 0'u32,
+    streamIsUnidirectional: false,
+    note: "peer stream started")
+  emitConnectionEvent(state, ev)
+
+proc emitStreamReceive(state: StreamState; offset: uint64; payloadData: seq[byte]; fin: bool) =
+  if state.isNil:
+    return
+  if not state.callback.isNil:
+    var native = QuicStreamEvent(Type: QUIC_STREAM_EVENT_RECEIVE, Padding: 0)
+    var buffer = QuicBuffer(
+      Length: uint32(payloadData.len),
+      Buffer: (if payloadData.len == 0: nil else: cast[ptr uint8](unsafeAddr payloadData[0]))
+    )
+    var payload = QuicStreamEventReceivePayload(
+      AbsoluteOffset: offset,
+      TotalBufferLength: uint64(payloadData.len),
+      Buffers: (if payloadData.len == 0: nil else: cast[pointer](addr buffer)),
+      BufferCount: (if payloadData.len == 0: 0'u32 else: 1'u32),
+      Flags: (if fin: 0x01'u32 else: 0'u32)
+    )
+    copyMem(addr native.Data[0], addr payload, sizeof(payload))
+    discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
+  var ev = StreamEvent(
+    kind: seReceive,
+    absoluteOffset: offset,
+    totalBufferLength: uint64(payloadData.len),
+    bufferCount: (if payloadData.len == 0: 0'u32 else: 1'u32),
+    flags: (if fin: 0x01'u32 else: 0'u32),
+    payload: payloadData
+  )
+  emitStreamEvent(state, ev)
+  if fin:
+    if not state.callback.isNil:
+      var native = QuicStreamEvent(Type: QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN, Padding: 0)
+      discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
+    var shutdownEv = StreamEvent(kind: sePeerSendShutdown)
+    emitStreamEvent(state, shutdownEv)
+
+proc sendOneRttPacket(conn: ConnectionState; payload: seq[byte];
+    frameKind: SentFrameKind; ackEliciting: bool;
+    stream: StreamState = nil; streamOffset = 0'u64;
+    streamPayload: seq[byte] = @[]; streamFin = false;
+    clientContext: pointer = nil;
+    targetRemote: ptr TransportAddress = nil): uint64 {.gcsafe.} =
+  if conn.isNil or conn.transport.isNil or not conn.handshakeComplete:
+    return 0'u64
+  conn.detectTimedOutLosses()
+  if ackEliciting and not qcc.canSend(conn.congestionController):
+    {.cast(gcsafe).}:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: cast[pointer](conn),
+        note: "TX blocked by congestion controller"
+      ))
+    return 0'u64
+  let nowUs = nowMicros()
+  if ackEliciting:
+    let allowance = qcc.sendAllowance(conn.congestionController, nowUs)
+    if allowance > 0 and uint64(payload.len) > allowance:
+      {.cast(gcsafe).}:
+        emitDiagnostics(DiagnosticsEvent(
+          kind: diagConnectionEvent,
+          handle: cast[pointer](conn),
+          note: "TX exceeds send allowance=" & $allowance
+        ))
+      return 0'u64
+  let sendMat = connectionSendMaterial(conn)
+  if sendMat.key.len < 16 or sendMat.iv.len < 12 or sendMat.hp.len < 16:
+    return 0'u64
+
+  let pn = uint64(conn.quicConn.model.packetSpaces[ceOneRtt].nextPacketNumber())
+  let destCid = cidBytes(conn.peerCid)
+  var header: seq[byte] = @[]
+  header.add(0x43'u8)
+  header.add(destCid)
+  let pnOffset = header.len
+  proto.writeUint32(header, uint32(pn))
+
+  var tag: array[16, byte]
+  let ciphertext = tls.encryptPacket(sendMat.key, sendMat.iv, pn, header, payload, tag)
+  var packet = header & ciphertext & @tag
+
+  if packet.len >= pnOffset + 4 + 16:
+    let sample = packet[pnOffset + 4 ..< pnOffset + 4 + 16]
+    var pnSlice: array[4, byte]
+    for i in 0 .. 3:
+      pnSlice[i] = packet[pnOffset + i]
+    tls.applyHeaderProtection(sendMat.hp, sample, packet[0], pnSlice)
+    for i in 0 .. 3:
+      packet[pnOffset + i] = pnSlice[i]
+
+  let sendRemote =
+    if targetRemote.isNil: conn.remoteAddress
+    else: targetRemote[]
+  asyncCheck conn.transport.sendTo(sendRemote, packet)
+  conn.recordSentPacket(SentPacketMeta(
+    packetNumber: pn,
+    epoch: ceOneRtt,
+    ackEliciting: ackEliciting,
+    packetLength: uint16(min(packet.len, high(uint16).int)),
+    sentTimeUs: nowUs,
+    frameKind: frameKind,
+    stream: cast[pointer](stream),
+    streamOffset: streamOffset,
+    streamPayload: streamPayload,
+    streamFin: streamFin,
+    clientContext: clientContext
+  ))
+  qcc.onPacketSent(
+    conn.congestionController,
+    uint32(min(packet.len, high(uint32).int)),
+    ackEliciting,
+    false,
+    nowUs
+  )
+  {.cast(gcsafe).}:
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagConnectionEvent,
+      handle: cast[pointer](conn),
+      note: "TX 1-RTT pn=" & $pn & " kind=" & $frameKind
+    ))
+  pn
+
+proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoch) {.gcsafe.} =
+  if conn.isNil:
+    return
+  var remaining: seq[SentPacketMeta] = @[]
+  var ackedBytes = 0'u32
+  var ackedMeta: SentPacketMeta
+  var ackedMetaFound = conn.findSentPacket(ack.largestAcked, epoch, ackedMeta)
+  for meta in conn.sentPackets:
+    if meta.epoch == epoch and packetAckedByFrame(ack, meta.packetNumber):
+      ackedBytes += meta.packetLength.uint32
+    else:
+      remaining.add(meta)
+  conn.sentPackets = remaining
+  conn.quicConn.model.packetSpaces[epoch].recordAckedPacket(ack.largestAcked)
+  conn.latestAckedPacket = max(conn.latestAckedPacket, ack.largestAcked)
+  let nowUs = nowMicros()
+  if ackedMetaFound and ackedMeta.sentTimeUs > 0 and nowUs >= ackedMeta.sentTimeUs:
+    let sampleRtt = nowUs - ackedMeta.sentTimeUs
+    conn.latestRttUs = sampleRtt
+    if conn.minRttUs == 0 or sampleRtt < conn.minRttUs:
+      conn.minRttUs = sampleRtt
+    if conn.smoothedRttUs == 0:
+      conn.smoothedRttUs = sampleRtt
+      conn.rttVarianceUs = sampleRtt div 2
+    else:
+      let rttDelta =
+        if conn.smoothedRttUs > sampleRtt: conn.smoothedRttUs - sampleRtt
+        else: sampleRtt - conn.smoothedRttUs
+      conn.rttVarianceUs = ((3 * conn.rttVarianceUs) + rttDelta) div 4
+      conn.smoothedRttUs = ((7 * conn.smoothedRttUs) + sampleRtt) div 8
+  let ackEvent = AckEventSnapshot(
+    timeNow: nowUs,
+    largestAck: ack.largestAcked,
+    largestSentPacketNumber: conn.lossDetection.largestSentPacketNumber,
+    totalAckedRetransmittableBytes: conn.lossDetection.totalBytesAcked + uint64(ackedBytes),
+    ackedRetransmittableBytes: ackedBytes,
+    smoothedRtt: max(conn.smoothedRttUs, 1'u64),
+    minRtt: max(conn.minRttUs, 1'u64),
+    oneWayDelay: 0'u64,
+    adjustedAckTime: nowUs,
+    implicitAck: false,
+    hasLoss: false,
+    largestAckAppLimited: false,
+    minRttValid: true
+  )
+  qloss.onAckReceived(conn.lossDetection, ackEvent)
+  qcc.onAcked(conn.congestionController, ackEvent)
+  {.cast(gcsafe).}:
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagConnectionEvent,
+      handle: cast[pointer](conn),
+      note: "RX ACK largest=" & $ack.largestAcked
+    ))
+
+proc sendAckFrame(conn: ConnectionState; largestAcked: uint64;
+    targetRemote: ptr TransportAddress = nil) {.gcsafe.} =
+  if conn.isNil or not conn.handshakeComplete:
+    return
+  let ackPayload = proto.encodeAckFrame(largestAcked, 0'u64)
+  discard conn.sendOneRttPacket(ackPayload, sfkAck, false, targetRemote = targetRemote)
+
+proc flushPendingDatagrams(conn: ConnectionState) {.gcsafe.} =
+  if conn.isNil or not conn.handshakeComplete or conn.pendingDatagrams.len == 0:
+    return
+  var pending = conn.pendingDatagrams
+  conn.pendingDatagrams = @[]
+  for datagram in pending:
+    let frame = proto.encodeDatagramFrame(datagram.payload, true)
+    discard conn.sendOneRttPacket(
+      frame,
+      sfkDatagram,
+      true,
+      clientContext = datagram.clientContext
+    )
 
 proc msquicSetContext(handle: HQUIC; context: pointer) {.cdecl, quicApiHot.} =
   let state = getHandleFast(handle)
@@ -556,6 +1322,10 @@ proc msquicSetCallbackHandler(handle: HQUIC; handler: pointer;
     let stream = StreamState(state)
     stream.callback = cast[QuicStreamCallback](handler)
     stream.callbackContext = context
+  of qhkListener:
+    let listener = ListenerState(state)
+    listener.callback = cast[QuicListenerCallback](handler)
+    listener.callbackContext = context
   else:
     discard
 
@@ -638,6 +1408,7 @@ proc msquicSetParam(handle: HQUIC; param: uint32; bufferLength: uint32;
     if state.congestionAlgorithm == algorithm:
       return QUIC_STATUS_SUCCESS
     state.congestionAlgorithm = algorithm
+    qcc.switchAlgorithm(state.congestionController, algorithm)
     let note = algorithmNote(algorithm)
     var ev = ConnectionEvent(
       kind: ceParameterUpdated,
@@ -800,6 +1571,17 @@ proc msquicGetParam(handle: HQUIC; param: uint32; bufferLength: ptr uint32;
       return QUIC_STATUS_INVALID_PARAMETER
     copyMem(buffer, addr state.settingsOverlay, sizeof(QuicSettingsOverlay))
     QUIC_STATUS_SUCCESS
+  of QUIC_PARAM_STREAM_ID:
+    let state = toStream(handle)
+    if state.isNil:
+      return QUIC_STATUS_INVALID_PARAMETER
+    let required = sizeof(uint64).uint32
+    if buffer.isNil or bufferLength[] < required:
+      bufferLength[] = required
+      return QUIC_STATUS_SUCCESS
+    cast[ptr uint64](buffer)[] = state.streamId
+    bufferLength[] = required
+    QUIC_STATUS_SUCCESS
   else:
     QUIC_STATUS_NOT_SUPPORTED
 
@@ -915,6 +1697,7 @@ proc msquicListenerOpen(registration: HQUIC; handler: pointer;
   state.context = context
   state.started = false
   state.stopped = false
+  state.acceptedConnections = initTable[string, ConnectionState]()
   listener[] = storeHandle(state)
   QUIC_STATUS_SUCCESS
 
@@ -933,24 +1716,424 @@ proc msquicListenerClose(listener: HQUIC) {.cdecl.} =
         system.copyMem(buf, unsafeAddr payload, sizeof(payload))
       )
       state.stopped = true
+    state.acceptedConnections.clear()
   releaseHandle(listener)
 
-proc listenerOnReceive(transp: DatagramTransport, remote: TransportAddress,
-                         local: TransportAddress, data: seq[byte]) {.async.} =
+proc parsePacketNumber(pnSlice: array[4, byte]): uint32 =
+  var tmp = pnSlice
+  var value: uint32
+  bigEndian32(addr value, addr tmp)
+  value
+
+proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress;
+    clientCidSeq, serverCidSeq: seq[byte]): ConnectionState =
+  let conn = ConnectionState(kind: qhkConnection)
+  conn.registration = state.registration
+  conn.callback = nil
+  conn.callbackContext = nil
+  conn.context = nil
+  conn.started = true
+  conn.serverName = ""
+  conn.serverPort = 0
+  conn.localCid = initConnectionId(serverCidSeq)
+  conn.peerCid = initConnectionId(clientCidSeq)
+  conn.quicConn = newConnection(crServer, conn.localCid, conn.peerCid, QuicVersion(1))
+  conn.eventHandlers = @[]
+  conn.datagramReceiveEnabled = false
+  conn.datagramSendEnabled = false
+  conn.streamSchedulingScheme = 0
+  conn.settingsOverlay = defaultQuicSettingsOverlay()
+  conn.congestionAlgorithm = caCubic
+  conn.closeReason = ""
+  conn.disable1RttEncryption = false
+  conn.transport = state.transport
+  conn.remoteAddress = remote
+  conn.initialSecrets = tls.deriveInitialSecrets(serverCidSeq)
+  conn.transcript = @[]
+  conn.handshakeComplete = false
+  conn.sessionResumed = false
+  conn.resumptionTicket = @[]
+  conn.resumptionData = @[]
+  conn.incomingStreams = initTable[uint64, StreamState]()
+  conn.ackTracker = qack.initAckTracker()
+  conn.lossDetection = qloss.initLossDetectionModel()
+  conn.congestionController = qcc.initCongestionController(caCubic, DefaultCongestionDatagramBytes)
+  conn.sentPackets = @[]
+  conn.pendingDatagrams = @[]
+  conn.latestAckedPacket = 0'u64
+  conn.localStreams = @[]
+  conn.smoothedRttUs = 0'u64
+  conn.minRttUs = 0'u64
+  conn.latestRttUs = 0'u64
+  conn.rttVarianceUs = 0'u64
+  conn.pathRemoteAddrs = initTable[uint8, TransportAddress]()
+  conn.pathRemoteKeys = initTable[uint8, string]()
+  conn.remotePathIds = initTable[string, uint8]()
+  conn.activeRemoteKey = remoteAddressKey(remote)
+  conn.registerPathRemote(0'u8, remote)
+  discard storeHandle(conn)
+  conn.initLocalStreamIds()
+  conn
+
+proc ensureIncomingStream(conn: ConnectionState; streamId: uint64): StreamState =
+  if conn.isNil:
+    return nil
+  if conn.incomingStreams.hasKey(streamId):
+    return conn.incomingStreams[streamId]
+  let stream = StreamState(kind: qhkStream)
+  stream.connection = conn
+  stream.callback = nil
+  stream.callbackContext = nil
+  stream.context = nil
+  stream.eventHandlers = @[]
+  stream.started = true
+  stream.closed = false
+  stream.sendBuffer = @[]
+  stream.sentOffset = 0
+  stream.finRequested = false
+  stream.finSent = false
+  stream.streamId = streamId
+  stream.pendingChunks = @[]
+  discard storeHandle(stream)
+  conn.incomingStreams[streamId] = stream
+  emitPeerStreamStarted(conn, stream)
+  stream
+
+proc findLocalStream(conn: ConnectionState; streamId: uint64): StreamState {.gcsafe.} =
+  if conn.isNil:
+    return nil
+  for stream in conn.localStreams:
+    if not stream.isNil and stream.streamId == streamId:
+      return stream
+  nil
+
+proc findAnyStream(conn: ConnectionState; streamId: uint64): StreamState {.gcsafe.} =
+  if conn.isNil:
+    return nil
+  let local = conn.findLocalStream(streamId)
+  if not local.isNil:
+    return local
+  if conn.incomingStreams.hasKey(streamId):
+    return conn.incomingStreams[streamId]
+  nil
+
+proc emitPeerSendAborted(state: StreamState; errorCode: uint64) {.gcsafe.} =
+  if state.isNil:
+    return
+  if not state.callback.isNil:
+    var native = QuicStreamEvent(Type: QUIC_STREAM_EVENT_PEER_SEND_ABORTED, Padding: 0)
+    var payload = QuicStreamEventPeerAbortedPayload(
+      ErrorCode: QUIC_UINT62(errorCode),
+      Reserved: 0'u16
+    )
+    copyMem(addr native.Data[0], addr payload, sizeof(payload))
+    {.cast(gcsafe).}:
+      discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
+  var ev = StreamEvent(kind: sePeerSendAborted, errorCode: errorCode)
+  {.cast(gcsafe).}:
+    emitStreamEvent(state, ev)
+
+proc emitPeerReceiveAborted(state: StreamState; errorCode: uint64) {.gcsafe.} =
+  if state.isNil:
+    return
+  if not state.callback.isNil:
+    var native = QuicStreamEvent(Type: QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED, Padding: 0)
+    var payload = QuicStreamEventPeerAbortedPayload(
+      ErrorCode: QUIC_UINT62(errorCode),
+      Reserved: 0'u16
+    )
+    copyMem(addr native.Data[0], addr payload, sizeof(payload))
+    {.cast(gcsafe).}:
+      discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
+  var ev = StreamEvent(kind: sePeerReceiveAborted, errorCode: errorCode)
+  {.cast(gcsafe).}:
+    emitStreamEvent(state, ev)
+
+proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
+    packetNumber: uint64; plaintext: seq[byte]) =
+  if conn.isNil:
+    return
+  conn.maybeInitiatePathMigration(remote)
+  qack.trackIncomingPacket(conn.ackTracker, packetNumber)
+  let nowUs = nowMicros()
+  var pos = 0
+  var ackEliciting = false
+  while pos < plaintext.len:
+    let frameType = plaintext[pos]
+    if (frameType and 0xF8'u8) == 0x08'u8:
+      ackEliciting = true
+      let frame = proto.parseStreamFrame(plaintext, pos)
+      let stream = ensureIncomingStream(conn, frame.streamId)
+      if not stream.isNil:
+        emitStreamReceive(stream, frame.offset, frame.data, frame.fin)
+    elif frameType == 0x30'u8 or frameType == 0x31'u8:
+      ackEliciting = true
+      let frame = proto.parseDatagramFrame(plaintext, pos)
+      if conn.datagramReceiveEnabled:
+        var ev = ConnectionEvent(
+          kind: ceDatagramReceived,
+          datagramPayload: frame.data,
+          datagramFlags: (if frame.containsLength: 1'u32 else: 0'u32),
+          note: "datagram received"
+        )
+        emitConnectionEvent(conn, ev)
+    elif frameType == 0x06'u8:
+      ackEliciting = true
+      inc pos
+      discard proto.parseCryptoFrame(plaintext, pos)
+    elif frameType == 0x04'u8:
+      ackEliciting = true
+      let frame = proto.parseResetStreamFrame(plaintext, pos)
+      let stream = conn.findAnyStream(frame.streamId)
+      if not stream.isNil:
+        stream.closed = true
+        stream.finRequested = true
+        stream.finSent = true
+        emitPeerSendAborted(stream, frame.applicationErrorCode)
+    elif frameType == 0x05'u8:
+      ackEliciting = true
+      let frame = proto.parseStopSendingFrame(plaintext, pos)
+      let stream = conn.findAnyStream(frame.streamId)
+      if not stream.isNil:
+        emitPeerReceiveAborted(stream, frame.applicationErrorCode)
+    elif frameType == 0x1A'u8:
+      ackEliciting = true
+      let frame = proto.parsePathChallengeFrame(plaintext, pos)
+      discard conn.sendOneRttPacket(
+        proto.encodePathResponseFrame(frame.data),
+        sfkPathResponse,
+        true,
+        targetRemote = unsafeAddr remote
+      )
+    elif frameType == 0x1B'u8:
+      ackEliciting = true
+      let frame = proto.parsePathResponseFrame(plaintext, pos)
+      conn.applyPathResponse(frame.data)
+    elif frameType == 0x02'u8 or frameType == 0x03'u8:
+      let ack = proto.parseAckFrame(plaintext, pos)
+      conn.applyAckFrame(ack, ceOneRtt)
+    elif frameType == 0x01'u8 or frameType == 0x00'u8:
+      if frameType == 0x01'u8:
+        ackEliciting = true
+      inc pos
+    else:
+      inc pos
+  if ackEliciting:
+    qack.markForAck(conn.ackTracker, packetNumber, nowUs, ackTypeAckImmediate)
+    conn.sendAckFrame(packetNumber, unsafeAddr remote)
+
+proc connectionMatchesDestCid(conn: ConnectionState; data: seq[byte]): bool {.gcsafe.} =
+  if conn.isNil or data.len < 2:
+    return false
+  let cidLen = int(conn.localCid.length)
+  if cidLen <= 0 or data.len < 1 + cidLen:
+    return false
+  let expected = cidBytes(conn.localCid)
+  if expected.len != cidLen:
+    return false
+  for i in 0 ..< cidLen:
+    if data[1 + i] != expected[i]:
+      return false
+  true
+
+proc findAcceptedConnectionByDestCid(state: ListenerState;
+    data: seq[byte]): ConnectionState {.gcsafe.} =
+  if state.isNil:
+    return nil
+  for conn in state.acceptedConnections.values:
+    if conn.connectionMatchesDestCid(data):
+      return conn
+  nil
+
+proc handleShortHeaderPacket(conn: ConnectionState; remote: TransportAddress; data: seq[byte]) =
+  if conn.isNil or not conn.handshakeComplete:
+    return
+  let cidLen = int(conn.localCid.length)
+  let pnOffset = 1 + cidLen
+  if data.len < pnOffset + 4 + 16:
+    return
+
+  var mutableData = data
+  var pnSlice: array[4, byte]
+  for i in 0 .. 3:
+    pnSlice[i] = mutableData[pnOffset + i]
+
+  let receiveMat = connectionReceiveMaterial(conn)
+  if receiveMat.hp.len < 16 or receiveMat.key.len < 16 or receiveMat.iv.len < 12:
+    return
+
+  tls.removeHeaderProtection(
+    receiveMat.hp,
+    mutableData[pnOffset + 4 ..< pnOffset + 4 + 16],
+    mutableData[0],
+    pnSlice
+  )
+  for i in 0 .. 3:
+    mutableData[pnOffset + i] = pnSlice[i]
+
+  let pnVal = parsePacketNumber(pnSlice)
+  let aad = mutableData[0 ..< pnOffset + 4]
+  let ciphertext = mutableData[pnOffset + 4 ..< mutableData.len - 16]
+  let recTag = mutableData[^16 .. ^1]
+  let plaintext =
+    if conn.disable1RttEncryption:
+      ciphertext
+    else:
+      tls.decryptPacket(receiveMat.key, receiveMat.iv, uint64(pnVal), aad, ciphertext, recTag)
+  if plaintext.len == 0 and ciphertext.len > 0:
+    return
+  handleOneRttPayload(conn, remote, uint64(pnVal), plaintext)
+
+proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; data: seq[byte]) =
+  let header = proto.parseUnprotectedHeader(data)
+  if header.destConnectionId.len == 0 or header.srcConnectionId.len == 0:
+    return
+  let initialSecrets = tls.deriveInitialSecrets(header.destConnectionId)
+  let pnOffset = header.payloadOffset
+  if pnOffset + 4 + 16 > data.len:
+    return
+
+  var mutableData = data
+  var pnSlice: array[4, byte]
+  for i in 0 .. 3:
+    pnSlice[i] = mutableData[pnOffset + i]
+
+  tls.removeHeaderProtection(
+    initialSecrets.clientHp,
+    mutableData[pnOffset + 4 ..< pnOffset + 4 + 16],
+    mutableData[0],
+    pnSlice
+  )
+  for i in 0 .. 3:
+    mutableData[pnOffset + i] = pnSlice[i]
+
+  let pnVal = parsePacketNumber(pnSlice)
+  let aad = mutableData[0 ..< pnOffset + 4]
+  let ciphertext = mutableData[pnOffset + 4 ..< mutableData.len - 16]
+  let recTag = mutableData[^16 .. ^1]
+  let plaintext = tls.decryptPacket(
+    initialSecrets.clientKey,
+    initialSecrets.clientIv,
+    uint64(pnVal),
+    aad,
+    ciphertext,
+    recTag
+  )
+  if plaintext.len == 0:
+    return
+
+  var cryptoData: seq[byte] = @[]
+  var pos = 0
+  while pos < plaintext.len:
+    let frameType = plaintext[pos]
+    if frameType == 0x06'u8:
+      inc pos
+      let frame = proto.parseCryptoFrame(plaintext, pos)
+      if frame.data.len > 0:
+        cryptoData = frame.data
+        break
+    else:
+      inc pos
+  if cryptoData.len == 0:
+    return
+
+  let remoteKey = remoteAddressKey(remote)
+  var conn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+  let isNewConnection = conn.isNil
+  if isNewConnection:
+    conn = newAcceptedConnection(state, remote, local, header.srcConnectionId, header.destConnectionId)
+    conn.initialSecrets = initialSecrets
+    state.acceptedConnections[remoteKey] = conn
+    emitListenerNewConnection(state, cast[HQUIC](conn))
+
+  if not conn.handshakeComplete:
+    let clientKeyShare = tls.findClientKeyShare(cryptoData)
+    if clientKeyShare.len != 32:
+      return
+    let serverKeyShare = tls.generateKeyShare()
+    let serverHello = tls.encodeServerHello(serverKeyShare.publicKey.getBytes())
+    conn.transcript = cryptoData & serverHello
+    let sharedSecret = tls.computeSharedSecret(serverKeyShare.privateKey, clientKeyShare)
+    let helloHash = tls.hashTranscript(conn.transcript)
+    let handshakeSecrets = tls.deriveHandshakeSecrets(sharedSecret, helloHash)
+    conn.oneRttKeys = tls.deriveApplicationSecrets(handshakeSecrets.clientSecret, helloHash)
+
+    var cryptoFrame: seq[byte] = @[0x06'u8]
+    proto.writeVarInt(cryptoFrame, 0'u64)
+    proto.writeVarInt(cryptoFrame, uint64(serverHello.len))
+    cryptoFrame.add(serverHello)
+
+    let destCid = cidBytes(conn.peerCid)
+    let srcCid = cidBytes(conn.localCid)
+    var headerBuf: seq[byte] = @[0xC3'u8]
+    headerBuf.writeUint32(1'u32)
+    headerBuf.add(byte(destCid.len))
+    headerBuf.add(destCid)
+    headerBuf.add(byte(srcCid.len))
+    headerBuf.add(srcCid)
+    headerBuf.writeVarInt(0'u64)
+    proto.writeVarInt(headerBuf, 4'u64 + uint64(cryptoFrame.len + 16))
+    let responsePnOffset = headerBuf.len
+    let responsePn = uint64(conn.quicConn.model.packetSpaces[ceInitial].nextPacketNumber())
+    headerBuf.writeUint32(uint32(responsePn))
+
+    var tag: array[16, byte]
+    let encrypted = tls.encryptPacket(
+      conn.initialSecrets.serverKey,
+      conn.initialSecrets.serverIv,
+      responsePn,
+      headerBuf,
+      cryptoFrame,
+      tag
+    )
+    var packet = headerBuf & encrypted & @tag
+    if packet.len >= responsePnOffset + 4 + 16:
+      let sample = packet[responsePnOffset + 4 ..< responsePnOffset + 4 + 16]
+      var responsePn: array[4, byte]
+      for i in 0 .. 3:
+        responsePn[i] = packet[responsePnOffset + i]
+      tls.applyHeaderProtection(conn.initialSecrets.serverHp, sample, packet[0], responsePn)
+      for i in 0 .. 3:
+        packet[responsePnOffset + i] = responsePn[i]
+
+    asyncCheck conn.transport.sendTo(conn.remoteAddress, packet)
+    conn.handshakeComplete = true
+    conn.markActivePathValidated(0)
+    for stream in conn.localStreams:
+      flushStream(stream)
+    flushPendingDatagrams(conn)
+    emitNativeConnected(conn)
+    var ev = ConnectionEvent(kind: ceConnected, negotiatedAlpn: "", note: "server handshake complete")
+    emitConnectionEvent(conn, ev)
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagConnectionEvent,
+      handle: cast[pointer](conn),
+      note: "ServerHello sent. 1-RTT enabled."))
+
+proc listenerOnReceive(state: ListenerState; transp: DatagramTransport; remote: TransportAddress;
+    local: TransportAddress; data: seq[byte]) {.async.} =
+  if state.isNil:
+    return
   try:
     let packet = proto.decodePacket(data)
-    if packet.isLongHeader:
+    if packet.isLongHeader and packet.longHeader.packetType == ptInitial:
       {.cast(gcsafe).}:
         emitDiagnostics(DiagnosticsEvent(
           kind: diagRegistrationOpened,
-          handle: cast[HQUIC](nil), # No handle context easily avail here yet
-          note: "RX Core: Long Header Pkt Type=" & $packet.longHeader.packetType & " Len=" & $data.len))
+          handle: cast[pointer](state),
+          note: "RX Initial len=" & $data.len))
+      {.cast(gcsafe).}:
+        handleInitialPacket(state, remote, local, data)
     else:
-       {.cast(gcsafe).}:
-         emitDiagnostics(DiagnosticsEvent(
-          kind: diagRegistrationOpened,
-          handle: cast[HQUIC](nil),
-          note: "RX Core: Short Header Pkt Len=" & $data.len))
+      let remoteKey = remoteAddressKey(remote)
+      var conn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+      if conn.isNil:
+        conn = state.findAcceptedConnectionByDestCid(data)
+        if not conn.isNil:
+          state.acceptedConnections[remoteKey] = conn
+      if not conn.isNil:
+        {.cast(gcsafe).}:
+          handleShortHeaderPacket(conn, remote, data)
   except Exception:
     discard
 
@@ -985,7 +2168,7 @@ proc msquicListenerStart(listener: HQUIC; alpn: ptr QuicBuffer;
     state.transport = newDatagramTransport(
       (proc (transp: DatagramTransport, remote: TransportAddress) {.async.} =
         let data = transp.getMessage()
-        asyncCheck listenerOnReceive(transp, remote, transp.localAddress, data)),
+        asyncCheck listenerOnReceive(state, transp, remote, transp.localAddress, data)),
       local = initTAddress("0.0.0.0", Port(bindPort))
     )
     warn "Bind success!"
@@ -1040,6 +2223,28 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
   state.congestionAlgorithm = caCubic
   state.closeReason = ""
   state.disable1RttEncryption = false
+  state.handshakeComplete = false
+  state.sessionResumed = false
+  state.resumptionTicket = @[]
+  state.resumptionData = @[]
+  state.incomingStreams = initTable[uint64, StreamState]()
+  state.ackTracker = qack.initAckTracker()
+  state.lossDetection = qloss.initLossDetectionModel()
+  state.congestionController = qcc.initCongestionController(caCubic, DefaultCongestionDatagramBytes)
+  state.sentPackets = @[]
+  state.pendingDatagrams = @[]
+  state.nextLocalBidiStreamId = 0'u64
+  state.nextLocalUniStreamId = 2'u64
+  state.latestAckedPacket = 0'u64
+  state.localStreams = @[]
+  state.smoothedRttUs = 0'u64
+  state.minRttUs = 0'u64
+  state.latestRttUs = 0'u64
+  state.rttVarianceUs = 0'u64
+  state.pathRemoteAddrs = initTable[uint8, TransportAddress]()
+  state.pathRemoteKeys = initTable[uint8, string]()
+  state.remotePathIds = initTable[string, uint8]()
+  state.activeRemoteKey = ""
   let raw = storeHandle(state)
   connection[] = raw
   QUIC_STATUS_SUCCESS
@@ -1085,11 +2290,23 @@ proc msquicConnectionSetConfiguration(connection: HQUIC;
 proc msquicConnectionSendResumption(connection: HQUIC;
     flags: QUIC_SEND_RESUMPTION_FLAGS; dataLength: uint16;
     data: ptr uint8): QUIC_STATUS {.cdecl.} =
-  discard connection
+  let state = toConnection(connection)
+  if state.isNil:
+    return QUIC_STATUS_INVALID_PARAMETER
   discard flags
-  discard dataLength
-  discard data
-  QUIC_STATUS_NOT_SUPPORTED
+  if dataLength > 0'u16 and data.isNil:
+    return QUIC_STATUS_INVALID_PARAMETER
+  var customData: seq[byte] = @[]
+  if dataLength > 0'u16:
+    customData = newSeq[byte](int(dataLength))
+    copyMem(addr customData[0], data, int(dataLength))
+  let ticket = buildBuiltinResumptionTicket(state, customData)
+  if ticket.len == 0:
+    return QUIC_STATUS_INVALID_STATE
+  state.resumptionTicket = ticket
+  state.resumptionData = customData
+  storeBuiltinResumptionEntry(state, ticket, customData)
+  QUIC_STATUS_SUCCESS
 
 proc attachConfiguration(state: ConnectionState; configuration: ConfigurationState): QUIC_STATUS =
   if configuration.isNil:
@@ -1119,127 +2336,146 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
   state.peerCid = serverCid
   state.serverName = if serverName.isNil: "" else: $serverName
   state.serverPort = serverPort
+  let cachedResumption = loadBuiltinResumptionEntry(
+    state.serverName,
+    state.serverPort,
+    alpnForConnection(state)
+  )
+  state.sessionResumed = cachedResumption.ticket.len > 0
+  state.resumptionTicket = cachedResumption.ticket
+  state.resumptionData = cachedResumption.data
   let version = QuicVersion(1)
   state.quicConn = newConnection(crClient, clientCid, serverCid, version)
+  state.initLocalStreamIds()
   discard family
   state.started = true
   state.datagramReceiveEnabled = state.settingsOverlay.datagramReceiveEnabled
   
   # Initialize Transport (Client)
+  var transportEnabled = false
   try:
     # Resolve remote address
     # For Phase 1, we assume serverName is an IP string. DNS resolution is skipped for now/handled by caller if needed
-    var remoteAddr: TransportAddress
     try:
-      # Try parsing as IP
-      remoteAddr = initTAddress(state.serverName, Port(state.serverPort))
-    except CatchableError:
-       # Fallback or error - simplistic handling
-       emitDiagnostics(DiagnosticsEvent(
-         kind: diagConnectionStarted,
-         handle: connection,
-         note: "Failed to parse IP: " & state.serverName))
-       return QUIC_STATUS_INVALID_PARAMETER
+      state.remoteAddress = initTAddress(state.serverName, Port(state.serverPort))
+      state.activeRemoteKey = remoteAddressKey(state.remoteAddress)
+      state.registerPathRemote(0'u8, state.remoteAddress)
+      state.transport = newDatagramTransport(
+        (proc (transp: DatagramTransport, remote: TransportAddress) {.async.} =
+          let data = transp.getMessage()
+          if data.len == 0:
+            return
 
-    state.remoteAddress = remoteAddr
-    
-    state.transport = newDatagramTransport(
-      (proc (transp: DatagramTransport, remote: TransportAddress) {.async.} =
-        # Client receive loop
-        let data = transp.getMessage()
-        if data.len == 0: return
-        
-        try:
-          # Phase 4: Receiver Logic
-          var header = proto.parseUnprotectedHeader(data)
-          # Initial Packet? (Long Header, Type 0x0)
-          if (header.firstByte and 0x80) != 0:
-             let pType = (header.firstByte and 0x30) shr 4
-             if pType == 0: # Initial
-               # Decrypt Logic
-               var mutableData = data
-               let pnOffset = header.payloadOffset
-               if pnOffset + 4 + 16 > mutableData.len: return
-               var pnSlice: array[4, byte]
-               for i in 0..3: pnSlice[i] = mutableData[pnOffset+i]
-               
-               tls.removeHeaderProtection(state.initialSecrets.serverHp, 
-                                          mutableData[pnOffset+4 ..< pnOffset+4+16], 
-                                          mutableData[0], 
-                                          pnSlice)
-               
-               var pnVal: uint32
-               bigEndian32(addr pnVal, addr pnSlice)
-               
-               let aadLen = pnOffset + 4
-               let aad = mutableData[0 ..< aadLen]
-               let ciphertext = mutableData[aadLen ..< mutableData.len - 16]
-               let recTag = mutableData[^16 .. ^1]
-               
-               let plaintext = tls.decryptPacket(state.initialSecrets.serverKey, state.initialSecrets.serverIv,
-                                                 uint64(pnVal), aad, ciphertext, recTag)
-                                               
-               if plaintext.len > 0:
-                 {.cast(gcsafe).}:
-                   emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: cast[HQUIC](state), note: "RX Initial Valid"))
-                 # Parse Frames
-                 var pos = 0
-                 while pos < plaintext.len:
-                   # Simplistic frame parser
-                   # We know CRYPTO frame is what we want.
-                   # Frame type could be PING(1), ACK(2), CRYPTO(6)
-                   let fType = plaintext[pos]
-                   if fType == 0x06: # CRYPTO
-                     pos += 1
-                     let crypto = proto.parseCryptoFrame(plaintext, pos)
-                     if not state.handshakeComplete:
-                       let serverHelloKey = tls.findServerKeyShare(crypto.data)
-                       if serverHelloKey.len == 32:
-                         {.cast(gcsafe).}:
-                           emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: cast[HQUIC](state), note: "RX ServerHello KeyShare"))
-                         
-                         # Hash Transcript: ClientHello + ServerHello
-                         # Note: simplistic assumption that crypto.data IS the ServerHello (single fragment)
-                         state.transcript.add(crypto.data)
-                         
-                         let sharedSecret = tls.computeSharedSecret(state.clientPrivateKey, serverHelloKey)
-                         let helloHash = tls.hashTranscript(state.transcript)
-                         
-                         # Derive Keys
-                         let handshakeSecrets = tls.deriveHandshakeSecrets(sharedSecret, helloHash)
-                         
-                         # For 1-RTT, we need Handshake Hash (ClientHello..Finished).
-                         # We are skipping verifying Finished/EncryptedExtensions for Skeleton.
-                         # We pretend Handshake Hash ~ Hello Hash for deriving Application Keys immediately.
-                         # This is technically WRONG (missing Finished hash), but allows us to Derive Keys.
-                         let trafficSecrets = tls.deriveApplicationSecrets(handshakeSecrets.clientSecret, helloHash)
-                         
-                         state.oneRttKeys = trafficSecrets
-                         state.handshakeComplete = true
-                         {.cast(gcsafe).}:
-                           emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: cast[HQUIC](state), note: "Handshake Keys Derived. 1-RTT Enabled."))
-                   elif fType == 0x02:
-                     # ACK Frame
-                     # pos += ... need parseAckFrame? 
-                     # For skeleton, just skip rest of packet if we can't parse perfectly.
-                     # But CRYPTO might be AFTER ACK.
-                     # We need robust parsing.
-                     # Skip ACK? ACK has variable length.
-                     # We lack `parseAckFrame` that returns length.
-                     # HACK: If we see ACK, we assume it's small or we break loop?
-                     # Let's hope CRYPTO is first. (Usually is).
-                     break 
-                   else:
-                     pos += 1
-          else:
-             # Short Header or other
-             # If Short Header, we could try decrypt using oneRttKeys if available
-             discard
-        except Exception:
-           discard
-      ),
-      local = initTAddress("0.0.0.0", Port(0))
-    )
+          try:
+            var header = proto.parseUnprotectedHeader(data)
+            if (header.firstByte and 0x80) != 0:
+              let pType = (header.firstByte and 0x30) shr 4
+              if pType == 0:
+                var mutableData = data
+                let pnOffset = header.payloadOffset
+                if pnOffset + 4 + 16 > mutableData.len:
+                  return
+                var pnSlice: array[4, byte]
+                for i in 0 .. 3:
+                  pnSlice[i] = mutableData[pnOffset + i]
+
+                tls.removeHeaderProtection(
+                  state.initialSecrets.serverHp,
+                  mutableData[pnOffset + 4 ..< pnOffset + 4 + 16],
+                  mutableData[0],
+                  pnSlice
+                )
+                for i in 0 .. 3:
+                  mutableData[pnOffset + i] = pnSlice[i]
+
+                let pnVal = parsePacketNumber(pnSlice)
+                let aadLen = pnOffset + 4
+                let aad = mutableData[0 ..< aadLen]
+                let ciphertext = mutableData[aadLen ..< mutableData.len - 16]
+                let recTag = mutableData[^16 .. ^1]
+
+                let plaintext = tls.decryptPacket(
+                  state.initialSecrets.serverKey,
+                  state.initialSecrets.serverIv,
+                  uint64(pnVal),
+                  aad,
+                  ciphertext,
+                  recTag
+                )
+
+                if plaintext.len > 0:
+                  {.cast(gcsafe).}:
+                    emitDiagnostics(DiagnosticsEvent(
+                      kind: diagConnectionEvent,
+                      handle: cast[HQUIC](state),
+                      note: "RX Initial Valid"
+                    ))
+                  var pos = 0
+                  while pos < plaintext.len:
+                    let fType = plaintext[pos]
+                    if fType == 0x06:
+                      inc pos
+                      let crypto = proto.parseCryptoFrame(plaintext, pos)
+                      if not state.handshakeComplete:
+                        let serverHelloKey = tls.findServerKeyShare(crypto.data)
+                        if serverHelloKey.len == 32:
+                          {.cast(gcsafe).}:
+                            emitDiagnostics(DiagnosticsEvent(
+                              kind: diagConnectionEvent,
+                              handle: cast[HQUIC](state),
+                              note: "RX ServerHello KeyShare"
+                            ))
+
+                          state.transcript.add(crypto.data)
+                          let sharedSecret = tls.computeSharedSecret(state.clientPrivateKey, serverHelloKey)
+                          let helloHash = tls.hashTranscript(state.transcript)
+                          let handshakeSecrets = tls.deriveHandshakeSecrets(sharedSecret, helloHash)
+                          let trafficSecrets =
+                            tls.deriveApplicationSecrets(handshakeSecrets.clientSecret, helloHash)
+
+                          state.oneRttKeys = trafficSecrets
+                          state.handshakeComplete = true
+                          state.markActivePathValidated(0)
+                          for stream in state.localStreams:
+                            flushStream(stream)
+                          flushPendingDatagrams(state)
+                          let negotiatedAlpn =
+                            if state.configuration.isNil or state.configuration.alpns.len == 0: ""
+                            else: state.configuration.alpns[0]
+                          {.cast(gcsafe).}:
+                            emitNativeConnected(state)
+                            var connectedEvent = ConnectionEvent(
+                              kind: ceConnected,
+                              sessionResumed: state.sessionResumed,
+                              negotiatedAlpn: negotiatedAlpn,
+                              note: "client handshake complete")
+                            emitConnectionEvent(state, connectedEvent)
+                          {.cast(gcsafe).}:
+                            if state.resumptionTicket.len == 0:
+                              state.resumptionTicket = buildBuiltinResumptionTicket(state)
+                            storeBuiltinResumptionEntry(state, state.resumptionTicket, state.resumptionData)
+                          {.cast(gcsafe).}:
+                            emitDiagnostics(DiagnosticsEvent(
+                              kind: diagConnectionEvent,
+                              handle: cast[HQUIC](state),
+                              note: "Handshake Keys Derived. 1-RTT Enabled."
+                            ))
+                    elif fType == 0x02:
+                      break
+                    else:
+                      inc pos
+            else:
+              {.cast(gcsafe).}:
+                handleShortHeaderPacket(state, remote, data)
+          except Exception:
+            discard
+        ),
+        local = initTAddress("0.0.0.0", Port(0))
+      )
+      transportEnabled = true
+    except CatchableError:
+      state.remoteAddress = TransportAddress()
+      state.transport = nil
 
     # Phase 3: Send Client Initial (ClientHello)
     let destCid = @(state.peerCid.bytes)[0 ..< int(state.peerCid.length)] 
@@ -1282,12 +2518,13 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
     headerBuf.add(lenField)
     
     let pnOffset = headerBuf.len
-    headerBuf.writeUint32(0'u32) # PN=0
+    let initialPn = uint64(state.quicConn.model.packetSpaces[ceInitial].nextPacketNumber())
+    headerBuf.writeUint32(uint32(initialPn))
     
     # Encrypt
     var tag: array[16, byte]
     let ciphertext = tls.encryptPacket(state.initialSecrets.clientKey, state.initialSecrets.clientIv, 
-                                       0'u64, headerBuf, payload, tag)
+                                       initialPn, headerBuf, payload, tag)
     
     var packet = headerBuf & ciphertext & @tag
     
@@ -1299,8 +2536,15 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
       tls.applyHeaderProtection(state.initialSecrets.clientHp, sample, packet[0], pnSlice)
       for i in 0..3: packet[pnOffset+i] = pnSlice[i]
       
-    asyncCheck state.transport.sendTo(state.remoteAddress, packet)
-    emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: connection, note: "TX Initial Encrypted"))
+    if transportEnabled and not state.transport.isNil:
+      asyncCheck state.transport.sendTo(state.remoteAddress, packet)
+      emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: connection, note: "TX Initial Encrypted"))
+    else:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: connection,
+        note: "TX Initial Skipped (non-IP endpoint)"
+      ))
 
   except CatchableError as exc:
     state.transport = nil
@@ -1310,18 +2554,6 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
        note: "Transport init failed: " & exc.msg))
     return QUIC_STATUS_INTERNAL_ERROR
 
-  if not state.callback.isNil:
-    let negotiatedAlpn =
-      if state.configuration.alpns.len == 0: "" else: state.configuration.alpns[0]
-    var event = initConnectedEvent(negotiatedAlpn)
-    discard state.callback(connection, state.callbackContext, addr event)
-  let negotiatedAlpn =
-    if state.configuration.alpns.len == 0: "" else: state.configuration.alpns[0]
-  var nimEvent = ConnectionEvent(
-    kind: ceConnected,
-    sessionResumed: false,
-    negotiatedAlpn: negotiatedAlpn)
-  emitConnectionEvent(state, nimEvent)
   emitDiagnostics(DiagnosticsEvent(
     kind: diagConnectionStarted,
     handle: connection,
@@ -1339,10 +2571,14 @@ proc msquicStreamOpen(connection: HQUIC; flags: QUIC_STREAM_OPEN_FLAGS;
   state.callback = handler
   state.callbackContext = context
   state.context = context
+  state.eventHandlers = @[]
   state.started = false
   state.closed = false
   state.connection = connState # Set parent connection
+  state.streamId = connState.allocLocalStreamId((flags and StreamOpenFlagUnidirectional) != 0)
+  state.pendingChunks = @[]
   stream[] = storeHandle(state)
+  connState.localStreams.add(state)
   streamEmitEvent(state, QUIC_STREAM_EVENT_PEER_ACCEPTED)
   QUIC_STATUS_SUCCESS
 
@@ -1374,7 +2610,7 @@ proc msquicStreamStart(stream: HQUIC;
   streamEmitEvent(state, QUIC_STREAM_EVENT_START_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
     var payload = QuicStreamEventStartCompletePayload(
       Status: QUIC_STATUS_SUCCESS,
-      Id: QUIC_UINT62(0),
+      Id: QUIC_UINT62(state.streamId),
       Flags: 0'u8,
       Reserved: [uint8(0),0,0,0,0,0,0]
     )
@@ -1387,88 +2623,89 @@ proc msquicStreamShutdown(stream: HQUIC;
   let state = toStream(stream)
   if state.isNil:
     return QUIC_STATUS_INVALID_PARAMETER
-  discard flags
-  discard errorCode
-  streamEmitEvent(state, QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE)
-  streamEmitEvent(state, QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
-    var payload = QuicStreamEventShutdownCompletePayload(
-      ConnectionShutdown: BOOLEAN(0),
-      Flags: 0'u8,
-      Reserved: [uint8(0),0,0,0,0,0],
-      ConnectionErrorCode: QUIC_UINT62(0),
-      ConnectionCloseStatus: QUIC_STATUS_SUCCESS
+  let graceful = (flags and QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL) != 0
+  let abortSend = (flags and QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND) != 0
+  let abortReceive = (flags and QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE) != 0
+  if graceful:
+    state.finRequested = true
+    flushStream(state)
+  if abortSend and not state.connection.isNil and state.connection.handshakeComplete:
+    let finalSize =
+      if state.finSent or state.finRequested: state.sentOffset
+      else: state.sentOffset
+    discard state.connection.sendOneRttPacket(
+      proto.encodeResetStreamFrame(state.streamId, uint64(errorCode), finalSize),
+      sfkStream,
+      true,
+      stream = state,
+      streamOffset = finalSize,
+      streamPayload = @[],
+      streamFin = true
+    )
+  if abortReceive and not state.connection.isNil and state.connection.handshakeComplete:
+    discard state.connection.sendOneRttPacket(
+      proto.encodeStopSendingFrame(state.streamId, uint64(errorCode)),
+      sfkStream,
+      true,
+      stream = state,
+      streamOffset = state.sentOffset,
+      streamPayload = @[],
+      streamFin = state.finSent
+    )
+  streamEmitEvent(state, QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
+    var payload = QuicStreamEventSendShutdownCompletePayload(
+      Graceful: BOOLEAN(if graceful and not abortSend: 1 else: 0),
+      Reserved: [uint8(0),0,0,0,0,0,0]
     )
     system.copyMem(buf, unsafeAddr payload, sizeof(payload))
   )
-  state.closed = true
+  if abortSend or abortReceive:
+    state.closed = true
+  if graceful or abortSend or abortReceive:
+    streamEmitEvent(state, QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
+      var payload = QuicStreamEventShutdownCompletePayload(
+        ConnectionShutdown: BOOLEAN(0),
+        Flags: 0'u8,
+        Reserved: [uint8(0),0,0,0,0,0],
+        ConnectionErrorCode: QUIC_UINT62(0),
+        ConnectionCloseStatus: QUIC_STATUS_SUCCESS
+      )
+      system.copyMem(buf, unsafeAddr payload, sizeof(payload))
+    )
   QUIC_STATUS_SUCCESS
 
-proc flushStream(state: StreamState) =
-  if state.connection.isNil: return
+proc flushStream(state: StreamState) {.gcsafe.} =
+  if state.isNil or state.connection.isNil:
+    return
   let conn = state.connection
-  
-  if state.sendBuffer.len == 0 and not (state.finRequested and not state.finSent):
+
+  if state.pendingChunks.len == 0:
     return
 
-  # Construct STREAM Frame
-  var payload = state.sendBuffer # Move/Copy
-  state.sendBuffer.setLen(0)
-  
-  # Stream ID? We don't have a real ID yet. Mock ID=0 if client initiated bidirectional.
-  # TODO: Real ID management.
-  let streamId = 0'u64 
-  let fin = state.finRequested
-  let streamFrame = proto.encodeStreamFrame(streamId, payload, state.sentOffset, fin)
-  
-  state.sentOffset += uint64(payload.len)
-  if fin: state.finSent = true
-
-  # Construct Short Header Packet (1-RTT)
+  let chunk = state.pendingChunks[0]
   if not conn.handshakeComplete:
-    # Buffer until handshake complete
-    # Restore buffer? 
-    # Logic: we consumed buffer into `payload`. We should push it back if we can't send.
-    # OR: just check check complete at top.
-    # BUT: we already extracted data.
-    # Better: check at top.
-    # Reverting extraction:
-    state.sendBuffer = payload & state.sendBuffer # Prepend (inefficient but safe)
     return
-
-  let pn = 1'u32 # TODO: Real PN
-  let destCid = @(conn.peerCid.bytes)[0 ..< int(conn.peerCid.length)] 
-  
-  # Payload
-  var pktPayload = streamFrame
-  
-  # Headers
-  var header: seq[byte] = @[]
-  header.add(0x43'u8) # Short Header
-  header.add(destCid)
-  let pnOffset = header.len
-  proto.writeUint32(header, pn)
-  
-  # Encrypt
-  var tag: array[16, byte]
-  let ciphertext = tls.encryptPacket(conn.oneRttKeys.clientKey, conn.oneRttKeys.clientIv, 
-                                     uint64(pn), header, pktPayload, tag)
-                                     
-  var packet = header & ciphertext & @tag
-  
-  # Header Protection
-  if packet.len >= pnOffset + 4 + 16:
-      let sample = packet[pnOffset + 4 ..< pnOffset + 4 + 16]
-      var pnSlice: array[4, byte]
-      for i in 0..3: pnSlice[i] = packet[pnOffset+i]
-      tls.applyHeaderProtection(conn.oneRttKeys.clientHp, sample, packet[0], pnSlice)
-      for i in 0..3: packet[pnOffset+i] = pnSlice[i]
-
-  asyncCheck conn.transport.sendTo(conn.remoteAddress, packet)
-  {.cast(gcsafe).}:
-    emitDiagnostics(DiagnosticsEvent(
-       kind: diagConnectionEvent,
-       handle: cast[HQUIC](conn),
-       note: "TX Stream 1-RTT Encrypted len=" & $packet.len))
+  let streamFrame = proto.encodeStreamFrame(
+    state.streamId,
+    chunk.payload,
+    chunk.offset,
+    chunk.fin
+  )
+  let pn = conn.sendOneRttPacket(
+    streamFrame,
+    sfkStream,
+    true,
+    stream = state,
+    streamOffset = chunk.offset,
+    streamPayload = chunk.payload,
+    streamFin = chunk.fin,
+    clientContext = chunk.clientContext
+  )
+  if pn == 0'u64:
+    return
+  state.pendingChunks.delete(0)
+  if chunk.fin:
+    state.finSent = true
 
 proc msquicStreamSend(stream: HQUIC; buffers: ptr QuicBuffer;
     bufferCount: uint32; flags: QUIC_SEND_FLAGS;
@@ -1476,8 +2713,11 @@ proc msquicStreamSend(stream: HQUIC; buffers: ptr QuicBuffer;
   let state = toStream(stream)
   if state.isNil:
     return QUIC_STATUS_INVALID_PARAMETER
-  
-  # 1. Buffer Data
+  if (flags and SendFlagAllowZeroRtt) != 0 and not state.connection.handshakeComplete and
+      not state.connection.sessionResumed and state.connection.resumptionTicket.len == 0:
+    return QUIC_STATUS_NOT_SUPPORTED
+
+  var payload: seq[byte] = @[]
   if bufferCount > 0 and not buffers.isNil:
     let bufArray = cast[ptr UncheckedArray[QuicBuffer]](buffers)
     for i in 0 ..< bufferCount:
@@ -1485,15 +2725,21 @@ proc msquicStreamSend(stream: HQUIC; buffers: ptr QuicBuffer;
       if qb.Length > 0 and not qb.Buffer.isNil:
         let src = qb.Buffer
         let len = int(qb.Length)
-        let paramBuf = newSeq[byte](len)
-        copyMem(unsafeAddr paramBuf[0], src, len)
-        state.sendBuffer.add(paramBuf)
-  
-  # 2. Check FIN
-  if (flags and 1) != 0: # QUIC_SEND_FLAG_FIN = 1 (usually)
-     state.finRequested = true
+        let start = payload.len
+        payload.setLen(start + len)
+        copyMem(addr payload[start], src, len)
 
-  # 3. Flush
+  let fin = (flags and SendFlagFin) != 0
+  state.pendingChunks.add(PendingStreamChunk(
+    offset: state.sentOffset,
+    payload: payload,
+    fin: fin,
+    clientContext: clientContext
+  ))
+  state.sentOffset += uint64(payload.len)
+  if fin:
+    state.finRequested = true
+
   flushStream(state)
 
   streamEmitEvent(state, QUIC_STREAM_EVENT_SEND_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
@@ -1525,14 +2771,43 @@ proc msquicDatagramSend(connection: HQUIC; buffers: ptr QuicBuffer;
   let state = toConnection(connection)
   if state.isNil:
     return QUIC_STATUS_INVALID_PARAMETER
-  discard buffers
-  discard bufferCount
-  discard flags
-  discard clientContext
+  if not state.datagramSendEnabled:
+    return QUIC_STATUS_INVALID_STATE
+  var payload: seq[byte] = @[]
+  if bufferCount > 0 and not buffers.isNil:
+    let bufArray = cast[ptr UncheckedArray[QuicBuffer]](buffers)
+    for i in 0 ..< bufferCount:
+      let qb = bufArray[i]
+      if qb.Length == 0 or qb.Buffer.isNil:
+        continue
+      let start = payload.len
+      let len = int(qb.Length)
+      payload.setLen(start + len)
+      copyMem(addr payload[start], qb.Buffer, len)
+  if payload.len == 0:
+    return QUIC_STATUS_SUCCESS
+  if not state.handshakeComplete:
+    if (flags and SendFlagAllowZeroRtt) == 0 or
+        (not state.sessionResumed and state.resumptionTicket.len == 0):
+      return QUIC_STATUS_NOT_SUPPORTED
+    state.pendingDatagrams.add(PendingDatagram(
+      payload: payload,
+      clientContext: clientContext
+    ))
+    return QUIC_STATUS_SUCCESS
+  let frame = proto.encodeDatagramFrame(payload, true)
+  let pn = state.sendOneRttPacket(
+    frame,
+    sfkDatagram,
+    true,
+    clientContext = clientContext
+  )
+  if pn == 0'u64:
+    return QUIC_STATUS_INVALID_STATE
   var nimEvent = ConnectionEvent(
     kind: ceParameterUpdated,
     paramId: QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED,
-    note: "datagram send enqueued",
+    note: "datagram send pn=" & $pn,
     userContext: state.context
   )
   emitConnectionEvent(state, nimEvent)
@@ -1572,6 +2847,20 @@ proc registerConnectionEventHandler*(connection: HQUIC; handler: ConnectionEvent
     state.eventHandlers = @[]
   state.eventHandlers.add(handler)
 
+proc registerStreamEventHandler*(stream: HQUIC; handler: StreamEventHandler) {.exportc.} =
+  let state = toStream(stream)
+  if state.isNil or handler.isNil:
+    return
+  if state.eventHandlers.len == 0:
+    state.eventHandlers = @[]
+  state.eventHandlers.add(handler)
+
+proc clearStreamEventHandlers*(stream: HQUIC) {.exportc.} =
+  let state = toStream(stream)
+  if state.isNil:
+    return
+  state.eventHandlers.setLen(0)
+
 proc clearConnectionEventHandlers*(connection: HQUIC) {.exportc.} =
   let state = toConnection(connection)
   if state.isNil:
@@ -1595,6 +2884,102 @@ proc getConnectionDatagramState*(connection: HQUIC; receiveEnabled: var bool; se
     return false
   receiveEnabled = state.datagramReceiveEnabled
   sendEnabled = state.datagramSendEnabled
+  true
+
+proc getConnectionCongestionWindow*(connection: HQUIC; windowBytes: var uint64): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  windowBytes = qcc.congestionWindowBytes(state.congestionController)
+  true
+
+proc getConnectionRttStats*(connection: HQUIC; latestRttUs: var uint64;
+    smoothedRttUs: var uint64; minRttUs: var uint64;
+    rttVarianceUs: var uint64): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  latestRttUs = state.latestRttUs
+  smoothedRttUs = state.smoothedRttUs
+  minRttUs = state.minRttUs
+  rttVarianceUs = state.rttVarianceUs
+  true
+
+proc getConnectionProbeCount*(connection: HQUIC; probeCount: var uint16): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  probeCount = state.lossDetection.probeCount
+  true
+
+proc expireBuiltinResumptionEntryForTest*(serverName: cstring; serverPort: uint16;
+    alpn: cstring): bool {.exportc.} =
+  let serverNameText = if serverName.isNil: "" else: $serverName
+  let alpnText = if alpn.isNil: "" else: $alpn
+  let key = resumptionCacheKey(serverNameText, serverPort, alpnText)
+  if key.len == 0 or not gBuiltinResumptionCache.hasKey(key):
+    return false
+  var entry = gBuiltinResumptionCache[key]
+  entry.expiresAtUs = 1'u64
+  gBuiltinResumptionCache[key] = entry
+  true
+
+proc runConnectionLossRecoveryTick*(connection: HQUIC): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  state.detectTimedOutLosses()
+  true
+
+proc getConnectionActivePathId*(connection: HQUIC; pathId: var uint8): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil or state.quicConn.isNil:
+    return false
+  pathId = state.quicConn.model.migration.activePathId
+  true
+
+proc getConnectionKnownPathCount*(connection: HQUIC; pathCount: var uint8): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil or state.quicConn.isNil:
+    return false
+  pathCount = uint8(min(state.quicConn.model.paths.len, high(uint8).int))
+  true
+
+proc getConnectionPathState*(connection: HQUIC; pathId: uint8;
+    isActive: var bool; isValidated: var bool;
+    challengeOutstanding: var bool; responsePending: var bool): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil or state.quicConn.isNil:
+    return false
+  for path in state.quicConn.model.paths:
+    if path.pathId == pathId:
+      isActive = path.isActive
+      isValidated = path.isValidated
+      challengeOutstanding = path.challengeOutstanding
+      responsePending = path.responsePending
+      return true
+  false
+
+proc triggerConnectionMigrationProbe*(connection: HQUIC; host: cstring;
+    port: uint16; pathId: var uint8): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil or state.quicConn.isNil or host.isNil:
+    return false
+  let remote = initTAddress($host, Port(port))
+  state.maybeInitiatePathMigration(remote)
+  let remoteKey = remoteAddressKey(remote)
+  if remoteKey.len == 0 or not state.remotePathIds.hasKey(remoteKey):
+    return false
+  pathId = state.remotePathIds[remoteKey]
+  true
+
+proc confirmConnectionValidatedPath*(connection: HQUIC; pathId: uint8): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil or state.quicConn.isNil:
+    return false
+  if not state.pathRemoteAddrs.hasKey(pathId):
+    return false
+  state.activateValidatedPath(pathId)
   true
 
 proc MsQuicSetContextShim*(handle: HQUIC; context: pointer) {.exportc, cdecl, quicApiHot.} =
@@ -1696,6 +3081,7 @@ proc MsQuicClose*(table: pointer) {.exportc, cdecl.} =
     dec gApiTableRefCount
   if gApiTableRefCount == 0:
     gHandleRegistry.clear()
+    gBuiltinResumptionCache.clear()
     gGlobalExecutionConfig = GlobalExecutionConfigState()
 
 proc getGlobalExecutionConfigState*(): GlobalExecutionConfigState =

@@ -12,6 +12,7 @@ type
 const
   DefaultMsQuicEnvVar* = "NIM_MSQUIC_LIB"
   DefaultMsQuicVersion* = MsQuicVersion(0x00000002)
+  CompileTimeBuiltinMsQuic* = defined(libp2p_msquic_builtin)
 
 type
   MsQuicOpenProc = proc(apiTable: ptr QuicApiTablePtr): MsQuicStatus {.cdecl.}
@@ -190,10 +191,46 @@ proc tryLoadFromPath(path: string; options: MsQuicLoadOptions): MsQuicLoadResult
     openSymbol: openSymbol
   )
 
+proc tryLoadBuiltin(options: MsQuicLoadOptions;
+                    attempted: seq[string]): MsQuicLoadResult =
+  const BuiltinRuntimeName = "builtin-nim-quic-native"
+  var tablePtr: QuicApiTablePtr = nil
+  let rawStatus = builtin_api.MsQuicOpenVersion(options.requestedVersion, addr tablePtr)
+  let status = MsQuicStatus(int32(rawStatus))
+
+  if rawStatus == builtin_api.QUIC_STATUS_SUCCESS and not tablePtr.isNil:
+    return MsQuicLoadResult(
+      success: true,
+      runtime: MsQuicRuntime(
+        handle: nil,
+        path: BuiltinRuntimeName,
+        apiTable: tablePtr,
+        closeProc: builtin_api.MsQuicClose,
+        status: status,
+        openSymbol: "MsQuicOpenVersion",
+        versionRequested: options.requestedVersion,
+        versionNegotiated: options.requestedVersion
+      ),
+      status: status,
+      attemptedPaths: attempted & @[BuiltinRuntimeName],
+      openSymbol: "MsQuicOpenVersion"
+    )
+
+  MsQuicLoadResult(
+    success: false,
+    status: status,
+    attemptedPaths: attempted & @[BuiltinRuntimeName],
+    error: "builtin fallback failed: " & $rawStatus
+  )
+
 proc loadMsQuic*(options: MsQuicLoadOptions = MsQuicLoadOptions()): MsQuicLoadResult =
-  let candidates = candidatePaths(options)
   var attempted: seq[string] = @[]
   var errors: seq[string] = @[]
+
+  if CompileTimeBuiltinMsQuic:
+    return tryLoadBuiltin(options, attempted)
+
+  let candidates = candidatePaths(options)
 
   for path in candidates:
     let res = tryLoadFromPath(path, options)
@@ -203,36 +240,10 @@ proc loadMsQuic*(options: MsQuicLoadOptions = MsQuicLoadOptions()): MsQuicLoadRe
     if res.error.len > 0:
       errors.add fmt"{path}: {res.error}"
 
-  let useBuiltin = getEnv("NIM_MSQUIC_USE_BUILTIN", "0").toLowerAscii() in ["1", "true", "yes"]
+  let useBuiltin =
+    getEnv("NIM_MSQUIC_USE_BUILTIN", "0").toLowerAscii() in ["1", "true", "yes"]
   if useBuiltin:
-    var tablePtr: QuicApiTablePtr = nil
-    let rawStatus = builtin_api.MsQuicOpenVersion(options.requestedVersion, addr tablePtr)
-    let status = MsQuicStatus(int32(rawStatus))
-
-    if rawStatus == builtin_api.QUIC_STATUS_SUCCESS and not tablePtr.isNil:
-      return MsQuicLoadResult(
-        success: true,
-        runtime: MsQuicRuntime(
-          handle: nil,
-          path: "builtin-nim-pure-skeleton",
-          apiTable: tablePtr,
-          closeProc: builtin_api.MsQuicClose,
-          status: status,
-          openSymbol: "MsQuicOpenVersion",
-          versionRequested: options.requestedVersion,
-          versionNegotiated: options.requestedVersion
-        ),
-        status: status,
-        attemptedPaths: attempted & @["builtin-nim-pure-skeleton"],
-        openSymbol: "MsQuicOpenVersion"
-      )
-
-    return MsQuicLoadResult(
-      success: false,
-      status: status,
-      attemptedPaths: attempted & @["builtin-nim-pure-skeleton"],
-      error: "builtin fallback failed: " & $rawStatus
-    )
+    return tryLoadBuiltin(options, attempted)
 
   MsQuicLoadResult(
     success: false,

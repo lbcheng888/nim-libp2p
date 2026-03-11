@@ -44,7 +44,9 @@ proc initLossDetectionModel*(): LossDetectionModel =
     lostQueue: @[],
     probeCount: 0)
 
-proc onPacketSent*(model: var LossDetectionModel, packet: PacketRecord) =
+proc resetProbeTimer*(model: var LossDetectionModel) {.gcsafe.}
+
+proc onPacketSent*(model: var LossDetectionModel, packet: PacketRecord) {.gcsafe.} =
   ## 对应 `QuicLossDetectionOnPacketSent` 的最小抽象。
   model.largestSentPacketNumber = max(model.largestSentPacketNumber, packet.packetNumber)
   model.timeOfLastPacketSent = packet.sentTimeUs
@@ -53,7 +55,7 @@ proc onPacketSent*(model: var LossDetectionModel, packet: PacketRecord) =
   if packet.ackEliciting:
     inc(model.packetsInFlight)
 
-proc onAckReceived*(model: var LossDetectionModel, ack: AckEventSnapshot) =
+proc onAckReceived*(model: var LossDetectionModel, ack: AckEventSnapshot) {.gcsafe.} =
   ## 抽象 `QuicLossDetectionProcessAckFrame` 的核心状态更新。
   model.largestAck = max(model.largestAck, ack.largestAck)
   model.totalBytesAcked = ack.totalAckedRetransmittableBytes
@@ -65,7 +67,7 @@ proc onAckReceived*(model: var LossDetectionModel, ack: AckEventSnapshot) =
   if model.packetsInFlight > 0 and ack.hasLoss:
     dec(model.packetsInFlight)
 
-proc markPacketLost*(model: var LossDetectionModel, packetNumber: uint64) =
+proc markPacketLost*(model: var LossDetectionModel, packetNumber: uint64) {.gcsafe.} =
   ## 在 Nim 蓝图内移动丢失包，方便后续恢复逻辑。
   for i, pkt in model.sentQueue:
     if pkt.packetNumber == packetNumber:
@@ -84,11 +86,11 @@ proc computeProbeTimeout*(
   let base = smoothedRttUs + (4 * rttVarianceUs)
   base shl int(model.probeCount)
 
-proc onProbeTimeoutFired*(model: var LossDetectionModel) =
+proc onProbeTimeoutFired*(model: var LossDetectionModel) {.gcsafe.} =
   ## 触发 PTO 时递增退避计数（上限与 QUIC_CLOSE_PTO_COUNT 一致）。
   if model.probeCount < ClosePtoCount.uint16:
     inc(model.probeCount)
 
-proc resetProbeTimer*(model: var LossDetectionModel) =
+proc resetProbeTimer*(model: var LossDetectionModel) {.gcsafe.} =
   ## 收到有效 ACK 或成功发送后，重置 PTO 退避。
   model.probeCount = 0

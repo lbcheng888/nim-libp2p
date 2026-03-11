@@ -5,11 +5,12 @@ import std/sequtils
 import std/strutils
 import std/endians
 import nimcrypto/rijndael
-import nimcrypto/bcmode
-import nimcrypto/sha2
-import nimcrypto/hmac
+import bearssl/aead
+import bearssl/blockx
 import bearssl/kdf
 import bearssl/hash as bhash
+import bearssl/hash
+import bearssl/hmac as bhmac
 import libp2p/crypto/hkdf
 import libp2p/crypto/curve25519
 import nimcrypto/sysrand
@@ -112,9 +113,27 @@ proc hkdfExpandLabel[T](secret: openArray[byte], label: string, context: openArr
 
 # --- Initial Secrets ---
 
-# Helper for wrapping HMAC-SHA256 based HKDF-Expand
-proc hmacSha256(key, data: openArray[byte]): MDigest[256] =
-  result = sha256.hmac(key, data)
+# Helper for wrapping BearSSL-based SHA-256/HMAC-SHA256.
+proc sha256Digest(data: openArray[byte]): array[32, byte] =
+  var ctx: bhash.Sha256Context
+  bhash.sha256Init(ctx)
+  if data.len > 0:
+    bhash.sha224Update(ctx, unsafeAddr data[0], uint(data.len))
+  bhash.sha256Out(ctx, addr result[0])
+
+proc hmacSha256(key, data: openArray[byte]): array[32, byte] =
+  var keyCtx: bhmac.HmacKeyContext
+  bhmac.hmacKeyInit(
+    keyCtx,
+    addr bhash.sha256Vtable,
+    if key.len > 0: unsafeAddr key[0] else: nil,
+    uint(key.len)
+  )
+  var ctx: bhmac.HmacContext
+  bhmac.hmacInit(ctx, keyCtx, 32)
+  if data.len > 0:
+    bhmac.hmacUpdate(ctx, unsafeAddr data[0], uint(data.len))
+  discard bhmac.hmacOut(ctx, addr result[0])
 
 proc hkdfExpand[Len: static int](prk: openArray[byte], info: openArray[byte]): array[Len, byte] =
   # RFC 5869 Section 2.3. Expand
@@ -131,7 +150,7 @@ proc hkdfExpand[Len: static int](prk: openArray[byte], info: openArray[byte]): a
     input.add(info)
     input.add(byte(i))
     let digest = hmacSha256(prk, input)
-    t = @(digest.data)
+    t = @digest
     okm.add(t)
     
   for i in 0 ..< Len:
@@ -157,7 +176,7 @@ proc deriveInitialSecrets*(dcid: openArray[byte]): InitialSecrets =
   # We use generic HKDF Extract here (HMAC-SHA256(Salt, IKM))
   # Since we don't have a direct Extract func, we use HMAC directly.
   let initialSecretDigest = hmacSha256(InitialSaltV1, dcid)
-  let initialSecret = initialSecretDigest.data
+  let initialSecret = initialSecretDigest
   
   # 2. Client Initial Secret
   let clientSecretArr = deriveSecret[32](initialSecret, "client in")
@@ -206,15 +225,20 @@ proc encryptPacket*(key, iv: openArray[byte], packetNumber: uint64,
   for i in 0 .. 7:
     nonce[12 - 8 + i] = nonce[12 - 8 + i] xor pnBytes[i]
     
-  # 2. AES-GCM Encrypt
-  var ctx: GCM[aes128]
-  ctx.init(key, nonce, header) # header is AAD
-  
   var ciphertext = newSeq[byte](payload.len)
+  var ctrCtx: AesCtCtrKeys
+  aesCtCtrInit(ctrCtx, unsafeAddr key[0], uint(key.len))
+  var gcmCtx: GcmContext
+  gcmInit(gcmCtx, cast[ptr ptr BlockCtrClass](addr ctrCtx), ghashCtmul32)
+  gcmReset(gcmCtx, unsafeAddr nonce[0], uint(nonce.len))
+  if header.len > 0:
+    gcmAadInject(gcmCtx, unsafeAddr header[0], uint(header.len))
+  gcmFlip(gcmCtx)
   if payload.len > 0:
-    ctx.encrypt(payload, ciphertext)
-  
-  ctx.getTag(paramTag)
+    copyMem(addr ciphertext[0], unsafeAddr payload[0], payload.len)
+    gcmRun(gcmCtx, 1, addr ciphertext[0], uint(ciphertext.len))
+
+  gcmGetTag(gcmCtx, addr paramTag[0])
   return ciphertext
 
 proc applyHeaderProtection*(hpKey: openArray[byte], sample: openArray[byte], 
@@ -266,25 +290,20 @@ proc decryptPacket*(key, iv: openArray[byte], packetNumber: uint64,
   for i in 0 .. 7:
     nonce[12 - 8 + i] = nonce[12 - 8 + i] xor pnBytes[i]
     
-  # 2. AES-GCM Decrypt
-  var ctx: GCM[aes128]
-  ctx.init(key, nonce, header) # header is AAD
-  
   var plaintext = newSeq[byte](ciphertext.len)
+  var ctrCtx: AesCtCtrKeys
+  aesCtCtrInit(ctrCtx, unsafeAddr key[0], uint(key.len))
+  var gcmCtx: GcmContext
+  gcmInit(gcmCtx, cast[ptr ptr BlockCtrClass](addr ctrCtx), ghashCtmul32)
+  gcmReset(gcmCtx, unsafeAddr nonce[0], uint(nonce.len))
+  if header.len > 0:
+    gcmAadInject(gcmCtx, unsafeAddr header[0], uint(header.len))
+  gcmFlip(gcmCtx)
   if ciphertext.len > 0:
-    ctx.decrypt(ciphertext, plaintext)
-    
-  var computedTag: array[16, byte]
-  ctx.getTag(computedTag)
-  
-  # 3. Verify Tag
-  # Since GCM.getTag returns the tag computed during decrypt, we compare it with the received tag.
-  var match = true
-  for i in 0..15:
-    if computedTag[i] != tag[i]:
-      match = false
-      
-  if not match:
+    copyMem(addr plaintext[0], unsafeAddr ciphertext[0], ciphertext.len)
+    gcmRun(gcmCtx, 0, addr plaintext[0], uint(plaintext.len))
+
+  if tag.len < 16 or gcmCheckTag(gcmCtx, unsafeAddr tag[0]) == 0'u32:
     # Decryption failure
     return @[]
     
@@ -407,6 +426,54 @@ proc encodeClientHello*(destCid: openArray[byte], keyShare: ClientKeyShare): seq
   
   return buf
 
+proc encodeServerHello*(keySharePublic: openArray[byte]): seq[byte] =
+  ## Minimal TLS 1.3 ServerHello for the builtin QUIC path.
+  var buf: seq[byte] = @[]
+
+  buf.add(0x02'u8)
+  buf.add([0x00'u8, 0x00, 0x00])
+  let startOffset = buf.len
+
+  buf.add([0x03'u8, 0x03])
+
+  var random: array[32, byte]
+  discard randomBytes(random)
+  buf.add(random)
+
+  buf.add(0x00'u8) # legacy_session_id_echo length
+  buf.add([0x13'u8, 0x01]) # TLS_AES_128_GCM_SHA256
+  buf.add(0x00'u8) # legacy compression method
+
+  var extBuf: seq[byte] = @[]
+
+  extBuf.add([0x00'u8, 0x2b, 0x00, 0x02, 0x03, 0x04]) # supported_versions = TLS1.3
+
+  var ksExt: seq[byte] = @[]
+  ksExt.add([0x00'u8, 0x1d]) # x25519
+  ksExt.add([0x00'u8, 0x20]) # 32-byte key
+  ksExt.add(keySharePublic)
+  extBuf.add([0x00'u8, 0x33])
+  var ksExtLenBe: uint16
+  var ksExtLenHost = uint16(ksExt.len)
+  bigEndian16(addr ksExtLenBe, addr ksExtLenHost)
+  extBuf.add(cast[ptr array[2, byte]](addr ksExtLenBe)[])
+  extBuf.add(ksExt)
+
+  extBuf.add([0x00'u8, 0x39, 0x00, 0x00]) # empty QUIC transport parameters
+
+  var extLenBe: uint16
+  var extLenHost = uint16(extBuf.len)
+  bigEndian16(addr extLenBe, addr extLenHost)
+  buf.add(cast[ptr array[2, byte]](addr extLenBe)[])
+  buf.add(extBuf)
+
+  let msgLen = buf.len - startOffset
+  buf[1] = byte((msgLen shr 16) and 0xff)
+  buf[2] = byte((msgLen shr 8) and 0xff)
+  buf[3] = byte(msgLen and 0xff)
+
+  buf
+
 # --- Handshake Parsing & Secrets ---
 
 proc computeSharedSecret*(privateKey: Curve25519Key, peerPublicKeyBytes: openArray[byte]): Secret =
@@ -434,7 +501,7 @@ proc deriveHandshakeSecrets*(sharedSecret: Secret, helloHash: openArray[byte]): 
   let zeroArr = [0'u8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
   # Early Secret
   let earlySecretDigest = hmacSha256(zeroArr, zeroArr) # salt=0, ikm=0
-  let earlySecret = earlySecretDigest.data
+  let earlySecret = earlySecretDigest
 
   # B. Derived Secret
   # emptyHash = SHA256("")
@@ -470,7 +537,7 @@ proc deriveHandshakeSecrets*(sharedSecret: Secret, helloHash: openArray[byte]): 
   
   # C. Handshake Secret = HKDF-Extract(Derived, SharedSecret)
   let handshakeSecretDigest = hmacSha256(derivedSecret, sharedSecret)
-  let handshakeSecret = handshakeSecretDigest.data
+  let handshakeSecret = handshakeSecretDigest
   
   # D. Client/Server Handshake Traffic Secret
   # Client HTS = HKDF-Expand-Label(Handshake Secret, "c hs traffic", HelloHash, 32)
@@ -527,7 +594,7 @@ proc deriveApplicationSecrets*(handshakeSecret: Secret, handshakeHash: openArray
   
   let zeroArr = [0'u8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
   let masterSecretDigest = hmacSha256(derivedSecret, zeroArr)
-  let masterSecret = masterSecretDigest.data
+  let masterSecret = masterSecretDigest
   
   # Client/Server Application Traffic Secret 0
   # c ap traffic = Expand-Label(Master, "c ap traffic", HandshakeHash, 32) 
@@ -605,7 +672,67 @@ proc findServerKeyShare*(handshakeBytes: openArray[byte]): seq[byte] =
     
   return @[]
 
-proc hashTranscript*(data: openArray[byte]): seq[byte] =
-  let d = sha256.digest(data)
-  result = @(d.data)
+proc findClientKeyShare*(handshakeBytes: openArray[byte]): seq[byte] =
+  ## Find the x25519 key share from a minimal ClientHello.
+  var idx = 0
+  if handshakeBytes.len < 4:
+    return @[]
 
+  let msgType = handshakeBytes[0]
+  if msgType != 1:
+    return @[]
+
+  idx += 4
+  idx += 34 # legacy_version + random
+
+  if idx >= handshakeBytes.len:
+    return @[]
+  let sessIdLen = int(handshakeBytes[idx])
+  idx += 1 + sessIdLen
+
+  if idx + 2 > handshakeBytes.len:
+    return @[]
+  let cipherLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+  idx += 2 + cipherLen
+
+  if idx >= handshakeBytes.len:
+    return @[]
+  let compressionLen = int(handshakeBytes[idx])
+  idx += 1 + compressionLen
+
+  if idx + 2 > handshakeBytes.len:
+    return @[]
+  let extLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+  idx += 2
+
+  let limit = min(handshakeBytes.len, idx + extLen)
+  while idx + 4 <= limit:
+    let extType = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+    let length = (int(handshakeBytes[idx + 2]) shl 8) or int(handshakeBytes[idx + 3])
+    idx += 4
+    if idx + length > limit:
+      return @[]
+
+    if extType == 0x0033 and length >= 6:
+      let listLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+      var cursor = idx + 2
+      let listLimit = min(idx + 2 + listLen, idx + length)
+      while cursor + 4 <= listLimit:
+        let group = (int(handshakeBytes[cursor]) shl 8) or int(handshakeBytes[cursor + 1])
+        let keyLen = (int(handshakeBytes[cursor + 2]) shl 8) or int(handshakeBytes[cursor + 3])
+        cursor += 4
+        if cursor + keyLen > listLimit:
+          break
+        if group == 0x001d and keyLen == 32:
+          result = newSeq[byte](32)
+          for i in 0 ..< 32:
+            result[i] = handshakeBytes[cursor + i]
+          return result
+        cursor += keyLen
+
+    idx += length
+
+  @[]
+
+proc hashTranscript*(data: openArray[byte]): seq[byte] =
+  result = @(sha256Digest(data))

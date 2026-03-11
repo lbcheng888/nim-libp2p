@@ -1,0 +1,19 @@
+processor   : 0
+vendor_id   : AuthenticAMD
+model name  : AMD EPYC 7B13
+cpu MHz     : 2450.000
+
+processor   : 1
+vendor_id   : AuthenticAMD
+model name  : AMD EPYC 7B13
+cpu MHz     : 2450.000
+
+processor   : 2
+vendor_id   : AuthenticAMD
+model name  : AMD EPYC 7B13
+cpu MHz     : 2450.000
+
+processor   : 3
+vendor_id   : AuthenticAMD
+model name  : AMD EPYC 7B13
+cpu MHz     : 2450.000

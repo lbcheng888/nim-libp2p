@@ -160,26 +160,32 @@ proc ensurePath*(conn: var QuicConnectionModel, pathId: uint8): var PathState =
   result = conn.paths[^1]
 
 proc initiatePathChallenge*(conn: var QuicConnectionModel, pathId: uint8, data: array[8, uint8]) =
-  var path = conn.ensurePath(pathId)
-  path.challengeOutstanding = true
-  path.challengeData = data
-  path.responsePending = true
+  discard conn.ensurePath(pathId)
+  for path in conn.paths.mitems:
+    if path.pathId == pathId:
+      path.challengeOutstanding = true
+      path.challengeData = data
+      path.responsePending = true
+      break
   conn.migration.pendingChallenges.add(data)
 
 proc completePathValidation*(conn: var QuicConnectionModel, pathId: uint8, success: bool) =
-  var path = conn.ensurePath(pathId)
-  if success:
-    path.isValidated = true
-    path.isActive = true
-    path.challengeOutstanding = false
-    path.responsePending = false
-    if not conn.migration.validatedPaths.contains(pathId):
-      conn.migration.validatedPaths.add(pathId)
-    conn.migration.activePathId = pathId
-  else:
-    path.isActive = false
-    path.challengeOutstanding = false
-    path.responsePending = false
+  discard conn.ensurePath(pathId)
+  for path in conn.paths.mitems:
+    if path.pathId == pathId:
+      if success:
+        path.isValidated = true
+        path.isActive = true
+        path.challengeOutstanding = false
+        path.responsePending = false
+        if not conn.migration.validatedPaths.contains(pathId):
+          conn.migration.validatedPaths.add(pathId)
+        conn.migration.activePathId = pathId
+      else:
+        path.isActive = false
+        path.challengeOutstanding = false
+        path.responsePending = false
+      break
 
 proc registerStatelessReset*(conn: var QuicConnectionModel, token: array[16, uint8]) =
   conn.migration.statelessResetTokens.add(token)

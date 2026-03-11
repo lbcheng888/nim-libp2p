@@ -400,6 +400,8 @@ const
   )
   TranscoderDNS* =
     Transcoder(stringToBuffer: dnsStB, bufferToString: dnsBtS, validateBuffer: dnsVB)
+  TranscoderDeviceLink* =
+    Transcoder(stringToBuffer: dnsStB, bufferToString: dnsBtS, validateBuffer: dnsVB)
   TranscoderMemory* = Transcoder(
     stringToBuffer: memoryStB, bufferToString: memoryBtS, validateBuffer: memoryVB
   )
@@ -421,6 +423,14 @@ const
     MAProtocol(mcodec: multiCodec("quic"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("quic-v1"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("webtransport"), kind: Marker, size: 0),
+    MAProtocol(mcodec: multiCodec("nan"), kind: Marker, size: 0),
+    MAProtocol(mcodec: multiCodec("nearlink"), kind: Marker, size: 0),
+    MAProtocol(
+      mcodec: multiCodec("id"), kind: Length, size: 0, coder: TranscoderDeviceLink
+    ),
+    MAProtocol(
+      mcodec: multiCodec("mac"), kind: Length, size: 0, coder: TranscoderDeviceLink
+    ),
     MAProtocol(
       mcodec: multiCodec("ip6zone"), kind: Length, size: 0, coder: TranscoderIP6Zone
     ),
@@ -477,6 +487,9 @@ const
   QUIC_V1_IP* = mapAnd(UDP_IP, mapEq("quic-v1"))
   QUIC_V1_DNS* = mapAnd(UDP_DNS, mapEq("quic-v1"))
   QUIC_V1* = mapOr(QUIC_V1_DNS, QUIC_V1_IP)
+  NAN* = mapAnd(mapEq("nan"), mapEq("id"))
+  NearLink* = mapAnd(mapEq("nearlink"), mapEq("mac"))
+  MobileNearfield* = mapOr(NAN, NearLink)
   WebTransport* =
     mapOr(mapAnd(QUIC, mapEq("webtransport")), mapAnd(QUIC_V1, mapEq("webtransport")))
   UNIX* = mapEq("unix")

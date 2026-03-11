@@ -27,7 +27,7 @@ proc initAckTracker*(): AckTrackerModel =
       alreadyWrittenAckFrame: false,
       nonZeroRecvEcn: false))
 
-proc trackIncomingPacket*(tracker: var AckTrackerModel, packetNumber: uint64) =
+proc trackIncomingPacket*(tracker: var AckTrackerModel, packetNumber: uint64) {.gcsafe.} =
   ## 追加一个已经接收的包号区间，用于重复包检测。
   if tracker.packetNumbersReceived.len == 0 or
       packetNumber > tracker.packetNumbersReceived[^1].last + 1:
@@ -36,7 +36,7 @@ proc trackIncomingPacket*(tracker: var AckTrackerModel, packetNumber: uint64) =
     tracker.packetNumbersReceived[^1].last = max(tracker.packetNumbersReceived[^1].last, packetNumber)
 
 proc markForAck*(tracker: var AckTrackerModel, packetNumber: uint64, recvTimeUs: uint64,
-    ackType: AckType, ackDelayMs: uint32 = MaxAckDelayDefaultMs) =
+    ackType: AckType, ackDelayMs: uint32 = MaxAckDelayDefaultMs) {.gcsafe.} =
   ## 抽象 ACK 聚合逻辑，便于 Nim 端推演 ACK 触发条件。
   if tracker.packetNumbersToAck.len == 0 or
       packetNumber > tracker.packetNumbersToAck[^1].last + 1:
@@ -50,7 +50,7 @@ proc markForAck*(tracker: var AckTrackerModel, packetNumber: uint64, recvTimeUs:
     tracker.counters.alreadyWrittenAckFrame = false
 
 proc shouldSendAck*(tracker: AckTrackerModel, packetTolerance: uint8,
-    ackType: AckType, reordered: bool): bool =
+    ackType: AckType, reordered: bool): bool {.gcsafe.} =
   ## 对应 `QuicAckTrackerAckPacket` 中的触发阈值。
   if ackType == ackTypeAckImmediate:
     return true

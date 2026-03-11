@@ -40,6 +40,10 @@ when defined(nimdoc):
       connectiongater,
       memorymanager,
       delegatedrouting,
+      services/noderesourceservice,
+      services/mobilemeshservice,
+      services/synccastcontrolservice,
+      services/distributedinferenceservice,
       providers/bitswapadvertiser,
     ]
 
@@ -77,11 +81,16 @@ else:
       record,
       memorymanager,
       delegatedrouting,
+      services/noderesourceservice,
+      services/mobilemeshservice,
+      services/synccastcontrolservice,
+      services/distributedinferenceservice,
       providers/bitswapadvertiser,
     ]
 
   when libp2pFetchEnabled:
     import libp2p/protocols/fetch/fetch
+    import libp2p/services/contentloopservice
 
   when libp2pDataTransferEnabled:
     import libp2p/protocols/datatransfer/[datatransfer, graphsyncadapter]
@@ -97,10 +106,11 @@ else:
     minprotobuf, switch, peerid, peerinfo, connection, multiaddress, crypto, lpstream,
     bufferstream, muxer, mplex, transport, tcptransport, noise, errors, cid, multihash,
     multicodec, builders, pubsub, connectiongater, pnet, livestream, record, memorymanager,
-    delegatedrouting, bitswapadvertiser
+    delegatedrouting, noderesourceservice, mobilemeshservice, synccastcontrolservice,
+    distributedinferenceservice, bitswapadvertiser
 
   when libp2pFetchEnabled:
-    export fetch
+    export fetch, contentloopservice
 
   when libp2pDataTransferEnabled:
     export datatransfer, graphsyncadapter
