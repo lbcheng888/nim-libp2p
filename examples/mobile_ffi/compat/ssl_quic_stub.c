@@ -45,6 +45,15 @@ int SSL_set1_initial_peer_addr(SSL *ssl, const BIO_ADDR *peer_addr)
 }
 #endif
 
+#ifndef SSL_get_peer_addr
+int SSL_get_peer_addr(SSL *ssl, BIO_ADDR *peer_addr)
+{
+    (void)ssl;
+    (void)peer_addr;
+    return 0;
+}
+#endif
+
 #ifndef SSL_handle_events
 int SSL_handle_events(SSL *ssl)
 {

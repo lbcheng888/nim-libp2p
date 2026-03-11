@@ -143,8 +143,15 @@ method run*(
 method stop*(
     self: HPService, switch: Switch
 ): Future[bool] {.public, async: (raises: [CancelledError]).} =
+  let hasBeenStopped = await procCall Service(self).stop(switch)
+  if not hasBeenStopped:
+    return false
+
   discard await self.autonatService.stop(switch)
+  if self.autoRelayService.isRunning():
+    discard await self.autoRelayService.stop(switch)
   if not isNil(self.newConnectedPeerHandler):
     switch.connManager.removePeerEventHandler(
       self.newConnectedPeerHandler, PeerEventKind.Joined
     )
+  true

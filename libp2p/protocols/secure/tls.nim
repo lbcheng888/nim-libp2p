@@ -22,7 +22,10 @@ import ../../utility
 import ../../errors
 import ../protocol
 import secure
-import ../../transports/tls/certificate
+when defined(libp2p_pure_crypto):
+  import ../../transports/tls/certificate_pure
+else:
+  import ../../transports/tls/certificate
 import ../../crypto/crypto
 import ../../utils/sequninit
 

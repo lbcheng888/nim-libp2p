@@ -463,9 +463,9 @@ proc close(state: MsQuicConnectionState) =
     state.signalLoop.cancel()
   else:
     closeSignal(state)
-  if state.lockInit:
-    deinitLock(state.lock)
-    state.lockInit = false
+  # MsQuic/runtime callbacks can still race in after we mark the state closed.
+  # Keep the lock alive for the lifetime of the ref object to avoid late
+  # callbacks touching a destroyed mutex on Android bionic.
 
 proc newMsQuicConnectionState(handle: MsQuicTransportHandle;
     queueLimit: int; pollInterval: Duration;
@@ -919,9 +919,8 @@ proc close(state: MsQuicStreamState) {.raises: [].} =
     state.signalLoop.cancel()
   else:
     closeSignal(state)
-  if state.lockInit:
-    deinitLock(state.lock)
-    state.lockInit = false
+  # Late runtime callbacks can still observe the connection state after close.
+  # Do not deinitialize the lock here; let process teardown reclaim it.
 
 proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC;
     queueLimit: int; pollInterval: Duration;
@@ -1150,9 +1149,8 @@ proc close(state: MsQuicListenerState) =
     state.signalLoop.cancel()
   else:
     closeSignal(state)
-  if state.lockInit:
-    deinitLock(state.lock)
-    state.lockInit = false
+  # Listener callbacks can outlive logical close; keep the lock valid until the
+  # ref object is reclaimed instead of destroying it eagerly.
 
 proc newMsQuicListenerState(handle: MsQuicTransportHandle; queueLimit: int;
     pollInterval: Duration; handler: MsQuicListenerHandler; userContext: pointer

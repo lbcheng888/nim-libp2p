@@ -1,5 +1,5 @@
 import std/[algorithm, atomics, base64, json, options, sequtils, sets, strformat,
-            strutils, tables, times, locks]
+            strutils, tables, times, locks, random]
 import std/os
 import chronos
 import chronos/threadsync
@@ -16,6 +16,7 @@ import libp2p/crypto/[crypto, ed25519/ed25519]
 import libp2p/protocols/pubsub/[gossipsub, pubsub, peertable]
 import libp2p/protocols/dm/dmservice
 import libp2p/protocols/feed/feedservice
+import libp2p/protocols/ping
 import nimcrypto/sha2 as nimsha2
 when libp2pFetchEnabled:
   import libp2p/protocols/fetch/[fetch, protobuf]
@@ -27,6 +28,7 @@ import bearssl/[rand, hash]
 
 when defined(libp2p_msquic_experimental):
   import libp2p/transports/msquicruntime
+  import libp2p/transports/msquictransport
 
 import examples/dex/dex_node as dex_node
 import examples/dex/mixer_service as mixer_service
@@ -106,8 +108,20 @@ const
     "frame_b64"
   ]
   MdnsConnectThrottleMs = 10_000
-  DefaultMdnsServiceName = "_unimaker._udp."
+  DefaultMdnsServiceName = "_unimaker._udp.local."
   EventLogLimit = (when defined(android): 0 else: 512)
+  NodeTelemetryTopic = "unimaker/node/telemetry/v1"
+  NodeTelemetryIntervalMs = 15_000
+  NodeTelemetryTtlMs = 180_000
+  PeerLatencyTimeoutMs = 1_500
+  ProbeDurationDefaultMs = 2_500
+  ProbeDurationMinMs = 800
+  ProbeDurationMaxMs = 15_000
+  ProbeChunkDefaultBytes = 12 * 1024
+  ProbeChunkMinBytes = 512
+  ProbeChunkMaxBytes = 64 * 1024
+  ProbeWindowTailMs = 600
+  ProbeSendTimeoutMs = 3_500
 
 var lastInitError = ""
 
@@ -235,6 +249,8 @@ type
     cmdSyncPeerstore,
     cmdLoadStoredPeers,
     cmdReconnectBootstrap,
+    cmdGetRandomBootstrapPeers,
+    cmdJoinViaRandomBootstrap,
     cmdSendDirect,
     cmdSendChatAck,
     cmdGetLastDirectError,
@@ -264,6 +280,7 @@ type
     cmdRendezvousUnregister,
     cmdReserveOnRelay,
     cmdReserveOnAllRelays,
+    cmdMeasurePeerBandwidth,
     cmdWaitSecureChannel,
     cmdPollEvents,
     cmdDexInit,
@@ -325,6 +342,7 @@ type
     dexNode: DexNode
     subscriptions: Table[pointer, Subscription]
     peerHints: Table[string, seq[string]]
+    bootstrapLastSeen: Table[string, int64]
     mdnsEnabled: bool
     mdnsIntervalSeconds: int
     running: Atomic[bool]
@@ -345,11 +363,16 @@ type
     connectionHandlers: seq[(ConnEventKind, ConnEventHandler)]
     keepAlivePeers: HashSet[string]
     keepAliveLoop: Future[void]
+    telemetryLoop: Future[void]
     metricsLoop: Future[void]
     metricsTextfileLoop: Future[void]
+    pingProtocol: Ping
     eventLog: seq[JsonNode]
     eventLogLock: Lock
     eventLogLimit: int
+    localSystemProfile: JsonNode
+    localSystemProfileUpdatedAt: int64
+    peerSystemProfiles: Table[string, JsonNode]
     lanEndpointsCache: JsonNode
     feedItems: seq[CachedFeedItem]
     livestreams: Table[string, LivestreamSession]
@@ -450,6 +473,22 @@ proc dequeueCommand(n: NimNode): Command =
   next
 
 proc logMemoryLoop(n: NimNode) {.async.}
+proc localPeerId(n: NimNode): string
+proc gatherKnownAddrs(n: NimNode, peer: PeerId): seq[MultiAddress]
+proc loadSocialStateUnsafe(node: NimNode): JsonNode
+proc socialStatsNode(state: JsonNode): JsonNode
+
+const
+  SocialStateVersion = 1
+  SocialMaxConversationMessages = 500
+  SocialMaxMoments = 1000
+  SocialMaxNotifications = 2000
+  SocialMaxSynccastRooms = 256
+  SocialDefaultLimit = 20
+
+var socialStateMem {.global.}: Table[int, JsonNode] = initTable[int, JsonNode]()
+var socialStateMemLock {.global.}: Lock
+initLock(socialStateMemLock)
 
 proc nowMillis(): int64 =
   int64(epochTime() * 1000)
@@ -680,6 +719,584 @@ proc jsonGetInt64(node: JsonNode, key: string, defaultValue: int64 = 0): int64 =
       discard
   defaultValue
 
+proc jsonGetFloat(node: JsonNode, key: string, defaultValue: float = 0.0): float =
+  if node.kind == JObject and node.hasKey(key):
+    let v = node.getOrDefault(key)
+    case v.kind
+    of JFloat:
+      return v.getFloat()
+    of JInt:
+      return float(v.getInt())
+    of JString:
+      try:
+        return parseFloat(v.getStr())
+      except CatchableError:
+        discard
+    else:
+      discard
+  defaultValue
+
+proc safeReadText(path: string): string =
+  if path.len == 0:
+    return ""
+  try:
+    if fileExists(path):
+      return readFile(path).strip()
+  except CatchableError:
+    discard
+  ""
+
+proc cloneOwnedString(text: string): string =
+  if text.len == 0:
+    return ""
+  text & ""
+
+proc parseIntLoose(text: string): int64 =
+  var token = ""
+  for ch in text:
+    if ch in {'0' .. '9'}:
+      token.add(ch)
+    elif token.len > 0:
+      break
+  if token.len == 0:
+    return 0
+  try:
+    parseBiggestInt(token)
+  except CatchableError:
+    0
+
+proc parseIntFlexible(text: string): int64 =
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    return 0
+  if trimmed.startsWith("0x") or trimmed.startsWith("0X"):
+    try:
+      return parseHexInt(trimmed).int64
+    except CatchableError:
+      discard
+  parseIntLoose(trimmed)
+
+proc valueAfterColon(line: string): string =
+  let idx = line.find(':')
+  if idx < 0:
+    return line.strip()
+  line[idx + 1 ..< line.len].strip()
+
+proc readCpuModel(): string =
+  let text = safeReadText("/proc/cpuinfo")
+  if text.len == 0:
+    return "unknown"
+  var fallbackProcessor = ""
+  for lineRaw in text.splitLines():
+    let line = lineRaw.strip()
+    if line.len == 0:
+      continue
+    let lowered = line.toLowerAscii()
+    if lowered.startsWith("hardware") or lowered.startsWith("model name") or
+        lowered.startsWith("cpu model"):
+      let value = valueAfterColon(line)
+      if value.len > 0:
+        return value
+    if lowered.startsWith("processor"):
+      let value = valueAfterColon(line)
+      if value.len > 0:
+        var numericOnly = true
+        for ch in value:
+          if ch notin {'0' .. '9'}:
+            numericOnly = false
+            break
+        if not numericOnly:
+          return value
+        if fallbackProcessor.len == 0:
+          fallbackProcessor = value
+  if fallbackProcessor.len > 0:
+    return "cpu-" & fallbackProcessor
+  "unknown"
+
+proc readCpuFrequencyMHz(): int =
+  let paths = @[
+    "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+    "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+    "/sys/devices/system/cpu/cpu0/cpufreq/base_frequency",
+  ]
+  for path in paths:
+    let raw = safeReadText(path)
+    let value = parseIntFlexible(raw)
+    if value > 0:
+      if value > 10_000:
+        return int(value div 1_000) # kHz -> MHz
+      return int(value)
+  let cpuInfo = safeReadText("/proc/cpuinfo")
+  for lineRaw in cpuInfo.splitLines():
+    let line = lineRaw.strip()
+    if line.toLowerAscii().startsWith("cpu mhz"):
+      let value = parseIntFlexible(valueAfterColon(line))
+      if value > 0:
+        return int(value)
+  0
+
+proc readCpuCoreCount(): int =
+  var cores = 0
+  try:
+    if dirExists("/sys/devices/system/cpu"):
+      for kind, path in walkDir("/sys/devices/system/cpu"):
+        if kind != pcDir:
+          continue
+        let name = splitPath(path).tail
+        if not name.startsWith("cpu") or name.len <= 3:
+          continue
+        var digitsOnly = true
+        for ch in name[3 ..< name.len]:
+          if ch notin {'0' .. '9'}:
+            digitsOnly = false
+            break
+        if digitsOnly:
+          inc cores
+  except CatchableError:
+    discard
+  if cores > 0:
+    return cores
+  when defined(posix):
+    when declared(sysconf) and declared(SC_NPROCESSORS_ONLN):
+      let online = sysconf(SC_NPROCESSORS_ONLN)
+      if online > 0:
+        return int(online)
+  0
+
+proc readMemoryTotalBytes(): int64 =
+  let memInfo = safeReadText("/proc/meminfo")
+  for lineRaw in memInfo.splitLines():
+    let line = lineRaw.strip()
+    if line.startsWith("MemTotal:"):
+      let kb = parseIntFlexible(line)
+      if kb > 0:
+        return kb * 1024
+  0
+
+proc readMemoryFrequencyMHz(): int =
+  when defined(android):
+    return 0
+  var maxFreqHz: int64 = 0
+  try:
+    if dirExists("/sys/class/devfreq"):
+      for kind, path in walkDir("/sys/class/devfreq"):
+        if kind != pcDir:
+          continue
+        let name = splitPath(path).tail.toLowerAscii()
+        if ("ddr" notin name) and ("mem" notin name) and ("bw" notin name):
+          continue
+        let value = parseIntFlexible(safeReadText(path / "cur_freq"))
+        if value > maxFreqHz:
+          maxFreqHz = value
+  except CatchableError:
+    discard
+  if maxFreqHz >= 1_000_000:
+    return int(maxFreqHz div 1_000_000)
+  if maxFreqHz >= 1_000:
+    return int(maxFreqHz div 1_000)
+  if maxFreqHz > 0:
+    return int(maxFreqHz)
+  0
+
+proc readDiskType(): string =
+  when defined(android):
+    return "flash"
+  var foundNvme = false
+  var foundUfs = false
+  var foundEmmc = false
+  try:
+    if dirExists("/sys/block"):
+      for kind, path in walkDir("/sys/block"):
+        if kind != pcDir:
+          continue
+        let name = splitPath(path).tail.toLowerAscii()
+        if name.startsWith("nvme"):
+          foundNvme = true
+        elif name.startsWith("sda") or name.startsWith("sdb") or
+            name.startsWith("sdc") or name.startsWith("ufs"):
+          foundUfs = true
+        elif name.startsWith("mmcblk"):
+          foundEmmc = true
+  except CatchableError:
+    discard
+  if foundNvme:
+    return "NVMe"
+  if foundUfs:
+    return "UFS"
+  if foundEmmc:
+    return "eMMC"
+  "unknown"
+
+proc readDiskSpaceBytes(basePath: string): tuple[total: int64, available: int64] =
+  var path = basePath.strip()
+  if path.len == 0:
+    path = getCurrentDir()
+  if path.len == 0:
+    path = "/"
+  when defined(posix):
+    when declared(statvfs):
+      var statbuf: Statvfs
+      if statvfs(path.cstring, statbuf) == 0:
+        let blockSize = int64(statbuf.f_frsize)
+        return (int64(statbuf.f_blocks) * blockSize, int64(statbuf.f_bavail) * blockSize)
+  (0'i64, 0'i64)
+
+proc readGpuModel(): string =
+  let candidates = @[
+    "/sys/class/kgsl/kgsl-3d0/gpu_model",
+    "/sys/class/kgsl/kgsl-3d0/device/model",
+    "/sys/class/misc/mali0/device/gpuinfo",
+    "/proc/gpuinfo",
+  ]
+  for path in candidates:
+    let text = safeReadText(path)
+    if text.len == 0:
+      continue
+    for lineRaw in text.splitLines():
+      let line = lineRaw.strip()
+      if line.len > 0:
+        return line
+  "unknown"
+
+proc readGpuMemoryBytes(): int64 =
+  let candidates = @[
+    "/sys/class/kgsl/kgsl-3d0/gmem_size",
+    "/sys/class/kgsl/kgsl-3d0/memstore_size",
+    "/sys/class/misc/mali0/device/memory",
+  ]
+  for path in candidates:
+    let value = parseIntFlexible(safeReadText(path))
+    if value > 0:
+      return value
+  0
+
+proc readOsVersion(): string =
+  when defined(android):
+    let buildProps = @[
+      "/system/build.prop",
+      "/system/system/build.prop",
+      "/vendor/build.prop",
+    ]
+    for buildPath in buildProps:
+      let buildProp = safeReadText(buildPath)
+      for lineRaw in buildProp.splitLines():
+        let line = lineRaw.strip()
+        if line.startsWith("ro.build.version.release="):
+          let idx = line.find('=')
+          if idx >= 0 and idx + 1 < line.len:
+            return line[idx + 1 ..< line.len].strip()
+    return "Android"
+  elif defined(ios):
+    "iOS"
+  elif defined(macosx):
+    "macOS"
+  elif defined(linux):
+    "Linux"
+  else:
+    "unknown"
+
+proc readKernelVersion(): string =
+  when defined(android):
+    let osRelease = safeReadText("/proc/sys/kernel/osrelease")
+    if osRelease.len > 0:
+      return osRelease
+    return "unknown"
+  else:
+    safeReadText("/proc/version")
+
+proc defaultSystemProfile(): JsonNode =
+  %* {
+    "os": {
+      "name": (when defined(android): "Android" elif defined(ios): "iOS" elif defined(macosx): "macOS" elif defined(linux): "Linux" else: "unknown"),
+      "version": readOsVersion(),
+      "kernel": readKernelVersion(),
+      "arch": hostCPU,
+    },
+    "cpu": {
+      "model": "unknown",
+      "frequencyMHz": 0,
+      "cores": 0,
+    },
+    "memory": {
+      "frequencyMHz": 0,
+      "totalBytes": 0'i64,
+    },
+    "disk": {
+      "type": "unknown",
+      "totalBytes": 0'i64,
+      "availableBytes": 0'i64,
+    },
+    "gpu": {
+      "model": "unknown",
+      "vramBytes": 0'i64,
+    },
+    "bandwidth": {
+      "uplinkBps": 0.0,
+      "downlinkBps": 0.0,
+      "uplinkTotalBytes": 0'i64,
+      "downlinkTotalBytes": 0'i64,
+      "totalTransferBytes": 0'i64,
+    },
+    "updatedAtMs": 0'i64,
+  }
+
+proc collectLocalSystemProfile(n: NimNode): JsonNode =
+  let nowTs = nowMillis()
+  if not n.localSystemProfile.isNil and nowTs - n.localSystemProfileUpdatedAt < 5_000:
+    return n.localSystemProfile
+
+  var profile = defaultSystemProfile()
+
+  profile["cpu"]["model"] = %readCpuModel()
+  profile["cpu"]["frequencyMHz"] = %readCpuFrequencyMHz()
+  profile["cpu"]["cores"] = %readCpuCoreCount()
+
+  profile["memory"]["frequencyMHz"] = %readMemoryFrequencyMHz()
+  profile["memory"]["totalBytes"] = %readMemoryTotalBytes()
+
+  let diskSpace = readDiskSpaceBytes(if n.cfg.dataDir.isSome: n.cfg.dataDir.get() else: "/")
+  profile["disk"]["type"] = %readDiskType()
+  profile["disk"]["totalBytes"] = %diskSpace.total
+  profile["disk"]["availableBytes"] = %diskSpace.available
+
+  profile["gpu"]["model"] = %readGpuModel()
+  profile["gpu"]["vramBytes"] = %readGpuMemoryBytes()
+
+  if not n.switchInstance.isNil and not n.switchInstance.bandwidthManager.isNil:
+    let snapshot = n.switchInstance.bandwidthManager.snapshot()
+    profile["bandwidth"]["uplinkBps"] = %snapshot.outboundRateBps
+    profile["bandwidth"]["downlinkBps"] = %snapshot.inboundRateBps
+    profile["bandwidth"]["uplinkTotalBytes"] = %snapshot.totalOutbound
+    profile["bandwidth"]["downlinkTotalBytes"] = %snapshot.totalInbound
+    profile["bandwidth"]["totalTransferBytes"] = %(snapshot.totalOutbound + snapshot.totalInbound)
+
+  profile["updatedAtMs"] = %nowTs
+  n.localSystemProfile = profile
+  n.localSystemProfileUpdatedAt = nowTs
+  profile
+
+proc sanitizeSystemProfile(node: JsonNode): JsonNode =
+  var profile = defaultSystemProfile()
+  if node.kind != JObject:
+    return profile
+  if node.hasKey("os") and node["os"].kind == JObject:
+    profile["os"] = node["os"]
+  if node.hasKey("cpu") and node["cpu"].kind == JObject:
+    profile["cpu"] = node["cpu"]
+  if node.hasKey("memory") and node["memory"].kind == JObject:
+    profile["memory"] = node["memory"]
+  if node.hasKey("disk") and node["disk"].kind == JObject:
+    profile["disk"] = node["disk"]
+  if node.hasKey("gpu") and node["gpu"].kind == JObject:
+    profile["gpu"] = node["gpu"]
+  if node.hasKey("bandwidth") and node["bandwidth"].kind == JObject:
+    profile["bandwidth"] = node["bandwidth"]
+    profile["bandwidth"]["totalTransferBytes"] = %(
+      jsonGetInt64(profile["bandwidth"], "totalTransferBytes",
+        jsonGetInt64(profile["bandwidth"], "uplinkTotalBytes", 0'i64) +
+        jsonGetInt64(profile["bandwidth"], "downlinkTotalBytes", 0'i64))
+    )
+  profile["updatedAtMs"] = %jsonGetInt64(node, "updatedAtMs", nowMillis())
+  profile
+
+proc prunePeerProfiles(n: NimNode) =
+  let nowTs = nowMillis()
+  var expired: seq[string] = @[]
+  for peerId, profile in n.peerSystemProfiles.pairs:
+    let updated = jsonGetInt64(profile, "updatedAtMs", 0)
+    if updated <= 0 or nowTs - updated > NodeTelemetryTtlMs:
+      expired.add(peerId)
+  for peerId in expired:
+    n.peerSystemProfiles.del(peerId)
+
+proc publishLocalTelemetry(n: NimNode): Future[void] {.async.} =
+  if n.isNil or not n.started or n.gossip.isNil:
+    return
+  var peerId = ""
+  if not n.switchInstance.isNil and not n.switchInstance.peerInfo.isNil:
+    try:
+      peerId = $n.switchInstance.peerInfo.peerId
+    except CatchableError:
+      discard
+  if peerId.len == 0:
+    return
+  let profile = collectLocalSystemProfile(n)
+  var payload = newJObject()
+  payload["peerId"] = %peerId
+  payload["systemProfile"] = profile
+  payload["timestamp_ms"] = %nowMillis()
+  try:
+    discard await n.gossip.PubSub.publish(NodeTelemetryTopic, stringToBytes($payload))
+  except CatchableError as exc:
+    debugLog("[nimlibp2p] publishLocalTelemetry failed err=" & exc.msg)
+
+proc telemetryLoop(n: NimNode) {.async.} =
+  while n.running.load(moAcquire):
+    if n.started and n.defaultTopicsReady:
+      prunePeerProfiles(n)
+      await publishLocalTelemetry(n)
+    await sleepAsync(chronos.milliseconds(NodeTelemetryIntervalMs))
+
+proc measureConnectionLatencyMs(n: NimNode, conn: Connection): Future[int] {.async.} =
+  if n.isNil or conn.isNil or n.pingProtocol.isNil:
+    return -1
+  try:
+    let pingFuture = n.pingProtocol.ping(conn)
+    let completed = await withTimeout(pingFuture, chronos.milliseconds(PeerLatencyTimeoutMs))
+    if not completed:
+      return -1
+    let duration = pingFuture.read()
+    let millis = duration.nanoseconds() div 1_000_000
+    if millis < 0:
+      return -1
+    return int(millis)
+  except CatchableError:
+    return -1
+
+proc clampProbeDurationMs(value: int): int =
+  let candidate = if value > 0: value else: ProbeDurationDefaultMs
+  max(ProbeDurationMinMs, min(candidate, ProbeDurationMaxMs))
+
+proc clampProbeChunkBytes(value: int): int =
+  let candidate = if value > 0: value else: ProbeChunkDefaultBytes
+  max(ProbeChunkMinBytes, min(candidate, ProbeChunkMaxBytes))
+
+proc isCircuitAddressText(addressText: string): bool =
+  "/p2p-circuit" in addressText.toLowerAscii()
+
+proc peerLikelyRelayed(n: NimNode, peerIdText: string, peerId: PeerId): bool =
+  if n.isNil:
+    return false
+  if n.peerHints.hasKey(peerIdText):
+    let hinted = n.peerHints.getOrDefault(peerIdText)
+    for addr in hinted:
+      if isCircuitAddressText(addr):
+        return true
+  if n.switchInstance.isNil:
+    return false
+  let addrBook = n.switchInstance.peerStore[AddressBook]
+  if addrBook.isNil:
+    return false
+  for pid, addrs in addrBook.book.pairs:
+    if pid != peerId:
+      continue
+    for addr in addrs:
+      if isCircuitAddressText($addr):
+        return true
+    break
+  false
+
+proc peerBandwidthTotals(n: NimNode, peerId: PeerId): tuple[outbound: int64, inbound: int64] =
+  if n.isNil or n.switchInstance.isNil:
+    return (0'i64, 0'i64)
+  let peerBw = n.switchInstance.bandwidthStats(peerId)
+  if peerBw.isSome():
+    let stats = peerBw.get()
+    return (int64(stats.outbound.totalBytes), int64(stats.inbound.totalBytes))
+  (0'i64, 0'i64)
+
+proc computeProbeBps(deltaBytes: int64, elapsedMs: int64): float64 =
+  if deltaBytes <= 0 or elapsedMs <= 0:
+    return 0.0
+  (float64(deltaBytes) * 8_000.0) / float64(elapsedMs)
+
+proc sendProbeChunks(
+    n: NimNode,
+    remotePid: PeerId,
+    sessionId: string,
+    durationMs: int,
+    chunkBytes: int
+): Future[tuple[payloadBytes: int64, elapsedMs: int64, chunkCount: int, ok: bool, err: string]] {.async.} =
+  if n.isNil or n.dmService.isNil:
+    return (0'i64, 0'i64, 0, false, "direct message service unavailable")
+  let safeDurationMs = clampProbeDurationMs(durationMs)
+  let safeChunkBytes = clampProbeChunkBytes(chunkBytes)
+  let timeout = chronos.milliseconds(max(ProbeSendTimeoutMs, safeDurationMs))
+  let chunkBody = "x".repeat(safeChunkBytes)
+  var sentBytes = 0'i64
+  var sentChunks = 0
+  let startMs = nowMillis()
+  while nowMillis() - startMs < int64(safeDurationMs):
+    var envelope = newJObject()
+    envelope["op"] = %"bw_probe_chunk"
+    envelope["sid"] = %sessionId
+    envelope["timestamp_ms"] = %nowMillis()
+    envelope["ackRequested"] = %false
+    envelope["body"] = %chunkBody
+    let payload = stringToBytes($envelope)
+    try:
+      let sendRes = await n.dmService.send(remotePid, payload, false, "", timeout)
+      if not sendRes[0]:
+        return (sentBytes, max(1'i64, nowMillis() - startMs), sentChunks, false, sendRes[1])
+      sentBytes += int64(safeChunkBytes)
+      inc sentChunks
+    except CatchableError as exc:
+      return (sentBytes, max(1'i64, nowMillis() - startMs), sentChunks, false, exc.msg)
+  (sentBytes, max(1'i64, nowMillis() - startMs), sentChunks, true, "")
+
+proc runProbePushTraffic(
+    n: NimNode,
+    targetPeerId: string,
+    sessionId: string,
+    durationMs: int,
+    chunkBytes: int
+) {.async.} =
+  if n.isNil or n.dmService.isNil or targetPeerId.len == 0:
+    return
+  var remotePid: PeerId
+  if not remotePid.init(targetPeerId):
+    return
+  let runResult = await sendProbeChunks(
+    n,
+    remotePid,
+    if sessionId.len > 0: sessionId else: ("probe-push-" & $nowMillis()),
+    durationMs,
+    chunkBytes
+  )
+  var event = newJObject()
+  event["type"] = %"BandwidthProbePushComplete"
+  event["peer_id"] = %targetPeerId
+  event["session_id"] = %(if sessionId.len > 0: sessionId else: "")
+  event["payload_bytes"] = %runResult.payloadBytes
+  event["elapsed_ms"] = %runResult.elapsedMs
+  event["chunk_count"] = %runResult.chunkCount
+  event["ok"] = %runResult.ok
+  if not runResult.ok and runResult.err.len > 0:
+    event["error"] = %runResult.err
+  event["timestamp_ms"] = %nowMillis()
+  recordEvent(n, "network_event", $event)
+
+proc handleNodeTelemetry(n: NimNode, payload: seq[byte]) =
+  let raw = bytesToString(payload).strip()
+  if raw.len == 0:
+    return
+  var envelope: JsonNode
+  try:
+    envelope = parseJson(raw)
+  except CatchableError:
+    return
+  if envelope.kind != JObject:
+    return
+  let peerId = jsonGetStr(envelope, "peerId")
+  var localId = ""
+  if not n.switchInstance.isNil and not n.switchInstance.peerInfo.isNil:
+    try:
+      localId = $n.switchInstance.peerInfo.peerId
+    except CatchableError:
+      discard
+  if peerId.len == 0 or peerId == localId:
+    return
+  let sourceProfile =
+    if envelope.hasKey("systemProfile"): envelope["systemProfile"] else: envelope
+  let profile = sanitizeSystemProfile(sourceProfile)
+  profile["updatedAtMs"] = %jsonGetInt64(envelope, "timestamp_ms", nowMillis())
+  n.peerSystemProfiles[peerId] = profile
+  var event = newJObject()
+  event["type"] = %"NodeTelemetry"
+  event["peer_id"] = %peerId
+  event["timestamp_ms"] = %nowMillis()
+  recordEvent(n, "network_event", $event)
+
 proc makeTopicHandler(
     n: NimNode, handler: proc(n: NimNode, topic: string, payload: seq[byte]) {.gcsafe.}
 ): TopicHandler =
@@ -864,6 +1481,15 @@ proc handleDirectMessageNode(n: NimNode, envelope: JsonNode, raw: string) =
   if op == "ack":
     handleDirectAckNode(n, envelope)
     return
+  if op == "bw_probe_push":
+    let sessionId = jsonGetStr(envelope, "sid", "probe-push")
+    let durationMs = clampProbeDurationMs(int(jsonGetInt64(envelope, "durationMs", int64(ProbeDurationDefaultMs))))
+    let chunkBytes = clampProbeChunkBytes(int(jsonGetInt64(envelope, "chunkBytes", int64(ProbeChunkDefaultBytes))))
+    if fromPeer.len > 0:
+      asyncSpawn(runProbePushTraffic(n, fromPeer, sessionId, durationMs, chunkBytes))
+    return
+  if op == "bw_probe_chunk":
+    return
   let originalMid = jsonGetStr(envelope, "mid")
   let mid = ensureMessageId(originalMid)
   let ts = jsonGetInt64(envelope, "timestamp_ms", nowMillis())
@@ -871,14 +1497,52 @@ proc handleDirectMessageNode(n: NimNode, envelope: JsonNode, raw: string) =
   var body = jsonGetStr(envelope, "body")
   if body.len == 0:
     body = raw
+  var payloadNode = envelope
+  if payloadNode.isNil or payloadNode.kind != JObject:
+    payloadNode = newJObject()
+  payloadNode["body"] = %body
+  payloadNode["messageId"] = %mid
+  payloadNode["mid"] = %mid
+  payloadNode["timestampMs"] = %ts
+  payloadNode["timestamp_ms"] = %ts
+  if fromPeer.len > 0:
+    payloadNode["from"] = %fromPeer
+    payloadNode["peerId"] = %fromPeer
+  let rawConvId = jsonGetStr(payloadNode, "conversationId")
+  let convId =
+    if rawConvId.len > 0:
+      rawConvId
+    elif fromPeer.len > 0:
+      "dm:" & fromPeer
+    else:
+      ""
+  if convId.len > 0:
+    payloadNode["conversationId"] = %convId
+  if fromPeer.len > 0:
+    payloadNode["sender"] = %fromPeer
   var event = newJObject()
   event["type"] = %"MessageReceived"
   event["peer_id"] = %((if fromPeer.len == 0: "unknown" else: fromPeer))
   event["message_id"] = %mid
   event["timestamp_ms"] = %ts
-  event["payload"] = %body
+  event["payload"] = payloadNode
+  event["body"] = %body
+  if convId.len > 0:
+    event["conversation_id"] = %convId
   event["transport"] = %"nim-direct"
   recordEvent(n, "network_event", $event)
+  if fromPeer.len > 0 and convId.len > 0:
+    var socialEvt = newJObject()
+    socialEvt["kind"] = %"social"
+    socialEvt["entity"] = %"dm"
+    socialEvt["op"] = %"receive"
+    socialEvt["traceId"] = %("trace-" & $ts & "-" & mid)
+    socialEvt["seq"] = %ts
+    socialEvt["timestampMs"] = %ts
+    socialEvt["conversationId"] = %convId
+    socialEvt["source"] = %"direct_message"
+    socialEvt["payload"] = payloadNode
+    recordEvent(n, "social_event", $socialEvt)
   if ackRequested and fromPeer.len > 0 and originalMid.len > 0:
     debugLog("[nimlibp2p] dm ack satisfied via direct stream peer=" & fromPeer & " mid=" & originalMid)
 
@@ -942,6 +1606,11 @@ proc setupDefaultTopics(n: NimNode): Future[void] {.async.} =
       proc(node: NimNode, t: string, payload: seq[byte]) =
         handleContentFeedNode(node, bytesToString(payload), "")
     ensureInternalSubscription(n, contentTopic, makeTopicHandler(n, handler))
+  if not n.internalSubscriptions.hasKey(NodeTelemetryTopic):
+    let telemetryHandler =
+      proc(node: NimNode, t: string, payload: seq[byte]) {.gcsafe.} =
+        handleNodeTelemetry(node, payload)
+    ensureInternalSubscription(n, NodeTelemetryTopic, makeTopicHandler(n, telemetryHandler))
   if n.feedService.isNil:
     var localPid: PeerId
     if localPid.init(local):
@@ -954,6 +1623,7 @@ proc setupDefaultTopics(n: NimNode): Future[void] {.async.} =
     else:
       warn "setupDefaultTopics: invalid local peer id for feed service", peer = local
   n.defaultTopicsReady = true
+  asyncSpawn(publishLocalTelemetry(n))
 
 proc isLanIpv4(ip: string): bool =
   if ip.len == 0:
@@ -984,9 +1654,13 @@ proc collectLanIpv4Addrs(preferred: string = ""): seq[string] =
   var ips = enumerateLanIpv4(preferred)
   let preferredValid = preferred.len > 0 and preferred != "0.0.0.0" and
     preferred != "127.0.0.1" and isLanIpv4(preferred)
-  if preferredValid and preferred notin ips:
-    debugLog("[nimlibp2p] collectLanIpv4Addrs force-keep preferred=" & preferred)
-    ips.insert(preferred, 0)
+  if preferredValid:
+    var reordered: seq[string] = @[preferred]
+    for ip in ips:
+      if ip != preferred:
+        reordered.add(ip)
+    ips = reordered
+    debugLog("[nimlibp2p] collectLanIpv4Addrs prioritize preferred=" & preferred)
   var filtered: seq[string] = @[]
   var seen = initHashSet[string]()
   for ipRaw in ips:
@@ -1215,7 +1889,15 @@ proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] =
   var base = n.switchInstance.peerInfo.listenAddrs
   if base.len == 0:
     base = n.switchInstance.peerInfo.addrs
-  let lanIpv4 = collectLanIpv4Addrs(n.mdnsPreferredIpv4)
+  let preservedBase = base
+  let preferredIpv4 = n.mdnsPreferredIpv4.strip()
+  let lanIpv4 =
+    if preferredIpv4.len > 0 and preferredIpv4 != "0.0.0.0" and
+        preferredIpv4 != "127.0.0.1" and isLanIpv4(preferredIpv4):
+      debugLog("[nimlibp2p] refreshLanAwareAddrs use preferred-only ipv4=" & preferredIpv4)
+      @[preferredIpv4]
+    else:
+      collectLanIpv4Addrs(preferredIpv4)
   let lanIpv6 = collectLanIpv6Addrs()
   debugLog("[nimlibp2p] refreshLanAwareAddrs lanIpv4=" &
     (if lanIpv4.len > 0: lanIpv4.join(",") else: "<empty>") &
@@ -1237,6 +1919,12 @@ proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] =
     if not seen.contains(key):
       dedup.add(ma)
       seen.incl(key)
+  if dedup.len == 0 and preservedBase.len > 0:
+    debugLog(
+      "[nimlibp2p] refreshLanAwareAddrs preserve-base because concrete listeners unavailable base=" &
+      preservedBase.mapIt($it).join(",")
+    )
+    return preservedBase
   if filtered > 0 and dedup.len == 0:
     debugLog("[nimlibp2p] refreshLanAwareAddrs dropped unspecified addresses; no concrete listeners available")
   elif filtered > 0:
@@ -1245,6 +1933,21 @@ proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] =
   n.switchInstance.peerInfo.listenAddrs = dedup
   n.switchInstance.peerInfo.addrs = dedup
   dedup
+
+proc mdnsDnsaddrPreview(node: NimNode): JsonNode =
+  var entries = newJArray()
+  if node.isNil or node.switchInstance.isNil or node.switchInstance.peerInfo.isNil:
+    return entries
+  let peerInfo = node.switchInstance.peerInfo
+  let preview =
+    if not node.mdnsInterface.isNil:
+      node.mdnsInterface.resolveMdnsDnsaddrs(Opt.some(peerInfo.peerId), peerInfo.listenAddrs)
+    else:
+      let fullAddrs = peerInfo.fullAddrs().valueOr: @[]
+      fullAddrs.mapIt("dnsaddr=" & $it)
+  for entry in preview:
+    entries.add(%entry)
+  entries
 
 proc isLanAddress(address: string): bool =
   if address.contains("/ip4/"):
@@ -1395,21 +2098,27 @@ proc extractPreferredIpv4(cfg: NodeConfig): string =
         return nested
   ""
 
-proc computeMdnsServiceName(n: NimNode): string =
+proc canonicalMdnsServiceName(name: string): string {.gcsafe.}
+proc legacyMdnsVariantsEnabled(): bool {.gcsafe.}
+proc noteMdnsDiscovery(
+  n: NimNode, peer: PeerId, addrs: seq[MultiAddress]
+) {.gcsafe, raises: [].}
+
+proc computeMdnsServiceName(n: NimNode): string {.gcsafe.} =
   let envService = getEnv("UNIMAKER_MDNS_SERVICE")
   if envService.len > 0:
-    return envService
+    return canonicalMdnsServiceName(envService)
   if not n.cfg.extra.isNil and n.cfg.extra.kind == JObject:
     if n.cfg.extra.hasKey("mdnsService"):
       let explicit = jsonGetStr(n.cfg.extra, "mdnsService")
       if explicit.len > 0:
-        return explicit
+        return canonicalMdnsServiceName(explicit)
     let mdnsNode = n.cfg.extra.getOrDefault("mdns")
     if mdnsNode.kind == JObject:
       let nested = jsonGetStr(mdnsNode, "service")
       if nested.len > 0:
-        return nested
-  DefaultMdnsServiceName
+        return canonicalMdnsServiceName(nested)
+  canonicalMdnsServiceName(DefaultMdnsServiceName)
 
 proc multiaddrsFromExtra(extra: JsonNode, key: string): seq[string] =
   if extra.isNil or extra.kind != JObject:
@@ -1477,6 +2186,7 @@ proc registerInitialPeerHints(n: NimNode, multiaddrs: seq[string], source: strin
       n.peerHints[peerId] = merged
     else:
       n.peerHints[peerId] = addrs
+    n.bootstrapLastSeen[peerId] = nowMillis()
     let peerRes = PeerId.init(peerId)
     if peerRes.isOk() and not store.isNil:
       try:
@@ -1511,7 +2221,7 @@ proc computeMdnsIntervals(n: NimNode): tuple[queryMs: int, announceMs: int] =
     announceMs = 1000
   (queryMs: queryMs, announceMs: announceMs)
 
-proc prepareMdns(n: NimNode) =
+proc prepareMdns(n: NimNode) {.gcsafe.} =
   if n.discovery != nil or not n.mdnsEnabled or n.switchInstance.isNil:
     return
   let peerInfo = n.switchInstance.peerInfo
@@ -1523,7 +2233,10 @@ proc prepareMdns(n: NimNode) =
   let intervals = computeMdnsIntervals(n)
   var preferredIp = ""
   let lanIpsSnapshot = collectLanIpv4Addrs(n.mdnsPreferredIpv4)
-  if not peerInfo.isNil:
+  if n.mdnsPreferredIpv4.len > 0 and
+      (lanIpsSnapshot.len == 0 or n.mdnsPreferredIpv4 in lanIpsSnapshot):
+    preferredIp = n.mdnsPreferredIpv4
+  if preferredIp.len == 0 and not peerInfo.isNil:
     for ma in peerInfo.listenAddrs:
       let addrStr = $ma
       if addrStr.contains("/ip4/"):
@@ -1532,7 +2245,8 @@ proc prepareMdns(n: NimNode) =
           let ipPart = parts[^1]
           let slashIdx = ipPart.find('/')
           let ip = if slashIdx >= 0: ipPart[0 ..< slashIdx] else: ipPart
-          if ip.len > 0 and ip != "0.0.0.0" and ip != "127.0.0.1":
+          if ip.len > 0 and ip != "0.0.0.0" and ip != "127.0.0.1" and
+              (lanIpsSnapshot.len == 0 or ip in lanIpsSnapshot):
             preferredIp = ip
             break
   if preferredIp.len == 0 and lanIpsSnapshot.len > 0:
@@ -1568,6 +2282,14 @@ proc prepareMdns(n: NimNode) =
   except Exception as exc:
     warn "mdns init failed", err = exc.msg
     return
+  mdnsIface.onPeerFound = proc(attrs: PeerAttributes) =
+    let peerOpt = attrs{PeerId}
+    if peerOpt.isNone:
+      return
+    let addrs = attrs.getAll(MultiAddress)
+    if addrs.len == 0:
+      return
+    noteMdnsDiscovery(n, peerOpt.get(), addrs)
   let disc = DiscoveryManager()
   disc.add(mdnsIface)
   n.discovery = disc
@@ -1580,7 +2302,7 @@ proc prepareMdns(n: NimNode) =
   n.mdnsReady = false
   debugLog("[nimlibp2p] prepareMdns: initialized service=" & serviceName)
 
-proc updateMdnsAdvertisements(n: NimNode) =
+proc updateMdnsAdvertisements(n: NimNode) {.gcsafe.} =
   if n.discovery.isNil or n.mdnsInterface.isNil or n.switchInstance.isNil:
     return
   let peerInfo = n.switchInstance.peerInfo
@@ -1728,8 +2450,10 @@ proc ensurePeerConnectivity(n: NimNode, peer: PeerId): Future[bool] {.async.} =
     let connectFuture = n.switchInstance.connect(peer, dialable, forceDial = true)
     let connected = await withTimeout(connectFuture, chronos.milliseconds(8_000))
     if not connected:
+      connectFuture.cancelSoon()
       debugLog("[nimlibp2p] ensurePeerConnectivity timeout peer=" & $peer)
       return false
+    await connectFuture
     return true
   except CatchableError as exc:
     let errMsg = if exc.msg.len > 0: exc.msg else: $exc.name
@@ -1745,11 +2469,171 @@ proc ensurePeerConnectivity(n: NimNode, peer: PeerId): Future[bool] {.async.} =
     warn "ensurePeerConnectivity connect fatal", peer = $peer, err = exc.msg
   peerCurrentlyConnected(n, peer)
 
-proc stripTrailingDots(value: var string) =
+type BootstrapCandidate = object
+  peerId: string
+  multiaddrs: seq[string]
+  lastSeenAt: int64
+  sources: seq[string]
+
+proc addBootstrapSource(target: var seq[string], source: string) =
+  if source.len > 0 and source notin target:
+    target.add(source)
+
+proc normalizeBootstrapMultiaddr(peerId: string, rawAddr: string): string =
+  var candidate = canonicalizeMultiaddrText(rawAddr.strip())
+  if candidate.len == 0:
+    return ""
+  if peerId.len > 0 and candidate.find("/p2p/") < 0:
+    candidate.add("/p2p/" & peerId)
+  if hasZeroPortSegment(candidate, "/tcp/") or hasZeroPortSegment(candidate, "/udp/"):
+    return ""
+  if isUnspecifiedMultiaddrText(candidate):
+    return ""
+  let maRes = MultiAddress.init(candidate)
+  if maRes.isErr():
+    return ""
+  var reason = ""
+  if not mdnsDialable(maRes.get(), reason):
+    return ""
+  $maRes.get()
+
+proc addBootstrapAddresses(peerId: string, values: seq[string], target: var seq[string]) =
+  for raw in values:
+    let normalized = normalizeBootstrapMultiaddr(peerId, raw)
+    if normalized.len > 0 and normalized notin target:
+      target.add(normalized)
+
+proc candidateLastSeen(n: NimNode, peerId: string): int64 =
+  var ts = n.bootstrapLastSeen.getOrDefault(peerId, 0)
+  ts = max(ts, n.mdnsLastSeen.getOrDefault(peerId, 0))
+  if n.peerSystemProfiles.hasKey(peerId):
+    ts = max(ts, jsonGetInt64(n.peerSystemProfiles.getOrDefault(peerId), "updatedAtMs", 0))
+  ts
+
+proc collectBootstrapCandidates(n: NimNode): seq[BootstrapCandidate] =
+  var candidates = initTable[string, BootstrapCandidate]()
+  let localId = localPeerId(n)
+  let nowTs = nowMillis()
+
+  proc upsert(peerId: string, addrs: seq[string], source: string, seenAt: int64 = 0'i64) =
+    let normalizedPeerId = peerId.strip()
+    if normalizedPeerId.len == 0 or normalizedPeerId == localId:
+      return
+    var entry = candidates.getOrDefault(
+      normalizedPeerId,
+      BootstrapCandidate(
+        peerId: normalizedPeerId,
+        multiaddrs: @[],
+        lastSeenAt: 0,
+        sources: @[]
+      )
+    )
+    addBootstrapAddresses(normalizedPeerId, addrs, entry.multiaddrs)
+    addBootstrapSource(entry.sources, source)
+    entry.lastSeenAt = max(entry.lastSeenAt, max(candidateLastSeen(n, normalizedPeerId), seenAt))
+    candidates[normalizedPeerId] = entry
+
+  for peerId, addrs in n.peerHints.pairs:
+    upsert(peerId, addrs, "Hints")
+
+  if not n.switchInstance.isNil:
+    var connected = initHashSet[string]()
+    try:
+      for pid in n.switchInstance.connectedPeers(Direction.Out):
+        connected.incl($pid)
+      for pid in n.switchInstance.connectedPeers(Direction.In):
+        connected.incl($pid)
+    except CatchableError:
+      discard
+    for peerId in connected.items():
+      upsert(peerId, @[], "Connected", nowTs)
+
+    let store = n.switchInstance.peerStore
+    if not store.isNil:
+      try:
+        let addrBook = store[AddressBook]
+        for peer, addrs in addrBook.book.pairs:
+          var addrStrings: seq[string] = @[]
+          for addr in addrs:
+            addrStrings.add($addr)
+          upsert($peer, addrStrings, "DHT")
+      except CatchableError as exc:
+        debugLog("[nimlibp2p] collectBootstrapCandidates peerstore failed err=" & exc.msg)
+
+  for peerId, item in candidates.pairs:
+    var entry = item
+    if entry.multiaddrs.len == 0:
+      continue
+    if entry.lastSeenAt <= 0 and "Connected" in entry.sources:
+      entry.lastSeenAt = nowTs
+    if entry.lastSeenAt <= 0:
+      entry.lastSeenAt = nowTs - 1
+    result.add(entry)
+
+  result.sort(proc(a, b: BootstrapCandidate): int =
+    result = cmp(b.lastSeenAt, a.lastSeenAt)
+    if result == 0:
+      result = cmp(a.peerId, b.peerId)
+  )
+
+proc clampBootstrapLimit(limit: int, defaultLimit: int, maxLimit: int): int =
+  let resolved = if limit > 0: limit else: defaultLimit
+  max(1, min(resolved, maxLimit))
+
+proc selectRandomBootstrapCandidates(candidates: seq[BootstrapCandidate], limit: int): seq[BootstrapCandidate] =
+  if candidates.len == 0 or limit <= 0:
+    return @[]
+  if candidates.len <= limit:
+    return candidates
+  var pool = candidates
+  let poolSize = min(pool.len, max(limit * 4, limit))
+  pool.setLen(poolSize)
+  random.randomize(int(nowMillis() and 0x7fff_ffff'i64))
+  for i in countdown(pool.high, 1):
+    let j = random.rand(i)
+    swap(pool[i], pool[j])
+  result = pool[0 ..< min(limit, pool.len)]
+  result.sort(proc(a, b: BootstrapCandidate): int =
+    result = cmp(b.lastSeenAt, a.lastSeenAt)
+    if result == 0:
+      result = cmp(a.peerId, b.peerId)
+  )
+
+proc connectBootstrapCandidate(n: NimNode, candidate: BootstrapCandidate): Future[bool] {.async.} =
+  if n.switchInstance.isNil or candidate.multiaddrs.len == 0:
+    return false
+  var parsed: seq[MultiAddress] = @[]
+  for addr in candidate.multiaddrs:
+    let maRes = MultiAddress.init(addr)
+    if maRes.isOk():
+      parsed.add(maRes.get())
+  if parsed.len == 0:
+    return false
+  let ordered = preferQuicMultiaddrs(parsed)
+  for ma in ordered:
+    try:
+      let connectFuture = n.switchInstance.connect(ma, allowUnknownPeerId = true)
+      let completed = await withTimeout(connectFuture, chronos.milliseconds(8_000))
+      if completed:
+        discard await connectFuture
+        return true
+      connectFuture.cancelSoon()
+    except CatchableError:
+      discard
+  let peerRes = PeerId.init(candidate.peerId)
+  if peerRes.isOk():
+    try:
+      await n.switchInstance.connect(peerRes.get(), ordered, forceDial = true)
+      return true
+    except CatchableError:
+      discard
+  false
+
+proc stripTrailingDots(value: var string) {.gcsafe.} =
   while value.len > 0 and value[^1] == '.':
     value.setLen(value.len - 1)
 
-proc resolveServiceBase(name: string): string =
+proc resolveServiceBase(name: string): string {.gcsafe.} =
   var base = name.strip()
   stripTrailingDots(base)
   const LocalSuffix = ".local"
@@ -1760,8 +2644,19 @@ proc resolveServiceBase(name: string): string =
       stripTrailingDots(base)
   base
 
-proc serviceQueryVariants(name: string): seq[string] =
-  ## 生成含/不含 `.local` 与尾随点的服务名变体，兼容不同端的 mDNS 约定。
+proc canonicalMdnsServiceName(name: string): string {.gcsafe.} =
+  let base = resolveServiceBase(name)
+  if base.len == 0:
+    return DefaultMdnsServiceName
+  base & ".local."
+
+proc legacyMdnsVariantsEnabled(): bool {.gcsafe.} =
+  let raw = getEnv("UNIMAKER_MDNS_LEGACY_VARIANTS").strip().toLowerAscii()
+  raw in ["1", "true", "yes", "on"]
+
+proc serviceQueryVariants(name: string): seq[string] {.gcsafe.} =
+  ## 生产环境默认只查询一个规范服务名，避免重复 query/response 放大局域网负担。
+  ## 如需兼容旧端，可用 UNIMAKER_MDNS_LEGACY_VARIANTS=1 临时恢复多变体探测。
   var variants: seq[string] = @[]
   proc addVariant(value: string) =
     let candidate = value.strip()
@@ -1769,6 +2664,10 @@ proc serviceQueryVariants(name: string): seq[string] =
       return
     if variants.find(candidate) < 0:
       variants.add(candidate)
+  let canonical = canonicalMdnsServiceName(name)
+  addVariant(canonical)
+  if not legacyMdnsVariantsEnabled():
+    return variants
   addVariant(name)
   let base = resolveServiceBase(name)
   if base.len == 0:
@@ -1797,6 +2696,12 @@ proc reportMdnsDialFailure(
     arr.add(%($ma))
   payload["addresses"] = arr
   recordEvent(n, "network_event", $payload)
+
+proc mdnsAutoConnectEnabled(): bool =
+  let raw = getEnv("LIBP2P_MDNS_AUTO_CONNECT", "").strip().toLowerAscii()
+  if raw.len == 0:
+    return false
+  raw in ["1", "true", "yes", "on"]
 
 proc connectMdnsPeer(n: NimNode, peer: PeerId, addrs: seq[MultiAddress]) {.async.} =
   if n.switchInstance.isNil or addrs.len == 0:
@@ -1841,7 +2746,9 @@ proc connectMdnsPeer(n: NimNode, peer: PeerId, addrs: seq[MultiAddress]) {.async
     let transient = shouldRetryDial(reason)
     reportMdnsDialFailure(n, peer, ordered, reason, transient = transient)
 
-proc noteMdnsDiscovery(n: NimNode, peer: PeerId, addrs: seq[MultiAddress]) =
+proc noteMdnsDiscovery(
+  n: NimNode, peer: PeerId, addrs: seq[MultiAddress]
+) {.gcsafe, raises: [].} =
   if addrs.len == 0:
     return
   if n.switchInstance.isNil:
@@ -1884,13 +2791,15 @@ proc noteMdnsDiscovery(n: NimNode, peer: PeerId, addrs: seq[MultiAddress]) =
       warn "mdns add addresses failed", peer = peerStr, err = exc.msg
 
   let now = nowMillis()
-  var shouldConnect = true
-  if n.mdnsLastSeen.hasKey(peerStr):
+  let autoConnectEnabled = mdnsAutoConnectEnabled()
+  var shouldConnect = autoConnectEnabled
+  if shouldConnect and n.mdnsLastSeen.hasKey(peerStr):
     let last = n.mdnsLastSeen.getOrDefault(peerStr)
     if now - last < MdnsConnectThrottleMs:
       shouldConnect = false
       debugLog("[nimlibp2p] mdns discovery throttled peer=" & peerStr & " elapsed=" & $(now - last))
   n.mdnsLastSeen[peerStr] = now
+  n.bootstrapLastSeen[peerStr] = now
 
   var event = newJObject()
   event["type"] = %"MdnsPeerDiscovered"
@@ -1905,6 +2814,8 @@ proc noteMdnsDiscovery(n: NimNode, peer: PeerId, addrs: seq[MultiAddress]) =
 
   if shouldConnect and dialable.len > 0:
     asyncCheck(connectMdnsPeer(n, peer, dialable))
+  elif dialable.len > 0 and not autoConnectEnabled:
+    debugLog("[nimlibp2p] mdns auto-connect disabled peer=" & peerStr)
 
 proc watchMdns(n: NimNode, query: DiscoveryQuery, service: string): Future[void] {.async.} =
   debugLog("[nimlibp2p] mdns watcher started service=" & service)
@@ -1975,15 +2886,30 @@ proc doStartMdns(n: NimNode): Future[void] {.async.} =
     n.mdnsReady = (n.mdnsWatchers.len > 0 and n.mdnsQueries.len > 0)
   if not n.mdnsEnabled or n.switchInstance.isNil:
     return
-  prepareMdns(n)
+  try:
+    prepareMdns(n)
+  except CatchableError as exc:
+    warn "prepareMdns failed", err = exc.msg
+    return
+  except Exception as exc:
+    warn "prepareMdns fatal", err = exc.msg
+    return
   if n.discovery.isNil or n.mdnsInterface.isNil:
     return
   debugLog("[nimlibp2p] startMdns: updating advertisements started=" & $n.started)
-  updateMdnsAdvertisements(n)
+  try:
+    updateMdnsAdvertisements(n)
+  except CatchableError as exc:
+    warn "updateMdnsAdvertisements failed", err = exc.msg
+    return
+  except Exception as exc:
+    warn "updateMdnsAdvertisements fatal", err = exc.msg
+    return
   if not n.started:
     return
   var services: seq[string] = @[]
-  let candidates = serviceQueryVariants(n.mdnsService) & serviceQueryVariants("_unimaker._udp.")
+  let candidates = serviceQueryVariants(n.mdnsService) &
+    serviceQueryVariants(DefaultMdnsServiceName)
   for candidate in candidates:
     if candidate.len > 0 and services.find(candidate) < 0:
       services.add(candidate)
@@ -2074,7 +3000,12 @@ proc kickMdnsQuery(n: NimNode): Future[void] {.async.} =
         " queries=" & $queryCount & " starting=" & $starting &
         " restarting=" & $restarting & " ready=" & $ready
       )
-      updateMdnsAdvertisements(n)
+      try:
+        updateMdnsAdvertisements(n)
+      except CatchableError as exc:
+        warn "kickMdnsQuery advertise failed", err = exc.msg
+      except Exception as exc:
+        warn "kickMdnsQuery advertise fatal", err = exc.msg
       return
     debugLog("[nimlibp2p] kickMdnsQuery restarting watchers=" & $watcherCount & " queries=" & $queryCount)
     try:
@@ -2089,13 +3020,28 @@ proc kickMdnsQuery(n: NimNode): Future[void] {.async.} =
       await sleepAsync(chronos.seconds(2))
   else:
     debugLog("[nimlibp2p] kickMdnsQuery keep-alive watchers=" & $watcherCount & " queries=" & $queryCount)
-    updateMdnsAdvertisements(n)
+    try:
+      updateMdnsAdvertisements(n)
+    except CatchableError as exc:
+      warn "kickMdnsQuery keepalive advertise failed", err = exc.msg
+    except Exception as exc:
+      warn "kickMdnsQuery keepalive advertise fatal", err = exc.msg
+    if not n.mdnsInterface.isNil:
+      try:
+        await n.mdnsInterface.probeNow()
+      except CatchableError as exc:
+        warn "kickMdnsQuery probe failed", err = exc.msg
+        debugLog("[nimlibp2p] kickMdnsQuery probe failed err=" & exc.msg)
+      except Exception as exc:
+        warn "kickMdnsQuery probe fatal", err = exc.msg
+        debugLog("[nimlibp2p] kickMdnsQuery probe fatal err=" & exc.msg)
 
 proc setupConnectionEvents(n: NimNode) =
   if n.connectionEventsEnabled:
     return
   let connectedHandler =
     proc(peerId: PeerId, event: ConnEvent): Future[void] {.closure, async: (raises: [CancelledError]).} =
+      n.bootstrapLastSeen[$peerId] = nowMillis()
       var ev = newJObject()
       ev["type"] = %"ConnectionEstablished"
       ev["peer_id"] = %($peerId)
@@ -2226,10 +3172,27 @@ proc waitForSecureChannel(n: NimNode, peerId: string, timeoutMs: int): Future[bo
     return false
   let peer = peerRes.get()
   let deadline = nowMillis() + max(timeoutMs, 500)
+  var lastConnCount = -1
+  var lastConnected = false
+  debugLog("[nimlibp2p] waitForSecureChannel start peer=" & peerId & " timeoutMs=" & $max(timeoutMs, 500))
   while nowMillis() < deadline:
-    if n.switchInstance.connManager.connCount(peer) > 0:
+    let connCount =
+      if n.switchInstance.isNil: 0
+      else: n.switchInstance.connManager.connCount(peer)
+    let connected = peerCurrentlyConnected(n, peer)
+    if connCount != lastConnCount or connected != lastConnected:
+      lastConnCount = connCount
+      lastConnected = connected
+      debugLog(
+        "[nimlibp2p] waitForSecureChannel peer=" & peerId &
+        " connCount=" & $connCount &
+        " connectedPeers=" & $(if connected: 1 else: 0)
+      )
+    if connCount > 0 or connected:
+      debugLog("[nimlibp2p] waitForSecureChannel ready peer=" & peerId)
       return true
     await sleepAsync(chronos.milliseconds(150))
+  debugLog("[nimlibp2p] waitForSecureChannel timeout peer=" & peerId)
   false
 
 type
@@ -2540,7 +3503,14 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     let bridgeRes = msquicruntime.acquireMsQuicBridge()
     if bridgeRes.success and not bridgeRes.bridge.isNil:
       msquicruntime.releaseMsQuicBridge(bridgeRes.bridge)
-      builder = builder.withMsQuicTransport()
+      var msquicBuilderCfg = MsQuicTransportBuilderConfig.init()
+      if cfg.dataDir.isSome():
+        let tlsTempDir = cfg.dataDir.get() / "tls_tmp"
+        msquicBuilderCfg.onTransport = Opt.some(MsQuicTransportHook(
+          proc(transport: MsQuicTransport) =
+            transport.setTlsTempDir(tlsTempDir)
+        ))
+      builder = builder.withMsQuicTransport(msquicBuilderCfg)
       debugLog("[nimlibp2p] buildSwitch applied MsQuic transport")
       msquicActivated = true
     else:
@@ -2705,6 +3675,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         n.stopRequested.store(false, moRelease)
         debugLog("[nimlibp2p] cmdStart: starting switch")
         try:
+          if n.pingProtocol.isNil:
+            n.pingProtocol = Ping.new()
+            n.switchInstance.mount(n.pingProtocol)
           await n.switchInstance.start()
           n.started = true
           debugLog("[nimlibp2p] cmdStart: switch.start completed")
@@ -2723,6 +3696,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             info "cmdStart: applying deferred mdns restart", ipv4 = n.mdnsPreferredIpv4
             asyncSpawn(restartMdnsSafe(n, "cmdStart"))
             debugLog("[nimlibp2p] cmdStart: mdns restart scheduled")
+          if n.telemetryLoop.isNil or n.telemetryLoop.finished():
+            n.telemetryLoop = telemetryLoop(n)
+            asyncSpawn(n.telemetryLoop)
           asyncSpawn(logMemoryLoop(n))
           debugLog(
             "[nimlibp2p] cmdStart: marking success node=" & $cast[int](n)
@@ -2739,6 +3715,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             if n.mdnsRestartPending:
               info "cmdStart: applying deferred mdns restart", ipv4 = n.mdnsPreferredIpv4
               asyncSpawn(restartMdnsSafe(n, "cmdStart:advertise"))
+            if n.telemetryLoop.isNil or n.telemetryLoop.finished():
+              n.telemetryLoop = telemetryLoop(n)
+              asyncSpawn(n.telemetryLoop)
             asyncSpawn(logMemoryLoop(n))
             command.resultCode = NimResultOk
             command.errorMsg = "WARN_DISCOVERY_ADVERTISE"
@@ -2903,6 +3882,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
               command.resultCode = NimResultOk
               command.errorMsg = ""
               n.lastDirectError = ""
+              n.bootstrapLastSeen[command.peerId] = nowMillis()
               info "cmdConnectPeer success", peer = command.peerId, addrCount = dialable.len
             else:
               let errMsg = if lastError.len > 0: lastError else: "connect failed"
@@ -2922,10 +3902,15 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           n.lastDirectError = command.errorMsg
           return
         let timeoutMs = if command.timeoutMs > 0: command.timeoutMs else: 10_000
-        let maxAttempts = 3
+        let maxAttempts = if command.timeoutMs > 0 and command.timeoutMs <= 2_000: 1 else: 3
         var attempt = 0
         var success = false
         var lastError = ""
+        debugLog(
+          "[nimlibp2p] cmdConnectMultiaddr start addr=" & command.multiaddr &
+          " timeoutMs=" & $timeoutMs &
+          " maxAttempts=" & $maxAttempts
+        )
         while attempt < maxAttempts and not success:
           let attemptNum = attempt + 1
           try:
@@ -2935,16 +3920,34 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
               fut.cancelSoon()
               lastError = "connect timeout"
               warn "cmdConnectMultiaddr timeout", addr = command.multiaddr, attempt = attemptNum
+              debugLog(
+                "[nimlibp2p] cmdConnectMultiaddr timeout addr=" & command.multiaddr &
+                " attempt=" & $attemptNum
+              )
             else:
               discard await fut
               success = true
+              debugLog(
+                "[nimlibp2p] cmdConnectMultiaddr connected addr=" & command.multiaddr &
+                " attempt=" & $attemptNum
+              )
               break
           except CancelledError as exc:
             lastError = exc.msg
+            debugLog(
+              "[nimlibp2p] cmdConnectMultiaddr cancelled addr=" & command.multiaddr &
+              " attempt=" & $attemptNum &
+              " err=" & lastError
+            )
             break
           except CatchableError as exc:
             lastError = if exc.msg.len > 0: exc.msg else: $exc.name
             warn "cmdConnectMultiaddr dial failed", addr = command.multiaddr, attempt = attemptNum, err = lastError
+            debugLog(
+              "[nimlibp2p] cmdConnectMultiaddr dial failed addr=" & command.multiaddr &
+              " attempt=" & $attemptNum &
+              " err=" & lastError
+            )
           attempt.inc()
           if attempt < maxAttempts:
             let delayMs = min(800, 200 * attempt)
@@ -2953,6 +3956,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.resultCode = NimResultOk
           command.errorMsg = ""
           n.lastDirectError = ""
+          let peerOpt = extractPeerIdFromMultiaddrStr(command.multiaddr)
+          if peerOpt.isSome():
+            n.bootstrapLastSeen[peerOpt.get()] = nowMillis()
           let successMsg = "[nimlibp2p] cmdConnectMultiaddr success addr=" & command.multiaddr
           info "cmdConnectMultiaddr success", addr = command.multiaddr
           debugLog(successMsg)
@@ -3033,6 +4039,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         if not seen.contains(s):
           seen.incl(s)
           allPeers.add(s)
+      let localProfile = collectLocalSystemProfile(n)
+      n.peerSystemProfiles[$peerInfo.peerId] = localProfile
+      prunePeerProfiles(n)
       var diagnostics = %* {
         "peerId": $peerInfo.peerId,
         "listenAddresses": listenAddrs,
@@ -3053,6 +4062,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         },
         "timestampMillis": int64(epochTime() * 1000),
         "natPublicAddr": publicAddr,
+        "systemProfile": localProfile,
       }
       if n.cfg.identity.isSome():
         let ident = n.cfg.identity.get()
@@ -3066,16 +4076,18 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       command.resultCode = NimResultOk
       debugLog("[nimlibp2p] cmdDiagnostics completed")
     of cmdConnectedPeersInfo:
+      prunePeerProfiles(n)
       var arr = newJArray()
       let connections = n.switchInstance.connManager.getConnections()
       for peerId, muxers in connections.pairs:
+        let peerIdText = $peerId
         var entry = newJObject()
-        entry["peerId"] = %($peerId)
+        entry["peerId"] = %peerIdText
         entry["connectionCount"] = %muxers.len
         var directions = newJArray()
         var streamCount = 0
         for mux in muxers:
-          if mux.isNil:
+          if mux.isNil or mux.connection.isNil:
             continue
           let dirStr =
             if mux.connection.dir == Direction.In: "inbound" else: "outbound"
@@ -3086,6 +4098,46 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             discard
         entry["directions"] = directions
         entry["streamCount"] = %streamCount
+        entry["latencyMs"] = %(-1)
+        let peerBw = n.switchInstance.bandwidthStats(peerId)
+        let relayed = peerLikelyRelayed(n, peerIdText, peerId)
+        var bandwidthNode = newJObject()
+        bandwidthNode["uplinkBps"] = %0.0
+        bandwidthNode["downlinkBps"] = %0.0
+        bandwidthNode["uplinkTotalBytes"] = %0'i64
+        bandwidthNode["downlinkTotalBytes"] = %0'i64
+        bandwidthNode["totalTransferBytes"] = %0'i64
+        bandwidthNode["isRelayed"] = %relayed
+        bandwidthNode["relayBottleneckBps"] = %0.0
+        var uplinkEma = 0.0
+        var downlinkEma = 0.0
+        if peerBw.isSome():
+          let stats = peerBw.get()
+          uplinkEma = stats.outbound.emaBytesPerSecond
+          downlinkEma = stats.inbound.emaBytesPerSecond
+          bandwidthNode["uplinkBps"] = %uplinkEma
+          bandwidthNode["downlinkBps"] = %downlinkEma
+          bandwidthNode["uplinkTotalBytes"] = %stats.outbound.totalBytes
+          bandwidthNode["downlinkTotalBytes"] = %stats.inbound.totalBytes
+          bandwidthNode["totalTransferBytes"] = %(stats.outbound.totalBytes + stats.inbound.totalBytes)
+        if relayed:
+          bandwidthNode["relayBottleneckBps"] = %min(uplinkEma, downlinkEma)
+        entry["bandwidth"] = bandwidthNode
+        entry["isRelayed"] = %relayed
+        var peerProfile = defaultSystemProfile()
+        if n.peerSystemProfiles.hasKey(peerIdText):
+          peerProfile = sanitizeSystemProfile(n.peerSystemProfiles.getOrDefault(peerIdText))
+        peerProfile["bandwidth"] = bandwidthNode
+        entry["systemProfile"] = peerProfile
+        var latency = -1
+        if not n.pingProtocol.isNil:
+          for mux in muxers:
+            if mux.isNil or mux.connection.isNil:
+              continue
+            latency = await measureConnectionLatencyMs(n, mux.connection)
+            if latency >= 0:
+              break
+        entry["latencyMs"] = %latency
         arr.add(entry)
       command.stringResult = $arr
       command.resultCode = NimResultOk
@@ -3111,6 +4163,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.errorMsg = "no valid addresses"
         return
       n.peerHints[command.peerId] = command.addresses
+      n.bootstrapLastSeen[command.peerId] = nowMillis()
       let peerStore = n.switchInstance.peerStore
       if not peerStore.isNil:
         try:
@@ -3231,6 +4284,59 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             warn "reconnectBootstrap: connect via peerId failed", peer = peerId, err = exc.msg
       command.delivered = attempts
       command.resultCode = NimResultOk
+    of cmdGetRandomBootstrapPeers:
+      let limit = clampBootstrapLimit(command.requestLimit, defaultLimit = 8, maxLimit = 32)
+      let candidates = collectBootstrapCandidates(n)
+      let selected = selectRandomBootstrapCandidates(candidates, limit)
+      var peersNode = newJArray()
+      for item in selected:
+        var entry = newJObject()
+        entry["peerId"] = %item.peerId
+        entry["multiaddrs"] = %item.multiaddrs
+        entry["lastSeenAt"] = %item.lastSeenAt
+        entry["sources"] = %item.sources
+        peersNode.add(entry)
+      var payload = newJObject()
+      payload["peers"] = peersNode
+      payload["selectedCount"] = %selected.len
+      payload["totalCount"] = %candidates.len
+      payload["timestamp_ms"] = %nowMillis()
+      command.stringResult = $payload
+      command.resultCode = NimResultOk
+    of cmdJoinViaRandomBootstrap:
+      if not n.started:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "node not started"
+      else:
+        let limit = clampBootstrapLimit(command.requestLimit, defaultLimit = 3, maxLimit = 8)
+        let candidates = collectBootstrapCandidates(n)
+        let selected = selectRandomBootstrapCandidates(candidates, limit)
+        var attemptsNode = newJArray()
+        var connectedCount = 0
+        for item in selected:
+          let connected = await connectBootstrapCandidate(n, item)
+          if connected:
+            inc connectedCount
+            n.bootstrapLastSeen[item.peerId] = nowMillis()
+          var entry = newJObject()
+          entry["peerId"] = %item.peerId
+          entry["multiaddrs"] = %item.multiaddrs
+          entry["lastSeenAt"] = %item.lastSeenAt
+          entry["sources"] = %item.sources
+          entry["connected"] = %connected
+          attemptsNode.add(entry)
+        var payload = newJObject()
+        payload["attempted"] = attemptsNode
+        payload["attemptCount"] = %selected.len
+        payload["connectedCount"] = %connectedCount
+        payload["ok"] = %(connectedCount > 0)
+        payload["timestamp_ms"] = %nowMillis()
+        command.stringResult = $payload
+        command.intResult = connectedCount
+        command.boolResult = connectedCount > 0
+        if connectedCount == 0:
+          command.errorMsg = "no bootstrap peer connected"
+        command.resultCode = NimResultOk
     of cmdSendDirect:
       if not n.started:
         command.resultCode = NimResultInvalidState
@@ -3309,11 +4415,20 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         var sendOk = false
         var sendErr = ""
         try:
-          let resultTuple = await n.dmService.send(
+          let sendFuture = n.dmService.send(
             remotePid, bytes, command.ackRequested, mid, timeout
           )
-          sendOk = resultTuple[0]
-          sendErr = resultTuple[1]
+          let sendCompleted = await withTimeout(sendFuture, timeout + chronos.milliseconds(750))
+          if not sendCompleted:
+            sendFuture.cancelSoon()
+            sendOk = false
+            sendErr = "send timeout"
+            debugLog("[nimlibp2p] cmdSendDirect timeout peer=" & command.peerId &
+              " mid=" & mid & " ackRequested=" & $command.ackRequested)
+          else:
+            let resultTuple = await sendFuture
+            sendOk = resultTuple[0]
+            sendErr = resultTuple[1]
         except CatchableError as exc:
           sendOk = false
           sendErr = if exc.msg.len > 0: exc.msg else: $exc.name
@@ -3662,6 +4777,14 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       obj["interval_seconds"] = %n.mdnsIntervalSeconds
       obj["interface_bound_ipv4"] =
         if not n.mdnsInterface.isNil: %n.mdnsInterface.boundIpv4 else: %""
+      if not n.switchInstance.isNil and not n.switchInstance.peerInfo.isNil:
+        let peerInfo = n.switchInstance.peerInfo
+        obj["listenAddresses"] = %(peerInfo.listenAddrs.mapIt($it))
+        obj["dialableAddresses"] = %(peerInfo.addrs.mapIt($it))
+      else:
+        obj["listenAddresses"] = newJArray()
+        obj["dialableAddresses"] = newJArray()
+      obj["dnsaddrEntries"] = mdnsDnsaddrPreview(n)
       command.stringResult = $obj
       command.resultCode = NimResultOk
     of cmdMdnsSetInterval:
@@ -3773,6 +4896,114 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           total += await reserveOnRelayAsync(n, addr)
       command.intResult = total
       command.resultCode = NimResultOk
+    of cmdMeasurePeerBandwidth:
+      if not n.started:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "node not started"
+      elif command.peerId.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peer id"
+      else:
+        await setupDefaultTopics(n)
+        if n.dmService.isNil:
+          command.resultCode = NimResultInvalidState
+          command.errorMsg = "direct message service unavailable"
+          return
+        var remotePid: PeerId
+        if not remotePid.init(command.peerId):
+          command.resultCode = NimResultInvalidArgument
+          command.errorMsg = "invalid peer id"
+          return
+        let durationMs = clampProbeDurationMs(command.timeoutMs)
+        let chunkBytes = clampProbeChunkBytes(command.intParam)
+        let relayed = peerLikelyRelayed(n, command.peerId, remotePid)
+        var probe = newJObject()
+        probe["ok"] = %false
+        probe["peerId"] = %command.peerId
+        probe["durationMs"] = %durationMs
+        probe["chunkBytes"] = %chunkBytes
+        probe["isRelayed"] = %relayed
+        let local = localPeerId(n)
+        probe["localPeerId"] = %local
+        let connectivityOk = await ensurePeerConnectivity(n, remotePid)
+        if not connectivityOk:
+          let err = if command.errorMsg.len > 0: command.errorMsg else: "peer unreachable"
+          command.errorMsg = err
+          probe["error"] = %err
+          probe["timestampMs"] = %nowMillis()
+          command.stringResult = $probe
+          command.boolResult = false
+          command.resultCode = NimResultOk
+          return
+
+        let sessionBase = "probe-" & $nowMillis()
+        let uploadWindowStart = nowMillis()
+        let uploadBefore = peerBandwidthTotals(n, remotePid)
+        let uploadRun = await sendProbeChunks(n, remotePid, sessionBase & "-up", durationMs, chunkBytes)
+        await sleepAsync(chronos.milliseconds(ProbeWindowTailMs))
+        let uploadAfter = peerBandwidthTotals(n, remotePid)
+        let uploadWindowMs = max(1'i64, nowMillis() - uploadWindowStart)
+        let uplinkBytes = max(0'i64, uploadAfter.outbound - uploadBefore.outbound)
+        let uplinkBps = computeProbeBps(uplinkBytes, uploadWindowMs)
+
+        let downloadWindowStart = nowMillis()
+        let downloadBefore = peerBandwidthTotals(n, remotePid)
+        let requestMid = ensureMessageId("bw-probe-down-" & $nowMillis())
+        var request = newJObject()
+        request["op"] = %"bw_probe_push"
+        request["mid"] = %requestMid
+        request["sid"] = %(sessionBase & "-down")
+        request["from"] = %local
+        request["durationMs"] = %durationMs
+        request["chunkBytes"] = %chunkBytes
+        request["timestamp_ms"] = %nowMillis()
+        request["ackRequested"] = %true
+        let requestPayload = stringToBytes($request)
+        let requestTimeout = chronos.milliseconds(max(ProbeSendTimeoutMs, durationMs))
+        var downloadRequestOk = false
+        var downloadRequestErr = ""
+        try:
+          let sendRes = await n.dmService.send(remotePid, requestPayload, true, requestMid, requestTimeout)
+          downloadRequestOk = sendRes[0]
+          downloadRequestErr = sendRes[1]
+        except CatchableError as exc:
+          downloadRequestOk = false
+          downloadRequestErr = exc.msg
+        if downloadRequestOk:
+          await sleepAsync(chronos.milliseconds(durationMs + ProbeWindowTailMs))
+        let downloadAfter = peerBandwidthTotals(n, remotePid)
+        let downloadWindowMs = max(1'i64, nowMillis() - downloadWindowStart)
+        let downlinkBytes = max(0'i64, downloadAfter.inbound - downloadBefore.inbound)
+        let downlinkBps = computeProbeBps(downlinkBytes, downloadWindowMs)
+        let bottleneckBps = if relayed: min(uplinkBps, downlinkBps) else: 0.0
+
+        let probeOk = uploadRun.ok and downloadRequestOk
+        probe["ok"] = %probeOk
+        probe["uplinkBps"] = %uplinkBps
+        probe["downlinkBps"] = %downlinkBps
+        probe["uplinkSampleBytes"] = %uplinkBytes
+        probe["downlinkSampleBytes"] = %downlinkBytes
+        probe["uploadWindowMs"] = %uploadWindowMs
+        probe["downloadWindowMs"] = %downloadWindowMs
+        probe["uploadChunkCount"] = %uploadRun.chunkCount
+        probe["uploadPayloadBytes"] = %uploadRun.payloadBytes
+        probe["relayLimited"] = %relayed
+        probe["relayBottleneckBps"] = %bottleneckBps
+        if not uploadRun.ok and uploadRun.err.len > 0:
+          probe["uploadError"] = %uploadRun.err
+        if not downloadRequestOk and downloadRequestErr.len > 0:
+          probe["downloadError"] = %downloadRequestErr
+        probe["timestampMs"] = %nowMillis()
+        command.boolResult = probeOk
+        if not probeOk:
+          if not uploadRun.ok and uploadRun.err.len > 0:
+            command.errorMsg = uploadRun.err
+          elif not downloadRequestOk and downloadRequestErr.len > 0:
+            command.errorMsg = downloadRequestErr
+          else:
+            command.errorMsg = "bandwidth probe failed"
+        command.stringResult = $probe
+        command.resultCode = NimResultOk
     of cmdWaitSecureChannel:
       if command.peerId.len == 0:
         command.resultCode = NimResultInvalidArgument
@@ -4422,6 +5653,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       shutdownSignal: shutdownSignalPtr,
       subscriptions: initTable[pointer, Subscription](),
       peerHints: initTable[string, seq[string]](),
+      bootstrapLastSeen: initTable[string, int64](),
       directWaiters: initTable[string, DirectWaiter](),
       lastDirectError: "",
       dmService: nil,
@@ -4433,8 +5665,13 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       connectionHandlers: @[],
       keepAlivePeers: initHashSet[string](),
       keepAliveLoop: nil,
+      telemetryLoop: nil,
+      pingProtocol: nil,
       eventLog: @[],
       eventLogLimit: EventLogLimit,
+      localSystemProfile: newJObject(),
+      localSystemProfileUpdatedAt: 0,
+      peerSystemProfiles: initTable[string, JsonNode](),
       lanEndpointsCache: newJObject(),
       feedItems: @[],
       livestreams: initTable[string, LivestreamSession](),
@@ -4672,6 +5909,25 @@ proc libp2p_connect_multiaddr*(
     warn "libp2p_connect_multiaddr failed", addr = $multiaddr, err = err
   rc
 
+proc libp2p_connect_multiaddr_timeout*(
+    handle: pointer, multiaddr: cstring, timeoutMs: cint
+): cint {.exportc, cdecl, dynlib.} =
+  if multiaddr.isNil:
+    return NimResultInvalidArgument
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return NimResultInvalidArgument
+  let cmd = makeCommand(cmdConnectMultiaddr)
+  cmd.multiaddr = $multiaddr
+  cmd.timeoutMs = max(int(timeoutMs), 250)
+  let result = submitCommand(node, cmd)
+  let rc = result.resultCode
+  let err = result.errorMsg
+  destroyCommand(cmd)
+  if rc != NimResultOk:
+    warn "libp2p_connect_multiaddr_timeout failed", addr = $multiaddr, timeoutMs = int(timeoutMs), err = err
+  rc
+
 proc libp2p_disconnect_peer*(handle: pointer, peerId: cstring): cint {.exportc, cdecl, dynlib.} =
   if peerId.isNil:
     return NimResultInvalidArgument
@@ -4835,7 +6091,7 @@ proc libp2p_get_last_direct_error*(handle: pointer): cstring {.exportc, cdecl, d
     return allocCString("")
   let cmd = makeCommand(cmdGetLastDirectError)
   let result = submitCommand(node, cmd)
-  let text = result.stringResult
+  let text = cloneOwnedString(result.stringResult)
   destroyCommand(cmd)
   allocCString(text)
 
@@ -4919,7 +6175,7 @@ proc libp2p_get_lan_endpoints_json*(handle: pointer): cstring {.exportc, cdecl, 
   if result.resultCode == NimResultOk:
     try:
       if result.stringResult.len > 0:
-        text = result.stringResult
+        text = cloneOwnedString(result.stringResult)
     except CatchableError:
       text = "[]"
   destroyCommand(cmd)
@@ -4931,7 +6187,12 @@ proc libp2p_fetch_feed_snapshot*(handle: pointer): cstring {.exportc, cdecl, dyn
     return allocCString("{}")
   let cmd = makeCommand(cmdFetchFeedSnapshot)
   let result = submitCommand(node, cmd)
-  let text = if result.resultCode == NimResultOk: result.stringResult else: "{}"
+  let text =
+    if result.resultCode == NimResultOk:
+      let copied = cloneOwnedString(result.stringResult)
+      if copied.len > 0: copied else: "{}"
+    else:
+      "{}"
   destroyCommand(cmd)
   allocCString(text)
 
@@ -5079,7 +6340,7 @@ proc libp2p_rendezvous_discover*(
   let result = submitCommand(node, cmd)
   let text =
     if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      result.stringResult
+      cloneOwnedString(result.stringResult)
     else:
       "[]"
   destroyCommand(cmd)
@@ -5112,6 +6373,33 @@ proc libp2p_wait_secure_channel_ffi*(handle: pointer, peerId: cstring, timeoutMs
   destroyCommand(cmd)
   ok
 
+proc libp2p_measure_peer_bandwidth*(
+    handle: pointer,
+    peerId: cstring,
+    durationMs: cint,
+    chunkBytes: cint
+): cstring {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"missing peer id\"}")
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node not initialized\"}")
+  let cmd = makeCommand(cmdMeasurePeerBandwidth)
+  cmd.peerId = $peerId
+  cmd.timeoutMs = int(durationMs)
+  cmd.intParam = int(chunkBytes)
+  let result = submitCommand(node, cmd)
+  let payload =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      (if result.errorMsg.len > 0:
+        "{\"ok\":false,\"error\":\"" & result.errorMsg.replace("\"", "\\\"") & "\"}"
+       else:
+        "{\"ok\":false,\"error\":\"probe failed\"}")
+  destroyCommand(cmd)
+  allocCString(payload)
+
 proc libp2p_poll_events*(handle: pointer, maxEvents: cint): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
@@ -5121,7 +6409,7 @@ proc libp2p_poll_events*(handle: pointer, maxEvents: cint): cstring {.exportc, c
   let result = submitCommand(node, cmd)
   let output =
     if result.resultCode == NimResultOk:
-      allocCString(result.stringResult)
+      allocCString(cloneOwnedString(result.stringResult))
     else:
       allocCString("[]")
   destroyCommand(cmd)
@@ -5134,7 +6422,7 @@ proc libp2p_get_connected_peers_json*(handle: pointer): cstring {.exportc, cdecl
   let result = submitCommand(node, cmd)
   let output =
     if result.resultCode == NimResultOk:
-      allocCString(result.stringResult)
+      allocCString(cloneOwnedString(result.stringResult))
     else:
       nil
   destroyCommand(cmd)
@@ -5150,7 +6438,7 @@ proc libp2p_connected_peers_info*(handle: pointer): cstring {.exportc, cdecl, dy
   let result = submitCommand(node, cmd)
   let output =
     if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      allocCString(result.stringResult)
+      allocCString(cloneOwnedString(result.stringResult))
     else:
       allocCString("[]")
   destroyCommand(cmd)
@@ -5169,7 +6457,7 @@ proc libp2p_get_peer_multiaddrs_json*(
   let result = submitCommand(node, cmd)
   let output =
     if result.resultCode == NimResultOk:
-      allocCString(result.stringResult)
+      allocCString(cloneOwnedString(result.stringResult))
     else:
       nil
   destroyCommand(cmd)
@@ -5237,7 +6525,7 @@ proc libp2p_sync_peerstore_state*(handle: pointer): cstring {.exportc, cdecl, dy
   let result = submitCommand(node, cmd)
   let output =
     if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      allocCString(result.stringResult)
+      allocCString(cloneOwnedString(result.stringResult))
     else:
       allocCString("{\"connected_peers\":[],\"total_count\":0}")
   destroyCommand(cmd)
@@ -5251,7 +6539,7 @@ proc libp2p_load_stored_peers*(handle: pointer): cstring {.exportc, cdecl, dynli
   let result = submitCommand(node, cmd)
   let output =
     if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      allocCString(result.stringResult)
+      allocCString(cloneOwnedString(result.stringResult))
     else:
       allocCString("{\"peers\":[],\"totalCount\":0}")
   destroyCommand(cmd)
@@ -5269,11 +6557,34 @@ proc libp2p_get_diagnostics_json*(handle: pointer): cstring {.exportc, cdecl, dy
   let cmd = makeCommand(cmdDiagnostics)
   let result = submitCommand(node, cmd)
   debugLog("[nimlibp2p] libp2p_get_diagnostics_json command completed code=" & $result.resultCode)
-  let output =
-    if result.resultCode == NimResultOk:
-      allocCString(result.stringResult)
+  var payloadText =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      result.stringResult
     else:
-      allocCString("{}")
+      "{}"
+  try:
+    var payload = parseJson(payloadText)
+    if payload.kind != JObject:
+      payload = newJObject()
+    var socialStats = newJObject()
+    socialStateMemLock.acquire()
+    try:
+      let socialState = loadSocialStateUnsafe(node)
+      socialStats = socialStatsNode(socialState)
+    finally:
+      socialStateMemLock.release()
+    if socialStats.kind != JObject:
+      socialStats = newJObject()
+    acquire(node.eventLogLock)
+    try:
+      socialStats["eventQueueDepth"] = %node.eventLog.len
+    finally:
+      release(node.eventLogLock)
+    payload["social"] = socialStats
+    payloadText = $payload
+  except CatchableError:
+    discard
+  let output = allocCString(payloadText)
   destroyCommand(cmd)
   output
 
@@ -5298,6 +6609,1654 @@ proc parseJsonStringSeq(text: string): seq[string] =
           result.add(item.getStr())
   except CatchableError:
     discard
+
+proc jsonArrayValues(node: JsonNode, key: string): seq[string] =
+  if node.kind != JObject or not node.hasKey(key):
+    return @[]
+  let arr = node.getOrDefault(key)
+  if arr.kind != JArray:
+    return @[]
+  for item in arr:
+    if item.kind == JString:
+      result.add(item.getStr())
+
+proc appendUniqueString(arr: JsonNode, value: string) =
+  if arr.isNil or arr.kind != JArray or value.len == 0:
+    return
+  for item in arr:
+    if item.kind == JString and item.getStr() == value:
+      return
+  arr.add(%value)
+
+proc defaultSocialState(): JsonNode =
+  result = newJObject()
+  result["version"] = %SocialStateVersion
+  result["conversations"] = newJObject()
+  result["contacts"] = newJObject()
+  result["groups"] = newJObject()
+  result["moments"] = newJArray()
+  result["notifications"] = newJArray()
+  result["synccastRooms"] = newJObject()
+
+proc ensureSocialSchema(state: JsonNode): JsonNode =
+  result = if state.isNil or state.kind != JObject: defaultSocialState() else: state
+  if not result.hasKey("version"): result["version"] = %SocialStateVersion
+  if not result.hasKey("conversations") or result["conversations"].kind != JObject:
+    result["conversations"] = newJObject()
+  if not result.hasKey("contacts") or result["contacts"].kind != JObject:
+    result["contacts"] = newJObject()
+  if not result.hasKey("groups") or result["groups"].kind != JObject:
+    result["groups"] = newJObject()
+  if not result.hasKey("moments") or result["moments"].kind != JArray:
+    result["moments"] = newJArray()
+  if not result.hasKey("notifications") or result["notifications"].kind != JArray:
+    result["notifications"] = newJArray()
+  if not result.hasKey("synccastRooms") or result["synccastRooms"].kind != JObject:
+    result["synccastRooms"] = newJObject()
+
+proc socialStatePath(node: NimNode): string =
+  if node.isNil or node.cfg.dataDir.isNone:
+    return ""
+  node.cfg.dataDir.get() / "social_state.json"
+
+proc loadSocialStateUnsafe(node: NimNode): JsonNode =
+  let key = cast[int](node)
+  if socialStateMem.hasKey(key):
+    return socialStateMem[key]
+  var state = defaultSocialState()
+  let path = socialStatePath(node)
+  if path.len > 0:
+    try:
+      if fileExists(path):
+        let parsed = parseJson(readFile(path))
+        if parsed.kind == JObject:
+          state = parsed
+    except CatchableError:
+      discard
+  state = ensureSocialSchema(state)
+  socialStateMem[key] = state
+  state
+
+proc persistSocialStateUnsafe(node: NimNode, state: JsonNode) =
+  if node.isNil:
+    return
+  let key = cast[int](node)
+  socialStateMem[key] = state
+  let path = socialStatePath(node)
+  if path.len == 0:
+    return
+  try:
+    writeFile(path, $state)
+  except CatchableError as exc:
+    warn "persist social state failed", err = exc.msg, path = path
+
+proc makeTraceId(): string =
+  "trace-" & $nowMillis() & "-" & $rand(1_000_000)
+
+proc socialStatsNode(state: JsonNode): JsonNode =
+  result = newJObject()
+  let convCount = if state.hasKey("conversations"): state["conversations"].len else: 0
+  let contactCount = if state.hasKey("contacts"): state["contacts"].len else: 0
+  let groupCount = if state.hasKey("groups"): state["groups"].len else: 0
+  let momentCount = if state.hasKey("moments") and state["moments"].kind == JArray: state["moments"].len else: 0
+  let notificationCount =
+    if state.hasKey("notifications") and state["notifications"].kind == JArray: state["notifications"].len else: 0
+  let synccastRoomCount =
+    if state.hasKey("synccastRooms") and state["synccastRooms"].kind == JObject: state["synccastRooms"].len else: 0
+  result["conversations"] = %convCount
+  result["contacts"] = %contactCount
+  result["groups"] = %groupCount
+  result["moments"] = %momentCount
+  result["notifications"] = %notificationCount
+  result["synccastRooms"] = %synccastRoomCount
+  result["pendingRetransmissions"] = %0
+  result["eventQueueDepth"] = %0
+
+proc makeNotificationNoLock(state: JsonNode, kind: string, title: string, body: string, payload: JsonNode = newJObject()) =
+  if state.kind != JObject or state["notifications"].kind != JArray:
+    return
+  var item = newJObject()
+  item["id"] = %("notif-" & $nowMillis() & "-" & $rand(10_000))
+  item["kind"] = %kind
+  item["title"] = %title
+  item["body"] = %body
+  item["payload"] = payload
+  item["read"] = %false
+  item["timestampMs"] = %nowMillis()
+  var nextNotifications = newJArray()
+  nextNotifications.add(item)
+  for existing in state["notifications"]:
+    if nextNotifications.len >= SocialMaxNotifications:
+      break
+    nextNotifications.add(existing)
+  state["notifications"] = nextNotifications
+
+proc ensureConversationNoLock(state: JsonNode, conversationId: string, peerId: string): JsonNode =
+  if state.kind != JObject:
+    return newJObject()
+  if not state.hasKey("conversations") or state["conversations"].kind != JObject:
+    state["conversations"] = newJObject()
+  let conversations = state["conversations"]
+  if not conversations.hasKey(conversationId) or conversations[conversationId].kind != JObject:
+    var conv = newJObject()
+    conv["conversationId"] = %conversationId
+    conv["peerId"] = %peerId
+    conv["messages"] = newJArray()
+    conv["updatedAt"] = %nowMillis()
+    conversations[conversationId] = conv
+  let conv = conversations[conversationId]
+  if not conv.hasKey("messages") or conv["messages"].kind != JArray:
+    conv["messages"] = newJArray()
+  conv
+
+proc appendConversationMessageNoLock(
+    state: JsonNode, conversationId: string, peerId: string, message: JsonNode
+) =
+  let conv = ensureConversationNoLock(state, conversationId, peerId)
+  if conv.kind != JObject:
+    return
+  conv["messages"].add(message)
+  if conv["messages"].len > SocialMaxConversationMessages:
+    var trimmed = newJArray()
+    let start = conv["messages"].len - SocialMaxConversationMessages
+    for i in start ..< conv["messages"].len:
+      trimmed.add(conv["messages"][i])
+    conv["messages"] = trimmed
+  conv["updatedAt"] = %nowMillis()
+
+proc normalizeSocialPayload(payload: string): JsonNode =
+  if payload.len == 0:
+    return newJObject()
+  try:
+    let parsed = parseJson(payload)
+    if parsed.kind == JObject:
+      return parsed
+  except CatchableError:
+    discard
+  var obj = newJObject()
+  obj["raw"] = %payload
+  obj
+
+proc maybeBodyFromPayload(payload: JsonNode): string =
+  if payload.kind != JObject:
+    return ""
+  result = jsonGetStr(payload, "text")
+  if result.len == 0: result = jsonGetStr(payload, "body")
+  if result.len == 0: result = jsonGetStr(payload, "content")
+
+proc recordSocialEvent(
+    node: NimNode,
+    entity: string,
+    op: string,
+    payload: JsonNode,
+    conversationId: string = "",
+    groupId: string = "",
+    postId: string = "",
+    source: string = "nim-social"
+) =
+  var evt = newJObject()
+  evt["kind"] = %"social"
+  evt["entity"] = %entity
+  evt["op"] = %op
+  evt["traceId"] = %makeTraceId()
+  evt["seq"] = %nowMillis()
+  evt["timestampMs"] = %nowMillis()
+  evt["source"] = %source
+  if conversationId.len > 0:
+    evt["conversationId"] = %conversationId
+  if groupId.len > 0:
+    evt["groupId"] = %groupId
+  if postId.len > 0:
+    evt["postId"] = %postId
+  evt["payload"] = payload
+  recordEvent(node, "social_event", $evt)
+
+proc takeCStringAndFree(value: cstring): string =
+  if value.isNil:
+    return ""
+  result = $value
+  libp2p_string_free(value)
+
+proc parseSourceFilter(sourceFilter: string): HashSet[string] =
+  result = initHashSet[string]()
+  for part in sourceFilter.split({',', ' ', ';'}):
+    let token = part.strip().toLowerAscii()
+    if token.len > 0:
+      result.incl(token)
+
+proc collectMdnsPeerRows(node: NimNode): JsonNode =
+  var peers = newJArray()
+  var ordered: seq[(string, int64)] = @[]
+  for peerId, seenAt in node.mdnsLastSeen.pairs:
+    if peerId.len == 0:
+      continue
+    ordered.add((peerId, seenAt))
+  ordered.sort(proc(a, b: (string, int64)): int =
+    result = cmp(b[1], a[1])
+    if result == 0:
+      result = cmp(a[0], b[0])
+  )
+  for entry in ordered:
+    let peerId = entry[0]
+    let seenAt = entry[1]
+    var row = newJObject()
+    row["peerId"] = %peerId
+    row["lastSeenAt"] = %seenAt
+    var sources = newJArray()
+    sources.add(%"mDNS")
+    let hints = preferQuicAddrStrings(node.peerHints.getOrDefault(peerId))
+    var addrs = newJArray()
+    var hasLan = false
+    var hasWan = false
+    for hint in hints:
+      let normalized = normalizeBootstrapMultiaddr(peerId, hint.strip())
+      if normalized.len == 0:
+        continue
+      addrs.add(%normalized)
+      if isLanAddress(normalized):
+        hasLan = true
+      else:
+        hasWan = true
+    if hasLan:
+      sources.add(%"LAN")
+    if hasWan:
+      sources.add(%"WAN")
+    row["sources"] = sources
+    row["multiaddrs"] = addrs
+    peers.add(row)
+  peers
+
+proc collectDiscoveredPeers(handle: pointer, node: NimNode): JsonNode =
+  var peers = initTable[string, JsonNode]()
+  let local = localPeerId(node)
+
+  proc upsertPeer(peerId: string, source: string, addrs: seq[string], seenAt: int64 = 0'i64) =
+    if peerId.len == 0 or (local.len > 0 and peerId == local):
+      return
+    let effectiveSeenAt = if seenAt > 0: seenAt else: nowMillis()
+    if not peers.hasKey(peerId):
+      var row = newJObject()
+      row["peerId"] = %peerId
+      row["multiaddrs"] = newJArray()
+      row["sources"] = newJArray()
+      row["lastSeenAt"] = %effectiveSeenAt
+      peers[peerId] = row
+    let row = peers[peerId]
+    if row.hasKey("multiaddrs") and row["multiaddrs"].kind == JArray:
+      for addr in addrs:
+        let normalized = normalizeBootstrapMultiaddr(peerId, addr.strip())
+        if normalized.len > 0:
+          appendUniqueString(row["multiaddrs"], normalized)
+    if row.hasKey("sources") and row["sources"].kind == JArray and source.len > 0:
+      appendUniqueString(row["sources"], source)
+    let existingSeenAt = jsonGetInt64(row, "lastSeenAt", 0)
+    row["lastSeenAt"] = %max(existingSeenAt, effectiveSeenAt)
+
+  proc annotateTransportSources(peerId: string, addrs: seq[string], seenAt: int64 = 0'i64) =
+    var hasLan = false
+    var hasWan = false
+    for addr in addrs:
+      let normalized = normalizeBootstrapMultiaddr(peerId, addr.strip())
+      if normalized.len == 0:
+        continue
+      if isLanAddress(normalized):
+        hasLan = true
+      else:
+        hasWan = true
+    if hasLan:
+      upsertPeer(peerId, "LAN", @[], seenAt)
+    if hasWan:
+      upsertPeer(peerId, "WAN", @[], seenAt)
+
+  let connectedRaw = takeCStringAndFree(libp2p_connected_peers_info(handle))
+  if connectedRaw.len > 0:
+    try:
+      let arr = parseJson(connectedRaw)
+      if arr.kind == JArray:
+        for row in arr:
+          let peerId = jsonGetStr(row, "peerId", jsonGetStr(row, "peer_id"))
+          let addrs = preferQuicAddrStrings(jsonArrayValues(row, "addresses") & jsonArrayValues(row, "multiaddrs"))
+          let seenAt = jsonGetInt64(row, "lastSeenAt", nowMillis())
+          upsertPeer(peerId, "Connected", addrs, seenAt)
+          annotateTransportSources(peerId, addrs, seenAt)
+    except CatchableError:
+      discard
+
+  for peerId, seenAt in node.mdnsLastSeen.pairs:
+    let hints = preferQuicAddrStrings(node.peerHints.getOrDefault(peerId))
+    upsertPeer(peerId, "mDNS", hints, seenAt)
+    annotateTransportSources(peerId, hints, seenAt)
+
+  var arr = newJArray()
+  for _, row in peers:
+    arr.add(row)
+  arr
+
+proc filteredDiscoveredPeers(handle: pointer, node: NimNode, sourceFilterText: string, limit: int): tuple[peers: JsonNode, totalCount: int] =
+  let filter = parseSourceFilter(sourceFilterText)
+  let discovered = collectDiscoveredPeers(handle, node)
+  var filtered: seq[JsonNode] = @[]
+  for row in discovered:
+    if filter.len > 0:
+      var matched = false
+      if row.kind == JObject and row.hasKey("sources") and row["sources"].kind == JArray:
+        for src in row["sources"]:
+          if src.kind == JString and filter.contains(src.getStr().toLowerAscii()):
+            matched = true
+            break
+      if not matched:
+        continue
+    filtered.add(row)
+  filtered.sort(
+    proc(a, b: JsonNode): int =
+      cmp(jsonGetInt64(b, "lastSeenAt"), jsonGetInt64(a, "lastSeenAt"))
+  )
+  let bounded = if limit <= 0: filtered.len else: min(filtered.len, limit)
+  var peers = newJArray()
+  if bounded > 0:
+    for i in 0 ..< bounded:
+      peers.add(filtered[i])
+  (peers: peers, totalCount: filtered.len)
+
+proc buildMdnsDebugPayload(node: NimNode): JsonNode =
+  var obj = newJObject()
+  obj["enabled"] = %node.mdnsEnabled
+  obj["started"] = %node.started
+  obj["preferred_ipv4"] = %node.mdnsPreferredIpv4
+  obj["restart_pending"] = %node.mdnsRestartPending
+  obj["interval_seconds"] = %node.mdnsIntervalSeconds
+  obj["interface_bound_ipv4"] =
+    if not node.mdnsInterface.isNil: %node.mdnsInterface.boundIpv4 else: %""
+  if not node.switchInstance.isNil and not node.switchInstance.peerInfo.isNil:
+    let peerInfo = node.switchInstance.peerInfo
+    obj["listenAddresses"] = %(peerInfo.listenAddrs.mapIt($it))
+    obj["dialableAddresses"] = %(peerInfo.addrs.mapIt($it))
+  else:
+    obj["listenAddresses"] = newJArray()
+    obj["dialableAddresses"] = newJArray()
+  obj["dnsaddrEntries"] = mdnsDnsaddrPreview(node)
+  let peers = collectMdnsPeerRows(node)
+  obj["peerCount"] = %peers.len
+  obj["peers"] = peers
+  obj
+
+proc connectedPeersInfoArray(handle: pointer): JsonNode =
+  let raw = takeCStringAndFree(libp2p_connected_peers_info(handle))
+  if raw.len > 0:
+    try:
+      let parsed = parseJson(raw)
+      if parsed.kind == JArray:
+        return parsed
+    except CatchableError:
+      discard
+  newJArray()
+
+proc connectedPeersArray(handle: pointer): JsonNode =
+  let raw = takeCStringAndFree(libp2p_get_connected_peers_json(handle))
+  if raw.len > 0:
+    try:
+      let parsed = parseJson(raw)
+      if parsed.kind == JArray:
+        return parsed
+    except CatchableError:
+      discard
+  newJArray()
+
+proc buildNetworkResourcesPayload(node: NimNode, discoveredCount: int, connectedCount: int): JsonNode =
+  let localProfile = collectLocalSystemProfile(node)
+  prunePeerProfiles(node)
+  var cpuTotal = jsonGetInt64(localProfile["cpu"], "cores", 0)
+  var memoryTotal = jsonGetInt64(localProfile["memory"], "totalBytes", 0)
+  var diskTotal = jsonGetInt64(localProfile["disk"], "totalBytes", 0)
+  var diskAvailable = jsonGetInt64(localProfile["disk"], "availableBytes", 0)
+  var gpuVramTotal = jsonGetInt64(localProfile["gpu"], "vramBytes", 0)
+  var uplink = jsonGetFloat(localProfile["bandwidth"], "uplinkBps", 0.0)
+  var downlink = jsonGetFloat(localProfile["bandwidth"], "downlinkBps", 0.0)
+  var uplinkBytes = jsonGetInt64(localProfile["bandwidth"], "uplinkTotalBytes", 0)
+  var downlinkBytes = jsonGetInt64(localProfile["bandwidth"], "downlinkTotalBytes", 0)
+  for peerId, profile in node.peerSystemProfiles.pairs:
+    if peerId == localPeerId(node):
+      continue
+    cpuTotal += jsonGetInt64(profile["cpu"], "cores", 0)
+    memoryTotal += jsonGetInt64(profile["memory"], "totalBytes", 0)
+    diskTotal += jsonGetInt64(profile["disk"], "totalBytes", 0)
+    diskAvailable += jsonGetInt64(profile["disk"], "availableBytes", 0)
+    gpuVramTotal += jsonGetInt64(profile["gpu"], "vramBytes", 0)
+    uplink += jsonGetFloat(profile["bandwidth"], "uplinkBps", 0.0)
+    downlink += jsonGetFloat(profile["bandwidth"], "downlinkBps", 0.0)
+    uplinkBytes += jsonGetInt64(profile["bandwidth"], "uplinkTotalBytes", 0)
+    downlinkBytes += jsonGetInt64(profile["bandwidth"], "downlinkTotalBytes", 0)
+  %* {
+    "nodeCount": max(1, discoveredCount + 1),
+    "onlineCount": max(1, connectedCount + discoveredCount),
+    "connectedPeers": connectedCount,
+    "cpuCoresTotal": cpuTotal,
+    "memoryTotalBytes": memoryTotal,
+    "diskTotalBytes": diskTotal,
+    "diskAvailableBytes": diskAvailable,
+    "gpuVramTotalBytes": gpuVramTotal,
+    "uplinkBps": uplink,
+    "downlinkBps": downlink,
+    "uplinkTotalBytes": uplinkBytes,
+    "downlinkTotalBytes": downlinkBytes,
+    "totalTransferBytes": uplinkBytes + downlinkBytes,
+  }
+
+proc social_list_discovered_peers*(handle: pointer, sourceFilter: cstring, limit: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"peers\":[],\"totalCount\":0}")
+  let sourceFilterText = if sourceFilter != nil: $sourceFilter else: ""
+  let filtered = filteredDiscoveredPeers(handle, node, sourceFilterText, int(limit))
+  var response = newJObject()
+  response["peers"] = filtered.peers
+  response["totalCount"] = %filtered.totalCount
+  allocCString($response)
+
+proc libp2p_get_local_system_profile_json*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{}")
+  allocCString($collectLocalSystemProfile(node))
+
+proc libp2p_get_network_resources_json*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{}")
+  prunePeerProfiles(node)
+  let discovered = filteredDiscoveredPeers(handle, node, "", 0)
+  let connected = connectedPeersInfoArray(handle)
+  let payload = buildNetworkResourcesPayload(node, discovered.totalCount, connected.len)
+  allocCString($payload)
+
+proc libp2p_refresh_node_resources*(handle: pointer, limit: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{}")
+  prunePeerProfiles(node)
+  let effectiveLimit = if limit <= 0: 0 else: int(limit)
+  let discovered = filteredDiscoveredPeers(handle, node, "", effectiveLimit)
+  let connected = connectedPeersInfoArray(handle)
+  let payload = buildNetworkResourcesPayload(node, discovered.totalCount, connected.len)
+  allocCString($payload)
+
+proc libp2p_network_discovery_snapshot*(handle: pointer, sourceFilter: cstring, limit: cint, connectCap: cint): cstring {.exportc, cdecl, dynlib.} =
+  discard connectCap
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"connectedPeers\":[],\"connectedPeersInfo\":[],\"discoveredPeers\":{\"peers\":[],\"totalCount\":0},\"mdnsDebug\":{}}")
+  let sourceFilterText = if sourceFilter != nil: $sourceFilter else: ""
+  let effectiveLimit = if limit <= 0: 0 else: int(limit)
+  let discovered = filteredDiscoveredPeers(handle, node, sourceFilterText, effectiveLimit)
+  let connected = connectedPeersArray(handle)
+  let connectedInfo = connectedPeersInfoArray(handle)
+  let localProfile = collectLocalSystemProfile(node)
+  let networkResources = buildNetworkResourcesPayload(node, discovered.totalCount, connectedInfo.len)
+  var payload = newJObject()
+  payload["ok"] = %true
+  payload["peerId"] = %localPeerId(node)
+  payload["connectedPeers"] = connected
+  payload["connectedPeersInfo"] = connectedInfo
+  payload["discoveredPeers"] = %* {
+    "peers": discovered.peers,
+    "totalCount": discovered.totalCount,
+  }
+  payload["mdnsDebug"] = buildMdnsDebugPayload(node)
+  payload["autoConnect"] = %* {
+    "enabled": mdnsAutoConnectEnabled(),
+    "attempted": 0,
+    "connected": connectedInfo.len,
+  }
+  payload["connectedCount"] = %connectedInfo.len
+  payload["localSystemProfile"] = localProfile
+  payload["systemProfile"] = localProfile
+  payload["networkResources"] = networkResources
+  payload["mdnsProbeOk"] = %true
+  payload["bootstrap"] = %* {"ok": true}
+  allocCString($payload)
+
+proc social_connect_peer*(handle: pointer, peerId: cstring, multiaddr: cstring): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  let dialAddr = if multiaddr == nil: "" else: $multiaddr
+  var connected = false
+  if dialAddr.len > 0:
+    connected = libp2p_connect_multiaddr(handle, dialAddr.cstring) == NimResultOk
+  if not connected:
+    connected = libp2p_connect_peer(handle, peer.cstring) == NimResultOk
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  payload["multiaddr"] = %dialAddr
+  payload["ok"] = %connected
+  recordSocialEvent(node, "discovery", "connect_peer", payload, source = "social_connect_peer")
+  connected
+
+proc social_dm_send*(
+    handle: pointer, peerId: cstring, conversationId: cstring, messageJson: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil or messageJson.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  var payload = normalizeSocialPayload($messageJson)
+  let convIdRaw = if conversationId != nil: $conversationId else: ""
+  let convId = if convIdRaw.len > 0: convIdRaw else: "dm:" & peer
+  var mid = jsonGetStr(payload, "messageId", jsonGetStr(payload, "mid", jsonGetStr(payload, "id")))
+  mid = ensureMessageId(mid)
+  payload["messageId"] = %mid
+  payload["mid"] = %mid
+  if not payload.hasKey("timestampMs"):
+    payload["timestampMs"] = %nowMillis()
+  payload["timestamp_ms"] = %jsonGetInt64(payload, "timestampMs", nowMillis())
+  payload["conversationId"] = %convId
+  payload["to"] = %peer
+  let me = localPeerId(node)
+  if me.len > 0:
+    payload["from"] = %me
+  let body = maybeBodyFromPayload(payload)
+  let wirePayload = $payload
+  var ok = libp2p_send_with_ack(handle, peer.cstring, ($payload).cstring, 8_000)
+  if not ok:
+    ok = libp2p_send_direct_text(
+      handle,
+      peer.cstring,
+      mid.cstring,
+      wirePayload.cstring,
+      "".cstring,
+      true,
+      8_000
+    )
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    var msg = newJObject()
+    msg["id"] = %mid
+    msg["sender"] = %"me"
+    msg["peerId"] = %peer
+    msg["conversationId"] = %convId
+    msg["content"] = %body
+    msg["timestampMs"] = %jsonGetInt64(payload, "timestampMs", nowMillis())
+    msg["status"] = %(if ok: "sent" else: "failed")
+    msg["payload"] = payload
+    appendConversationMessageNoLock(state, convId, peer, msg)
+    makeNotificationNoLock(
+      state,
+      if ok: "dm_sent" else: "dm_send_failed",
+      if ok: "消息已发送" else: "消息发送失败",
+      if body.len > 0: body else: mid,
+      msg
+    )
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  recordSocialEvent(node, "dm", "send", payload, conversationId = convId, source = "social_dm_send")
+  ok
+
+proc social_dm_edit*(
+    handle: pointer, peerId: cstring, conversationId: cstring, messageId: cstring, patchJson: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil or messageId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  let mid = $messageId
+  let convIdRaw = if conversationId != nil: $conversationId else: ""
+  let convId = if convIdRaw.len > 0: convIdRaw else: "dm:" & peer
+  let patchText = if patchJson == nil: "{}" else: $patchJson
+  let ok = libp2p_send_chat_control(
+    handle,
+    peer.cstring,
+    "edit".cstring,
+    mid.cstring,
+    patchText.cstring,
+    mid.cstring,
+    true,
+    8_000
+  )
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    let conv = ensureConversationNoLock(state, convId, peer)
+    if conv.kind == JObject and conv.hasKey("messages") and conv["messages"].kind == JArray:
+      for item in conv["messages"]:
+        if item.kind == JObject and jsonGetStr(item, "id") == mid:
+          let patch = normalizeSocialPayload(patchText)
+          let newBody = maybeBodyFromPayload(patch)
+          if newBody.len > 0:
+            item["content"] = %newBody
+          item["edited"] = %true
+          item["editedAt"] = %nowMillis()
+          item["patch"] = patch
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  payload["messageId"] = %mid
+  payload["patch"] = normalizeSocialPayload(patchText)
+  payload["ok"] = %ok
+  recordSocialEvent(node, "dm", "edit", payload, conversationId = convId, source = "social_dm_edit")
+  ok
+
+proc social_dm_revoke*(
+    handle: pointer, peerId: cstring, conversationId: cstring, messageId: cstring, reason: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil or messageId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  let mid = $messageId
+  let why = if reason == nil: "revoke" else: $reason
+  let convIdRaw = if conversationId != nil: $conversationId else: ""
+  let convId = if convIdRaw.len > 0: convIdRaw else: "dm:" & peer
+  let ok = libp2p_send_chat_control(
+    handle,
+    peer.cstring,
+    "revoke".cstring,
+    mid.cstring,
+    why.cstring,
+    mid.cstring,
+    true,
+    8_000
+  )
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    let conv = ensureConversationNoLock(state, convId, peer)
+    if conv.kind == JObject and conv.hasKey("messages") and conv["messages"].kind == JArray:
+      for item in conv["messages"]:
+        if item.kind == JObject and jsonGetStr(item, "id") == mid:
+          item["revoked"] = %true
+          item["revokeReason"] = %why
+          item["revokedAt"] = %nowMillis()
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  payload["messageId"] = %mid
+  payload["reason"] = %why
+  payload["ok"] = %ok
+  recordSocialEvent(node, "dm", "revoke", payload, conversationId = convId, source = "social_dm_revoke")
+  ok
+
+proc social_dm_ack*(
+    handle: pointer, peerId: cstring, conversationId: cstring, messageId: cstring, status: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil or messageId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  let mid = $messageId
+  let stat = if status == nil: "acked" else: $status
+  let success = stat.toLowerAscii() in ["ok", "acked", "success", "delivered"]
+  let convIdRaw = if conversationId != nil: $conversationId else: ""
+  let convId = if convIdRaw.len > 0: convIdRaw else: "dm:" & peer
+  let ok = libp2p_send_chat_ack_ffi(handle, peer.cstring, mid.cstring, success, stat.cstring)
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    let conv = ensureConversationNoLock(state, convId, peer)
+    if conv.kind == JObject and conv.hasKey("messages") and conv["messages"].kind == JArray:
+      for item in conv["messages"]:
+        if item.kind == JObject and jsonGetStr(item, "id") == mid:
+          item["ackStatus"] = %stat
+          item["ackedAt"] = %nowMillis()
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  payload["messageId"] = %mid
+  payload["status"] = %stat
+  payload["ok"] = %ok
+  recordSocialEvent(node, "dm", "ack", payload, conversationId = convId, source = "social_dm_ack")
+  ok
+
+proc social_contacts_send_request*(handle: pointer, peerId: cstring, helloText: cstring): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  let hello = if helloText == nil: "" else: $helloText
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if not state["contacts"].hasKey(peer) or state["contacts"][peer].kind != JObject:
+      state["contacts"][peer] = newJObject()
+    let contact = state["contacts"][peer]
+    contact["peerId"] = %peer
+    contact["status"] = %"pending_outgoing"
+    contact["helloText"] = %hello
+    contact["updatedAt"] = %nowMillis()
+    makeNotificationNoLock(state, "contact_request_sent", "好友申请已发送", peer, contact)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  payload["helloText"] = %hello
+  recordSocialEvent(node, "contacts", "send_request", payload, source = "social_contacts_send_request")
+  true
+
+proc social_contacts_accept*(handle: pointer, peerId: cstring): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if not state["contacts"].hasKey(peer) or state["contacts"][peer].kind != JObject:
+      state["contacts"][peer] = newJObject()
+    let contact = state["contacts"][peer]
+    contact["peerId"] = %peer
+    contact["status"] = %"accepted"
+    contact["updatedAt"] = %nowMillis()
+    makeNotificationNoLock(state, "contact_accepted", "已添加好友", peer, contact)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  recordSocialEvent(node, "contacts", "accept", payload, source = "social_contacts_accept")
+  true
+
+proc social_contacts_reject*(handle: pointer, peerId: cstring, reason: cstring): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  let why = if reason == nil: "rejected" else: $reason
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if not state["contacts"].hasKey(peer) or state["contacts"][peer].kind != JObject:
+      state["contacts"][peer] = newJObject()
+    let contact = state["contacts"][peer]
+    contact["peerId"] = %peer
+    contact["status"] = %"rejected"
+    contact["reason"] = %why
+    contact["updatedAt"] = %nowMillis()
+    makeNotificationNoLock(state, "contact_rejected", "已拒绝好友申请", peer, contact)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  payload["reason"] = %why
+  recordSocialEvent(node, "contacts", "reject", payload, source = "social_contacts_reject")
+  true
+
+proc social_contacts_remove*(handle: pointer, peerId: cstring): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let peer = $peerId
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state["contacts"].hasKey(peer):
+      state["contacts"].delete(peer)
+    makeNotificationNoLock(state, "contact_removed", "已删除联系人", peer)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["peerId"] = %peer
+  recordSocialEvent(node, "contacts", "remove", payload, source = "social_contacts_remove")
+  true
+
+proc social_groups_create*(handle: pointer, groupMetaJson: cstring): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_nil\"}")
+  var meta = normalizeSocialPayload(if groupMetaJson == nil: "{}" else: $groupMetaJson)
+  var groupId = jsonGetStr(meta, "groupId", jsonGetStr(meta, "id"))
+  if groupId.len == 0:
+    groupId = "group-" & $nowMillis() & "-" & $rand(10_000)
+  var members = jsonArrayValues(meta, "members")
+  let me = localPeerId(node)
+  if me.len > 0 and me notin members:
+    members.add(me)
+  socialStateMemLock.acquire()
+  var group = newJObject()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    group["groupId"] = %groupId
+    group["name"] = %jsonGetStr(meta, "name", groupId)
+    group["ownerPeerId"] = %jsonGetStr(meta, "ownerPeerId", me)
+    group["createdAt"] = %nowMillis()
+    group["updatedAt"] = %nowMillis()
+    group["members"] = newJArray()
+    for member in members:
+      appendUniqueString(group["members"], member)
+    group["meta"] = meta
+    state["groups"][groupId] = group
+    makeNotificationNoLock(state, "group_created", "群组已创建", jsonGetStr(group, "name"), group)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  recordSocialEvent(node, "groups", "create", group, groupId = groupId, source = "social_groups_create")
+  var response = newJObject()
+  response["ok"] = %true
+  response["groupId"] = %groupId
+  response["group"] = group
+  allocCString($response)
+
+proc social_groups_update*(handle: pointer, groupId: cstring, patchJson: cstring): bool {.exportc, cdecl, dynlib.} =
+  if groupId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let gid = $groupId
+  let patch = normalizeSocialPayload(if patchJson == nil: "{}" else: $patchJson)
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state["groups"].hasKey(gid) and state["groups"][gid].kind == JObject:
+      let group = state["groups"][gid]
+      for key, value in pairs(patch):
+        if key in ["groupId", "id", "createdAt"]:
+          continue
+        group[key] = value
+      group["updatedAt"] = %nowMillis()
+      ok = true
+      persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["groupId"] = %gid
+  payload["patch"] = patch
+  payload["ok"] = %ok
+  recordSocialEvent(node, "groups", "update", payload, groupId = gid, source = "social_groups_update")
+  ok
+
+proc social_groups_invite*(handle: pointer, groupId: cstring, peerIdsJson: cstring): bool {.exportc, cdecl, dynlib.} =
+  if groupId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let gid = $groupId
+  let peers = parseJsonStringSeq(if peerIdsJson == nil: "[]" else: $peerIdsJson)
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state["groups"].hasKey(gid) and state["groups"][gid].kind == JObject:
+      let group = state["groups"][gid]
+      if not group.hasKey("members") or group["members"].kind != JArray:
+        group["members"] = newJArray()
+      for peer in peers:
+        appendUniqueString(group["members"], peer)
+      group["updatedAt"] = %nowMillis()
+      ok = true
+      makeNotificationNoLock(state, "group_invite", "群邀请已发送", gid, group)
+      persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["groupId"] = %gid
+  payload["peerIds"] = %(peers)
+  payload["ok"] = %ok
+  recordSocialEvent(node, "groups", "invite", payload, groupId = gid, source = "social_groups_invite")
+  ok
+
+proc social_groups_kick*(handle: pointer, groupId: cstring, peerId: cstring): bool {.exportc, cdecl, dynlib.} =
+  if groupId.isNil or peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let gid = $groupId
+  let peer = $peerId
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state["groups"].hasKey(gid) and state["groups"][gid].kind == JObject:
+      let group = state["groups"][gid]
+      if group.hasKey("members") and group["members"].kind == JArray:
+        var nextMembers = newJArray()
+        for member in group["members"]:
+          if member.kind == JString and member.getStr() != peer:
+            nextMembers.add(member)
+        group["members"] = nextMembers
+      group["updatedAt"] = %nowMillis()
+      ok = true
+      persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["groupId"] = %gid
+  payload["peerId"] = %peer
+  payload["ok"] = %ok
+  recordSocialEvent(node, "groups", "kick", payload, groupId = gid, source = "social_groups_kick")
+  ok
+
+proc social_groups_leave*(handle: pointer, groupId: cstring): bool {.exportc, cdecl, dynlib.} =
+  if groupId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let gid = $groupId
+  let me = localPeerId(node)
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state["groups"].hasKey(gid) and state["groups"][gid].kind == JObject:
+      let group = state["groups"][gid]
+      if group.hasKey("members") and group["members"].kind == JArray:
+        var nextMembers = newJArray()
+        for member in group["members"]:
+          if member.kind == JString and member.getStr() != me:
+            nextMembers.add(member)
+        group["members"] = nextMembers
+      group["updatedAt"] = %nowMillis()
+      ok = true
+      persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["groupId"] = %gid
+  payload["peerId"] = %me
+  payload["ok"] = %ok
+  recordSocialEvent(node, "groups", "leave", payload, groupId = gid, source = "social_groups_leave")
+  ok
+
+proc social_groups_send*(handle: pointer, groupId: cstring, messageJson: cstring): bool {.exportc, cdecl, dynlib.} =
+  if groupId.isNil or messageJson.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let gid = $groupId
+  var payload = normalizeSocialPayload($messageJson)
+  var mid = jsonGetStr(payload, "messageId", jsonGetStr(payload, "mid", jsonGetStr(payload, "id")))
+  mid = ensureMessageId(mid)
+  let me = localPeerId(node)
+  payload["messageId"] = %mid
+  payload["mid"] = %mid
+  payload["groupId"] = %gid
+  payload["from"] = %me
+  payload["timestampMs"] = %jsonGetInt64(payload, "timestampMs", nowMillis())
+  let topic = "unimaker/group/" & gid & "/v1"
+  let data = stringToBytes($payload)
+  var delivered: csize_t = 0
+  let rc = libp2p_pubsub_publish(
+    handle,
+    topic.cstring,
+    if data.len > 0: addr data[0] else: nil,
+    csize_t(data.len),
+    addr delivered
+  )
+  let ok = rc == NimResultOk
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    var message = newJObject()
+    message["id"] = %mid
+    message["sender"] = %"me"
+    message["groupId"] = %gid
+    message["content"] = %maybeBodyFromPayload(payload)
+    message["timestampMs"] = %jsonGetInt64(payload, "timestampMs", nowMillis())
+    message["status"] = %(if ok: "sent" else: "failed")
+    message["payload"] = payload
+    appendConversationMessageNoLock(state, "group:" & gid, gid, message)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  recordSocialEvent(node, "groups", "send", payload, conversationId = "group:" & gid, groupId = gid, source = "social_groups_send")
+  ok
+
+proc ensureSynccastRoomNoLock(state: JsonNode, roomId: string): JsonNode =
+  if state.kind != JObject:
+    return newJObject()
+  if not state.hasKey("synccastRooms") or state["synccastRooms"].kind != JObject:
+    state["synccastRooms"] = newJObject()
+  let rooms = state["synccastRooms"]
+  if not rooms.hasKey(roomId) or rooms[roomId].kind != JObject:
+    var room = newJObject()
+    room["roomId"] = %roomId
+    room["createdAt"] = %nowMillis()
+    room["updatedAt"] = %nowMillis()
+    room["program"] = newJObject()
+    room["members"] = newJArray()
+    room["state"] = newJObject()
+    room["lastControl"] = newJObject()
+    rooms[roomId] = room
+  let room = rooms[roomId]
+  if not room.hasKey("program") or room["program"].kind != JObject:
+    room["program"] = newJObject()
+  if not room.hasKey("members") or room["members"].kind != JArray:
+    room["members"] = newJArray()
+  if not room.hasKey("state") or room["state"].kind != JObject:
+    room["state"] = newJObject()
+  if not room.hasKey("lastControl") or room["lastControl"].kind != JObject:
+    room["lastControl"] = newJObject()
+  room
+
+proc synccastConversationId(roomId: string): string =
+  "group:" & roomId
+
+proc synccastControlAllowed(op: string): bool =
+  let normalized = op.toLowerAscii()
+  if normalized in ["seek", "set_seek", "rate", "set_rate", "speed", "set_speed", "playback_rate"]:
+    return false
+  normalized in ["play", "pause", "resume", "stop", "heartbeat", "sync_anchor", "pip_join", "pip_leave", "ready", "state"]
+
+proc social_synccast_upsert_program*(
+    handle: pointer, roomId: cstring, programJson: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  if roomId.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"room_id_missing\"}")
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_nil\"}")
+  let rid = ($roomId).strip()
+  if rid.len == 0:
+    return allocCString("{\"ok\":false,\"error\":\"room_id_missing\"}")
+  var program = normalizeSocialPayload(if programJson == nil: "{}" else: $programJson)
+  var programId = jsonGetStr(program, "programId", jsonGetStr(program, "id"))
+  if programId.len == 0:
+    programId = "program-" & $nowMillis() & "-" & $rand(10_000)
+  let nowTs = nowMillis()
+  program["programId"] = %programId
+  program["id"] = %programId
+  program["updatedAt"] = %nowTs
+  if not program.hasKey("allowSeek"):
+    program["allowSeek"] = %false
+  if not program.hasKey("allowRateChange"):
+    program["allowRateChange"] = %false
+  if not program.hasKey("mode"):
+    program["mode"] = %"realtime_program"
+  var roomSnapshot = newJObject()
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    let room = ensureSynccastRoomNoLock(state, rid)
+    room["program"] = program
+    room["updatedAt"] = %nowTs
+    let stateNode = room["state"]
+    stateNode["programId"] = %programId
+    if not stateNode.hasKey("playbackState"):
+      stateNode["playbackState"] = %"paused"
+    roomSnapshot = room
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["roomId"] = %rid
+  payload["groupId"] = %rid
+  payload["program"] = program
+  payload["ok"] = %true
+  recordSocialEvent(
+    node,
+    "synccast",
+    "upsert_program",
+    payload,
+    conversationId = synccastConversationId(rid),
+    groupId = rid,
+    source = "social_synccast_upsert_program"
+  )
+  var wire = newJObject()
+  wire["kind"] = %"social"
+  wire["entity"] = %"synccast"
+  wire["op"] = %"upsert_program"
+  wire["roomId"] = %rid
+  wire["groupId"] = %rid
+  wire["conversationId"] = %synccastConversationId(rid)
+  wire["timestampMs"] = %nowTs
+  wire["program"] = program
+  discard social_groups_send(handle, rid.cstring, ($wire).cstring)
+  var response = newJObject()
+  response["ok"] = %true
+  response["roomId"] = %rid
+  response["programId"] = %programId
+  response["room"] = roomSnapshot
+  allocCString($response)
+
+proc social_synccast_join*(
+    handle: pointer, roomId: cstring, peerId: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if roomId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let rid = ($roomId).strip()
+  if rid.len == 0:
+    return false
+  let local = localPeerId(node)
+  var targetPeer = if peerId == nil: local else: ($peerId).strip()
+  if targetPeer.len == 0:
+    targetPeer = local
+  if targetPeer.len == 0:
+    return false
+  let nowTs = nowMillis()
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    let room = ensureSynccastRoomNoLock(state, rid)
+    appendUniqueString(room["members"], targetPeer)
+    if local.len > 0:
+      appendUniqueString(room["members"], local)
+    room["updatedAt"] = %nowTs
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["roomId"] = %rid
+  payload["peerId"] = %targetPeer
+  payload["ok"] = %true
+  recordSocialEvent(
+    node,
+    "synccast",
+    "join",
+    payload,
+    conversationId = synccastConversationId(rid),
+    groupId = rid,
+    source = "social_synccast_join"
+  )
+  var wire = newJObject()
+  wire["kind"] = %"social"
+  wire["entity"] = %"synccast"
+  wire["op"] = %"join"
+  wire["roomId"] = %rid
+  wire["groupId"] = %rid
+  wire["conversationId"] = %synccastConversationId(rid)
+  wire["peerId"] = %targetPeer
+  wire["timestampMs"] = %nowTs
+  discard social_groups_send(handle, rid.cstring, ($wire).cstring)
+  true
+
+proc social_synccast_leave*(
+    handle: pointer, roomId: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if roomId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let rid = ($roomId).strip()
+  if rid.len == 0:
+    return false
+  let local = localPeerId(node)
+  if local.len == 0:
+    return false
+  var ok = false
+  let nowTs = nowMillis()
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("synccastRooms") and state["synccastRooms"].kind == JObject and state["synccastRooms"].hasKey(rid):
+      let room = state["synccastRooms"][rid]
+      if room.kind == JObject and room.hasKey("members") and room["members"].kind == JArray:
+        var nextMembers = newJArray()
+        for member in room["members"]:
+          if member.kind == JString and member.getStr() != local:
+            nextMembers.add(member)
+        room["members"] = nextMembers
+      room["updatedAt"] = %nowTs
+      ok = true
+      persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["roomId"] = %rid
+  payload["peerId"] = %local
+  payload["ok"] = %ok
+  recordSocialEvent(
+    node,
+    "synccast",
+    "leave",
+    payload,
+    conversationId = synccastConversationId(rid),
+    groupId = rid,
+    source = "social_synccast_leave"
+  )
+  if ok:
+    var wire = newJObject()
+    wire["kind"] = %"social"
+    wire["entity"] = %"synccast"
+    wire["op"] = %"leave"
+    wire["roomId"] = %rid
+    wire["groupId"] = %rid
+    wire["conversationId"] = %synccastConversationId(rid)
+    wire["peerId"] = %local
+    wire["timestampMs"] = %nowTs
+    discard social_groups_send(handle, rid.cstring, ($wire).cstring)
+  ok
+
+proc social_synccast_control*(
+    handle: pointer, roomId: cstring, controlJson: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if roomId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let rid = ($roomId).strip()
+  if rid.len == 0:
+    return false
+  var control = normalizeSocialPayload(if controlJson == nil: "{}" else: $controlJson)
+  let op = jsonGetStr(control, "op", jsonGetStr(control, "action")).toLowerAscii()
+  if op.len == 0:
+    return false
+  if not synccastControlAllowed(op):
+    var rejected = newJObject()
+    rejected["roomId"] = %rid
+    rejected["op"] = %op
+    rejected["error"] = %"unsupported_op_for_watch_party"
+    rejected["ok"] = %false
+    recordSocialEvent(
+      node,
+      "synccast",
+      "control_rejected",
+      rejected,
+      conversationId = synccastConversationId(rid),
+      groupId = rid,
+      source = "social_synccast_control"
+    )
+    return false
+  let nowTs = nowMillis()
+  control["op"] = %op
+  control["timestampMs"] = %jsonGetInt64(control, "timestampMs", nowTs)
+  control["timestamp_ms"] = %jsonGetInt64(control, "timestampMs", nowTs)
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    let room = ensureSynccastRoomNoLock(state, rid)
+    let stateNode = room["state"]
+    stateNode["op"] = %op
+    stateNode["timestampMs"] = %jsonGetInt64(control, "timestampMs", nowTs)
+    if op in ["play", "resume"]:
+      stateNode["playbackState"] = %"playing"
+    elif op in ["pause", "stop"]:
+      stateNode["playbackState"] = %(if op == "pause": "paused" else: "stopped")
+    if control.hasKey("positionMs"):
+      stateNode["positionMs"] = %jsonGetInt64(control, "positionMs", 0)
+    if control.hasKey("anchorTsMs"):
+      stateNode["anchorTsMs"] = %jsonGetInt64(control, "anchorTsMs", nowTs)
+    for key, value in pairs(control):
+      if key in ["op", "action", "timestamp_ms"]:
+        continue
+      stateNode[key] = value
+    room["lastControl"] = control
+    room["updatedAt"] = %nowTs
+    ok = true
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["roomId"] = %rid
+  payload["groupId"] = %rid
+  payload["control"] = control
+  payload["ok"] = %ok
+  recordSocialEvent(
+    node,
+    "synccast",
+    "control",
+    payload,
+    conversationId = synccastConversationId(rid),
+    groupId = rid,
+    source = "social_synccast_control"
+  )
+  if ok:
+    var wire = newJObject()
+    wire["kind"] = %"social"
+    wire["entity"] = %"synccast"
+    wire["op"] = %op
+    wire["roomId"] = %rid
+    wire["groupId"] = %rid
+    wire["conversationId"] = %synccastConversationId(rid)
+    wire["timestampMs"] = %jsonGetInt64(control, "timestampMs", nowTs)
+    wire["control"] = control
+    discard social_groups_send(handle, rid.cstring, ($wire).cstring)
+  ok
+
+proc social_synccast_get_state*(
+    handle: pointer, roomId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  if roomId.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"room_id_missing\"}")
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_nil\"}")
+  let rid = ($roomId).strip()
+  if rid.len == 0:
+    return allocCString("{\"ok\":false,\"error\":\"room_id_missing\"}")
+  var response = newJObject()
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("synccastRooms") and state["synccastRooms"].kind == JObject and state["synccastRooms"].hasKey(rid):
+      response["ok"] = %true
+      response["roomId"] = %rid
+      response["room"] = state["synccastRooms"][rid]
+    else:
+      response["ok"] = %false
+      response["roomId"] = %rid
+      response["error"] = %"room_not_found"
+  finally:
+    socialStateMemLock.release()
+  allocCString($response)
+
+proc social_synccast_list_rooms*(
+    handle: pointer, limit: cint
+): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"items\":[],\"totalCount\":0}")
+  var rooms: seq[JsonNode] = @[]
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("synccastRooms") and state["synccastRooms"].kind == JObject:
+      for _, room in pairs(state["synccastRooms"]):
+        if room.kind == JObject:
+          rooms.add(room)
+  finally:
+    socialStateMemLock.release()
+  rooms.sort(
+    proc(a, b: JsonNode): int =
+      cmp(jsonGetInt64(b, "updatedAt"), jsonGetInt64(a, "updatedAt"))
+  )
+  let requested =
+    if limit <= 0:
+      min(rooms.len, SocialMaxSynccastRooms)
+    else:
+      min(rooms.len, min(int(limit), SocialMaxSynccastRooms))
+  var items = newJArray()
+  if requested > 0:
+    for i in 0 ..< requested:
+      items.add(rooms[i])
+  var response = newJObject()
+  response["items"] = items
+  response["totalCount"] = %rooms.len
+  allocCString($response)
+
+proc social_moments_publish*(handle: pointer, postJson: cstring): cstring {.exportc, cdecl, dynlib.} =
+  if postJson.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"post_missing\"}")
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_nil\"}")
+  var post = normalizeSocialPayload($postJson)
+  var postId = jsonGetStr(post, "postId", jsonGetStr(post, "id"))
+  if postId.len == 0:
+    postId = "post-" & $nowMillis() & "-" & $rand(10_000)
+  post["postId"] = %postId
+  post["id"] = %postId
+  post["authorPeerId"] = %localPeerId(node)
+  post["timestampMs"] = %jsonGetInt64(post, "timestampMs", nowMillis())
+  if not post.hasKey("likes") or post["likes"].kind != JArray:
+    post["likes"] = newJArray()
+  if not post.hasKey("comments") or post["comments"].kind != JArray:
+    post["comments"] = newJArray()
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    var nextMoments = newJArray()
+    nextMoments.add(post)
+    for existing in state["moments"]:
+      if nextMoments.len >= SocialMaxMoments:
+        break
+      nextMoments.add(existing)
+    state["moments"] = nextMoments
+    makeNotificationNoLock(state, "moment_published", "动态已发布", jsonGetStr(post, "content"), post)
+    persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  recordSocialEvent(node, "moments", "publish", post, postId = postId, source = "social_moments_publish")
+  var response = newJObject()
+  response["ok"] = %true
+  response["postId"] = %postId
+  response["post"] = post
+  allocCString($response)
+
+proc social_moments_delete*(handle: pointer, postId: cstring): bool {.exportc, cdecl, dynlib.} =
+  if postId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let pid = $postId
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("moments") and state["moments"].kind == JArray:
+      for post in state["moments"]:
+        if post.kind == JObject and jsonGetStr(post, "postId", jsonGetStr(post, "id")) == pid:
+          post["deleted"] = %true
+          post["deletedAt"] = %nowMillis()
+          ok = true
+      if ok:
+        persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["postId"] = %pid
+  payload["ok"] = %ok
+  recordSocialEvent(node, "moments", "delete", payload, postId = pid, source = "social_moments_delete")
+  ok
+
+proc social_moments_like*(handle: pointer, postId: cstring, like: bool): bool {.exportc, cdecl, dynlib.} =
+  if postId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let pid = $postId
+  let me = localPeerId(node)
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("moments") and state["moments"].kind == JArray:
+      for post in state["moments"]:
+        if post.kind != JObject:
+          continue
+        if jsonGetStr(post, "postId", jsonGetStr(post, "id")) != pid:
+          continue
+        if not post.hasKey("likes") or post["likes"].kind != JArray:
+          post["likes"] = newJArray()
+        if like:
+          appendUniqueString(post["likes"], me)
+        else:
+          var nextLikes = newJArray()
+          for item in post["likes"]:
+            if item.kind == JString and item.getStr() != me:
+              nextLikes.add(item)
+          post["likes"] = nextLikes
+        post["updatedAt"] = %nowMillis()
+        ok = true
+      if ok:
+        persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["postId"] = %pid
+  payload["like"] = %like
+  payload["peerId"] = %me
+  payload["ok"] = %ok
+  recordSocialEvent(node, "moments", "like", payload, postId = pid, source = "social_moments_like")
+  ok
+
+proc social_moments_comment*(handle: pointer, postId: cstring, commentJson: cstring): bool {.exportc, cdecl, dynlib.} =
+  if postId.isNil or commentJson.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let pid = $postId
+  var comment = normalizeSocialPayload($commentJson)
+  var commentId = jsonGetStr(comment, "commentId", jsonGetStr(comment, "id"))
+  if commentId.len == 0:
+    commentId = "comment-" & $nowMillis() & "-" & $rand(10_000)
+  comment["commentId"] = %commentId
+  comment["id"] = %commentId
+  comment["peerId"] = %localPeerId(node)
+  comment["timestampMs"] = %jsonGetInt64(comment, "timestampMs", nowMillis())
+  var ok = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("moments") and state["moments"].kind == JArray:
+      for post in state["moments"]:
+        if post.kind != JObject:
+          continue
+        if jsonGetStr(post, "postId", jsonGetStr(post, "id")) != pid:
+          continue
+        if not post.hasKey("comments") or post["comments"].kind != JArray:
+          post["comments"] = newJArray()
+        post["comments"].add(comment)
+        post["updatedAt"] = %nowMillis()
+        ok = true
+      if ok:
+        persistSocialStateUnsafe(node, state)
+  finally:
+    socialStateMemLock.release()
+  var payload = newJObject()
+  payload["postId"] = %pid
+  payload["comment"] = comment
+  payload["ok"] = %ok
+  recordSocialEvent(node, "moments", "comment", payload, postId = pid, source = "social_moments_comment")
+  ok
+
+proc social_moments_timeline*(handle: pointer, cursor: cstring, limit: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"items\":[],\"nextCursor\":\"\",\"hasMore\":false}")
+  let requested = if limit > 0: int(limit) else: SocialDefaultLimit
+  let startIndex =
+    if cursor.isNil:
+      0
+    else:
+      int(max(parseIntLoose($cursor), 0))
+  var response = newJObject()
+  var items = newJArray()
+  var nextCursor = ""
+  var hasMore = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("moments") and state["moments"].kind == JArray:
+      var filtered: seq[JsonNode] = @[]
+      for post in state["moments"]:
+        if post.kind == JObject and not jsonGetBool(post, "deleted", false):
+          filtered.add(post)
+      filtered.sort(
+        proc(a, b: JsonNode): int =
+          cmp(jsonGetInt64(b, "timestampMs", jsonGetInt64(b, "timestamp", 0)),
+              jsonGetInt64(a, "timestampMs", jsonGetInt64(a, "timestamp", 0)))
+      )
+      if startIndex < filtered.len:
+        let stopIndex = min(startIndex + requested, filtered.len)
+        for i in startIndex ..< stopIndex:
+          items.add(filtered[i])
+        hasMore = stopIndex < filtered.len
+        if hasMore:
+          nextCursor = $stopIndex
+  finally:
+    socialStateMemLock.release()
+  response["items"] = items
+  response["nextCursor"] = %nextCursor
+  response["hasMore"] = %hasMore
+  allocCString($response)
+
+proc social_notifications_list*(handle: pointer, cursor: cstring, limit: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"items\":[],\"nextCursor\":\"\",\"hasMore\":false}")
+  let requested = if limit > 0: int(limit) else: SocialDefaultLimit
+  let startIndex =
+    if cursor.isNil:
+      0
+    else:
+      int(max(parseIntLoose($cursor), 0))
+  var response = newJObject()
+  var items = newJArray()
+  var nextCursor = ""
+  var hasMore = false
+  socialStateMemLock.acquire()
+  try:
+    let state = loadSocialStateUnsafe(node)
+    if state.hasKey("notifications") and state["notifications"].kind == JArray:
+      let list = state["notifications"]
+      if startIndex < list.len:
+        let stopIndex = min(startIndex + requested, list.len)
+        for i in startIndex ..< stopIndex:
+          items.add(list[i])
+        hasMore = stopIndex < list.len
+        if hasMore:
+          nextCursor = $stopIndex
+  finally:
+    socialStateMemLock.release()
+  response["items"] = items
+  response["nextCursor"] = %nextCursor
+  response["hasMore"] = %hasMore
+  allocCString($response)
+
+proc social_query_presence*(handle: pointer, peerIdsJson: cstring): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"peers\":[]}")
+  let peerIds = parseJsonStringSeq(if peerIdsJson == nil: "[]" else: $peerIdsJson)
+  var connected = initHashSet[string]()
+  let connectedRaw = takeCStringAndFree(libp2p_get_connected_peers_json(handle))
+  if connectedRaw.len > 0:
+    try:
+      let arr = parseJson(connectedRaw)
+      if arr.kind == JArray:
+        for item in arr:
+          if item.kind == JString:
+            connected.incl(item.getStr())
+    except CatchableError:
+      discard
+  var peers = newJArray()
+  for peer in peerIds:
+    if peer.len == 0:
+      continue
+    var row = newJObject()
+    row["peerId"] = %peer
+    row["online"] = %connected.contains(peer)
+    row["lastSeenAt"] = %(if connected.contains(peer): nowMillis() else: int64(0))
+    row["source"] = %(if connected.contains(peer): "connected_peers" else: "peerstore")
+    peers.add(row)
+  var response = newJObject()
+  response["peers"] = peers
+  allocCString($response)
+
+proc social_poll_events*(handle: pointer, maxEvents: cint): cstring {.exportc, cdecl, dynlib.} =
+  libp2p_poll_events(handle, maxEvents)
 
 proc libp2p_get_listen_addresses*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
@@ -5371,32 +8330,33 @@ proc libp2p_get_bootstrap_status*(handle: pointer): cstring {.exportc, cdecl, dy
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{}")
-  when defined(android):
-    var obj = newJObject()
-    try:
-      if node.switchInstance != nil:
-        var connected = initHashSet[string]()
-        for pid in node.switchInstance.connectedPeers(Direction.Out):
-          connected.incl($pid)
-        for pid in node.switchInstance.connectedPeers(Direction.In):
-          connected.incl($pid)
-        let addrBook = node.switchInstance.peerStore[AddressBook]
-        if addrBook != nil:
-          for pid, addrs in addrBook.book:
-            let peerIdStr = $pid
-            let statusVal =
-              if connected.contains(peerIdStr): "connected=true"
-              elif addrs.len > 0: "connected=false"
-              else: "unknown"
-            obj[peerIdStr] = %statusVal
-    except CatchableError:
-      discard
-    if obj.len == 0:
-      return allocCString("{}")
-    allocCString($obj)
-  else:
-    ## HarmonyOS 版本暂不访问内部 peerStore，避免未适配导致崩溃。
+  ## Return real bootstrap status on every mobile platform (Android/iOS/Harmony)
+  ## to keep bridge diagnostics consistent.
+  var obj = newJObject()
+  try:
+    if node.switchInstance != nil:
+      var connected = initHashSet[string]()
+      for pid in node.switchInstance.connectedPeers(Direction.Out):
+        connected.incl($pid)
+      for pid in node.switchInstance.connectedPeers(Direction.In):
+        connected.incl($pid)
+
+      let addrBook = node.switchInstance.peerStore[AddressBook]
+      if addrBook != nil:
+        for pid, addrs in addrBook.book:
+          let peerIdStr = $pid
+          let statusVal =
+            if connected.contains(peerIdStr): "connected=true"
+            elif addrs.len > 0: "connected=false"
+            else: "unknown"
+          obj[peerIdStr] = %statusVal
+  except CatchableError:
+    discard
+
+  if obj.len == 0:
     allocCString("{}")
+  else:
+    allocCString($obj)
 
 proc libp2p_reconnect_bootstrap*(handle: pointer): bool {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
@@ -5407,6 +8367,36 @@ proc libp2p_reconnect_bootstrap*(handle: pointer): bool {.exportc, cdecl, dynlib
   let ok = result.resultCode == NimResultOk
   destroyCommand(cmd)
   ok
+
+proc libp2p_get_random_bootstrap_peers*(handle: pointer, limit: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"peers\":[],\"selectedCount\":0,\"totalCount\":0}")
+  let cmd = makeCommand(cmdGetRandomBootstrapPeers)
+  cmd.requestLimit = int(limit)
+  let result = submitCommand(node, cmd)
+  let output =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      allocCString(cloneOwnedString(result.stringResult))
+    else:
+      allocCString("{\"peers\":[],\"selectedCount\":0,\"totalCount\":0}")
+  destroyCommand(cmd)
+  output
+
+proc libp2p_join_via_random_bootstrap*(handle: pointer, limit: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"attemptCount\":0,\"connectedCount\":0,\"attempted\":[]}")
+  let cmd = makeCommand(cmdJoinViaRandomBootstrap)
+  cmd.requestLimit = int(limit)
+  let result = submitCommand(node, cmd)
+  let output =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      allocCString(cloneOwnedString(result.stringResult))
+    else:
+      allocCString("{\"ok\":false,\"attemptCount\":0,\"connectedCount\":0,\"attempted\":[]}")
+  destroyCommand(cmd)
+  output
 
 proc libp2p_mdns_set_enabled*(handle: pointer, enabled: bool): bool {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
@@ -5562,7 +8552,7 @@ proc libp2p_mdns_debug*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
   let result = submitCommand(node, cmd)
   let payload =
     if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      result.stringResult
+      cloneOwnedString(result.stringResult)
     else:
       "{\"error\":\"mdns_debug_failed\",\"detail\":\"" & result.errorMsg & "\"}"
   destroyCommand(cmd)
@@ -5666,7 +8656,7 @@ proc libp2p_dex_get_market_data*(handle: pointer, asset: cstring): cstring {.exp
   let cmd = makeCommand(cmdDexGetMarketData)
   cmd.textPayload = if asset != nil: $asset else: ""
   let result = submitCommand(node, cmd)
-  let payload = if result.resultCode == NimResultOk: result.stringResult else: ""
+  let payload = if result.resultCode == NimResultOk: cloneOwnedString(result.stringResult) else: ""
   destroyCommand(cmd)
   allocCString(payload)
 
@@ -5677,7 +8667,12 @@ proc libp2p_dex_get_wallets*(handle: pointer): cstring {.exportc, cdecl, dynlib.
   if node.isNil: return allocCString("[]")
   let cmd = makeCommand(cmdDexGetWallets)
   let result = submitCommand(node, cmd)
-  let payload = if result.resultCode == NimResultOk: result.stringResult else: "[]"
+  let payload =
+    if result.resultCode == NimResultOk:
+      let copied = cloneOwnedString(result.stringResult)
+      if copied.len > 0: copied else: "[]"
+    else:
+      "[]"
   destroyCommand(cmd)
   allocCString(payload)
 

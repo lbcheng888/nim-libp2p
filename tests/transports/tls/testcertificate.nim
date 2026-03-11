@@ -3,8 +3,11 @@
 import unittest2
 
 import times
-import ../../../libp2p/transports/tls/certificate
-import ../../../libp2p/transports/tls/certificate_ffi
+when defined(libp2p_pure_crypto):
+  import ../../../libp2p/transports/tls/certificate_pure
+else:
+  import ../../../libp2p/transports/tls/certificate
+  import ../../../libp2p/transports/tls/certificate_ffi
 import ../../../libp2p/crypto/crypto
 import ../../../libp2p/peerid
 
@@ -110,55 +113,56 @@ suite "Test vectors":
     # should not verify
     check not cert.verify()
 
-  test "CSR generation":
-    var certKey: cert_key_t
-    var certCtx: cert_context_t
-    var derCSR: ptr cert_buffer = nil
+  when not defined(libp2p_pure_crypto):
+    test "CSR generation":
+      var certKey: cert_key_t
+      var certCtx: cert_context_t
+      var derCSR: ptr cert_buffer = nil
 
-    check cert_init_drbg("seed".cstring, 4, certCtx.addr) == CERT_SUCCESS
-    check cert_generate_key(certCtx, certKey.addr) == CERT_SUCCESS
+      check cert_init_drbg("seed".cstring, 4, certCtx.addr) == CERT_SUCCESS
+      check cert_generate_key(certCtx, certKey.addr) == CERT_SUCCESS
 
-    check cert_signing_req("my.domain.string".cstring, certKey, derCSR.addr) ==
-      CERT_SUCCESS
+      check cert_signing_req("my.domain.string".cstring, certKey, derCSR.addr) ==
+        CERT_SUCCESS
 
-    check cert_signing_req(
-      "my.big.domain.string.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaa".cstring,
-        # 253 characters, no labels longer than 63, okay
-      certKey,
-      derCSR.addr,
-    ) == CERT_SUCCESS
+      check cert_signing_req(
+        "my.big.domain.string.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaa".cstring,
+          # 253 characters, no labels longer than 63, okay
+        certKey,
+        derCSR.addr,
+      ) == CERT_SUCCESS
 
-    check cert_signing_req(
-      "my.domain.".cstring, # domain ending in ".", okay
-      certKey,
-      derCSR.addr,
-    ) == CERT_SUCCESS
+      check cert_signing_req(
+        "my.domain.".cstring, # domain ending in ".", okay
+        certKey,
+        derCSR.addr,
+      ) == CERT_SUCCESS
 
-    check cert_signing_req(
-      "my.big.domain.string.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".cstring,
-        # 254 characters, too long
-      certKey,
-      derCSR.addr,
-    ) == -48 # CERT_ERROR_CN_TOO_LONG
+      check cert_signing_req(
+        "my.big.domain.string.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".cstring,
+          # 254 characters, too long
+        certKey,
+        derCSR.addr,
+      ) == -48 # CERT_ERROR_CN_TOO_LONG
 
-    check cert_signing_req(
-      "my.big.domain.string.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".cstring,
-        # 64 character label, too long
-      certKey,
-      derCSR.addr,
-    ) == -49 # CERT_ERROR_CN_LABEL_TOO_LONG
+      check cert_signing_req(
+        "my.big.domain.string.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".cstring,
+          # 64 character label, too long
+        certKey,
+        derCSR.addr,
+      ) == -49 # CERT_ERROR_CN_LABEL_TOO_LONG
 
-    check cert_signing_req(
-      "my..empty.label.domain".cstring, # domain with empty label
-      certKey,
-      derCSR.addr,
-    ) == -50 # CERT_ERROR_CN_EMPTY_LABEL
+      check cert_signing_req(
+        "my..empty.label.domain".cstring, # domain with empty label
+        certKey,
+        derCSR.addr,
+      ) == -50 # CERT_ERROR_CN_EMPTY_LABEL
 
-    check cert_signing_req(
-      "".cstring, # domain with empty cn
-      certKey,
-      derCSR.addr,
-    ) == -51 # CERT_ERROR_CN_EMPTY
+      check cert_signing_req(
+        "".cstring, # domain with empty cn
+        certKey,
+        derCSR.addr,
+      ) == -51 # CERT_ERROR_CN_EMPTY
 
 suite "utilities test":
   test "parseCertTime":
@@ -168,24 +172,28 @@ suite "utilities test":
     dt = parseCertTime("Jan  1 00:00:00 1975 GMT")
     check 157766400 == dt.toUnix()
 
-  test "KeyPair to cert_key_t":
-    var certKey: cert_key_t
-    var certKeyBack: ptr cert_buffer = nil
+    dt = parseCertTime("20250319115431Z")
+    check 1742385271 == dt.toUnix()
 
-    let key = KeyPair.random(PKScheme.RSA, newRng()[]).get()
+  when not defined(libp2p_pure_crypto):
+    test "KeyPair to cert_key_t":
+      var certKey: cert_key_t
+      var certKeyBack: ptr cert_buffer = nil
 
-    let rawSeckey: seq[byte] = key.seckey.getRawBytes.valueOr:
-      raiseAssert "Failed to get seckey raw bytes (DER)"
+      let key = KeyPair.random(PKScheme.RSA, newRng()[]).get()
 
-    let seckeyBuffer = rawSeckey.toCertBuffer()
+      let rawSeckey: seq[byte] = key.seckey.getRawBytes.valueOr:
+        raiseAssert "Failed to get seckey raw bytes (DER)"
 
-    # make seckey into certKey
-    check cert_new_key_t(seckeyBuffer.unsafeAddr, certKey.addr) == CERT_SUCCESS
+      let seckeyBuffer = rawSeckey.toCertBuffer()
 
-    # make certKey back into seq[byte]
-    check cert_serialize_privk(certKey, certKeyBack.addr, CERT_FORMAT_DER) ==
-      CERT_SUCCESS
+      # make seckey into certKey
+      check cert_new_key_t(seckeyBuffer.unsafeAddr, certKey.addr) == CERT_SUCCESS
 
-    # after and before should be the same
-    let rawSeckeyBack = certKeyBack.toSeq()
-    check rawSeckey == rawSeckeyBack
+      # make certKey back into seq[byte]
+      check cert_serialize_privk(certKey, certKeyBack.addr, CERT_FORMAT_DER) ==
+        CERT_SUCCESS
+
+      # after and before should be the same
+      let rawSeckeyBack = certKeyBack.toSeq()
+      check rawSeckey == rawSeckeyBack

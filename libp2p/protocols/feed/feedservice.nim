@@ -94,7 +94,7 @@ proc encodeEntry*(entry: FeedEntry): seq[byte] =
   if entry.cover.len > 0:
     node["cover"] = newJString(encode(entry.cover))
   else:
-    node.delete("cover")
+    node["cover"] = newJNull()
   let text = $node
   text.toSeq().mapIt(byte(it))
 

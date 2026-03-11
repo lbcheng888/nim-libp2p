@@ -1656,7 +1656,10 @@ proc prepareMdns(n: NimNode) =
   let intervals = computeMdnsIntervals(n)
   var preferredIp = ""
   let lanIpsSnapshot = collectLanIpv4Addrs(n.mdnsPreferredIpv4)
-  if not peerInfo.isNil:
+  if n.mdnsPreferredIpv4.len > 0 and
+      (lanIpsSnapshot.len == 0 or n.mdnsPreferredIpv4 in lanIpsSnapshot):
+    preferredIp = n.mdnsPreferredIpv4
+  if preferredIp.len == 0 and not peerInfo.isNil:
     for ma in peerInfo.listenAddrs:
       let addrStr = $ma
       if addrStr.contains("/ip4/"):
@@ -1665,7 +1668,8 @@ proc prepareMdns(n: NimNode) =
           let ipPart = parts[^1]
           let slashIdx = ipPart.find('/')
           let ip = if slashIdx >= 0: ipPart[0 ..< slashIdx] else: ipPart
-          if ip.len > 0 and ip != "0.0.0.0" and ip != "127.0.0.1":
+          if ip.len > 0 and ip != "0.0.0.0" and ip != "127.0.0.1" and
+              (lanIpsSnapshot.len == 0 or ip in lanIpsSnapshot):
             preferredIp = ip
             break
   if preferredIp.len == 0 and lanIpsSnapshot.len > 0:
@@ -3022,7 +3026,7 @@ proc runCommand(
         var directions = newJArray()
         var streamCount = 0
         for mux in muxers:
-          if mux.isNil:
+          if mux.isNil or mux.connection.isNil:
             continue
           let dirStr =
             if mux.connection.dir == Direction.In: "inbound" else: "outbound"

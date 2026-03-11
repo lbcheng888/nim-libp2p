@@ -5,26 +5,22 @@ interface NimBridgeStorage {
 
 declare const AppStorage: NimBridgeStorage;
 
-const MODULE = 'libnimbridge.so';
-const MODULE_NAME = 'com.example.unimaker.nimbridge';
+const MODULE = 'libnimlibp2p.so';
+const MODULE_NAME = 'nimlibp2p';
 const STAGE_CANDIDATES = [
-  'entry/libnimbridge',
-  'entry/libnimbridge.so',
-  'entry/libs/arm64-v8a/libnimbridge.so',
-  'entry/libs/arm64/libnimbridge.so',
-  'entry/lib/libnimbridge',
-  'entry/lib/libnimbridge.so',
-  'libs/arm64-v8a/libnimbridge.so',
-  'libs/arm64/libnimbridge.so',
-  'entry/libp2pbridge',
-  'entry/libp2pbridge.so',
-  'entry/libs/arm64-v8a/libp2pbridge.so',
-  'entry/libs/arm64/libp2pbridge.so',
-  'entry/lib/libp2pbridge',
-  'entry/lib/libp2pbridge.so',
-  'libs/arm64-v8a/libp2pbridge.so',
-  'libs/arm64/libp2pbridge.so',
-  'libs/arm64/libp2pbridge.so'
+  'entry/nimlibp2p',
+  'entry/libnimlibp2p.so',
+  'entry/libnimlibp2p.z.so',
+  'entry/libs/arm64-v8a/libnimlibp2p.so',
+  'entry/libs/arm64-v8a/libnimlibp2p.z.so',
+  'entry/libs/arm64/libnimlibp2p.so',
+  'entry/libs/arm64/libnimlibp2p.z.so',
+  'entry/lib/libnimlibp2p.so',
+  'entry/lib/libnimlibp2p.z.so',
+  'libs/arm64-v8a/libnimlibp2p.so',
+  'libs/arm64-v8a/libnimlibp2p.z.so',
+  'libs/arm64/libnimlibp2p.so',
+  'libs/arm64/libnimlibp2p.z.so'
 ] as const;
 const REQUIRED_EXPORTS: Array<keyof NimBridgeModule> = [
   'initNode',
@@ -129,13 +125,13 @@ function loadNative(): NimBridgeModule {
       if (module && isBridgeModule(module)) {
         nativeBridge = module;
         const keys = Object.keys(nativeBridge as object);
-        hilog.info(0xD0B0, 'nimlib', 'Loaded nimbridge via %{public}s keys=%{public}s', label, JSON.stringify(keys));
+        hilog.info(0xD0B0, 'nimlib', 'Loaded nimlibp2p via %{public}s keys=%{public}s', label, JSON.stringify(keys));
         return true;
       }
       if (module) {
         const keys = Object.keys(module as object);
         errors.push(`${label}: missing exports keys=${JSON.stringify(keys)}`);
-        hilog.warn(0xD0B0, 'nimlib', 'nimbridge module missing exports (%{public}s): %{public}s', label, JSON.stringify(keys));
+        hilog.warn(0xD0B0, 'nimlib', 'nimlibp2p module missing exports (%{public}s): %{public}s', label, JSON.stringify(keys));
       }
     } catch (err) {
       let message = 'unknown error';
@@ -151,22 +147,20 @@ function loadNative(): NimBridgeModule {
         }
       }
       errors.push(`${label}: ${message}`);
-      hilog.warn(0xD0B0, 'nimlib', 'nimbridge load failed (%{public}s): %{public}s', label, message);
+      hilog.warn(0xD0B0, 'nimlib', 'nimlibp2p load failed (%{public}s): %{public}s', label, message);
     }
     return false;
   };
 
   const primaryCandidates: string[] = [
     MODULE_NAME,
-    'nimbridge',
-    'libnimbridge',
-    'libnimbridge.so',
-    'libp2pbridge',
-    'libp2pbridge.so',
-    'libs/arm64-v8a/libnimbridge.so',
-    'libs/arm64/libnimbridge.so',
-    'libs/arm64-v8a/libp2pbridge.so',
-    'libs/arm64/libp2pbridge.so',
+    'libnimlibp2p',
+    'libnimlibp2p.so',
+    'libnimlibp2p.z.so',
+    'libs/arm64-v8a/libnimlibp2p.so',
+    'libs/arm64-v8a/libnimlibp2p.z.so',
+    'libs/arm64/libnimlibp2p.so',
+    'libs/arm64/libnimlibp2p.z.so',
     MODULE,
     ...STAGE_CANDIDATES
   ];
@@ -214,26 +208,26 @@ function loadNative(): NimBridgeModule {
     searchPaths.forEach(root => {
       if (root && root.length > 0) {
         extraCandidates.push(`${root}/${MODULE}`);
-        extraCandidates.push(`${root}/libnimbridge.so`);
-        extraCandidates.push(`${root}/lib/libnimbridge.so`);
-        extraCandidates.push(`${root}/libs/arm64-v8a/libnimbridge.so`);
-        extraCandidates.push(`${root}/libp2pbridge.so`);
-        extraCandidates.push(`${root}/lib/libp2pbridge.so`);
-        extraCandidates.push(`${root}/libs/arm64-v8a/libp2pbridge.so`);
+        extraCandidates.push(`${root}/libnimlibp2p.so`);
+        extraCandidates.push(`${root}/libnimlibp2p.z.so`);
+        extraCandidates.push(`${root}/lib/libnimlibp2p.so`);
+        extraCandidates.push(`${root}/lib/libnimlibp2p.z.so`);
+        extraCandidates.push(`${root}/libs/arm64-v8a/libnimlibp2p.so`);
+        extraCandidates.push(`${root}/libs/arm64-v8a/libnimlibp2p.z.so`);
         extraCandidates.push(`${root}/${MODULE_NAME}`);
       }
     });
   }
   extraCandidates.push(MODULE);
   extraCandidates.push(MODULE_NAME);
-  extraCandidates.push('libnimbridge.so');
-  extraCandidates.push('lib/libnimbridge.so');
-  extraCandidates.push('libs/arm64-v8a/libnimbridge.so');
-  extraCandidates.push('libs/arm64/libnimbridge.so');
-  extraCandidates.push('libp2pbridge.so');
-  extraCandidates.push('lib/libp2pbridge.so');
-  extraCandidates.push('libs/arm64-v8a/libp2pbridge.so');
-  extraCandidates.push('libs/arm64/libp2pbridge.so');
+  extraCandidates.push('libnimlibp2p.so');
+  extraCandidates.push('libnimlibp2p.z.so');
+  extraCandidates.push('lib/libnimlibp2p.so');
+  extraCandidates.push('lib/libnimlibp2p.z.so');
+  extraCandidates.push('libs/arm64-v8a/libnimlibp2p.so');
+  extraCandidates.push('libs/arm64-v8a/libnimlibp2p.z.so');
+  extraCandidates.push('libs/arm64/libnimlibp2p.so');
+  extraCandidates.push('libs/arm64/libnimlibp2p.z.so');
 
   for (const candidate of extraCandidates) {
     if (runtime.requireNapiModule) {
@@ -256,8 +250,8 @@ function loadNative(): NimBridgeModule {
   }
 
   const summary = errors.length > 0 ? errors.join(' | ') : 'all loaders failed without explicit error';
-  hilog.error(0xD0B0, 'nimlib', 'Unable to load nimbridge module: %{public}s', summary);
-  throw new Error(`nimbridge load failed: ${summary}`);
+  hilog.error(0xD0B0, 'nimlib', 'Unable to load nimlibp2p module: %{public}s', summary);
+  throw new Error(`nimlibp2p load failed: ${summary}`);
 }
 
 function requireNapi(name: string): NimBridgeModule {

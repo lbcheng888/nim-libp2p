@@ -68,6 +68,12 @@ type
     pump*: Future[void]
     stopped*: bool
 
+proc releaseSafe(lock: AsyncLock) =
+  try:
+    lock.release()
+  except AsyncLockError:
+    discard
+
 proc init*(
     _: type BitswapClientConfig,
     maxMessageBytes: int = DefaultMaxMessageBytes,
@@ -167,13 +173,14 @@ proc blockMatchesCid(cid: Cid, data: seq[byte]): bool =
   expected.data.buffer == computed.data.buffer
 
 proc takePending(
-    session: BitswapSession, cids: openArray[Cid]
-): seq[(Cid, Future[Option[seq[byte]]])] {.async: (raises: [CancelledError]).} =
+    session: BitswapSession, cids: seq[Cid]
+): Future[seq[(Cid, Future[Option[seq[byte]]])]] {.async: (raises: [CancelledError]).} =
   await session.lock.acquire()
-  defer: session.lock.release()
+  defer:
+    releaseSafe(session.lock)
   for cid in cids:
     session.pending.withValue(cid, fut):
-      result.add((cid, fut))
+      result.add((cid, fut[]))
       session.pending.del(cid)
       if session.retryCounts.hasKey(cid):
         session.retryCounts.del(cid)
@@ -207,7 +214,7 @@ proc scheduleMissingRetry(
       else:
         session.retryCounts[cid] = attempts + 1
         toRequeue.add(cid)
-  session.lock.release()
+  releaseSafe(session.lock)
 
   if toFail.len > 0:
     let err = newError(
@@ -235,7 +242,7 @@ proc scheduleMissingRetry(
         session.queue.add(cid)
         session.queueSet.incl(cid)
         trigger = true
-  session.lock.release()
+  releaseSafe(session.lock)
 
   if trigger:
     trace "bitswap scheduling retry for missing blocks",
@@ -296,12 +303,12 @@ proc completeDontHave(
     if not fut.finished():
       fut.complete(none(seq[byte]))
 
-proc drainQueue(session: BitswapSession): Future[seq[Cid]] {.async.} =
+proc drainQueue(session: BitswapSession): Future[seq[Cid]] {.async: (raises: [CancelledError]).} =
   await session.lock.acquire()
   let wants = session.queue
   session.queue = @[]
   session.queueSet.clear()
-  session.lock.release()
+  releaseSafe(session.lock)
   wants
 
 proc mapBlocks(
@@ -565,7 +572,7 @@ proc new*(
     pump: nil,
     stopped: false,
   )
-  session.pump = asyncSpawn session.runPump()
+  session.pump = session.runPump()
   session
 
 proc requestBlock*(
@@ -586,10 +593,11 @@ proc requestBlock*(
   var trigger = false
   await session.lock.acquire()
   if session.stopped:
-    session.lock.release()
+    releaseSafe(session.lock)
     raise newError("bitswap session closed", BitswapClientErrorKind.bceClosed)
   if session.pending.hasKey(cid):
-    fut = session.pending[cid]
+    session.pending.withValue(cid, pending):
+      fut = pending[]
   else:
     fut = newFuture[Option[seq[byte]]]("bitswap.session.request")
     session.pending[cid] = fut
@@ -597,20 +605,43 @@ proc requestBlock*(
       session.queue.add(cid)
       session.queueSet.incl(cid)
       trigger = true
-  session.lock.release()
+  releaseSafe(session.lock)
   if trigger:
     session.event.fire()
-  result = await fut
+  try:
+    result = await fut
+  except CancelledError as exc:
+    raise exc
+  except BitswapClientError as err:
+    raise err
+  except CatchableError as exc:
+    raise newError(
+      "bitswap request failed: " & exc.msg,
+      BitswapClientErrorKind.bceInvalidResponse,
+      exc,
+    )
 
 proc requestBlocks*(
-    session: BitswapSession, cids: openArray[Cid]
+    session: BitswapSession, cids: seq[Cid]
 ): Future[Table[Cid, Option[seq[byte]]]] {.
-    async: (raises: [CancelledError, BitswapClientError]).
+    async: (raises: [CancelledError, BitswapClientError])
   .} =
   var tasks: seq[Future[Option[seq[byte]]]] = @[]
   for cid in cids:
     tasks.add(session.requestBlock(cid))
-  let results = await all(tasks)
+  let results =
+    try:
+      await all(tasks)
+    except CancelledError as exc:
+      raise exc
+    except BitswapClientError as err:
+      raise err
+    except CatchableError as exc:
+      raise newError(
+        "bitswap multi-request failed: " & exc.msg,
+        BitswapClientErrorKind.bceInvalidResponse,
+        exc,
+      )
   var table = initTable[Cid, Option[seq[byte]]](cids.len)
   for i, cid in cids.pairs():
     table[cid] = results[i]
@@ -629,7 +660,7 @@ proc close*(session: BitswapSession) {.async: (raises: [CancelledError]).} =
   await session.lock.acquire()
   let futures = toSeq(session.pending.values())
   session.pending.clear()
-  session.lock.release()
+  releaseSafe(session.lock)
   let err = newError("bitswap session closed", BitswapClientErrorKind.bceClosed)
   for fut in futures:
     if not fut.finished():

@@ -1,0 +1,3 @@
+Model:           NVIDIA H100 SXM5 80GB
+IRQ:             83
+GPU UUID:        GPU-test

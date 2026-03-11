@@ -35,7 +35,9 @@ import
   testautorelay, testdcutr, testhpservice, testutility, testhelpers,
   testwildcardresolverservice, testperf, testpkifilter, testpnet, testgossip_optimum,
   testlivestream, testepisub, testfetch, testpeerrecord, testhttp, testgossipsub_limits,
-  teststandardservices, testupdater, testresourcemanager, testdatatransfer, testquicconfig,
+  teststandardservices, testcontentloop_service, testupdater, testresourcemanager,
+  testdatatransfer, testquicconfig, testnoderesource_service, testmobilemesh_service,
+  testsynccast_distributed_inference_service, mobile_mdns_dm_test,
   integration/connectivity/testdirectconnect, integration/connectivity/testmdnsconnect
 
 when defined(libp2p_run_relay_tests):

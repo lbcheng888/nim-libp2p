@@ -1,0 +1,2 @@
+Filesystem 512-blocks      Used  Available Capacity Mounted on
+/dev/disk3s1 1953125000 976562500 976562500    50%    /Volumes/Models

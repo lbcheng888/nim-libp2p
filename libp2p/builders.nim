@@ -15,7 +15,7 @@ runnableExamples:
 
 {.push raises: [].}
 
-import options, tables, chronos, chronicles, sequtils, stew/byteutils
+import options, tables, chronos, chronicles, sequtils, strutils, stew/byteutils
 import features
 import
   switch,
@@ -53,6 +53,8 @@ import protocols/[
   pnet,
   protocols/connectivity/[
     autonat/server,
+    autonat/client,
+    autonat/service,
     autonatv2/server,
     autonatv2/service,
     autonatv2/client,
@@ -74,7 +76,9 @@ import protocols/[
   delegatedrouting,
   delegatedrouting/[store, server],
   providers/bitswapadvertiser
-import services/[wildcardresolverservice, metricsservice, otelmetricsservice]
+import services/[wildcardresolverservice, metricsservice, otelmetricsservice,
+  noderesourceservice, mobilemeshservice, synccastcontrolservice,
+  distributedinferenceservice, autorelayservice, hpservice]
 when libp2pDataTransferEnabled:
   import services/[otellogsservice, oteltracesservice]
 
@@ -821,6 +825,109 @@ proc withServices*(b: SwitchBuilder, services: seq[Service]): SwitchBuilder =
   b.services = services
   b
 
+proc withNodeResourceService*(
+    b: SwitchBuilder,
+    dataDir = "",
+    config: NodeResourceServiceConfig = NodeResourceServiceConfig.init(),
+    source: NodeResourceCollectorSource = NodeResourceCollectorSource(),
+): SwitchBuilder {.public.} =
+  let svc = NodeResourceService.new(dataDir = dataDir, config = config, source = source)
+  b.services.keepItIf(not (it of NodeResourceService))
+  b.services.add(svc)
+  b
+
+proc withMobileMeshService*(
+    b: SwitchBuilder,
+    config: MobileMeshServiceConfig = MobileMeshServiceConfig.init(),
+): SwitchBuilder {.public.} =
+  let svc = MobileMeshService.new(config = config)
+  b.services.keepItIf(not (it of MobileMeshService))
+  b.services.add(svc)
+  b
+
+proc withMobileFullP2PProfile*(
+    b: SwitchBuilder,
+    dataDir = "",
+    resourceConfig: NodeResourceServiceConfig = NodeResourceServiceConfig.init(),
+    resourceSource: NodeResourceCollectorSource = NodeResourceCollectorSource(),
+    mobileMeshConfig: MobileMeshServiceConfig = MobileMeshServiceConfig.init(),
+    maxNumRelays = 2,
+): SwitchBuilder {.public, raises: [LPError].} =
+  if b.rng.isNil:
+    b.rng = newRng()
+  if b.rng.isNil:
+    raise newException(LPError, "failed to initialize RNG for mobile full P2P profile")
+
+  if b.addresses.len == 0 or
+      (b.addresses.len == 1 and $b.addresses[0] == "/ip4/127.0.0.1/tcp/0"):
+    discard b.withAddresses(
+      @[MultiAddress.init("/ip4/0.0.0.0/udp/0/quic-v1").tryGet()]
+    )
+  else:
+    for address in b.addresses:
+      if not ($address).contains("/quic"):
+        raise newException(
+          LPError,
+          "mobile full P2P profile requires QUIC listen addresses, got " & $address,
+        )
+
+  b.transports.setLen(0)
+  when defined(libp2p_msquic_experimental):
+    discard b.withMsQuicTransport()
+    if b.muxers.len == 0:
+      discard b.withMplex()
+  elif defined(libp2p_quic_support):
+    discard b.withQuicTransport()
+  else:
+    raise newException(
+      LPError,
+      "mobile full P2P profile requires QUIC support (-d:libp2p_msquic_experimental or -d:libp2p_quic_support)",
+    )
+
+  discard b.withNodeResourceService(
+    dataDir = dataDir, config = resourceConfig, source = resourceSource
+  )
+  discard b.withMobileMeshService(config = mobileMeshConfig)
+  discard b.withAutonat()
+
+  let relayClient = RelayClient.new()
+  discard b.withCircuitRelay(relayClient)
+
+  let autoRelaySvc =
+    AutoRelayService.new(max(1, maxNumRelays), relayClient, nil, b.rng)
+  let autonatSvc =
+    AutonatService.new(AutonatClient(), b.rng, enableAddressMapper = false)
+  let hpSvc = HPService.new(autonatSvc, autoRelaySvc)
+  b.services.keepItIf(not (it of HPService))
+  b.services.add(hpSvc)
+  b
+
+proc withSynccastControlService*(
+    b: SwitchBuilder,
+    config: SynccastControlConfig = SynccastControlConfig.init(),
+): SwitchBuilder {.public.} =
+  let next = b.withNodeResourceService()
+  let svc = SynccastControlService.new(config = config)
+  next.services.keepItIf(not (it of SynccastControlService))
+  next.services.add(svc)
+  next
+
+proc withDistributedInferenceService*(
+    b: SwitchBuilder,
+    config: DistributedInferenceConfig = DistributedInferenceConfig.init(),
+    store: BitswapBlockStore = nil,
+    executor: DistributedInferenceExecutor = nil,
+): SwitchBuilder {.public.} =
+  let next = b.withNodeResourceService()
+  let svc = DistributedInferenceService.new(
+    config = config,
+    store = store,
+    executor = executor,
+  )
+  next.services.keepItIf(not (it of DistributedInferenceService))
+  next.services.add(svc)
+  next
+
 proc withMetricsExporter*(
     b: SwitchBuilder,
     address: string = "127.0.0.1",
@@ -924,11 +1031,9 @@ proc withBitswap*(
     config: BitswapConfig = BitswapConfig.init(),
 ): SwitchBuilder {.public.} =
   if not b.bitswapService.isNil:
-    let prevPtr = cast[pointer](b.bitswapService)
-    b.services.keepItIf(cast[pointer](it) != prevPtr)
+    discard
   let svc = BitswapService.new(provider = provider, config = config)
   b.bitswapService = svc
-  b.services.add(cast[Service](svc))
   b
 
 proc withBitswap*(
@@ -939,11 +1044,9 @@ proc withBitswap*(
   if store.isNil():
     raise newException(Defect, "bitswap store must not be nil")
   if not b.bitswapService.isNil:
-    let prevPtr = cast[pointer](b.bitswapService)
-    b.services.keepItIf(cast[pointer](it) != prevPtr)
+    discard
   let svc = BitswapService.new(store = store, config = config)
   b.bitswapService = svc
-  b.services.add(cast[Service](svc))
   b
 
 proc withGraphSync*(
@@ -1248,6 +1351,9 @@ proc build*(b: SwitchBuilder): Switch {.raises: [LPError], public.} =
   )
 
   switch.mount(identify)
+
+  if not switch.bitswap.isNil:
+    switch.mount(switch.bitswap)
 
   if not isNil(b.autonatV2Client):
     b.autonatV2Client.setup(switch)

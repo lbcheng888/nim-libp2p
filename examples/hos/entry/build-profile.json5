@@ -9,12 +9,7 @@
     "napiLibFilterOption": {
       "enableOverride": true,
       "pickFirsts": [
-        "libnimbridge.so",
-        "libp2pbridge.so",
-        "libnimlibp2p.so",
-        "libssl.so",
-        "libcrypto.so",
-        "libc++_shared.so"
+        "libnimlibp2p.so"
       ]
     }
   },

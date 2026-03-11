@@ -244,3 +244,137 @@ suite "Connectivity - mDNS Discovery (mobile)":
     let discoveredPeer = attrs[PeerId]
     check discoveredPeer == listener.switch.peerInfo.peerId
     check attrs.getAll(MultiAddress).len > 0
+
+  asyncTest "mdns discovery tolerates canonical trailing dot mismatch":
+    let serviceCanonical = "_nimlibp2p_test._udp.local."
+    let serviceWithoutDot = "_nimlibp2p_test._udp.local"
+    let listener = newGossipNode(@["/ip4/127.0.0.1/tcp/0"])
+    let dialer = newGossipNode(@["/ip4/127.0.0.1/tcp/0"])
+
+    await listener.switch.start()
+    await dialer.switch.start()
+    defer:
+      await listener.switch.stop()
+      await dialer.switch.stop()
+
+    let advertiserMdns = block:
+      var res: MdnsInterface
+      try:
+        res = MdnsInterface.new(
+          listener.switch.peerInfo,
+          serviceName = serviceWithoutDot,
+          announceInterval = 1.seconds,
+          queryInterval = 1.seconds
+        )
+      except CatchableError as exc:
+        doAssert false, "advertiser mdns init failed: " & exc.msg
+      except Exception as exc:
+        doAssert false, "advertiser mdns unexpected failure: " & exc.msg
+      res
+    advertiserMdns.setPreferredIpv4("127.0.0.1")
+
+    let explorerMdns = block:
+      var res: MdnsInterface
+      try:
+        res = MdnsInterface.new(
+          dialer.switch.peerInfo,
+          serviceName = serviceCanonical,
+          announceInterval = 1.seconds,
+          queryInterval = 1.seconds
+        )
+      except CatchableError as exc:
+        doAssert false, "explorer mdns init failed: " & exc.msg
+      except Exception as exc:
+        doAssert false, "explorer mdns unexpected failure: " & exc.msg
+      res
+    explorerMdns.setPreferredIpv4("127.0.0.1")
+
+    let advertiserDM = DiscoveryManager()
+    advertiserDM.add(advertiserMdns)
+    advertiserDM.advertise(DiscoveryService(serviceWithoutDot))
+
+    let explorerDM = DiscoveryManager()
+    explorerDM.add(explorerMdns)
+
+    let query = explorerDM.request(DiscoveryService(serviceCanonical))
+    defer:
+      query.stop()
+      explorerDM.stop()
+      advertiserDM.stop()
+      await advertiserMdns.closeTransport()
+      await explorerMdns.closeTransport()
+
+    let fut = query.getPeer()
+    doAssert await fut.withTimeout(5.seconds), "mDNS trailing-dot discovery timed out"
+    let attrs = await fut
+    let discoveredPeer = attrs[PeerId]
+    check discoveredPeer == listener.switch.peerInfo.peerId
+    check attrs.getAll(MultiAddress).len > 0
+
+  asyncTest "mdns discovery recovers when query starts after initial cached announcement":
+    let listener = newGossipNode(@["/ip4/127.0.0.1/tcp/0"])
+    let dialer = newGossipNode(@["/ip4/127.0.0.1/tcp/0"])
+
+    await listener.switch.start()
+    await dialer.switch.start()
+    defer:
+      await listener.switch.stop()
+      await dialer.switch.stop()
+
+    let advertiserMdns = block:
+      var res: MdnsInterface
+      try:
+        res = MdnsInterface.new(
+          listener.switch.peerInfo,
+          serviceName = MdnsTestService,
+          announceInterval = 300.milliseconds,
+          queryInterval = 300.milliseconds,
+        )
+      except CatchableError as exc:
+        doAssert false, "advertiser mdns init failed: " & exc.msg
+      except Exception as exc:
+        doAssert false, "advertiser mdns unexpected failure: " & exc.msg
+      res
+    advertiserMdns.setPreferredIpv4("127.0.0.1")
+
+    let explorerMdns = block:
+      var res: MdnsInterface
+      try:
+        res = MdnsInterface.new(
+          dialer.switch.peerInfo,
+          serviceName = MdnsTestService,
+          announceInterval = 300.milliseconds,
+          queryInterval = 300.milliseconds,
+        )
+      except CatchableError as exc:
+        doAssert false, "explorer mdns init failed: " & exc.msg
+      except Exception as exc:
+        doAssert false, "explorer mdns unexpected failure: " & exc.msg
+      res
+    explorerMdns.setPreferredIpv4("127.0.0.1")
+
+    let advertiserDM = DiscoveryManager()
+    advertiserDM.add(advertiserMdns)
+    advertiserDM.advertise(DiscoveryService(MdnsTestService))
+
+    let explorerDM = DiscoveryManager()
+    explorerDM.add(explorerMdns)
+    # Start the explorer transport first so an early remote announcement can be
+    # cached before the actual discovery query is attached.
+    explorerDM.advertise(DiscoveryService(MdnsTestService))
+    await sleepAsync(1500.milliseconds)
+
+    let query = explorerDM.request(DiscoveryService(MdnsTestService))
+    defer:
+      query.stop()
+      explorerDM.stop()
+      advertiserDM.stop()
+      await advertiserMdns.closeTransport()
+      await explorerMdns.closeTransport()
+
+    let fut = query.getPeer()
+    doAssert await fut.withTimeout(5.seconds), "mDNS late-query discovery timed out"
+    let attrs = await fut
+    let discoveredPeer = attrs[PeerId]
+    check discoveredPeer == listener.switch.peerInfo.peerId
+    check attrs.getAll(MultiAddress).len > 0

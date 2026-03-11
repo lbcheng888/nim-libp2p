@@ -107,7 +107,10 @@ type
 proc add*(dm: DiscoveryManager, di: DiscoveryInterface) =
   dm.interfaces &= di
 
+  let previousCallback = di.onPeerFound
   di.onPeerFound = proc(pa: PeerAttributes) =
+    if not previousCallback.isNil:
+      previousCallback(pa)
     for query in dm.queries:
       if query.attr.match(pa):
         try:

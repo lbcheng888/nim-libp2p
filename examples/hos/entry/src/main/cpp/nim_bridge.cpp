@@ -251,7 +251,29 @@ bool ensureLibraryLoadedLocked()
         return true;
     }
     void *handle = nullptr;
+#if defined(NIMBRIDGE_EMBEDDED)
+    Dl_info selfInfo{};
+    if (dladdr(reinterpret_cast<void *>(ensureLibraryLoadedLocked), &selfInfo) != 0 && selfInfo.dli_fname != nullptr) {
+        dlerror();
+        handle = dlopen(selfInfo.dli_fname, RTLD_NOW);
+        if (handle != nullptr) {
+            g_lastLibPath = selfInfo.dli_fname;
+            OH_LOG_Print(LOG_APP, LOG_INFO, BRIDGE_LOG_DOMAIN, BRIDGE_LOG_TAG,
+                         "embedded bridge opened self %{public}s", selfInfo.dli_fname);
+        } else {
+            const char *err = dlerror();
+            if (err == nullptr) {
+                err = "unknown";
+            }
+            OH_LOG_Print(LOG_APP, LOG_WARN, BRIDGE_LOG_DOMAIN, BRIDGE_LOG_TAG,
+                         "embedded bridge self open failed: %{public}s", err);
+        }
+    }
+#endif
     for (const auto *candidate : kLibCandidates) {
+        if (handle != nullptr) {
+            break;
+        }
         dlerror();
         handle = dlopen(candidate, RTLD_NOW);
         if (handle != nullptr) {
@@ -2406,7 +2428,7 @@ static napi_module g_module = {
     .nm_flags = 0,
     .nm_filename = nullptr,
     .nm_register_func = RegisterModule,
-    .nm_modname = "nimbridge",
+    .nm_modname = "nimlibp2p",
     .nm_priv = nullptr,
     .reserved = {0}
 };

@@ -20,7 +20,10 @@ import ../wire
 import ../muxers/muxer
 import ../upgrademngrs/upgrade
 import ./transport as baseTransport
-import tls/certificate
+when defined(libp2p_pure_crypto):
+  import tls/certificate_pure
+else:
+  import tls/certificate
 import ../bandwidthmanager
 
 export multiaddress
