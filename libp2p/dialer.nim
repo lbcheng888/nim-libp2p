@@ -45,20 +45,24 @@ type Dialer* = ref object of Dial
   nameResolver: NameResolver
   gater: ConnectionGater
 
-proc addrQuicPriority(ma: MultiAddress): int =
+proc addrStablePriority(ma: MultiAddress): int =
   let lower = ($ma).toLowerAscii()
-  if lower.contains("/quic"):
+  if lower.contains("/tcp/"):
     return 0
-  if lower.contains("/udp/"):
+  if lower.contains("/quic-v1"):
     return 1
-  return 2
+  if lower.contains("/quic"):
+    return 2
+  if lower.contains("/udp/"):
+    return 3
+  return 4
 
-proc preferQuicAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
+proc preferStableAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
   if addrs.len <= 1:
     return addrs
   var indexed: seq[(int, int, MultiAddress)] = @[]
   for idx, addr in addrs:
-    indexed.add((addrQuicPriority(addr), idx, addr))
+    indexed.add((addrStablePriority(addr), idx, addr))
   indexed.sort(proc(a, b: (int, int, MultiAddress)): int =
     result = cmp(a[0], b[0])
     if result == 0:
@@ -216,7 +220,7 @@ method dialAndUpgrade*(
   debug "Dialing peer", peerId = peerId.get(default(PeerId)), addrs
   var lastErr: ref CatchableError = nil
   var lastMsg = ""
-  let orderedAddrs = preferQuicAddrs(addrs)
+  let orderedAddrs = preferStableAddrs(addrs)
   for rawAddress in orderedAddrs:
     # resolve potential dnsaddr
     let addresses = await self.expandDnsAddr(peerId, rawAddress)

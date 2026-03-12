@@ -58,7 +58,7 @@ proc onPacketSent*(
   of caCubic:
     controller.cubic.onPacketSent(bytes, ackEliciting)
   of caBbr:
-    controller.bbr.onPacketSent(bytes, appLimited)
+    controller.bbr.onPacketSent(bytes, ackEliciting, appLimited)
     if sendTimeUs != 0 and ackEliciting:
       controller.pacing.commitSend(sendTimeUs, bytes)
 
@@ -86,6 +86,28 @@ proc onLost*(
   of caBbr:
     controller.bbr.onDataLost(loss)
     controller.pacing.onLoss()
+
+proc onProbeTimeout*(
+    controller: var CongestionController
+  ) =
+  ## PTO 触发时执行最小窗口回退。
+  case controller.algorithm
+  of caCubic:
+    controller.cubic.onProbeTimeout()
+  of caBbr:
+    controller.bbr.onProbeTimeout()
+    controller.pacing.onLoss()
+
+proc grantExemptions*(
+    controller: var CongestionController;
+    count: uint8
+  ) =
+  ## 为 PTO probe 等特殊发送保留临时额度。
+  case controller.algorithm
+  of caCubic:
+    controller.cubic.grantExemptions(count)
+  of caBbr:
+    controller.bbr.grantExemptions(count)
 
 proc canSend*(controller: CongestionController): bool =
   ## 是否允许继续发包。

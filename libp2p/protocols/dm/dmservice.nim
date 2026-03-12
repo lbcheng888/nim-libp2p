@@ -47,6 +47,16 @@ proc stringToBytes(text: string): seq[byte] =
 proc nowMillis(): int64 =
   int64(epochTime() * 1000)
 
+proc closeConnSoon(conn: Connection) =
+  if conn.isNil:
+    return
+  proc runner() {.async.} =
+    try:
+      await conn.close()
+    except CatchableError:
+      discard
+  asyncSpawn runner()
+
 proc jsonGetStr(node: JsonNode, key: string, defaultVal = ""): string =
   if node.kind == JObject and node.hasKey(key) and node[key].kind == JString:
     return node[key].getStr()
@@ -341,10 +351,7 @@ proc send*(
     return (false, exc.msg)
 
   if not ackRequested or messageId.len == 0:
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
+    closeConnSoon(conn)
     return (true, "")
 
   let ackFuture = conn.readLp(svc.maxAckBytes)
@@ -363,27 +370,18 @@ proc send*(
 
   if not completed:
     debug "direct message ack timeout", peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
+    closeConnSoon(conn)
     return (false, "ack timeout")
 
   var ackBytes: seq[byte]
   try:
     ackBytes = await ackFuture
   except CatchableError as exc:
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
+    closeConnSoon(conn)
     return (false, exc.msg)
 
   let ackResult = parseAckPayload(ackBytes)
-  try:
-    await conn.close()
-  except CatchableError:
-    discard
+  closeConnSoon(conn)
 
   if not ackResult.ok or ackResult.mid != messageId:
     warn "direct message received invalid ack", peer = $peer, expected = messageId, received = ackResult.mid

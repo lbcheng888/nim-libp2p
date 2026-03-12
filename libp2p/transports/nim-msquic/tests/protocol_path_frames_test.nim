@@ -22,3 +22,24 @@ suite "QUIC path frames":
     let parsed = parsePathResponseFrame(encoded, pos)
     check pos == encoded.len
     check parsed.data == response
+
+  test "NEW_CONNECTION_ID round-trips":
+    let cid = @[0xAA'u8, 0xBB'u8, 0xCC'u8, 0xDD'u8]
+    var token: array[16, byte]
+    for i in 0 ..< 16:
+      token[i] = byte(0x30 + i)
+    let encoded = encodeNewConnectionIdFrame(7'u64, 3'u64, cid, token)
+    var pos = 0
+    let parsed = parseNewConnectionIdFrame(encoded, pos)
+    check pos == encoded.len
+    check parsed.sequence == 7'u64
+    check parsed.retirePriorTo == 3'u64
+    check parsed.connectionId == cid
+    check parsed.statelessResetToken == token
+
+  test "RETIRE_CONNECTION_ID round-trips":
+    let encoded = encodeRetireConnectionIdFrame(5'u64)
+    var pos = 0
+    let parsed = parseRetireConnectionIdFrame(encoded, pos)
+    check pos == encoded.len
+    check parsed.sequence == 5'u64
