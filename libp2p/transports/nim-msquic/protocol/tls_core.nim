@@ -20,6 +20,27 @@ type
   Iv = seq[byte]
   Key = seq[byte]
   HpKey = seq[byte]
+
+  HandshakeMessage* = object
+    msgType*: byte
+    raw*: seq[byte]
+    body*: seq[byte]
+
+  QuicTransportParameters* = object
+    present*: bool
+    maxIdleTimeoutMs*: uint64
+    maxUdpPayloadSize*: uint64
+    initialMaxData*: uint64
+    initialMaxStreamDataBidiLocal*: uint64
+    initialMaxStreamDataBidiRemote*: uint64
+    initialMaxStreamDataUni*: uint64
+    initialMaxStreamsBidi*: uint64
+    initialMaxStreamsUni*: uint64
+    ackDelayExponent*: uint64
+    maxAckDelayMs*: uint64
+    activeConnectionIdLimit*: uint64
+    disableActiveMigration*: bool
+    initialSourceConnectionId*: seq[byte]
   
   InitialSecrets* = object
     clientSecret*: Secret
@@ -49,67 +70,144 @@ const
   
   # Label prefixes
   LabelPrefix = "tls13 "
+  HandshakeTypeClientHello* = 0x01'u8
+  HandshakeTypeNewSessionTicket* = 0x04'u8
+  HandshakeTypeServerHello* = 0x02'u8
+  HandshakeTypeFinished* = 0x14'u8
+  ExtQuicTransportParameters = 0x0039'u16
+  ExtBuiltinResumptionTicket = 0xFFA0'u16
+  ExtBuiltinResumeAccepted = 0xFFA1'u16
+  ExtBuiltinResumptionBinder = 0xFFA2'u16
+  ExtBuiltinZeroRttAccepted = 0xFFA3'u16
+  ExtBuiltinTicketAge = 0xFFA4'u16
+  ExtTlsEarlyData = 0x002A'u16
 
-# --- HKDF Helpers ---
+  TpMaxIdleTimeout = 0x01'u64
+  TpMaxUdpPayloadSize = 0x03'u64
+  TpInitialMaxData = 0x04'u64
+  TpInitialMaxStreamDataBidiLocal = 0x05'u64
+  TpInitialMaxStreamDataBidiRemote = 0x06'u64
+  TpInitialMaxStreamDataUni = 0x07'u64
+  TpInitialMaxStreamsBidi = 0x08'u64
+  TpInitialMaxStreamsUni = 0x09'u64
+  TpAckDelayExponent = 0x0A'u64
+  TpMaxAckDelay = 0x0B'u64
+  TpDisableActiveMigration = 0x0C'u64
+  TpActiveConnectionIdLimit = 0x0E'u64
+  TpInitialSourceConnectionId = 0x0F'u64
 
-proc hkdfExpandLabel[T](secret: openArray[byte], label: string, context: openArray[byte], length: static int): array[length, byte] =
-  # RFC 8446 Section 7.1. Key Schedule Context
-  # HkdfLabel { length, label<7..255>, context<0..255> }
-  var hkdfLabel: seq[byte] = @[]
-  
-  # Length (uint16)
-  var lenNet: uint16
-  var lenHost = uint16(length)
-  bigEndian16(addr lenNet, addr lenHost)
-  hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
-  
-  # Label (opaque<7..255>) -> "tls13 " + label
-  let fullLabel = LabelPrefix & label
-  hkdfLabel.add(byte(fullLabel.len))
-  for c in fullLabel: hkdfLabel.add(byte(c))
-  
-  # Context (opaque<0..255>)
-  hkdfLabel.add(byte(context.len))
-  hkdfLabel.add(context)
-  
-  var outKey: array[length, byte]
-  var outArr: array[1, array[length, byte]]
-  
-  # Using generic HKDF from crypto/hkdf.nim which expects specific signature
-  # We use a localized version of expand since existing 'hkdf' proc does Extract+Expand combined
-  # But here we need Expand only if we already have the PRK (pseudo random key).
-  # However, for simplicity and since `hkdf.nim` exposes a combined one,
-  # we might need to manually call BearSSL if we want pure Expand.
-  # WA: Using the provided `hkdf` from `libp2p/crypto/hkdf.nim` behaves as Extract+Expand.
-  # RFC 9001 details:
-  # Initial Secret = HKDF-Extract(salt, client_dst_connection_id)
-  # Client Initial Secret = HKDF-Expand-Label(Initial Secret, "client in", "", 32)
-  # Key = HKDF-Expand-Label(Client Initial Secret, "quic key", "", 16)
-  
-  # Since we don't have a pure Expand exposed easily in `hkdf.nim` (it does both),
-  # we will use BearSSL APIs directly for fine-grained control if needed, 
-  # OR misuse the `hkdf` proc with empty salt if appropriate (though Extract with empty salt != generic Expand).
-  
-  # Let's direct access generic BearSSL kdf for robustness as used in `hkdf.nim`.
-  var ctx: HkdfContext
-  hkdfInit(ctx, addr sha256Vtable, nil, 0) # Fake init
-  
-  # We assume `secret` IS the PRK for Expand step.
-  # We skip Extract step by manually injecting PRK ? No, BearSSL `hkdfInit` does Extract.
-  # To do Expand-Only, we'd need to bypass `hkdfInit` logic or provide it as PRK.
-  # Actually, `hkdf.nim` is: Init(Extract) -> Inject(IKM) -> Flip -> Produce(Expand).
-  
-  # RFC 5869: If salt checks out, we produce PRK.
-  # For "Expand Only", we treat the input secret as the PRK. 
-  # BearSSL's `hkdfFlip` prepares for expansion.
-  # We might need to implement a small helper here to do Expand-Label cleanly using existing libs.
-  # FOR SKELETON: We will stick to `hkdf` proc if possible or implement a mini one.
-  
-  # Let's implement a clean `hkdfExpand` using `hmac`?
-  # Or just use the `hkdf` wrapper and assume we re-extract. (Suboptimal).
-  
-  # CORRECT PATH: Re-implement lightweight Expand using HMAC-SHA256 from nimcrypto.
-  discard
+proc appendVarInt(buf: var seq[byte]; val: uint64) =
+  if val <= 63:
+    buf.add(byte(val))
+  elif val <= 16383:
+    var tmp = uint16(val) or 0x4000'u16
+    var outVal: uint16
+    bigEndian16(addr outVal, addr tmp)
+    buf.add(cast[ptr array[2, byte]](addr outVal)[])
+  elif val <= 1073741823:
+    var tmp = uint32(val) or 0x80000000'u32
+    var outVal: uint32
+    bigEndian32(addr outVal, addr tmp)
+    buf.add(cast[ptr array[4, byte]](addr outVal)[])
+  else:
+    var tmp = val or 0xC000000000000000'u64
+    var outVal: uint64
+    bigEndian64(addr outVal, addr tmp)
+    buf.add(cast[ptr array[8, byte]](addr outVal)[])
+
+proc readVarIntAt(data: openArray[byte]; pos: var int): uint64 =
+  if pos >= data.len:
+    return 0'u64
+  let first = data[pos]
+  let prefix = first shr 6
+  let length =
+    case prefix
+    of 0'u8: 1
+    of 1'u8: 2
+    of 2'u8: 4
+    else: 8
+  if pos + length > data.len:
+    pos = data.len
+    return 0'u64
+  case length
+  of 1:
+    result = uint64(first and 0x3F'u8)
+  of 2:
+    result = (uint64(first and 0x3F'u8) shl 8) or uint64(data[pos + 1])
+  of 4:
+    result = (uint64(first and 0x3F'u8) shl 24) or
+      (uint64(data[pos + 1]) shl 16) or
+      (uint64(data[pos + 2]) shl 8) or
+      uint64(data[pos + 3])
+  else:
+    result = (uint64(first and 0x3F'u8) shl 56) or
+      (uint64(data[pos + 1]) shl 48) or
+      (uint64(data[pos + 2]) shl 40) or
+      (uint64(data[pos + 3]) shl 32) or
+      (uint64(data[pos + 4]) shl 24) or
+      (uint64(data[pos + 5]) shl 16) or
+      (uint64(data[pos + 6]) shl 8) or
+      uint64(data[pos + 7])
+  pos += length
+
+proc encodeHandshakeMessage(msgType: byte; body: openArray[byte]): seq[byte] =
+  result = @[msgType,
+    byte((body.len shr 16) and 0xFF),
+    byte((body.len shr 8) and 0xFF),
+    byte(body.len and 0xFF)]
+  result.add(body)
+
+proc appendUint16BE(buf: var seq[byte]; value: uint16) =
+  var outVal: uint16
+  var host = value
+  bigEndian16(addr outVal, addr host)
+  buf.add(cast[ptr array[2, byte]](addr outVal)[])
+
+proc appendUint32BE(buf: var seq[byte]; value: uint32) =
+  var outVal: uint32
+  var host = value
+  bigEndian32(addr outVal, addr host)
+  buf.add(cast[ptr array[4, byte]](addr outVal)[])
+
+proc readUint16BE(data: openArray[byte]; pos: var int): uint16 =
+  if pos + 2 > data.len:
+    return 0'u16
+  result = (uint16(data[pos]) shl 8) or uint16(data[pos + 1])
+  pos += 2
+
+proc readUint32BE(data: openArray[byte]; pos: var int): uint32 =
+  if pos + 4 > data.len:
+    return 0'u32
+  result = (uint32(data[pos]) shl 24) or
+    (uint32(data[pos + 1]) shl 16) or
+    (uint32(data[pos + 2]) shl 8) or
+    uint32(data[pos + 3])
+  pos += 4
+
+proc appendExtension(extBuf: var seq[byte]; extType: uint16; payload: openArray[byte]) =
+  extBuf.appendUint16BE(extType)
+  extBuf.appendUint16BE(uint16(min(payload.len, high(uint16).int)))
+  extBuf.add(payload[0 ..< min(payload.len, high(uint16).int)])
+
+type
+  NewSessionTicket* = object
+    present*: bool
+    ticketLifetimeSec*: uint32
+    ticketAgeAdd*: uint32
+    maxEarlyData*: uint32
+    ticket*: seq[byte]
+
+  BuiltinResumptionOffer* = object
+    ticket*: seq[byte]
+    binder*: seq[byte]
+    agePresent*: bool
+    obfuscatedTicketAge*: uint32
+    earlyDataRequested*: bool
+
+  ZeroRttMaterial* = object
+    key*: seq[byte]
+    iv*: seq[byte]
+    hp*: seq[byte]
 
 # --- Initial Secrets ---
 
@@ -156,20 +254,84 @@ proc hkdfExpand[Len: static int](prk: openArray[byte], info: openArray[byte]): a
   for i in 0 ..< Len:
     result[i] = okm[i]
 
-proc deriveSecret[Len: static int](secret: openArray[byte], label: string): array[Len, byte] =
+proc deriveSecretWithContext[Len: static int](secret: openArray[byte];
+    label: string; context: openArray[byte]): array[Len, byte] =
   var hkdfLabel: seq[byte] = @[]
   var lenNet: uint16
   var lenHost = uint16(Len)
   bigEndian16(addr lenNet, addr lenHost)
   hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
-  
+
   let fullLabel = LabelPrefix & label
   hkdfLabel.add(byte(fullLabel.len))
-  for c in fullLabel: hkdfLabel.add(byte(c))
-  
-  hkdfLabel.add(0'u8) # Length of context (empty)
-  
-  return hkdfExpand[Len](secret, hkdfLabel)
+  for c in fullLabel:
+    hkdfLabel.add(byte(c))
+
+  hkdfLabel.add(byte(context.len))
+  hkdfLabel.add(context)
+  hkdfExpand[Len](secret, hkdfLabel)
+
+proc deriveSecret[Len: static int](secret: openArray[byte], label: string): array[Len, byte] =
+  deriveSecretWithContext[Len](secret, label, [])
+
+proc defaultQuicTransportParameters*(initialSourceConnectionId: openArray[byte]): QuicTransportParameters =
+  result.present = true
+  result.maxIdleTimeoutMs = 30_000'u64
+  result.maxUdpPayloadSize = 1_200'u64
+  result.initialMaxData = 1_048_576'u64
+  result.initialMaxStreamDataBidiLocal = 262_144'u64
+  result.initialMaxStreamDataBidiRemote = 262_144'u64
+  result.initialMaxStreamDataUni = 262_144'u64
+  result.initialMaxStreamsBidi = 64'u64
+  result.initialMaxStreamsUni = 64'u64
+  result.ackDelayExponent = 3'u64
+  result.maxAckDelayMs = 25'u64
+  result.activeConnectionIdLimit = 4'u64
+  result.disableActiveMigration = false
+  result.initialSourceConnectionId = @initialSourceConnectionId
+
+proc appendTransportParamValue(buf: var seq[byte]; paramId, value: uint64) =
+  var encodedValue: seq[byte] = @[]
+  appendVarInt(encodedValue, value)
+  appendVarInt(buf, paramId)
+  appendVarInt(buf, uint64(encodedValue.len))
+  buf.add(encodedValue)
+
+proc encodeQuicTransportParameters*(params: QuicTransportParameters): seq[byte] =
+  appendTransportParamValue(result, TpMaxIdleTimeout, params.maxIdleTimeoutMs)
+  appendTransportParamValue(result, TpMaxUdpPayloadSize, params.maxUdpPayloadSize)
+  appendTransportParamValue(result, TpInitialMaxData, params.initialMaxData)
+  appendTransportParamValue(result, TpInitialMaxStreamDataBidiLocal, params.initialMaxStreamDataBidiLocal)
+  appendTransportParamValue(result, TpInitialMaxStreamDataBidiRemote, params.initialMaxStreamDataBidiRemote)
+  appendTransportParamValue(result, TpInitialMaxStreamDataUni, params.initialMaxStreamDataUni)
+  appendTransportParamValue(result, TpInitialMaxStreamsBidi, params.initialMaxStreamsBidi)
+  appendTransportParamValue(result, TpInitialMaxStreamsUni, params.initialMaxStreamsUni)
+  appendTransportParamValue(result, TpAckDelayExponent, params.ackDelayExponent)
+  appendTransportParamValue(result, TpMaxAckDelay, params.maxAckDelayMs)
+  appendTransportParamValue(result, TpActiveConnectionIdLimit, params.activeConnectionIdLimit)
+  if params.disableActiveMigration:
+    appendVarInt(result, TpDisableActiveMigration)
+    appendVarInt(result, 0'u64)
+  if params.initialSourceConnectionId.len > 0:
+    appendVarInt(result, TpInitialSourceConnectionId)
+    appendVarInt(result, uint64(params.initialSourceConnectionId.len))
+    result.add(params.initialSourceConnectionId)
+
+proc transportParametersEqual*(lhs, rhs: QuicTransportParameters): bool =
+  lhs.present == rhs.present and
+    lhs.maxIdleTimeoutMs == rhs.maxIdleTimeoutMs and
+    lhs.maxUdpPayloadSize == rhs.maxUdpPayloadSize and
+    lhs.initialMaxData == rhs.initialMaxData and
+    lhs.initialMaxStreamDataBidiLocal == rhs.initialMaxStreamDataBidiLocal and
+    lhs.initialMaxStreamDataBidiRemote == rhs.initialMaxStreamDataBidiRemote and
+    lhs.initialMaxStreamDataUni == rhs.initialMaxStreamDataUni and
+    lhs.initialMaxStreamsBidi == rhs.initialMaxStreamsBidi and
+    lhs.initialMaxStreamsUni == rhs.initialMaxStreamsUni and
+    lhs.ackDelayExponent == rhs.ackDelayExponent and
+    lhs.maxAckDelayMs == rhs.maxAckDelayMs and
+    lhs.activeConnectionIdLimit == rhs.activeConnectionIdLimit and
+    lhs.disableActiveMigration == rhs.disableActiveMigration and
+    lhs.initialSourceConnectionId == rhs.initialSourceConnectionId
 
 proc deriveInitialSecrets*(dcid: openArray[byte]): InitialSecrets =
   # 1. Initial Secret = HKDF-Extract(InitialSalt, DCID)
@@ -332,7 +494,364 @@ proc generateKeyShare*(): ClientKeyShare =
   # 3. Compute Public Key
   result.publicKey = public(result.privateKey)
 
-proc encodeClientHello*(destCid: openArray[byte], keyShare: ClientKeyShare): seq[byte] =
+proc splitHandshakeMessages*(data: openArray[byte]): seq[HandshakeMessage] =
+  var pos = 0
+  while pos + 4 <= data.len:
+    let msgType = data[pos]
+    let length = (int(data[pos + 1]) shl 16) or (int(data[pos + 2]) shl 8) or int(data[pos + 3])
+    let endPos = pos + 4 + length
+    if endPos > data.len:
+      break
+    result.add(HandshakeMessage(
+      msgType: msgType,
+      raw: @(data[pos ..< endPos]),
+      body: @(data[pos + 4 ..< endPos])
+    ))
+    pos = endPos
+
+proc extractExtensionPayload(handshakeBytes: openArray[byte]; extTypeTarget: uint16): seq[byte] =
+  var idx = 0
+  if handshakeBytes.len < 4:
+    return @[]
+  let msgType = handshakeBytes[0]
+  idx += 4
+  case msgType
+  of HandshakeTypeClientHello:
+    idx += 34
+    if idx >= handshakeBytes.len:
+      return @[]
+    let sessIdLen = int(handshakeBytes[idx])
+    idx += 1 + sessIdLen
+    if idx + 2 > handshakeBytes.len:
+      return @[]
+    let cipherLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+    idx += 2 + cipherLen
+    if idx >= handshakeBytes.len:
+      return @[]
+    let compressionLen = int(handshakeBytes[idx])
+    idx += 1 + compressionLen
+  of HandshakeTypeServerHello:
+    idx += 34
+    if idx >= handshakeBytes.len:
+      return @[]
+    let sessIdLen = int(handshakeBytes[idx])
+    idx += 1 + sessIdLen
+    idx += 3
+  else:
+    return @[]
+
+  if idx + 2 > handshakeBytes.len:
+    return @[]
+  let extLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+  idx += 2
+  let limit = min(handshakeBytes.len, idx + extLen)
+  while idx + 4 <= limit:
+    let extType = (uint16(handshakeBytes[idx]) shl 8) or uint16(handshakeBytes[idx + 1])
+    let length = (int(handshakeBytes[idx + 2]) shl 8) or int(handshakeBytes[idx + 3])
+    idx += 4
+    if idx + length > limit:
+      return @[]
+    if extType == extTypeTarget:
+      return @(handshakeBytes[idx ..< idx + length])
+    idx += length
+  @[]
+
+proc hasExtension(handshakeBytes: openArray[byte]; extTypeTarget: uint16): bool =
+  var idx = 0
+  if handshakeBytes.len < 4:
+    return false
+  let msgType = handshakeBytes[0]
+  idx += 4
+  case msgType
+  of HandshakeTypeClientHello:
+    idx += 34
+    if idx >= handshakeBytes.len:
+      return false
+    let sessIdLen = int(handshakeBytes[idx])
+    idx += 1 + sessIdLen
+    if idx + 2 > handshakeBytes.len:
+      return false
+    let cipherLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+    idx += 2 + cipherLen
+    if idx >= handshakeBytes.len:
+      return false
+    let compressionLen = int(handshakeBytes[idx])
+    idx += 1 + compressionLen
+  of HandshakeTypeServerHello:
+    idx += 34
+    if idx >= handshakeBytes.len:
+      return false
+    let sessIdLen = int(handshakeBytes[idx])
+    idx += 1 + sessIdLen
+    idx += 3
+  else:
+    return false
+
+  if idx + 2 > handshakeBytes.len:
+    return false
+  let extLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+  idx += 2
+  let limit = min(handshakeBytes.len, idx + extLen)
+  while idx + 4 <= limit:
+    let extType = (uint16(handshakeBytes[idx]) shl 8) or uint16(handshakeBytes[idx + 1])
+    let length = (int(handshakeBytes[idx + 2]) shl 8) or int(handshakeBytes[idx + 3])
+    idx += 4
+    if idx + length > limit:
+      return false
+    if extType == extTypeTarget:
+      return true
+    idx += length
+  false
+
+proc stripExtension(handshakeBytes: openArray[byte]; extTypeTarget: uint16): seq[byte] =
+  result = @handshakeBytes
+  if handshakeBytes.len < 4:
+    return
+  var idx = 4
+  case handshakeBytes[0]
+  of HandshakeTypeClientHello:
+    idx += 34
+    if idx >= handshakeBytes.len:
+      return
+    let sessIdLen = int(handshakeBytes[idx])
+    idx += 1 + sessIdLen
+    if idx + 2 > handshakeBytes.len:
+      return
+    let cipherLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+    idx += 2 + cipherLen
+    if idx >= handshakeBytes.len:
+      return
+    let compressionLen = int(handshakeBytes[idx])
+    idx += 1 + compressionLen
+  of HandshakeTypeServerHello:
+    idx += 34
+    if idx >= handshakeBytes.len:
+      return
+    let sessIdLen = int(handshakeBytes[idx])
+    idx += 1 + sessIdLen
+    idx += 3
+  else:
+    return
+
+  if idx + 2 > handshakeBytes.len:
+    return
+  let extLenPos = idx
+  let extLen = (int(handshakeBytes[idx]) shl 8) or int(handshakeBytes[idx + 1])
+  idx += 2
+  let limit = min(handshakeBytes.len, idx + extLen)
+  var rebuiltExts: seq[byte] = @[]
+  while idx + 4 <= limit:
+    let extHeaderStart = idx
+    let extType = (uint16(handshakeBytes[idx]) shl 8) or uint16(handshakeBytes[idx + 1])
+    let length = (int(handshakeBytes[idx + 2]) shl 8) or int(handshakeBytes[idx + 3])
+    idx += 4
+    if idx + length > limit:
+      return @handshakeBytes
+    if extType != extTypeTarget:
+      rebuiltExts.add(handshakeBytes[extHeaderStart ..< idx + length])
+    idx += length
+  result.setLen(extLenPos + 2)
+  result.add(rebuiltExts)
+  let newExtLen = rebuiltExts.len
+  result[extLenPos] = byte((newExtLen shr 8) and 0xFF)
+  result[extLenPos + 1] = byte(newExtLen and 0xFF)
+  let msgLen = result.len - 4
+  result[1] = byte((msgLen shr 16) and 0xFF)
+  result[2] = byte((msgLen shr 8) and 0xFF)
+  result[3] = byte(msgLen and 0xFF)
+
+proc parseQuicTransportParameters*(handshakeBytes: openArray[byte]): QuicTransportParameters =
+  let payload = extractExtensionPayload(handshakeBytes, ExtQuicTransportParameters)
+  if payload.len == 0:
+    return
+  result.present = true
+  var pos = 0
+  while pos < payload.len:
+    let paramId = readVarIntAt(payload, pos)
+    let paramLen = int(readVarIntAt(payload, pos))
+    if pos + paramLen > payload.len:
+      result.present = false
+      return
+    case paramId
+    of TpDisableActiveMigration:
+      result.disableActiveMigration = true
+    of TpInitialSourceConnectionId:
+      result.initialSourceConnectionId = @(payload[pos ..< pos + paramLen])
+    else:
+      var innerPos = pos
+      let value = readVarIntAt(payload, innerPos)
+      if innerPos == pos + paramLen:
+        case paramId
+        of TpMaxIdleTimeout: result.maxIdleTimeoutMs = value
+        of TpMaxUdpPayloadSize: result.maxUdpPayloadSize = value
+        of TpInitialMaxData: result.initialMaxData = value
+        of TpInitialMaxStreamDataBidiLocal: result.initialMaxStreamDataBidiLocal = value
+        of TpInitialMaxStreamDataBidiRemote: result.initialMaxStreamDataBidiRemote = value
+        of TpInitialMaxStreamDataUni: result.initialMaxStreamDataUni = value
+        of TpInitialMaxStreamsBidi: result.initialMaxStreamsBidi = value
+        of TpInitialMaxStreamsUni: result.initialMaxStreamsUni = value
+        of TpAckDelayExponent: result.ackDelayExponent = value
+        of TpMaxAckDelay: result.maxAckDelayMs = value
+        of TpActiveConnectionIdLimit: result.activeConnectionIdLimit = value
+        else: discard
+    pos += paramLen
+
+proc encodeFinished*(baseSecret: openArray[byte]; transcriptHash: openArray[byte]): seq[byte] =
+  let finishedKey = deriveSecretWithContext[32](baseSecret, "finished", [])
+  let verifyData = hmacSha256(finishedKey, transcriptHash)
+  encodeHandshakeMessage(HandshakeTypeFinished, verifyData)
+
+proc verifyFinished*(baseSecret: openArray[byte]; transcriptHash: openArray[byte];
+    finishedMessage: openArray[byte]): bool =
+  let messages = splitHandshakeMessages(finishedMessage)
+  if messages.len != 1 or messages[0].msgType != HandshakeTypeFinished:
+    return false
+  let expected = encodeFinished(baseSecret, transcriptHash)
+  if expected.len != finishedMessage.len:
+    return false
+  var diff = 0'u8
+  for idx in 0 ..< expected.len:
+    diff = diff or (expected[idx] xor finishedMessage[idx])
+  diff == 0'u8
+
+proc extractClientResumptionTicket*(clientHelloBytes: openArray[byte]): seq[byte] =
+  extractExtensionPayload(clientHelloBytes, ExtBuiltinResumptionTicket)
+
+proc extractClientResumptionBinder*(clientHelloBytes: openArray[byte]): seq[byte] =
+  extractExtensionPayload(clientHelloBytes, ExtBuiltinResumptionBinder)
+
+proc extractClientResumptionTicketAge*(clientHelloBytes: openArray[byte];
+    obfuscatedAge: var uint32): bool =
+  let payload = extractExtensionPayload(clientHelloBytes, ExtBuiltinTicketAge)
+  if payload.len != 4:
+    return false
+  var pos = 0
+  obfuscatedAge = readUint32BE(payload, pos)
+  true
+
+proc clientHelloRequestsEarlyData*(clientHelloBytes: openArray[byte]): bool =
+  hasExtension(clientHelloBytes, ExtTlsEarlyData)
+
+proc serverHelloSessionResumed*(serverHelloBytes: openArray[byte]): bool =
+  let payload = extractExtensionPayload(serverHelloBytes, ExtBuiltinResumeAccepted)
+  payload.len > 0 and payload[0] == 1'u8
+
+proc serverHelloZeroRttAccepted*(serverHelloBytes: openArray[byte]): bool =
+  let payload = extractExtensionPayload(serverHelloBytes, ExtBuiltinZeroRttAccepted)
+  payload.len > 0 and payload[0] == 1'u8
+
+proc deriveBuiltinBinderKey(ticket: openArray[byte]): array[32, byte] =
+  let pskSeed = sha256Digest(ticket)
+  deriveSecretWithContext[32](pskSeed, "builtin binder", [])
+
+proc computeBuiltinResumptionBinder*(clientHelloWithoutBinder: openArray[byte];
+    ticket: openArray[byte]): seq[byte] =
+  if ticket.len == 0:
+    return @[]
+  let binderKey = deriveBuiltinBinderKey(ticket)
+  let transcriptHash = sha256Digest(clientHelloWithoutBinder)
+  let binder = hmacSha256(binderKey, transcriptHash)
+  @binder
+
+proc verifyBuiltinResumptionBinder*(clientHelloBytes: openArray[byte];
+    ticket: openArray[byte]; binder: openArray[byte]): bool =
+  if ticket.len == 0 or binder.len == 0:
+    return false
+  let stripped = stripExtension(clientHelloBytes, ExtBuiltinResumptionBinder)
+  let expected = computeBuiltinResumptionBinder(stripped, ticket)
+  if expected.len != binder.len:
+    return false
+  var diff = 0'u8
+  for idx in 0 ..< expected.len:
+    diff = diff or (expected[idx] xor binder[idx])
+  diff == 0'u8
+
+proc extractBuiltinResumptionOffer*(clientHelloBytes: openArray[byte]): BuiltinResumptionOffer =
+  result.ticket = extractClientResumptionTicket(clientHelloBytes)
+  result.binder = extractClientResumptionBinder(clientHelloBytes)
+  result.agePresent = extractClientResumptionTicketAge(
+    clientHelloBytes,
+    result.obfuscatedTicketAge
+  )
+  result.earlyDataRequested = clientHelloRequestsEarlyData(clientHelloBytes)
+
+proc encodeNewSessionTicket*(ticket: openArray[byte];
+    maxEarlyData: uint32 = 16_384'u32;
+    ticketAgeAdd: uint32 = 0'u32;
+    ticketLifetimeSec: uint32 = 600'u32): seq[byte] =
+  var body: seq[byte] = @[]
+  body.appendUint32BE(ticketLifetimeSec)
+  body.appendUint32BE(ticketAgeAdd)
+  body.add(0'u8)             # ticket_nonce len
+  body.appendUint16BE(uint16(min(ticket.len, high(uint16).int)))
+  body.add(ticket[0 ..< min(ticket.len, high(uint16).int)])
+
+  var extBuf: seq[byte] = @[]
+  if maxEarlyData > 0'u32:
+    var earlyDataPayload: seq[byte] = @[]
+    earlyDataPayload.appendUint32BE(maxEarlyData)
+    appendExtension(extBuf, ExtTlsEarlyData, earlyDataPayload)
+
+  body.appendUint16BE(uint16(extBuf.len))
+  body.add(extBuf)
+  encodeHandshakeMessage(HandshakeTypeNewSessionTicket, body)
+
+proc parseNewSessionTicket*(ticketMessage: openArray[byte]): NewSessionTicket =
+  let messages = splitHandshakeMessages(ticketMessage)
+  if messages.len != 1 or messages[0].msgType != HandshakeTypeNewSessionTicket:
+    return
+  let body = messages[0].body
+  if body.len < 4 + 4 + 1 + 2 + 2:
+    return
+  var pos = 0
+  result.present = true
+  result.ticketLifetimeSec = readUint32BE(body, pos)
+  result.ticketAgeAdd = readUint32BE(body, pos)
+  let nonceLen = int(body[pos])
+  inc pos
+  if pos + nonceLen + 2 > body.len:
+    result.present = false
+    return
+  pos += nonceLen
+  let ticketLen = int(readUint16BE(body, pos))
+  if pos + ticketLen + 2 > body.len:
+    result.present = false
+    return
+  result.ticket = @(body[pos ..< pos + ticketLen])
+  pos += ticketLen
+  let extLen = int(readUint16BE(body, pos))
+  if pos + extLen > body.len:
+    result.present = false
+    return
+  let extLimit = pos + extLen
+  while pos + 4 <= extLimit:
+    let extType = readUint16BE(body, pos)
+    let payloadLen = int(readUint16BE(body, pos))
+    if pos + payloadLen > extLimit:
+      result.present = false
+      return
+    if extType == ExtTlsEarlyData and payloadLen == 4:
+      var extPos = pos
+      result.maxEarlyData = readUint32BE(body, extPos)
+    pos += payloadLen
+
+proc deriveBuiltinZeroRttMaterial*(ticket: openArray[byte]): ZeroRttMaterial =
+  if ticket.len == 0:
+    return
+  let pskSeed = sha256Digest(ticket)
+  let zeroRttSecret = deriveSecretWithContext[32](pskSeed, "builtin zrt", [])
+  let key = deriveSecret[16](zeroRttSecret, "quic key")
+  let iv = deriveSecret[12](zeroRttSecret, "quic iv")
+  let hp = deriveSecret[16](zeroRttSecret, "quic hp")
+  result.key = @key
+  result.iv = @iv
+  result.hp = @hp
+
+proc encodeClientHelloBody(initialSourceCid: openArray[byte], keyShare: ClientKeyShare;
+    transportParams: QuicTransportParameters; randomBytesValue: openArray[byte];
+    resumptionTicket: seq[byte]; binderPayload: seq[byte];
+    requestEarlyData = true; includeTicketAge = false;
+    obfuscatedTicketAge = 0'u32): seq[byte] =
   # RFC 8446 ClientHello
   var buf: seq[byte] = @[]
   
@@ -348,9 +867,12 @@ proc encodeClientHello*(destCid: openArray[byte], keyShare: ClientKeyShare): seq
   buf.add([0x03'u8, 0x03])
   
   # Random: 32 bytes
-  var random: array[32, byte]
-  discard randomBytes(random)
-  buf.add(random)
+  if randomBytesValue.len == 32:
+    buf.add(randomBytesValue)
+  else:
+    var random: array[32, byte]
+    discard randomBytes(random)
+    buf.add(random)
   
   # Legacy Session ID: 0 length (or 32 bytes random if compatibility needed, often 0 for QUIC)
   buf.add(0x00'u8) 
@@ -400,17 +922,22 @@ proc encodeClientHello*(destCid: openArray[byte], keyShare: ClientKeyShare): seq
   extBuf.add(cast[ptr array[2, byte]](addr ksExtLenBe)[])
   extBuf.add(ksExt)
   
-  # 3. QUIC Transport Parameters (0x0039 or 0xffa5 for draft?)
-  # RFC 9000 uses 0x39. Required for QUIC handshake.
-  # Empty sequence for now? Or minimal?
-  # Minimal: initial_source_connection_id
-  # But we don't have full encoder here. 
-  # Skipping might cause server to abort, but let's try MINIMAL first for Skeleton.
-  # Actually, let's omit if possible, or add empty one.
-  # Extension Type: 0x39 (57)
-  # Extension Len: 0
-  extBuf.add([0x00'u8, 0x39]) 
-  extBuf.add([0x00'u8, 0x00])
+  let tpPayload =
+    if transportParams.present:
+      encodeQuicTransportParameters(transportParams)
+    else:
+      encodeQuicTransportParameters(defaultQuicTransportParameters(initialSourceCid))
+  appendExtension(extBuf, ExtQuicTransportParameters, tpPayload)
+  if resumptionTicket.len > 0:
+    appendExtension(extBuf, ExtBuiltinResumptionTicket, resumptionTicket)
+    if includeTicketAge:
+      var ticketAgePayload: seq[byte] = @[]
+      ticketAgePayload.appendUint32BE(obfuscatedTicketAge)
+      appendExtension(extBuf, ExtBuiltinTicketAge, ticketAgePayload)
+    if requestEarlyData:
+      appendExtension(extBuf, ExtTlsEarlyData, [])
+  if binderPayload.len > 0:
+    appendExtension(extBuf, ExtBuiltinResumptionBinder, binderPayload)
 
   # Extensions Length
   let extLen = uint16(extBuf.len)
@@ -426,7 +953,74 @@ proc encodeClientHello*(destCid: openArray[byte], keyShare: ClientKeyShare): seq
   
   return buf
 
-proc encodeServerHello*(keySharePublic: openArray[byte]): seq[byte] =
+proc encodeClientHello*(initialSourceCid: openArray[byte], keyShare: ClientKeyShare;
+    transportParams: QuicTransportParameters; resumptionTicket: seq[byte] = @[];
+    requestEarlyData = true; includeTicketAge = false;
+    obfuscatedTicketAge = 0'u32): seq[byte] =
+  var clientRandom: array[32, byte]
+  discard randomBytes(clientRandom)
+  result = encodeClientHelloBody(
+    initialSourceCid,
+    keyShare,
+    transportParams,
+    clientRandom,
+    resumptionTicket,
+    @[],
+    requestEarlyData,
+    includeTicketAge,
+    obfuscatedTicketAge
+  )
+  if resumptionTicket.len > 0:
+    let binder = computeBuiltinResumptionBinder(result, resumptionTicket)
+    result = encodeClientHelloBody(
+      initialSourceCid,
+      keyShare,
+      transportParams,
+      clientRandom,
+      resumptionTicket,
+      binder,
+      requestEarlyData,
+      includeTicketAge,
+      obfuscatedTicketAge
+    )
+
+proc encodeClientHelloWithBuiltinResumptionOverride*(initialSourceCid: openArray[byte];
+    keyShare: ClientKeyShare; transportParams: QuicTransportParameters;
+    binderSourceTicket: seq[byte]; ticketPayload: seq[byte];
+    tamperBinder = false; requestEarlyData = true;
+    includeTicketAge = false; obfuscatedTicketAge = 0'u32): seq[byte] =
+  var clientRandom: array[32, byte]
+  discard randomBytes(clientRandom)
+  result = encodeClientHelloBody(
+    initialSourceCid,
+    keyShare,
+    transportParams,
+    clientRandom,
+    ticketPayload,
+    @[],
+    requestEarlyData,
+    includeTicketAge,
+    obfuscatedTicketAge
+  )
+  if binderSourceTicket.len > 0:
+    var binder = computeBuiltinResumptionBinder(result, binderSourceTicket)
+    if tamperBinder and binder.len > 0:
+      binder[0] = binder[0] xor 0x5A'u8
+    result = encodeClientHelloBody(
+      initialSourceCid,
+      keyShare,
+      transportParams,
+      clientRandom,
+      ticketPayload,
+      binder,
+      requestEarlyData,
+      includeTicketAge,
+      obfuscatedTicketAge
+    )
+
+proc encodeServerHello*(keySharePublic: openArray[byte];
+    transportParams: QuicTransportParameters; sessionResumed = false;
+    zeroRttAccepted = false): seq[byte] =
   ## Minimal TLS 1.3 ServerHello for the builtin QUIC path.
   var buf: seq[byte] = @[]
 
@@ -459,7 +1053,16 @@ proc encodeServerHello*(keySharePublic: openArray[byte]): seq[byte] =
   extBuf.add(cast[ptr array[2, byte]](addr ksExtLenBe)[])
   extBuf.add(ksExt)
 
-  extBuf.add([0x00'u8, 0x39, 0x00, 0x00]) # empty QUIC transport parameters
+  let tpPayload =
+    if transportParams.present:
+      encodeQuicTransportParameters(transportParams)
+    else:
+      encodeQuicTransportParameters(defaultQuicTransportParameters(@[]))
+  appendExtension(extBuf, ExtQuicTransportParameters, tpPayload)
+  if sessionResumed:
+    appendExtension(extBuf, ExtBuiltinResumeAccepted, @[1'u8])
+  if zeroRttAccepted:
+    appendExtension(extBuf, ExtBuiltinZeroRttAccepted, @[1'u8])
 
   var extLenBe: uint16
   var extLenHost = uint16(extBuf.len)
@@ -516,22 +1119,6 @@ proc deriveHandshakeSecrets*(sharedSecret: Secret, helloHash: openArray[byte]): 
   # existing `deriveSecret` passes EMPTY context.
   # We need one that takes context.
   
-  proc deriveSecretWithContext[Len: static int](secret: openArray[byte], label: string, context: openArray[byte]): array[Len, byte] =
-    var hkdfLabel: seq[byte] = @[]
-    var lenNet: uint16
-    var lenHost = uint16(Len)
-    bigEndian16(addr lenNet, addr lenHost)
-    hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
-    
-    let fullLabel = LabelPrefix & label
-    hkdfLabel.add(byte(fullLabel.len))
-    for c in fullLabel: hkdfLabel.add(byte(c))
-    
-    hkdfLabel.add(byte(context.len))
-    hkdfLabel.add(context)
-    
-    return hkdfExpand[Len](secret, hkdfLabel)
-
   let derivedSecretArr = deriveSecretWithContext[32](earlySecret, "derived", emptyHash)
   let derivedSecret = @derivedSecretArr
   
@@ -572,22 +1159,6 @@ proc deriveApplicationSecrets*(handshakeSecret: Secret, handshakeHash: openArray
   # 2. Master Secret = HKDF-Extract(Derived Secret, 0)
   
   let emptyHash = [0xe3'u8, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55]
-
-  proc deriveSecretWithContext[Len: static int](secret: openArray[byte], label: string, context: openArray[byte]): array[Len, byte] =
-    var hkdfLabel: seq[byte] = @[]
-    var lenNet: uint16
-    var lenHost = uint16(Len)
-    bigEndian16(addr lenNet, addr lenHost)
-    hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
-    
-    let fullLabel = LabelPrefix & label
-    hkdfLabel.add(byte(fullLabel.len))
-    for c in fullLabel: hkdfLabel.add(byte(c))
-    
-    hkdfLabel.add(byte(context.len))
-    hkdfLabel.add(context)
-    
-    return hkdfExpand[Len](secret, hkdfLabel)
 
   let derivedSecretArr = deriveSecretWithContext[32](handshakeSecret, "derived", emptyHash)
   let derivedSecret = @derivedSecretArr

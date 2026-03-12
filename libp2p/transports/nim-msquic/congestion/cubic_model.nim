@@ -147,6 +147,8 @@ proc canSend*(model: CubicModel): bool =
 proc sendAllowance*(model: CubicModel): uint64 =
   if model.congestionWindow > model.bytesInFlight:
     uint64(model.congestionWindow - model.bytesInFlight)
+  elif model.exemptions > 0:
+    uint64(model.datagramPayloadBytes) * uint64(model.exemptions)
   else:
     0
 
@@ -156,12 +158,20 @@ proc onPacketSent*(
     ackEliciting: bool = true
   ) =
   ## 记录发送事件，更新飞行字节数。
+  if ackEliciting and model.exemptions > 0:
+    dec(model.exemptions)
   if ackEliciting:
     if model.bytesInFlight <= high(uint32) - bytes:
       model.bytesInFlight += bytes
     else:
       model.bytesInFlight = high(uint32)
   model.bytesInFlightMax = max(model.bytesInFlightMax, model.bytesInFlight)
+
+proc grantExemptions*(model: var CubicModel; count: uint8) =
+  if count == 0'u8:
+    return
+  let room = high(uint8) - model.exemptions
+  model.exemptions += min(count, room)
 
 proc onDataAcked*(model: var CubicModel, ack: AckEventSnapshot) =
   ## 依据 CUBIC 函数更新拥塞窗口。
@@ -234,8 +244,16 @@ proc onDataLost*(model: var CubicModel, loss: LossEventSnapshot) =
   model.windowMax = max(model.congestionWindow, model.computeMinCwnd())
 
   let minCwnd = model.computeMinCwnd()
-  model.slowStartThreshold = max(model.congestionWindow shr 1, minCwnd)
-  model.congestionWindow = max(model.slowStartThreshold, minCwnd)
+  if loss.persistentCongestion:
+    model.isInPersistentCongestion = true
+    model.slowStartThreshold = minCwnd
+    model.congestionWindow = minCwnd
+    model.windowMax = minCwnd
+    model.windowPrior = minCwnd
+  else:
+    model.isInPersistentCongestion = false
+    model.slowStartThreshold = max(model.congestionWindow shr 1, minCwnd)
+    model.congestionWindow = max(model.slowStartThreshold, minCwnd)
 
   model.updateKCubic()
   model.bytesInFlight = min(model.bytesInFlight, model.congestionWindow)

@@ -72,6 +72,17 @@ proc acquireMsQuicBridge*(options: MsQuicLoadOptions = MsQuicLoadOptions()):
       errMsg = "failed to load MsQuic runtime bridge"
     MsQuicBridgeResult(success: false, bridge: nil, error: errMsg)
 
+proc closeBridgeQuietly(bridge: RuntimeBridge) {.raises: [].} =
+  if bridge.isNil:
+    return
+  try:
+    var tmp = bridge
+    tmp.close()
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
 proc releaseMsQuicBridge*(bridge: RuntimeBridge) {.raises: [].} =
   ## 释放 RuntimeBridge 引用。引用计数归零时卸载 MsQuic 库。
   if bridge.isNil:
@@ -86,12 +97,7 @@ proc releaseMsQuicBridge*(bridge: RuntimeBridge) {.raises: [].} =
       bridgeToClose = gBridge
       gBridge = nil
       gBridgeRefCount = 0
-  if not bridgeToClose.isNil:
-    try:
-      var tmp = bridgeToClose
-      tmp.close()
-    except Exception:
-      discard
+  closeBridgeQuietly(bridgeToClose)
 
 proc currentMsQuicBridge*(): RuntimeBridge {.raises: [].} =
   ensureLock()

@@ -26,12 +26,50 @@ suite "Connection migration state":
     check conn.paths[0].challengeOutstanding
     check conn.paths[0].responsePending
     conn.completePathValidation(1, true)
+    check conn.migration.pendingChallenges.len == 0
     check conn.migration.activePathId == 1
     check conn.migration.validatedPaths.contains(1)
     check conn.paths[0].isValidated
     check conn.paths[0].isActive
     check not conn.paths[0].challengeOutstanding
     check not conn.paths[0].responsePending
+
+  test "successful validation switches active path exclusively":
+    var conn = newConnectionModel(
+      initConnectionId(@[3'u8,4'u8,5'u8,6'u8]),
+      initConnectionId(@[7'u8,8'u8,9'u8,10'u8]),
+      attempted = 0x1,
+      negotiated = 0x1)
+    conn.completePathValidation(0, true)
+    conn.initiatePathChallenge(1, challenge8(30))
+    conn.completePathValidation(1, true)
+    check conn.migration.activePathId == 1
+    check conn.migration.pendingChallenges.len == 0
+    check conn.paths.len == 2
+    check conn.paths[0].isValidated
+    check not conn.paths[0].isActive
+    check conn.paths[1].isValidated
+    check conn.paths[1].isActive
+
+  test "failed validation clears pending challenge and keeps current active path":
+    var conn = newConnectionModel(
+      initConnectionId(@[13'u8,14'u8,15'u8,16'u8]),
+      initConnectionId(@[17'u8,18'u8,19'u8,20'u8]),
+      attempted = 0x1,
+      negotiated = 0x1)
+    conn.completePathValidation(0, true)
+    conn.initiatePathChallenge(1, challenge8(40))
+    check conn.migration.pendingChallenges.len == 1
+    conn.completePathValidation(1, false)
+    check conn.migration.activePathId == 0
+    check conn.migration.pendingChallenges.len == 0
+    check conn.paths.len == 2
+    check conn.paths[0].isActive
+    check conn.paths[0].isValidated
+    check not conn.paths[1].isActive
+    check not conn.paths[1].isValidated
+    check not conn.paths[1].challengeOutstanding
+    check not conn.paths[1].responsePending
 
   test "stateless reset tokens are tracked":
     var conn = newConnectionModel(
@@ -40,7 +78,10 @@ suite "Connection migration state":
       attempted = 0x1,
       negotiated = 0x1)
     conn.registerStatelessReset(token16(0x10))
+    conn.registerStatelessReset(token16(0x10))
     check conn.migration.statelessResetTokens.len == 1
+    conn.unregisterStatelessReset(token16(0x10))
+    check conn.migration.statelessResetTokens.len == 0
     conn.ensurePath(0).recordStatelessResetToken(token16(0x20))
     check conn.paths[0].resetToken == token16(0x20)
 

@@ -165,4 +165,3 @@ suite "Switch":
     await conn.close()
 
     await allFuturesThrowing(done.wait(5.seconds), switch1.stop(), switch2.stop())
-

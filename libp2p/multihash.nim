@@ -25,6 +25,7 @@
 {.used.}
 
 import tables
+import bearssl/hash as bhash
 import nimcrypto/[sha, sha2, keccak, blake2, hash, utils]
 import varint, vbuffer, multicodec, multibase
 import stew/base58
@@ -79,16 +80,23 @@ proc sha1hash(data: openArray[byte], output: var openArray[byte]) =
         sha1.sizeDigest
     copyMem(addr output[0], addr digest.data[0], length)
 
+proc bearSha256Digest(data: openArray[byte]): array[32, byte] =
+  var ctx: bhash.Sha256Context
+  bhash.sha256Init(ctx)
+  if data.len > 0:
+    bhash.sha224Update(ctx, unsafeAddr data[0], uint(data.len))
+  bhash.sha256Out(ctx, addr result[0])
+
 proc dblsha2_256hash(data: openArray[byte], output: var openArray[byte]) =
   if len(output) > 0:
-    var digest1 = sha256.digest(data)
-    var digest2 = sha256.digest(digest1.data)
+    let digest1 = bearSha256Digest(data)
+    let digest2 = bearSha256Digest(digest1)
     var length =
       if sha256.sizeDigest > len(output):
         len(output)
       else:
         sha256.sizeDigest
-    copyMem(addr output[0], addr digest2.data[0], length)
+    copyMem(addr output[0], unsafeAddr digest2[0], length)
 
 proc blake2Bhash(data: openArray[byte], output: var openArray[byte]) =
   if len(output) > 0:
@@ -112,13 +120,13 @@ proc blake2Shash(data: openArray[byte], output: var openArray[byte]) =
 
 proc sha2_256hash(data: openArray[byte], output: var openArray[byte]) =
   if len(output) > 0:
-    var digest = sha256.digest(data)
+    let digest = bearSha256Digest(data)
     var length =
       if sha256.sizeDigest > len(output):
         len(output)
       else:
         sha256.sizeDigest
-    copyMem(addr output[0], addr digest.data[0], length)
+    copyMem(addr output[0], unsafeAddr digest[0], length)
 
 proc sha2_512hash(data: openArray[byte], output: var openArray[byte]) =
   if len(output) > 0:

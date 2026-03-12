@@ -2,7 +2,7 @@
 ## 参考 `src/core/bbr.c`, `src/core/cubic.c`, `src/core/congestion_control.h`,
 ## `src/core/loss_detection.h`, `src/core/ack_tracker.h`, `src/core/quicdef.h`。
 
-import ../core/common
+import ../core/[common, packet_model]
 
 type
   SlidingWindowMode* = enum
@@ -93,8 +93,11 @@ type
 
   AckEventSnapshot* = object            ## 对应 `QUIC_ACK_EVENT`
     timeNow*: uint64
+    ackEpoch*: CryptoEpoch
     largestAck*: uint64
     largestSentPacketNumber*: uint64
+    timeOfLargestAckedPacketSent*: uint64
+    totalBytesSentAtLargestAck*: uint64
     totalAckedRetransmittableBytes*: uint64
     ackedRetransmittableBytes*: uint32
     smoothedRtt*: uint64

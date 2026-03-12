@@ -12,9 +12,10 @@
 import std/strformat
 import chronos
 import chronicles
-import bearssl/[rand, hash]
+import bearssl/[rand, kdf]
+import bearssl/hash as bhash
 import stew/[endians2, byteutils]
-import nimcrypto/[utils, sha2, hmac]
+import nimcrypto/utils
 import ../../stream/[connection]
 import ../../peerid
 import ../../peerinfo
@@ -48,6 +49,8 @@ const
   MaxInlineMuxers = 100
 
 type
+  NoiseHash = array[32, byte]
+
   KeyPair = object
     privateKey: Curve25519Key
     publicKey: Curve25519Key
@@ -61,7 +64,7 @@ type
   SymmetricState = object
     cs: CipherState
     ck: ChaChaPolyKey
-    h: MDigest[256]
+    h: NoiseHash
 
   # https://noiseprotocol.org/noise.html#the-handshakestate-object
   HandshakeState = object
@@ -149,15 +152,65 @@ proc genKeyPair(rng: var HmacDrbgContext): KeyPair =
   result.privateKey = Curve25519Key.random(rng)
   result.publicKey = result.privateKey.public()
 
-proc hashProtocol(name: string): MDigest[256] =
+proc sha256Digest(data: openArray[byte]): NoiseHash =
+  var ctx: bhash.Sha256Context
+  bhash.sha256Init(ctx)
+  if data.len > 0:
+    bhash.sha224Update(ctx, unsafeAddr data[0], uint(data.len))
+  bhash.sha256Out(ctx, addr result[0])
+
+proc sha256Digest(prefix, suffix: openArray[byte]): NoiseHash =
+  var ctx: bhash.Sha256Context
+  bhash.sha256Init(ctx)
+  if prefix.len > 0:
+    bhash.sha224Update(ctx, unsafeAddr prefix[0], uint(prefix.len))
+  if suffix.len > 0:
+    bhash.sha224Update(ctx, unsafeAddr suffix[0], uint(suffix.len))
+  bhash.sha256Out(ctx, addr result[0])
+
+proc hkdfSha256[len: static int](
+    salt, ikm, info: openArray[byte], outputs: var openArray[array[len, byte]]
+) =
+  var ctx: HkdfContext
+  hkdfInit(
+    ctx,
+    addr bhash.sha256Vtable,
+    if salt.len > 0:
+      unsafeAddr salt[0]
+    else:
+      nil,
+    csize_t(salt.len),
+  )
+  hkdfInject(
+    ctx,
+    if ikm.len > 0:
+      unsafeAddr ikm[0]
+    else:
+      nil,
+    csize_t(ikm.len),
+  )
+  hkdfFlip(ctx)
+  for i in 0 .. outputs.high:
+    discard hkdfProduce(
+      ctx,
+      if info.len > 0:
+        unsafeAddr info[0]
+      else:
+        nil,
+      csize_t(info.len),
+      addr outputs[i][0],
+      csize_t(outputs[i].len),
+    )
+
+proc hashProtocol(name: string): NoiseHash =
   # If protocol_name is less than or equal to HASHLEN bytes in length,
   # sets h to protocol_name with zero bytes appended to make HASHLEN bytes.
   # Otherwise sets h = HASH(protocol_name).
 
   if name.len <= 32:
-    result.data[0 .. name.high] = name.toBytes
+    result[0 .. name.high] = name.toBytes
   else:
-    result = sha256.digest(name)
+    result = sha256Digest(name.toBytes)
 
 proc dh(priv: Curve25519Key, pub: Curve25519Key): Curve25519Key =
   result = pub
@@ -216,28 +269,24 @@ proc decryptWithAd(
 
 proc init(_: type[SymmetricState]): SymmetricState =
   result.h = ProtocolXXName.hashProtocol
-  result.ck = result.h.data.intoChaChaPolyKey
+  result.ck = result.h.intoChaChaPolyKey
   result.cs = CipherState(k: EmptyKey)
 
 proc mixKey(ss: var SymmetricState, ikm: ChaChaPolyKey) =
   var temp_keys: array[2, ChaChaPolyKey]
-  sha256.hkdf(ss.ck, ikm, [], temp_keys)
+  hkdfSha256(ss.ck, ikm, [], temp_keys)
   ss.ck = temp_keys[0]
   ss.cs = CipherState(k: temp_keys[1])
   trace "mixKey", key = ss.cs.k.shortLog
 
 proc mixHash(ss: var SymmetricState, data: openArray[byte]) =
-  var ctx: sha256
-  ctx.init()
-  ctx.update(ss.h.data)
-  ctx.update(data)
-  ss.h = ctx.finish()
-  trace "mixHash", hash = ss.h.data.shortLog
+  ss.h = sha256Digest(ss.h, data)
+  trace "mixHash", hash = ss.h.shortLog
 
 # We might use this for other handshake patterns/tokens
 proc mixKeyAndHash(ss: var SymmetricState, ikm: openArray[byte]) {.used.} =
   var temp_keys: array[3, ChaChaPolyKey]
-  sha256.hkdf(ss.ck, ikm, [], temp_keys)
+  hkdfSha256(ss.ck, ikm, [], temp_keys)
   ss.ck = temp_keys[0]
   ss.mixHash(temp_keys[1])
   ss.cs = CipherState(k: temp_keys[2])
@@ -247,7 +296,7 @@ proc encryptAndHash(
 ): seq[byte] {.raises: [NoiseNonceMaxError].} =
   # according to spec if key is empty leave plaintext
   if ss.cs.hasKey:
-    result = ss.cs.encryptWithAd(ss.h.data, data)
+    result = ss.cs.encryptWithAd(ss.h, data)
   else:
     result = @data
   ss.mixHash(result)
@@ -257,14 +306,14 @@ proc decryptAndHash(
 ): seq[byte] {.raises: [NoiseDecryptTagError, NoiseNonceMaxError].} =
   # according to spec if key is empty leave plaintext
   if ss.cs.hasKey and data.len > ChaChaPolyTag.len:
-    result = ss.cs.decryptWithAd(ss.h.data, data)
+    result = ss.cs.decryptWithAd(ss.h, data)
   else:
     result = @data
   ss.mixHash(data)
 
 proc split(ss: var SymmetricState): tuple[cs1, cs2: CipherState] =
   var temp_keys: array[2, ChaChaPolyKey]
-  sha256.hkdf(ss.ck, [], [], temp_keys)
+  hkdfSha256(ss.ck, [], [], temp_keys)
   return (CipherState(k: temp_keys[0]), CipherState(k: temp_keys[1]))
 
 proc init(_: type[HandshakeState]): HandshakeState =

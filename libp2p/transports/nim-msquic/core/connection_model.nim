@@ -159,10 +159,23 @@ proc ensurePath*(conn: var QuicConnectionModel, pathId: uint8): var PathState =
     resetToken: [uint8 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
   result = conn.paths[^1]
 
+proc removePendingChallenge(conn: var QuicConnectionModel;
+    data: array[8, uint8]) =
+  var nextPending: seq[array[8, uint8]] = @[]
+  var removed = false
+  for item in conn.migration.pendingChallenges:
+    if not removed and item == data:
+      removed = true
+    else:
+      nextPending.add(item)
+  conn.migration.pendingChallenges = move(nextPending)
+
 proc initiatePathChallenge*(conn: var QuicConnectionModel, pathId: uint8, data: array[8, uint8]) =
   discard conn.ensurePath(pathId)
   for path in conn.paths.mitems:
     if path.pathId == pathId:
+      if path.challengeOutstanding or path.responsePending:
+        conn.removePendingChallenge(path.challengeData)
       path.challengeOutstanding = true
       path.challengeData = data
       path.responsePending = true
@@ -171,6 +184,19 @@ proc initiatePathChallenge*(conn: var QuicConnectionModel, pathId: uint8, data: 
 
 proc completePathValidation*(conn: var QuicConnectionModel, pathId: uint8, success: bool) =
   discard conn.ensurePath(pathId)
+  var hadPendingChallenge = false
+  var challengeData = [uint8 0,0,0,0,0,0,0,0]
+  for path in conn.paths.mitems:
+    if path.pathId == pathId:
+      hadPendingChallenge = path.challengeOutstanding or path.responsePending
+      challengeData = path.challengeData
+      break
+  if hadPendingChallenge:
+    conn.removePendingChallenge(challengeData)
+  if success:
+    for path in conn.paths.mitems:
+      if path.pathId != pathId:
+        path.isActive = false
   for path in conn.paths.mitems:
     if path.pathId == pathId:
       if success:
@@ -188,11 +214,26 @@ proc completePathValidation*(conn: var QuicConnectionModel, pathId: uint8, succe
       break
 
 proc registerStatelessReset*(conn: var QuicConnectionModel, token: array[16, uint8]) =
+  for existing in conn.migration.statelessResetTokens:
+    if existing == token:
+      return
   conn.migration.statelessResetTokens.add(token)
 
-proc configurePreferredAddress*(conn: var QuicConnectionModel, preferred: PreferredAddressState) =
+proc unregisterStatelessReset*(conn: var QuicConnectionModel;
+    token: array[16, uint8]) =
+  var nextTokens: seq[array[16, uint8]] = @[]
+  var removed = false
+  for existing in conn.migration.statelessResetTokens:
+    if not removed and existing == token:
+      removed = true
+    else:
+      nextTokens.add(existing)
+  conn.migration.statelessResetTokens = move(nextTokens)
+
+proc configurePreferredAddress*(conn: var QuicConnectionModel;
+    preferred: PreferredAddressState; preferredPathId: uint8 = 0'u8) =
   conn.migration.preferredAddress = preferred
-  conn.migration.preferredPathId = preferred.cid.length
+  conn.migration.preferredPathId = preferredPathId
   conn.migration.preferredAddress.hasPreferred = true
 
 proc recordStatelessResetToken*(path: var PathState, token: array[16, uint8]) =

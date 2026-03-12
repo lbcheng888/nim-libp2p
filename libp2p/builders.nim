@@ -1234,14 +1234,16 @@ proc build*(b: SwitchBuilder): Switch {.raises: [LPError], public.} =
     )
 
   var secureManagerInstances: seq[Secure]
-  if SecureProtocol.Noise in b.secureManagers:
-    let muxerCodecs = b.muxers.mapIt(it.codec)
-    secureManagerInstances.add(
-      Noise.new(b.rng, seckey, supportedMuxers = muxerCodecs).Secure
-    )
-  if SecureProtocol.Tls in b.secureManagers:
-    when not defined(libp2p_no_tls):
-      secureManagerInstances.add(TLS.new(b.rng, seckey).Secure)
+  let muxerCodecs = b.muxers.mapIt(it.codec)
+  for secureProtocol in b.secureManagers:
+    case secureProtocol
+    of SecureProtocol.Noise:
+      secureManagerInstances.add(
+        Noise.new(b.rng, seckey, supportedMuxers = muxerCodecs).Secure
+      )
+    of SecureProtocol.Tls:
+      when not defined(libp2p_no_tls):
+        secureManagerInstances.add(TLS.new(b.rng, seckey).Secure)
 
   if b.muxers.len > 0:
     let alpnMuxers = b.muxers.mapIt(it.codec).filterIt(it.len > 0)

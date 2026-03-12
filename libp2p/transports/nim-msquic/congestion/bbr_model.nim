@@ -275,22 +275,34 @@ proc canSend*(model: BbrModel): bool =
 proc sendAllowance*(model: BbrModel): uint64 =
   if model.congestionWindow > model.bytesInFlight:
     uint64(model.congestionWindow - model.bytesInFlight)
+  elif model.exemptions > 0:
+    uint64(model.datagramPayloadBytes) * uint64(model.exemptions)
   else:
     0
 
 proc onPacketSent*(
     model: var BbrModel,
     bytes: uint32,
+    ackEliciting: bool = true,
     appLimited: bool = false
   ) =
   ## 记录发送到网络的数据，配合 app-limited 状态。
-  if model.bytesInFlight <= high(uint32) - bytes:
-    model.bytesInFlight += bytes
-  else:
-    model.bytesInFlight = high(uint32)
-  model.bytesInFlightMax = max(model.bytesInFlightMax, model.bytesInFlight)
+  if ackEliciting and model.exemptions > 0:
+    dec(model.exemptions)
+  if ackEliciting:
+    if model.bytesInFlight <= high(uint32) - bytes:
+      model.bytesInFlight += bytes
+    else:
+      model.bytesInFlight = high(uint32)
+    model.bytesInFlightMax = max(model.bytesInFlightMax, model.bytesInFlight)
   if appLimited:
     model.bandwidthFilter.appLimited = true
+
+proc grantExemptions*(model: var BbrModel; count: uint8) =
+  if count == 0'u8:
+    return
+  let room = high(uint8) - model.exemptions
+  model.exemptions += min(count, room)
 
 proc onDataAcked*(model: var BbrModel, ack: AckEventSnapshot): uint64 =
   ## BBR 主状态机：采样带宽、更新窗口与 pacing。
@@ -449,8 +461,22 @@ proc onDataLost*(model: var BbrModel, loss: LossEventSnapshot) =
   model.endOfRecoveryValid = true
   model.endOfRecovery = loss.largestSentPacketNumber
 
-  let halved = model.congestionWindow shr 1
-  model.congestionWindow = max(halved, model.minCongestionWindow)
+  if loss.persistentCongestion:
+    model.congestionWindow = model.minCongestionWindow
+  else:
+    let halved = model.congestionWindow shr 1
+    model.congestionWindow = max(halved, model.minCongestionWindow)
   model.targetCongestionWindow = model.congestionWindow
   model.recoveryWindow = model.congestionWindow
   model.bytesInFlight = min(model.bytesInFlight, model.congestionWindow)
+
+proc onProbeTimeout*(model: var BbrModel) =
+  ## PTO 触发时退回最小窗口，并重置到保守恢复态。
+  model.resetAckAggregation()
+  model.recoveryState = recoveryConservative
+  model.state = bbrProbeBandwidth
+  model.congestionWindow = model.minCongestionWindow
+  model.targetCongestionWindow = model.congestionWindow
+  model.recoveryWindow = model.congestionWindow
+  model.bytesInFlight = min(model.bytesInFlight, model.congestionWindow)
+  model.pacingGain = GainUnit

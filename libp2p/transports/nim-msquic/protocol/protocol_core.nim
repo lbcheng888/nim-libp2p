@@ -1,7 +1,7 @@
 ## Pure Nim QUIC Protocol Definitions (RFC 9000)
 ## This module handles packet wire formats, header encoding/decoding, and basic frame structures.
 
-import std/endians
+import std/[algorithm, endians]
 
 type
   QuicPacketType* = enum
@@ -104,6 +104,21 @@ proc encodeInitialPacket*(destCid, srcCid: ConnectionId, token: seq[byte],
   # Payload (Frames)
   result.add(payload)
 
+proc encodeHandshakePacket*(destCid, srcCid: ConnectionId;
+    payload: seq[byte]; packetNumber: uint32): seq[byte] =
+  var firstByte = 0xE3'u8
+  result.add(firstByte)
+  result.writeUint32(1'u32)
+  result.add(byte(destCid.len))
+  result.add(destCid)
+  result.add(byte(srcCid.len))
+  result.add(srcCid)
+  let pnLen = 4'u64
+  let lengthVal = pnLen + uint64(payload.len)
+  result.writeVarInt(lengthVal)
+  result.writeUint32(packetNumber)
+  result.add(payload)
+
 proc encodeShortHeaderPacket*(destCid: ConnectionId, packetNumber: uint32, 
                               payload: seq[byte]): seq[byte] =
   # RFC 9000 Section 17.3.1. Short Header
@@ -192,6 +207,25 @@ type
   PathResponseFrame* = object
     data*: array[8, byte]
 
+  NewConnectionIdFrame* = object
+    sequence*: uint64
+    retirePriorTo*: uint64
+    connectionId*: ConnectionId
+    statelessResetToken*: array[16, byte]
+
+  RetireConnectionIdFrame* = object
+    sequence*: uint64
+
+  HandshakeDoneFrame* = object
+    present*: bool
+
+  ConnectionCloseFrame* = object
+    applicationClose*: bool
+    errorCode*: uint64
+    hasFrameType*: bool
+    frameType*: uint64
+    reasonPhrase*: string
+
 proc encodeStreamFrame*(streamId: uint64, data: seq[byte], offset: uint64, fin: bool): seq[byte] =
   # STREAM Frame Layout:
   # Type (0x08..0x0F):
@@ -255,6 +289,33 @@ proc encodePathResponseFrame*(response: array[8, byte]): seq[byte] =
   result.add(0x1B'u8)
   for b in response:
     result.add(b)
+
+proc encodeNewConnectionIdFrame*(sequence: uint64; retirePriorTo: uint64;
+    connectionId: ConnectionId; statelessResetToken: array[16, byte]): seq[byte] =
+  result.add(0x18'u8)
+  result.writeVarInt(sequence)
+  result.writeVarInt(retirePriorTo)
+  result.add(byte(connectionId.len))
+  result.add(connectionId)
+  for b in statelessResetToken:
+    result.add(b)
+
+proc encodeRetireConnectionIdFrame*(sequence: uint64): seq[byte] =
+  result.add(0x19'u8)
+  result.writeVarInt(sequence)
+
+proc encodeHandshakeDoneFrame*(): seq[byte] =
+  @[0x1E'u8]
+
+proc encodeConnectionCloseFrame*(errorCode: uint64; reasonPhrase = "";
+    frameType = 0'u64; applicationClose = true): seq[byte] =
+  result.add(if applicationClose: 0x1D'u8 else: 0x1C'u8)
+  result.writeVarInt(errorCode)
+  if not applicationClose:
+    result.writeVarInt(frameType)
+  result.writeVarInt(uint64(reasonPhrase.len))
+  for ch in reasonPhrase:
+    result.add(byte(ord(ch)))
 
 # --- Decoding ---
 
@@ -555,6 +616,57 @@ proc parsePathResponseFrame*(data: openArray[byte], pos: var int): PathResponseF
     result.data[i] = data[pos + i]
   pos += 8
 
+proc parseNewConnectionIdFrame*(data: openArray[byte], pos: var int): NewConnectionIdFrame =
+  if pos >= data.len or data[pos] != 0x18'u8:
+    return
+  inc pos
+  result.sequence = readVarInt(data, pos)
+  result.retirePriorTo = readVarInt(data, pos)
+  if pos >= data.len:
+    return
+  let cidLen = int(data[pos])
+  inc pos
+  if cidLen < 0 or pos + cidLen + 16 > data.len:
+    result.connectionId = @[]
+    return
+  result.connectionId = @(data[pos ..< pos + cidLen])
+  pos += cidLen
+  for i in 0 .. 15:
+    result.statelessResetToken[i] = data[pos + i]
+  pos += 16
+
+proc parseRetireConnectionIdFrame*(data: openArray[byte], pos: var int): RetireConnectionIdFrame =
+  if pos >= data.len or data[pos] != 0x19'u8:
+    return
+  inc pos
+  result.sequence = readVarInt(data, pos)
+
+proc parseHandshakeDoneFrame*(data: openArray[byte], pos: var int): HandshakeDoneFrame =
+  if pos >= data.len or data[pos] != 0x1E'u8:
+    return
+  inc pos
+  result.present = true
+
+proc parseConnectionCloseFrame*(data: openArray[byte], pos: var int): ConnectionCloseFrame =
+  if pos >= data.len:
+    return
+  let frameType = data[pos]
+  if frameType != 0x1C'u8 and frameType != 0x1D'u8:
+    return
+  inc pos
+  result.applicationClose = frameType == 0x1D'u8
+  result.errorCode = readVarInt(data, pos)
+  result.hasFrameType = not result.applicationClose
+  if result.hasFrameType:
+    result.frameType = readVarInt(data, pos)
+  let reasonLen = int(readVarInt(data, pos))
+  if reasonLen < 0 or pos + reasonLen > data.len:
+    return
+  result.reasonPhrase = newString(reasonLen)
+  for i in 0 ..< reasonLen:
+    result.reasonPhrase[i] = char(data[pos + i])
+  pos += reasonLen
+
 proc encodeAckFrame*(largestAcked: uint64, delay: uint64): seq[byte] =
   # RFC 9000 Section 19.3.1. ACK Frame
   # Type (0x02)
@@ -575,3 +687,42 @@ proc encodeAckFrame*(largestAcked: uint64, delay: uint64): seq[byte] =
   # For cumulative ack from 0 to LargestAcked, Range = LargestAcked.
   result.writeVarInt(largestAcked) 
   # Note: This implies 0..LargestAcked are ALL received.
+
+proc encodeAckFrame*(ranges: openArray[AckRange], delay: uint64): seq[byte] =
+  ## Encode explicit ACK ranges using RFC 9000 Section 19.3.1 framing.
+  if ranges.len == 0:
+    return encodeAckFrame(0'u64, delay)
+
+  var ordered = @ranges
+  if ordered.len > 1:
+    ordered.sort(proc(a, b: AckRange): int = cmp(b.largest, a.largest))
+
+  let largestAcked = ordered[0].largest
+  let firstRange =
+    if ordered[0].largest >= ordered[0].smallest:
+      ordered[0].largest - ordered[0].smallest
+    else:
+      0'u64
+
+  result.add(0x02'u8)
+  result.writeVarInt(largestAcked)
+  result.writeVarInt(delay)
+  result.writeVarInt(uint64(max(0, ordered.len - 1)))
+  result.writeVarInt(firstRange)
+
+  var previousSmallest = ordered[0].smallest
+  for i in 1 ..< ordered.len:
+    let current = ordered[i]
+    let gap =
+      if previousSmallest > current.largest:
+        previousSmallest - current.largest - 2'u64
+      else:
+        0'u64
+    let ackRangeLength =
+      if current.largest >= current.smallest:
+        current.largest - current.smallest
+      else:
+        0'u64
+    result.writeVarInt(gap)
+    result.writeVarInt(ackRangeLength)
+    previousSmallest = current.smallest
