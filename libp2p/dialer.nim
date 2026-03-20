@@ -26,6 +26,8 @@ import
   upgrademngrs/upgrade,
   errors,
   connectiongater
+when defined(libp2p_msquic_experimental):
+  import transports/msquicconnection
 
 export dial, errors, results
 
@@ -333,12 +335,69 @@ proc internalConnect(
     )
 
   try:
+    debug "internalConnect storeMuxer begin",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
     self.connManager.storeMuxer(muxed)
-    await self.peerStore.identify(muxed)
-    await self.connManager.triggerPeerEvents(
-      muxed.connection.peerId,
-      PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-    )
+    debug "internalConnect storeMuxer done",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
+    when defined(libp2p_msquic_experimental):
+      if muxed.connection of msquicconnection.MsQuicConnection:
+        proc finishNativeQuicIdentify() {.async: (raises: []).} =
+          try:
+            warn "internalConnect native QUIC identify begin",
+              peerId = muxed.connection.peerId,
+              protocol = muxed.connection.protocol,
+              negotiated = muxed.connection.negotiatedMuxer
+            await self.peerStore.identify(muxed)
+            warn "internalConnect native QUIC identify done",
+              peerId = muxed.connection.peerId,
+              protocol = muxed.connection.protocol,
+              negotiated = muxed.connection.negotiatedMuxer
+            await self.connManager.triggerPeerEvents(
+              muxed.connection.peerId,
+              PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+            )
+          except CancelledError:
+            discard
+          except CatchableError as exc:
+            warn "internalConnect native QUIC identify failed",
+              peerId = muxed.connection.peerId,
+              protocol = muxed.connection.protocol,
+              negotiated = muxed.connection.negotiatedMuxer,
+              description = exc.msg
+        asyncSpawn finishNativeQuicIdentify()
+      else:
+        warn "internalConnect identify begin",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+        await self.peerStore.identify(muxed)
+        warn "internalConnect identify done",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+        await self.connManager.triggerPeerEvents(
+          muxed.connection.peerId,
+          PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+        )
+    else:
+      warn "internalConnect identify begin",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
+      await self.peerStore.identify(muxed)
+      warn "internalConnect identify done",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
+      await self.connManager.triggerPeerEvents(
+        muxed.connection.peerId,
+        PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+      )
     return muxed
   except CancelledError as exc:
     await muxed.close()

@@ -1,5 +1,4 @@
-when defined(libp2p_msquic_experimental):
-  {.error: "OpenSSL QUIC transport is no longer available when enabling libp2p_msquic_experimental. Please remove -d:libp2p_quic_support and switch to MsQuic transport.".}
+{.error: "OpenSSL QUIC transport path has been removed. Use -d:libp2p_msquic_experimental and libp2p/transports/msquictransport only.".}
 
 import std/[sequtils, strutils, base64, options, sets, tables, os]
 import chronos
@@ -1638,9 +1637,9 @@ proc new*(
 method handles*(transport: QuicTransport, address: MultiAddress): bool {.raises: [].} =
   if not procCall Transport(transport).handles(address):
     return false
-  if QUIC_V1.match(address):
+  if QUIC_V1.matchPartial(address):
     return true
-  WebTransport.match(address)
+  WebTransport.matchPartial(address)
 
 proc makeConfig(self: QuicTransport): TLSConfig =
   let cert = self.ensureCertificate()
@@ -2180,7 +2179,7 @@ proc tryDialMsQuic(
           if not completed:
             eventFuture.cancel()
             fallbackReason = "timeout waiting for MsQuic connection event"
-            break
+            continue
           let event = await eventFuture
           case event.kind
           of msevents.ceConnected:

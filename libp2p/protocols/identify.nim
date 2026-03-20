@@ -243,7 +243,17 @@ method init*(p: Identify) =
       trace "handling identify request", conn
       let metadata = p.collectMetadata()
       var pb = encodeMsg(p.peerInfo, conn.observedAddr, p.sendSignedPeerRecord, metadata)
+      warn "identify handler write begin",
+        peerId = conn.peerId,
+        protocol = conn.protocol,
+        negotiated = conn.negotiatedMuxer,
+        payloadBytes = pb.buffer.len
       await conn.writeLp(pb.buffer)
+      warn "identify handler write done",
+        peerId = conn.peerId,
+        protocol = conn.protocol,
+        negotiated = conn.negotiatedMuxer,
+        payloadBytes = pb.buffer.len
     except CancelledError as exc:
       trace "cancelled identify handler"
       raise exc
@@ -265,7 +275,16 @@ proc identify*(
     )
 .} =
   trace "initiating identify", conn
+  warn "identify read begin",
+    peerId = conn.peerId,
+    protocol = conn.protocol,
+    negotiated = conn.negotiatedMuxer
   var message = await conn.readLp(64 * 1024)
+  warn "identify read done",
+    peerId = conn.peerId,
+    protocol = conn.protocol,
+    negotiated = conn.negotiatedMuxer,
+    payloadBytes = message.len
   if len(message) == 0:
     trace "identify: Empty message received!", conn
     raise newException(IdentityInvalidMsgError, "Empty message received!")
@@ -279,7 +298,7 @@ proc identify*(
     peer = PeerId.init(pubkey).valueOr:
       raise newException(IdentityInvalidMsgError, $error)
 
-  if peer != remotePeerId:
+  if remotePeerId.len > 0 and peer != remotePeerId:
     trace "Peer ids don't match", remote = peer, local = remotePeerId
     raise newException(IdentityNoMatchError, "Peer ids don't match")
   info.peerId = peer

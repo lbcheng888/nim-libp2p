@@ -2,10 +2,12 @@
 
 import ./blueprint
 import ./common
-import ./openssl_adapter
 import ./security_audit
+when not defined(libp2p_pure_crypto):
+  import ./openssl_adapter
 
 export blueprint
 export common
-export openssl_adapter
 export security_audit
+when not defined(libp2p_pure_crypto):
+  export openssl_adapter

@@ -25,6 +25,7 @@ const char *libp2p_get_connected_peers_json(void *handle);
 const char *libp2p_connected_peers_info(void *handle);
 const char *libp2p_get_local_peer_id(void *handle);
 const char *libp2p_fetch_feed_snapshot(void *handle);
+const char *libp2p_ui_frame_snapshot(void *handle, int maxEvents, int discoveryLimit);
 const char *libp2p_get_last_direct_error(void *handle);
 const char *libp2p_identity_from_seed(const uint8_t *seed, size_t seedLen);
 bool libp2p_register_peer_hints(void *handle, const char *peerId, const char *addressesJson, const char *source);
@@ -516,6 +517,21 @@ Java_com_example_libp2psmoke_native_NimBridge_nativeFetchFeedSnapshot(JNIEnv *en
   std::lock_guard<std::mutex> nimGuard(g_nim_mutex);
   ensureThreadAttached();
   const char *raw = libp2p_fetch_feed_snapshot(toHandle(handle));
+  return copyAndFree(env, raw);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeUiFrameSnapshot(JNIEnv *env,
+                                                                    jclass,
+                                                                    jlong handle,
+                                                                    jint maxEvents,
+                                                                    jint discoveryLimit) {
+  std::lock_guard<std::mutex> nimGuard(g_nim_mutex);
+  ensureThreadAttached();
+  const char *raw = libp2p_ui_frame_snapshot(
+      toHandle(handle),
+      static_cast<int>(maxEvents),
+      static_cast<int>(discoveryLimit));
   return copyAndFree(env, raw);
 }
 

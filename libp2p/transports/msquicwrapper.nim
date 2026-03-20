@@ -1,8 +1,4 @@
-## MsQuic 适配包装层
-##
-## 该模块负责在现有 OpenSSL QUIC 适配层之上初始化 nim-msquic 的 API
-## 蓝图，并对外暴露原有接口。后续若逐步将底层实现替换为 MsQuic，
-## 可在此模块集中调整而无需影响上层调用者。
+{.error: "MsQuic wrapper compatibility layer has been removed. Use libp2p/transports/msquictransport only.".}
 
 import std/[json, options, sequtils, strutils]
 

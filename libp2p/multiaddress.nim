@@ -423,6 +423,7 @@ const
     MAProtocol(mcodec: multiCodec("quic"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("quic-v1"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("webtransport"), kind: Marker, size: 0),
+    MAProtocol(mcodec: multiCodec("awdl"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("nan"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("nearlink"), kind: Marker, size: 0),
     MAProtocol(

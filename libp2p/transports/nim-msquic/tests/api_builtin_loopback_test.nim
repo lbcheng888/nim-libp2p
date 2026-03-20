@@ -241,6 +241,10 @@ suite "MsQuic builtin pure-Nim loopback":
         )
     check initialHandshakeReady
 
+    var initialTicketAgeAdd = 0'u32
+    check getConnectionResumptionTicketAgeAddForTest(clientConnection, initialTicketAgeAdd)
+    check initialTicketAgeAdd != 0'u32
+
     var clientRemoteLen = uint32(sizeof(Sockaddr_storage))
     var clientRemote: Sockaddr_storage
     check api.GetParam(clientConnection, QUIC_PARAM_CONN_REMOTE_ADDRESS, addr clientRemoteLen, addr clientRemote) ==
@@ -527,6 +531,12 @@ suite "MsQuic builtin pure-Nim loopback":
     check serverResumedState
     check waitForPredicate(proc(): bool = gReceivedMessageOk, rounds = 120)
     check waitForPredicate(proc(): bool = gZeroRttPreHandshakeObserved, rounds = 120)
+    check waitForPredicate(proc(): bool = gSessionTicketReceived, rounds = 120)
+
+    var refreshedTicketAgeAdd = 0'u32
+    check getConnectionResumptionTicketAgeAddForTest(resumedConnection, refreshedTicketAgeAdd)
+    check refreshedTicketAgeAdd != 0'u32
+    check refreshedTicketAgeAdd != initialTicketAgeAdd
 
     check setBuiltinResumptionTicketForTest(
       cstring("127.0.0.1"),
@@ -850,6 +860,68 @@ suite "MsQuic builtin pure-Nim loopback":
       , rounds = 120)
       check waitForPredicate(proc(): bool = gReceivedMessageOk, rounds = 120)
       check not gZeroRttPreHandshakeObserved
+
+    block:
+      setDropBuiltinTicketAgeForTest(true)
+      defer:
+        setDropBuiltinTicketAgeForTest(false)
+
+      gAcceptedConn = nil
+      gAcceptedStream = nil
+      gReceivedMessageOk = false
+      gSessionResumedObserved = false
+      gServerSessionResumedObserved = false
+      gExpectZeroRttWindow = false
+      gZeroRttPreHandshakeObserved = false
+      gColdStartConnected = false
+      gColdStartResumed = true
+      gClientFinishedHandshakeVerifyFailed = false
+
+      var droppedTicketAgeConnection: HQUIC
+      check api.ConnectionOpen(registration, nil, nil, addr droppedTicketAgeConnection) == QUIC_STATUS_SUCCESS
+      defer:
+        api.ConnectionClose(droppedTicketAgeConnection)
+      check api.ConnectionSetConfiguration(droppedTicketAgeConnection, configuration) == QUIC_STATUS_SUCCESS
+      registerConnectionEventHandler(droppedTicketAgeConnection, proc(ev: ConnectionEvent) =
+        if ev.kind == ceConnected:
+          gColdStartConnected = true
+          gColdStartResumed = ev.sessionResumed
+      )
+      check api.ConnectionStart(
+        droppedTicketAgeConnection,
+        configuration,
+        QUIC_ADDRESS_FAMILY(2),
+        cstring("127.0.0.1"),
+        uint16(41001)
+      ) == QUIC_STATUS_SUCCESS
+
+      var droppedTicketAgeStream: HQUIC
+      check api.StreamOpen(
+        droppedTicketAgeConnection,
+        QUIC_STREAM_OPEN_FLAGS(0),
+        nil,
+        nil,
+        addr droppedTicketAgeStream
+      ) == QUIC_STATUS_SUCCESS
+      defer:
+        api.StreamClose(droppedTicketAgeStream)
+      check api.StreamStart(droppedTicketAgeStream, QUIC_STREAM_START_FLAGS(0)) == QUIC_STATUS_SUCCESS
+      check api.StreamSend(
+        droppedTicketAgeStream,
+        addr sendBuffer,
+        1'u32,
+        QUIC_SEND_FLAGS(0x0001'u32),
+        nil
+      ) == QUIC_STATUS_SUCCESS
+
+      check waitForPredicate(proc(): bool = gColdStartConnected, rounds = 120)
+      check not gColdStartResumed
+      check waitForPredicate(proc(): bool = gReceivedMessageOk, rounds = 120)
+      check not gClientFinishedHandshakeVerifyFailed
+      check not gServerSessionResumedObserved
+      check not gAcceptedConn.isNil
+      check getConnectionSessionResumedForTest(gAcceptedConn, serverResumedState)
+      check not serverResumedState
 
     block:
       setDropBuiltinResumptionBinderForTest(true)
@@ -1209,6 +1281,69 @@ suite "MsQuic builtin pure-Nim loopback":
       check api.StreamStart(wrongTicketAgeStream, QUIC_STREAM_START_FLAGS(0)) == QUIC_STATUS_SUCCESS
       check api.StreamSend(
         wrongTicketAgeStream,
+        addr sendBuffer,
+        1'u32,
+        QUIC_SEND_FLAGS(0),
+        nil
+      ) == QUIC_STATUS_SUCCESS
+
+      check waitForPredicate(proc(): bool = gColdStartConnected, rounds = 120)
+      check not gColdStartResumed
+      check waitForPredicate(proc(): bool = gReceivedMessageOk, rounds = 120)
+      check not gZeroRttPreHandshakeObserved
+      check not gClientFinishedHandshakeVerifyFailed
+      check not gServerSessionResumedObserved
+      check not gAcceptedConn.isNil
+      check getConnectionSessionResumedForTest(gAcceptedConn, serverResumedState)
+      check not serverResumedState
+
+    block:
+      setDropBuiltinTicketAgeForTest(true)
+      defer:
+        setDropBuiltinTicketAgeForTest(false)
+
+      gAcceptedConn = nil
+      gAcceptedStream = nil
+      gReceivedMessageOk = false
+      gSessionResumedObserved = false
+      gServerSessionResumedObserved = false
+      gExpectZeroRttWindow = false
+      gZeroRttPreHandshakeObserved = false
+      gColdStartConnected = false
+      gColdStartResumed = true
+      gClientFinishedHandshakeVerifyFailed = false
+
+      var missingTicketAgeConnection: HQUIC
+      check api.ConnectionOpen(registration, nil, nil, addr missingTicketAgeConnection) == QUIC_STATUS_SUCCESS
+      defer:
+        api.ConnectionClose(missingTicketAgeConnection)
+      check api.ConnectionSetConfiguration(missingTicketAgeConnection, configuration) == QUIC_STATUS_SUCCESS
+      registerConnectionEventHandler(missingTicketAgeConnection, proc(ev: ConnectionEvent) =
+        if ev.kind == ceConnected:
+          gColdStartConnected = true
+          gColdStartResumed = ev.sessionResumed
+      )
+      check api.ConnectionStart(
+        missingTicketAgeConnection,
+        configuration,
+        QUIC_ADDRESS_FAMILY(2),
+        cstring("127.0.0.1"),
+        uint16(41001)
+      ) == QUIC_STATUS_SUCCESS
+
+      var missingTicketAgeStream: HQUIC
+      check api.StreamOpen(
+        missingTicketAgeConnection,
+        QUIC_STREAM_OPEN_FLAGS(0),
+        nil,
+        nil,
+        addr missingTicketAgeStream
+      ) == QUIC_STATUS_SUCCESS
+      defer:
+        api.StreamClose(missingTicketAgeStream)
+      check api.StreamStart(missingTicketAgeStream, QUIC_STREAM_START_FLAGS(0)) == QUIC_STATUS_SUCCESS
+      check api.StreamSend(
+        missingTicketAgeStream,
         addr sendBuffer,
         1'u32,
         QUIC_SEND_FLAGS(0),

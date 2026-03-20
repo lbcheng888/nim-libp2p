@@ -82,12 +82,6 @@ build_android() {
   local clang="$toolchain/bin/${triple}${api}-clang"
   local ar="$toolchain/bin/llvm-ar"
   local sysroot="$toolchain/sysroot"
-  local openssl_dir="${OPENSSL_DIR:-$REPO_ROOT/build/openssl-android/android-arm64}"
-  if [[ ! -f "$openssl_dir/lib/libssl.so" ]]; then
-    echo "[mobile-mvp] OpenSSL not found at $openssl_dir" >&2
-    exit 1
-  fi
-
   local out_root="$REPO_ROOT/build/android-examples"
   local bin_dir="$out_root/bin"
   local lib_dir="$out_root/lib"
@@ -105,6 +99,9 @@ build_android() {
     "--threads:on"
     "--cc:clang"
     "--define:release"
+    "--define:libp2p_msquic_experimental"
+    "--define:libp2p_msquic_builtin"
+    "--define:libp2p_pure_crypto"
     "--stacktrace:off"
     "--lineTrace:off"
     "--path:."
@@ -115,13 +112,9 @@ build_android() {
     "--passC:-D_GNU_SOURCE"
     "--passC:--target=${triple}${api}"
     "--passC:--sysroot=$sysroot"
-    "--passC:-I$openssl_dir/include"
     "--passL:--target=${triple}${api}"
     "--passL:--sysroot=$sysroot"
-    "--passL:-L$openssl_dir/lib"
     "--passL:-L$lib_dir"
-    "--passL:-l:libssl.so"
-    "--passL:-l:libcrypto.so"
     "--passL:-llog"
     "--passL:-landroid"
   )
@@ -134,33 +127,16 @@ build_android() {
     CC="$clang" AR="$ar" nim "${nim_flags[@]}" "--out:$out" "$src"
   done
 
-  for lib in libssl.so libcrypto.so; do
-    cp "$openssl_dir/lib/$lib" "$lib_dir/$lib"
-  done
-
   local libcxx="$toolchain/sysroot/usr/lib/${triple}/${api}/libc++_shared.so"
   [[ -f "$libcxx" ]] || libcxx="$toolchain/sysroot/usr/lib/${triple}/libc++_shared.so"
   cp "$libcxx" "$lib_dir/libc++_shared.so"
-
-  for dir in ossl-modules engines-4; do
-    if [[ -d "$openssl_dir/lib/$dir" ]]; then
-      rm -rf "$lib_dir/$dir"
-      mkdir -p "$lib_dir/$dir"
-      cp -R "$openssl_dir/lib/$dir/." "$lib_dir/$dir/"
-    fi
-  done
-
-  "$clang" -shared -fPIC --target=${triple}${api} --sysroot="$sysroot" \
-    -I"$openssl_dir/include" -L"$openssl_dir/lib" \
-    -lssl -lcrypto \
-    "$REPO_ROOT/compat/openssl_compat.c" \
-    -o "$lib_dir/libcrypto_compat.so"
+  rm -f "$lib_dir/libssl.so" "$lib_dir/libcrypto.so" "$lib_dir/libcrypto_compat.so" "$lib_dir/libmsquic.so"
+  rm -rf "$lib_dir/ossl-modules" "$lib_dir/engines-4"
 
   cat <<'SH' > "$bin_dir/run_mobile_mdns.sh"
 #!/system/bin/sh
 APP_ROOT="/data/local/tmp/nimlibp2p_mvp"
 export LD_LIBRARY_PATH="$APP_ROOT/lib:$LD_LIBRARY_PATH"
-export LD_PRELOAD="$APP_ROOT/lib/libcrypto_compat.so${LD_PRELOAD:+:$LD_PRELOAD}"
 exec "$APP_ROOT/bin/mobile_mdns_mvp_android" "$@"
 SH
 
@@ -168,7 +144,6 @@ SH
 #!/system/bin/sh
 APP_ROOT="/data/local/tmp/nimlibp2p_mvp"
 export LD_LIBRARY_PATH="$APP_ROOT/lib:$LD_LIBRARY_PATH"
-export LD_PRELOAD="$APP_ROOT/lib/libcrypto_compat.so${LD_PRELOAD:+:$LD_PRELOAD}"
 exec "$APP_ROOT/bin/mobile_dm_mvp_android" "$@"
 SH
 
@@ -206,12 +181,6 @@ build_ohos() {
     echo "[mobile-mvp] OpenHarmony toolchain missing; set OH_SDK_ROOT" >&2
     exit 1
   fi
-  local openssl_dir="${OPENSSL_DIR:-$REPO_ROOT/build/openssl-ohos/aarch64-linux-ohos}"
-  if [[ ! -f "$openssl_dir/lib/libssl.so" ]]; then
-    echo "[mobile-mvp] OpenSSL for OHOS not found at $openssl_dir" >&2
-    exit 1
-  fi
-
   local out_root="$REPO_ROOT/build/ohos-examples"
   local bin_dir="$out_root/bin"
   local lib_dir="$out_root/lib"
@@ -237,6 +206,9 @@ build_ohos() {
     "--define:release"
     "--define:ohos"
     "--define:chronicles_enabled=false"
+    "--define:libp2p_msquic_experimental"
+    "--define:libp2p_msquic_builtin"
+    "--define:libp2p_pure_crypto"
     "--stacktrace:off"
     "--lineTrace:off"
     "--path:."
@@ -246,16 +218,12 @@ build_ohos() {
     "--passC:-includeexplicit_bzero.h"
     "--passC:$targetflag"
     "--passC:$sysflag"
-    "--passC:-I$openssl_dir/include"
     "--passL:$targetflag"
     "--passL:$sysflag"
-    "--passL:-L$openssl_dir/lib"
     "--passL:-L$lib_dir"
     "--passL:-shared"
     "--passL:-Wl,-export-dynamic"
     "--passL:-lhilog_ndk.z"
-    "--passL:-l:libssl.so"
-    "--passL:-l:libcrypto.so"
   )
 
   for src in "${EXAMPLE_SRCS[@]}"; do
@@ -266,29 +234,13 @@ build_ohos() {
     CC="$clang $targetflag $sysflag" AR="$ar" nim "${nim_flags[@]}" "--out:$out" "$src"
   done
 
-  for lib in libssl.so libcrypto.so; do
-    cp "$openssl_dir/lib/$lib" "$lib_dir/$lib"
-  done
-
-  for dir in ossl-modules engines-4; do
-    if [[ -d "$openssl_dir/lib/$dir" ]]; then
-      rm -rf "$lib_dir/$dir"
-      mkdir -p "$lib_dir/$dir"
-      cp -R "$openssl_dir/lib/$dir/." "$lib_dir/$dir/"
-    fi
-  done
-
-  $clang $targetflag $sysflag -shared -fPIC \
-    -I"$openssl_dir/include" -L"$openssl_dir/lib" \
-    -lssl -lcrypto \
-    "$REPO_ROOT/compat/openssl_compat.c" \
-    -o "$lib_dir/libcrypto_compat.so"
+  rm -f "$lib_dir/libssl.so" "$lib_dir/libcrypto.so" "$lib_dir/libcrypto_compat.so" "$lib_dir/libmsquic.so"
+  rm -rf "$lib_dir/ossl-modules" "$lib_dir/engines-4"
 
   cat <<'SH' > "$bin_dir/run_mobile_mdns.sh"
 #!/system/bin/sh
 APP_ROOT="/data/local/tmp/nimlibp2p_mvp"
 export LD_LIBRARY_PATH="$APP_ROOT/lib:$LD_LIBRARY_PATH"
-export LD_PRELOAD="$APP_ROOT/lib/libcrypto_compat.so${LD_PRELOAD:+:$LD_PRELOAD}"
 exec "$APP_ROOT/bin/mobile_mdns_mvp_ohos" "$@"
 SH
 
@@ -296,7 +248,6 @@ SH
 #!/system/bin/sh
 APP_ROOT="/data/local/tmp/nimlibp2p_mvp"
 export LD_LIBRARY_PATH="$APP_ROOT/lib:$LD_LIBRARY_PATH"
-export LD_PRELOAD="$APP_ROOT/lib/libcrypto_compat.so${LD_PRELOAD:+:$LD_PRELOAD}"
 exec "$APP_ROOT/bin/mobile_dm_mvp_ohos" "$@"
 SH
 

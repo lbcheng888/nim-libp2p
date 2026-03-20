@@ -54,6 +54,8 @@ type
     datagramWaiters: seq[Future[seq[byte]]]
     datagramSendEnabled*: bool
     datagramMaxSend*: uint16
+    nativeMuxActive*: bool
+    shadowStreams: seq[(pointer, msquicdrv.MsQuicStreamState)]
     onClosed: proc(conn: MsQuicConnection): Future[void] {.gcsafe.}
     registered*: bool
 
@@ -85,6 +87,8 @@ proc completeWebtransportHandshake*(
 proc msquicConnError(msg: string; parent: ref Exception = nil): ref LPStreamError =
   (ref LPStreamError)(msg: msg, parent: parent)
 
+proc promotePendingPeerStream(conn: MsQuicConnection) {.gcsafe.}
+
 proc ensureStream(conn: MsQuicConnection) =
   if conn.isNil or conn.streamState.isNil or conn.streamHandle.isNil:
     raise newLPStreamConnDownError()
@@ -115,6 +119,22 @@ proc remoteSettings*(conn: MsQuicConnection): Option[Http3Settings] =
     return none(Http3Settings)
   conn.http3Settings
 
+proc activateNativeMux*(conn: MsQuicConnection) =
+  if conn.isNil:
+    return
+  conn.nativeMuxActive = true
+
+proc detachPrimaryStreamState*(
+    conn: MsQuicConnection
+): tuple[state: msquicdrv.MsQuicStreamState, localInitiated: bool] {.gcsafe.} =
+  if conn.isNil or conn.streamState.isNil:
+    return (nil, false)
+  result.state = conn.streamState
+  result.localInitiated = msquicdrv.isLocalInitiated(conn.streamState)
+  conn.streamHandle = nil
+  conn.streamState = nil
+  conn.cached.setLen(0)
+
 proc closePrimaryStream(conn: MsQuicConnection) {.gcsafe, raises: [].} =
   if conn.streamHandle.isNil:
     return
@@ -126,6 +146,19 @@ proc closePrimaryStream(conn: MsQuicConnection) {.gcsafe, raises: [].} =
   conn.streamHandle = nil
   conn.streamState = nil
   conn.cached.setLen(0)
+
+proc closeShadowStreams(conn: MsQuicConnection) {.gcsafe, raises: [].} =
+  if conn.isNil or conn.shadowStreams.len == 0:
+    return
+  for (streamHandle, streamState) in conn.shadowStreams:
+    if streamHandle.isNil:
+      continue
+    try:
+      msquicSafe:
+        msquicdrv.closeStream(conn.handle, streamHandle, streamState)
+    except Exception as exc:
+      trace "MsQuic close shadow stream raised", err = exc.msg
+  conn.shadowStreams.setLen(0)
 
 proc shutdownConnection(conn: MsQuicConnection) {.gcsafe, raises: [].} =
   if conn.connHandle.isNil:
@@ -207,6 +240,8 @@ proc monitorConnection(conn: MsQuicConnection): Future[void] {.async.} =
       case event.kind
       of msevents.ceConnected:
         trace "MsQuic connection established", resumed = event.sessionResumed
+      of msevents.cePeerStreamStarted:
+        conn.promotePendingPeerStream()
       of msevents.ceShutdownInitiated, msevents.ceShutdownComplete:
         trace "MsQuic connection shutdown event", note = event.note
         break
@@ -226,6 +261,7 @@ proc monitorConnection(conn: MsQuicConnection): Future[void] {.async.} =
     conn.failDatagramWaiters()
     await noCancel closeWebtransportStreams(conn)
     closePrimaryStream(conn)
+    closeShadowStreams(conn)
     shutdownConnection(conn)
     if not conn.onClosed.isNil:
       try:
@@ -302,6 +338,8 @@ proc newMsQuicConnection*(
       except Exception as exc:
         trace "MsQuic stream cleanup raised", err = exc.msg
       raise msquicConnError("MsQuic stream start failed: " & startErr)
+    msquicSafe:
+      msquicdrv.markStreamStartComplete(streamState)
 
   result = MsQuicConnection(
     handle: handle,
@@ -331,6 +369,8 @@ proc newMsQuicConnection*(
     datagramWaiters: @[],
     datagramSendEnabled: false,
     datagramMaxSend: 0'u16,
+    nativeMuxActive: false,
+    shadowStreams: @[],
     onClosed: onClosed,
     registered: false
   )
@@ -401,6 +441,8 @@ proc openMsQuicStream*(
     msquicSafe:
       msquicdrv.closeStream(conn.handle, res.stream, state)
     raise msquicConnError("MsQuic stream start failed: " & startErr)
+  msquicSafe:
+    msquicdrv.markStreamStartComplete(state)
   let stream = newMsQuicStream(
     state,
     conn.handle,
@@ -460,6 +502,54 @@ proc transportHandle*(conn: MsQuicConnection): msquicdrv.MsQuicTransportHandle {
     return nil
   conn.handle
 
+proc promotePendingPeerStream(conn: MsQuicConnection) {.gcsafe.} =
+  if conn.isNil or conn.nativeMuxActive or conn.isWebtransport or
+      conn.connState.isNil or conn.streamState.isNil:
+    return
+  if not msquicdrv.isLocalInitiated(conn.streamState):
+    return
+
+  while true:
+    let pendingOpt = block:
+      var tmp: Option[msquicdrv.MsQuicStreamState]
+      msquicSafe:
+        tmp = msquicdrv.popPendingStreamState(conn.connState)
+      tmp
+    if pendingOpt.isNone:
+      return
+    let pending = pendingOpt.get()
+    if pending.isNil or pending.stream.isNil:
+      continue
+
+    let idRes = block:
+      var tmp: Result[uint64, string]
+      msquicSafe:
+        tmp = msquicdrv.streamId(pending)
+      tmp
+    if idRes.isOk and ((idRes.get() and 0x2'u64) != 0'u64):
+      try:
+        msquicSafe:
+          msquicdrv.closeStream(conn.handle, cast[pointer](pending.stream), pending)
+      except Exception as exc:
+        trace "MsQuic close unexpected unidirectional peer stream raised", err = exc.msg
+      continue
+
+    let previousHandle = conn.streamHandle
+    let previousState = conn.streamState
+    if not previousHandle.isNil and not previousState.isNil:
+      conn.shadowStreams.add((previousHandle, previousState))
+    conn.streamHandle = cast[pointer](pending.stream)
+    conn.streamState = pending
+    conn.cached.setLen(0)
+    if not previousState.isNil:
+      msquicSafe:
+        msquicdrv.handoffReadWaiters(previousState, pending)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic connection promoted peer stream as primary",
+        stream = cast[uint64](conn.streamHandle),
+        shadowCount = conn.shadowStreams.len
+    return
+
 
 method readOnce*(
     conn: MsQuicConnection, pbytes: pointer, nbytes: int
@@ -467,6 +557,7 @@ method readOnce*(
   if nbytes <= 0:
     return 0
   conn.ensureStream()
+  conn.promotePendingPeerStream()
   await msquicdrv.waitStreamStart(conn.streamState)
   if conn.cached.len == 0:
     var chunk: seq[byte]
@@ -510,6 +601,7 @@ method write*(
   if bytes.len == 0:
     return
   conn.ensureStream()
+  conn.promotePendingPeerStream()
   await msquicdrv.waitStreamStart(conn.streamState)
   if not conn.bandwidthManager.isNil and conn.peerId.len > 0:
     try:
@@ -529,7 +621,20 @@ method write*(
     conn.bandwidthManager.record(conn.peerId, Direction.Out, bytes.len, conn.protocol)
 
 method closeWrite*(conn: MsQuicConnection) {.async: (raises: []).} =
-  closePrimaryStream(conn)
+  if conn.isNil or conn.streamState.isNil or conn.streamHandle.isNil:
+    return
+  try:
+    await msquicdrv.waitStreamStart(conn.streamState)
+  except CatchableError:
+    discard
+  try:
+    discard msquicdrv.shutdownStream(
+      conn.handle,
+      conn.streamHandle,
+      state = conn.streamState
+    )
+  except CatchableError:
+    discard
 
 method closeImpl*(conn: MsQuicConnection) {.async: (raises: []).} =
   if conn.isNil:
@@ -537,5 +642,6 @@ method closeImpl*(conn: MsQuicConnection) {.async: (raises: []).} =
   if not conn.monitor.isNil and not conn.monitor.finished():
     conn.monitor.cancelSoon()
   closePrimaryStream(conn)
+  closeShadowStreams(conn)
   shutdownConnection(conn)
   await procCall Connection(conn).closeImpl()

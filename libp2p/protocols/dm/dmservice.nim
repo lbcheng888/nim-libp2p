@@ -106,15 +106,6 @@ proc orderDialAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
     if not seen.contains(text):
       expanded.add(ma)
       seen.incl(text)
-    when defined(libp2p_msquic_experimental):
-      let synth = synthesizeQuicAddressText(text)
-      if synth.isSome:
-        let parsed = MultiAddress.init(synth.get())
-        if parsed.isOk():
-          let key = $parsed.get()
-          if key.len > 0 and not seen.contains(key):
-            expanded.add(parsed.get())
-            seen.incl(key)
   if expanded.len <= 1:
     return expanded
   var quic: seq[MultiAddress] = @[]
@@ -240,6 +231,10 @@ proc handleIncoming(
     debug "direct message handler failed", peer = remotePeer, err = exc.msg
   finally:
     try:
+      await conn.closeWrite()
+    except CatchableError:
+      discard
+    try:
       await conn.close()
     except CatchableError:
       discard
@@ -317,31 +312,18 @@ proc send*(
     dialErr = "no existing connection"
 
   if conn.isNil:
-    let errLower = dialErr.toLowerAscii()
-    if hasConn and (errLower.contains("failed dial existing") or
-        errLower.contains("unable to select sub-protocol") or
-        errLower.contains("error in newstream") or
-        errLower.contains("error in new stream")):
-      try:
-        if not svc.switch.connManager.isNil:
-          debug "direct message dropping peer before fallback", peer = $peer
-          await svc.switch.connManager.dropPeer(peer)
-      except CatchableError as dropErr:
-        warn "direct message dropPeer failed", peer = $peer, err = dropErr.msg
     if orderedAddrs.len == 0:
-      debug "direct message fallback has no stored addresses", peer = $peer
+      debug "direct message dial aborted without fallback; no stored addresses", peer = $peer
       return (false, if dialErr.len > 0: dialErr else: "no stored addresses")
-    try:
-      conn = await svc.switch.dial(peer, orderedAddrs, @[svc.codec], forceDial = true)
-      debug "direct message fallback dial succeeded", peer = $peer, codec = svc.codec
-    except CancelledError as exc:
-      raise exc
-    except CatchableError as fallbackErr:
-      warn "direct message fallback dial failed", peer = $peer, err = fallbackErr.msg
-      return (false, if dialErr.len > 0: dialErr else: fallbackErr.msg)
+    debug "direct message dial aborted without fallback", peer = $peer, err = dialErr
+    return (false, if dialErr.len > 0: dialErr else: "dial failed without fallback")
 
   try:
     await conn.writeLp(payload)
+    try:
+      await conn.closeWrite()
+    except CatchableError as closeErr:
+      warn "direct message closeWrite failed", peer = $peer, err = closeErr.msg
     debug "direct message payload sent", peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
   except CatchableError as exc:
     try:

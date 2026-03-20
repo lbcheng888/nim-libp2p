@@ -13,6 +13,7 @@ type
     packetNumbersToAck*: seq[PacketRange]
     largestPacketNumberAcked*: uint64
     largestPacketNumberRecvTime*: uint64
+    ackDeadlineUs*: uint64
     counters*: AckTrackerCounters
 
   AckTrackerModel* = object
@@ -27,6 +28,7 @@ proc initAckTracker*(): AckTrackerModel =
       packetNumbersToAck: @[],
       largestPacketNumberAcked: 0,
       largestPacketNumberRecvTime: 0,
+      ackDeadlineUs: 0,
       counters: AckTrackerCounters(
         ackElicitingPacketsToAck: 0,
         alreadyWrittenAckFrame: false,
@@ -40,9 +42,6 @@ proc ackSpaceEpoch(epoch: CryptoEpoch): CryptoEpoch {.gcsafe.} =
     epoch
 
 proc stateForEpoch(tracker: var AckTrackerModel; epoch: CryptoEpoch): var AckEpochState {.gcsafe.} =
-  tracker.epochs[ackSpaceEpoch(epoch)]
-
-proc stateForEpoch(tracker: AckTrackerModel; epoch: CryptoEpoch): AckEpochState {.gcsafe.} =
   tracker.epochs[ackSpaceEpoch(epoch)]
 
 proc insertPacketRange(ranges: var seq[PacketRange]; packetNumber: uint64): bool {.gcsafe.} =
@@ -91,10 +90,9 @@ proc trackIncomingPacket*(tracker: var AckTrackerModel; epoch: CryptoEpoch;
   let ackEpoch = ackSpaceEpoch(epoch)
   discard insertPacketRange(tracker.epochs[ackEpoch].packetNumbersReceived, packetNumber)
 
-proc wasPacketReceived*(tracker: AckTrackerModel; epoch: CryptoEpoch;
+proc wasPacketReceived*(tracker: var AckTrackerModel; epoch: CryptoEpoch;
     packetNumber: uint64): bool {.gcsafe.} =
-  let state = tracker.stateForEpoch(epoch)
-  for packetRange in state.packetNumbersReceived:
+  for packetRange in tracker.stateForEpoch(epoch).packetNumbersReceived:
     if packetNumber < packetRange.first:
       return false
     if packetNumber <= packetRange.last:
@@ -119,41 +117,57 @@ proc markForAck*(tracker: var AckTrackerModel; epoch: CryptoEpoch;
   elif packetNumber > tracker.epochs[ackEpoch].largestPacketNumberAcked:
     tracker.epochs[ackEpoch].largestPacketNumberAcked = packetNumber
     tracker.epochs[ackEpoch].largestPacketNumberRecvTime = recvTimeUs
+  if ackType == ackTypeAckEliciting and tracker.epochs[ackEpoch].ackDeadlineUs == 0'u64:
+    tracker.epochs[ackEpoch].ackDeadlineUs =
+      recvTimeUs + uint64(ackDelayMs) * 1_000'u64
+  elif ackType == ackTypeAckImmediate:
+    tracker.epochs[ackEpoch].ackDeadlineUs = recvTimeUs
   tracker.epochs[ackEpoch].counters.alreadyWrittenAckFrame = false
 
 proc consumePendingAck*(tracker: var AckTrackerModel; epoch: CryptoEpoch) {.gcsafe.} =
   ## 发送 ACK 后消费当前待确认区间，避免重复刷同一份 ACK。
   let ackEpoch = ackSpaceEpoch(epoch)
   tracker.epochs[ackEpoch].packetNumbersToAck.setLen(0)
+  tracker.epochs[ackEpoch].ackDeadlineUs = 0'u64
   tracker.epochs[ackEpoch].counters.ackElicitingPacketsToAck = 0'u16
   tracker.epochs[ackEpoch].counters.alreadyWrittenAckFrame = true
 
-proc shouldSendAck*(tracker: AckTrackerModel; epoch: CryptoEpoch;
-    packetTolerance: uint8; ackType: AckType; reordered: bool): bool {.gcsafe.} =
+proc shouldSendAck*(tracker: var AckTrackerModel; epoch: CryptoEpoch;
+    packetTolerance: uint8; ackType: AckType; reordered: bool;
+    nowUs: uint64 = 0'u64): bool {.gcsafe.} =
   ## 对应 `QuicAckTrackerAckPacket` 中的触发阈值。
-  let state = tracker.stateForEpoch(epoch)
   if ackType == ackTypeAckImmediate:
     return true
-  if state.counters.ackElicitingPacketsToAck >= uint16(packetTolerance):
+  if tracker.stateForEpoch(epoch).counters.ackElicitingPacketsToAck >= uint16(packetTolerance):
     return true
   if reordered:
     return true
+  if tracker.stateForEpoch(epoch).ackDeadlineUs > 0'u64 and
+      nowUs >= tracker.stateForEpoch(epoch).ackDeadlineUs:
+    return true
   false
 
-proc packetNumbersToAck*(tracker: AckTrackerModel; epoch: CryptoEpoch): seq[PacketRange] {.gcsafe.} =
+proc packetNumbersToAck*(tracker: var AckTrackerModel; epoch: CryptoEpoch): seq[PacketRange] {.gcsafe.} =
   tracker.stateForEpoch(epoch).packetNumbersToAck
 
-proc largestPacketNumberAcked*(tracker: AckTrackerModel; epoch: CryptoEpoch): uint64 {.gcsafe.} =
+proc largestPacketNumberAcked*(tracker: var AckTrackerModel; epoch: CryptoEpoch): uint64 {.gcsafe.} =
   tracker.stateForEpoch(epoch).largestPacketNumberAcked
 
-proc largestPacketNumberRecvTime*(tracker: AckTrackerModel; epoch: CryptoEpoch): uint64 {.gcsafe.} =
+proc largestPacketNumberRecvTime*(tracker: var AckTrackerModel; epoch: CryptoEpoch): uint64 {.gcsafe.} =
   tracker.stateForEpoch(epoch).largestPacketNumberRecvTime
 
-proc ackElicitingPacketsToAck*(tracker: AckTrackerModel; epoch: CryptoEpoch): uint16 {.gcsafe.} =
+proc ackElicitingPacketsToAck*(tracker: var AckTrackerModel; epoch: CryptoEpoch): uint16 {.gcsafe.} =
   tracker.stateForEpoch(epoch).counters.ackElicitingPacketsToAck
 
-proc alreadyWrittenAckFrame*(tracker: AckTrackerModel; epoch: CryptoEpoch): bool {.gcsafe.} =
+proc alreadyWrittenAckFrame*(tracker: var AckTrackerModel; epoch: CryptoEpoch): bool {.gcsafe.} =
   tracker.stateForEpoch(epoch).counters.alreadyWrittenAckFrame
+
+proc setAlreadyWrittenAckFrame*(tracker: var AckTrackerModel; epoch: CryptoEpoch;
+    written: bool) {.gcsafe.} =
+  tracker.epochs[ackSpaceEpoch(epoch)].counters.alreadyWrittenAckFrame = written
+
+proc ackDeadlineUs*(tracker: var AckTrackerModel; epoch: CryptoEpoch): uint64 {.gcsafe.} =
+  tracker.stateForEpoch(epoch).ackDeadlineUs
 
 proc setLargestPacketNumberRecvTime*(tracker: var AckTrackerModel; epoch: CryptoEpoch;
     recvTimeUs: uint64) {.gcsafe.} =

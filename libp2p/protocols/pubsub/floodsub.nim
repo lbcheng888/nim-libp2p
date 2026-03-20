@@ -17,7 +17,6 @@ import
   ./timedcache,
   ./peertable,
   ./rpc/[message, messages, protobuf],
-  nimcrypto/[hash, sha2],
   ../../crypto/crypto,
   ../../stream/connection,
   ../../peerid,
@@ -38,14 +37,40 @@ type FloodSub* {.public.} = ref object of PubSub
     # We use a salted id because the messages in this cache have not yet
     # been validated meaning that an attacker has greater control over the
     # hash key and therefore could poison the table
-  seenSalt*: sha256
-    # The salt in this case is a partially updated SHA256 context pre-seeded
-    # with some random data
+  seenSaltSeed*: array[32, byte]
+    # Keep raw seed bytes instead of a copied SHA256 context. Copying nimcrypto
+    # hash state across publish paths has been unstable on Android arm64.
 
 proc salt*(f: FloodSub, msgId: MessageId): SaltedId =
-  var tmp = f.seenSalt
-  tmp.update(msgId)
-  SaltedId(data: tmp.finish())
+  func rotl64(value: uint64, shift: int): uint64 =
+    let normalized = shift mod 64
+    if normalized == 0:
+      value
+    else:
+      (value shl normalized) or (value shr (64 - normalized))
+
+  proc mixLane(state: var uint64, b: byte, rotateBy: int) =
+    state = state xor (uint64(b) + 1'u64)
+    state = rotl64(state * 0x100000001b3'u64 + 0x9e3779b97f4a7c15'u64, rotateBy)
+
+  var lanes = [
+    0x243f6a8885a308d3'u64,
+    0x13198a2e03707344'u64,
+    0xa4093822299f31d0'u64,
+    0x082efa98ec4e6c89'u64,
+  ]
+  const rotates = [13, 27, 39, 57]
+  for index, b in f.seenSaltSeed:
+    mixLane(lanes[index mod lanes.len], b, rotates[index mod rotates.len])
+  for index, b in msgId:
+    mixLane(lanes[index mod lanes.len], b, rotates[index mod rotates.len])
+  var digest: MDigest[256]
+  for laneIndex in 0 ..< lanes.len:
+    var lane = lanes[laneIndex]
+    for byteIndex in 0 ..< 8:
+      digest.data[laneIndex * 8 + byteIndex] = byte(lane and 0xff'u64)
+      lane = lane shr 8
+  SaltedId(data: digest)
 
 proc hasSeen*(f: FloodSub, saltedId: SaltedId): bool =
   saltedId in f.seen
@@ -244,10 +269,6 @@ method publish*(
 method initPubSub*(f: FloodSub) {.raises: [InitializationError].} =
   procCall PubSub(f).initPubSub()
   f.seen = TimedCache[SaltedId].init(2.minutes)
-  f.seenSalt.init()
-
-  var tmp: array[32, byte]
-  hmacDrbgGenerate(f.rng[], tmp)
-  f.seenSalt.update(tmp)
+  hmacDrbgGenerate(f.rng[], f.seenSaltSeed)
 
   f.init()

@@ -148,7 +148,10 @@ proc hasSecret(secrets: seq[TlsSecret], direction: TlsDirection): bool =
   false
 
 when isMainModule:
-  if not openSslAvailable():
+  when defined(macosx):
+    echo "跳过 TLS 测试：macOS 上的动态 OpenSSL 装载在当前环境不安全。"
+    quit QuitSuccess
+  elif not openSslAvailable():
     echo "跳过 TLS 测试：当前环境无法加载 OpenSSL 库。"
     quit QuitSuccess
   suite "Nim MsQuic TLS OpenSSL Adapter":

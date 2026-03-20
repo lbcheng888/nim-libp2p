@@ -51,6 +51,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.libp2psmoke.dex.DexKlineBucket
 import com.example.libp2psmoke.dex.OrderBookEntry
@@ -60,6 +63,7 @@ import com.example.libp2psmoke.model.ChainWallet
 import com.example.libp2psmoke.model.FeedEntry
 import com.example.libp2psmoke.model.NodeUiState
 import com.example.libp2psmoke.ui.UiIntent
+import com.example.libp2psmoke.ui.NimUiFrameClock
 import com.example.libp2psmoke.ui.components.*
 import com.example.libp2psmoke.ui.theme.*
 import com.example.libp2psmoke.viewmodel.NimNodeViewModel
@@ -76,10 +80,39 @@ class MainActivity : ComponentActivity() {
         setContent {
             Libp2pSmokeTheme {
                 val viewModel: NimNodeViewModel = viewModel()
+                BindNimUiFrameClock(viewModel)
                 val uiState by viewModel.state.collectAsState()
                 val windowSizeClass = calculateWindowSizeClass(this)
                 ProLibp2pApp(uiState = uiState, viewModel = viewModel, windowSizeClass = windowSizeClass)
             }
+        }
+    }
+}
+
+@Composable
+private fun BindNimUiFrameClock(viewModel: NimNodeViewModel) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val frameClock = remember(viewModel) {
+        NimUiFrameClock { frameTimeNanos, frameDeltaNanos ->
+            viewModel.onUiFrame(frameTimeNanos, frameDeltaNanos)
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, frameClock) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> frameClock.start()
+                Lifecycle.Event.ON_STOP -> frameClock.stop()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            frameClock.start()
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            frameClock.stop()
         }
     }
 }
@@ -219,4 +252,3 @@ private fun ProLibp2pApp(
 }
 
 data class NavTab(val title: String, val selectedIcon: ImageVector, val icon: ImageVector)
-

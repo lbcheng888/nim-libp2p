@@ -395,6 +395,7 @@ const MultiCodecList = [
   ("quic-v1", 0x01CD),
   ("webtransport", 0x01D1),
   ("certhash", 0x01D2),
+  ("awdl", 0x300000),
   ("nan", 0x300001),
   ("nearlink", 0x300002),
   ("id", 0x300003),

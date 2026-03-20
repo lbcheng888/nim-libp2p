@@ -84,7 +84,7 @@ method readOnce*(
       raise msquicStreamError("MsQuic read failed: " & exc.msg, exc)
     if chunk.len == 0:
       raise newLPStreamEOFError()
-    stream.cached = chunk
+    swap(stream.cached, chunk)
   let toRead = min(nbytes, stream.cached.len)
   copyMem(pbytes, addr stream.cached[0], toRead)
   if toRead < stream.cached.len:
@@ -103,8 +103,8 @@ method read*(
 ): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError]).} =
   stream.ensureOpen()
   if stream.cached.len > 0:
-    let chunk = stream.cached
-    stream.cached = @[]
+    var chunk: seq[byte] = @[]
+    swap(chunk, stream.cached)
     return chunk
   var buf = newSeqUninit[byte](MsQuicStreamReadChunk)
   let readCount = await stream.readOnce(addr buf[0], MsQuicStreamReadChunk)
@@ -150,7 +150,23 @@ proc closeState(stream: MsQuicStream) =
   stream.state = nil
 
 method closeWrite*(stream: MsQuicStream) {.async: (raises: []).} =
-  stream.closeState()
+  if stream.isNil or stream.state.isNil:
+    return
+  try:
+    await msquicdrv.waitStreamStart(stream.state)
+  except CatchableError:
+    discard
+  var nativeStream: pointer = nil
+  when declared(stream.state.stream):
+    nativeStream = cast[pointer](stream.state.stream)
+  try:
+    discard msquicdrv.shutdownStream(
+      stream.handle,
+      nativeStream,
+      state = stream.state
+    )
+  except CatchableError:
+    discard
 
 method closeImpl*(stream: MsQuicStream) {.async: (raises: []).} =
   stream.closeState()

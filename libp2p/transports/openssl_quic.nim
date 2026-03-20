@@ -1,8 +1,4 @@
-# Nim-LibP2P
-# Copyright (c) 2025
-#
-# 基于 OpenSSL QUIC API 的传输适配层。当前实现覆盖上下文配置、证书载入、
-# 客户端/服务端握手、基础流创建与读写。数据报面向未来扩展暂以空实现返回。
+{.error: "OpenSSL QUIC implementation has been removed. Use the native MsQuic transport path only.".}
 
 import std/[options, sequtils, strutils, os, posix, times]
 import chronos

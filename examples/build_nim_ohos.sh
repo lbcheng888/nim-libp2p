@@ -71,7 +71,6 @@ mkdir -p "${MODULE_LIB64_DIR}"
 mkdir -p "${JNI_DIR}"
 mkdir -p "${ENTRY_LIB_DIR}"
 
-OPENSSL_DIR="${OPENSSL_DIR:-$REPO_ROOT/build/openssl-ohos/${TARGET_TRIPLE}}"
 LIBCXX_SHARED="${LLVM_DIR}/lib/aarch64-linux-ohos/libc++_shared.so"
 if [[ ! -f "${LIBCXX_SHARED}" ]]; then
   echo "[nim-ohos] libc++_shared.so not found at ${LIBCXX_SHARED}"
@@ -93,22 +92,11 @@ BRIDGE_SRC="${REPO_ROOT}/examples/hos/entry/src/main/cpp/nim_bridge.cpp"
 BRIDGE_OBJ_DIR="${REPO_ROOT}/build/ohos-bridge"
 BRIDGE_OBJ="${BRIDGE_OBJ_DIR}/nim_bridge.o"
 NIM_OHOS_QUIC_BACKEND="${NIM_OHOS_QUIC_BACKEND:-builtin}"
-NIM_OHOS_PURE_CRYPTO="${NIM_OHOS_PURE_CRYPTO:-auto}"
-
-if [[ "${NIM_OHOS_PURE_CRYPTO}" == "auto" ]]; then
-  if [[ "${NIM_OHOS_QUIC_BACKEND}" == "builtin" ]]; then
-    NIM_OHOS_PURE_CRYPTO=1
-  else
-    NIM_OHOS_PURE_CRYPTO=0
-  fi
-fi
+NIM_OHOS_PURE_CRYPTO="${NIM_OHOS_PURE_CRYPTO:-1}"
 
 if [[ "${NIM_OHOS_PURE_CRYPTO}" != "1" ]]; then
-  if [[ ! -d "${OPENSSL_DIR}" ]]; then
-    echo "[nim-ohos] OpenSSL for HarmonyOS not found at ${OPENSSL_DIR}"
-    echo "[nim-ohos] Run: scripts/build_openssl_ohos.sh"
-    exit 1
-  fi
+  echo "[nim-ohos] OpenSSL/libssl packaging has been removed; set NIM_OHOS_PURE_CRYPTO=1" >&2
+  exit 1
 fi
 
 CLANG_BIN="${LLVM_DIR}/bin/clang"
@@ -174,38 +162,23 @@ NIM_FLAGS=(
   "--out:${OUT_PATH}"
 )
 
-if [[ "${NIM_OHOS_PURE_CRYPTO}" != "1" ]]; then
-  NIM_FLAGS+=(
-    "--passC:-I${OPENSSL_DIR}/include"
-    "--passL:-L${OPENSSL_DIR}/lib"
-    "--passL:-lssl"
-    "--passL:-lcrypto"
-  )
-else
-  echo "[nim-ohos] Pure builtin crypto packaging enabled"
-fi
+echo "[nim-ohos] Pure builtin crypto packaging enabled"
 
 case "${NIM_OHOS_QUIC_BACKEND}" in
   builtin)
     NIM_FLAGS+=("--define:libp2p_msquic_experimental" "--define:libp2p_msquic_builtin")
     echo "[nim-ohos] Using builtin pure-Nim MsQuic API"
     ;;
-  external)
-    NIM_FLAGS+=("--define:libp2p_msquic_experimental")
-    echo "[nim-ohos] Using external MsQuic runtime resolution"
-    ;;
   off)
     echo "[nim-ohos] QUIC disabled"
     ;;
   *)
-    echo "[nim-ohos] Unsupported NIM_OHOS_QUIC_BACKEND=${NIM_OHOS_QUIC_BACKEND}; expected builtin|external|off" >&2
+    echo "[nim-ohos] Unsupported NIM_OHOS_QUIC_BACKEND=${NIM_OHOS_QUIC_BACKEND}; expected builtin|off" >&2
     exit 1
     ;;
 esac
 
-if [[ "${NIM_OHOS_PURE_CRYPTO}" == "1" ]]; then
-  NIM_FLAGS+=("--define:libp2p_pure_crypto")
-fi
+NIM_FLAGS+=("--define:libp2p_pure_crypto")
 
 # Allow enabling trace info explicitly to avoid Nim 2.3.x cross-compilation crashes by default
 if [[ "${NIM_OHOS_ENABLE_TRACES:-0}" == "1" ]]; then
@@ -251,30 +224,20 @@ echo "[nim-ohos] Building Nim libp2p -> ${OUT_PATH}"
 
 # Propagate libnimlibp2p to secondary copies (stage expects multiple layouts).
 for dest in "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${MODULE_LIB64_DIR}" "${JNI_DIR}" "${ENTRY_LIB_DIR}"; do
+  mkdir -p "${dest}"
   cp "${OUT_PATH}" "${dest}/libnimlibp2p.so"
   if [[ "${ENABLE_Z_SO_PACKAGING}" == "1" && "${dest}" == "${JNI_DIR}" ]]; then
     zip_copy "${dest}/libnimlibp2p.so" "${dest}/libnimlibp2p.z.so"
   fi
 done
 
-if [[ "${NIM_OHOS_PURE_CRYPTO}" != "1" ]]; then
-  # Copy OpenSSL runtime libraries required for QUIC/DTLS.
-  for lib in libssl.so libssl.so.3 libssl.so.4 libcrypto.so libcrypto.so.3 libcrypto.so.4; do
-    if [[ -f "${OPENSSL_DIR}/lib/${lib}" ]]; then
-      for dest in "${OUT_DIR}" "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${MODULE_LIB64_DIR}" "${JNI_DIR}" "${ENTRY_LIB_DIR}"; do
-        cp "${OPENSSL_DIR}/lib/${lib}" "${dest}/${lib}"
-      done
-    else
-      echo "[nim-ohos] WARNING: ${lib} not found under ${OPENSSL_DIR}/lib" >&2
-    fi
-  done
-else
-  for dest in "${OUT_DIR}" "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${MODULE_LIB64_DIR}" "${JNI_DIR}" "${ENTRY_LIB_DIR}"; do
-    rm -f "${dest}"/libssl.so "${dest}"/libssl.so.3 "${dest}"/libssl.so.4 \
-      "${dest}"/libcrypto.so "${dest}"/libcrypto.so.3 "${dest}"/libcrypto.so.4
-    rm -rf "${dest}/ossl-modules" "${dest}/engines-3" "${dest}/engines-4"
-  done
-fi
+for dest in "${OUT_DIR}" "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${MODULE_LIB64_DIR}" "${JNI_DIR}" "${ENTRY_LIB_DIR}"; do
+  mkdir -p "${dest}"
+  rm -f "${dest}"/libssl.so "${dest}"/libssl.so.3 "${dest}"/libssl.so.4 \
+    "${dest}"/libcrypto.so "${dest}"/libcrypto.so.3 "${dest}"/libcrypto.so.4 \
+    "${dest}"/libmsquic.so
+  rm -rf "${dest}/ossl-modules" "${dest}/engines-3" "${dest}/engines-4"
+done
 
 NEEDS_LIBCXX_SHARED=0
 if command -v objdump >/dev/null 2>&1 && objdump -p "${OUT_PATH}" 2>/dev/null | grep -q 'NEEDED[[:space:]]\+libc++_shared\.so'; then
@@ -282,6 +245,7 @@ if command -v objdump >/dev/null 2>&1 && objdump -p "${OUT_PATH}" 2>/dev/null | 
 fi
 
 for dest in "${OUT_DIR}" "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${MODULE_LIB64_DIR}" "${JNI_DIR}" "${ENTRY_LIB_DIR}"; do
+  mkdir -p "${dest}"
   rm -f "${dest}/libnimbridge.so" "${dest}/libnimbridge.z.so" \
     "${dest}/libp2pbridge.so" "${dest}/libp2pbridge.z.so"
   if [[ "${NEEDS_LIBCXX_SHARED}" == "1" ]]; then
@@ -290,22 +254,5 @@ for dest in "${OUT_DIR}" "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${M
     rm -f "${dest}/libc++_shared.so"
   fi
 done
-
-if [[ "${NIM_OHOS_PURE_CRYPTO}" != "1" ]]; then
-  # Distribute OpenSSL provider/engine directories.
-  for dir in ossl-modules engines-3 engines-4; do
-    SRC_DIR="${OPENSSL_DIR}/lib/${dir}"
-    if [[ -d "${SRC_DIR}" ]]; then
-      for dest in "${OUT_DIR}" "${SECONDARY_DIR}" "${LEGACY_DIR}" "${MODULE_DIR}" "${MODULE_LIB64_DIR}" "${JNI_DIR}"; do
-        rm -rf "${dest}/${dir}"
-        mkdir -p "${dest}/${dir}"
-        cp -R "${SRC_DIR}/." "${dest}/${dir}/"
-      done
-      echo "[nim-ohos] Copied ${dir}"
-    else
-      echo "[nim-ohos] WARNING: OpenSSL directory ${SRC_DIR} missing" >&2
-    fi
-  done
-fi
 
 echo "[nim-ohos] Done."

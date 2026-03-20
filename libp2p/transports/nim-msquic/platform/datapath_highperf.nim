@@ -409,6 +409,13 @@ proc queueForEndpoint*(datapath: HighPerfDatapath, endpoint: UdpEndpoint,
   datapath.queueForPacket(endpoint.localAddress, remoteAddr,
                           endpoint.localPort, remotePort)
 
+proc queueForInboundPacket(datapath: HighPerfDatapath, endpoint: UdpEndpoint,
+                           remoteAddr: string, remotePort: Port): int =
+  ## 入站包的 RSS 应按真实报文方向 remote -> local 计算，否则会把接收统计
+  ## 记到反向五元组对应的队列上。
+  datapath.queueForPacket(remoteAddr, endpoint.localAddress,
+                          remotePort, endpoint.localPort)
+
 proc queueStats*(datapath: HighPerfDatapath, queueId: Natural): QueueStats =
   if datapath.isNil:
     raise newException(ValueError, "datapath 未初始化")
@@ -603,7 +610,7 @@ proc dispatchInbound(datapath: HighPerfDatapath, endpoint: UdpEndpoint,
     handler = datapath.recvOriginalHandlers[endpoint]
   if handler.isNil:
     return
-  let queue = datapath.queueForEndpoint(endpoint, msg.remoteAddress, msg.remotePort)
+  let queue = datapath.queueForInboundPacket(endpoint, msg.remoteAddress, msg.remotePort)
   if queue < 0 or queue >= datapath.queueRuntimes.len:
     handler(endpoint, msg)
     return

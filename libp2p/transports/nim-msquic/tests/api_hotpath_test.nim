@@ -6,20 +6,64 @@ import "../api/event_model"
 import "../api/param_catalog"
 import "../api/diagnostics_model"
 
+type
+  HotpathNote = enum
+    hnReceiveTrue
+    hnReceiveFalse
+    hnSendTrue
+    hnSendFalse
+
+  HotpathEvent = object
+    paramId: uint32
+    boolValue: bool
+    note: HotpathNote
+
+var
+  gDiagNotes: array[8, HotpathNote]
+  gDiagNoteCount: int
+  gConnectionEvents: array[8, HotpathEvent]
+  gConnectionEventCount: int
+
+proc classifyHotpathNote(note: string): HotpathNote =
+  case note
+  of "receive=true":
+    hnReceiveTrue
+  of "receive=false":
+    hnReceiveFalse
+  of "send=true":
+    hnSendTrue
+  else:
+    hnSendFalse
+
+proc pushDiagNote(note: HotpathNote) =
+  doAssert gDiagNoteCount < gDiagNotes.len
+  gDiagNotes[gDiagNoteCount] = note
+  inc gDiagNoteCount
+
+proc pushConnectionEvent(paramId: uint32; boolValue: bool; note: HotpathNote) =
+  doAssert gConnectionEventCount < gConnectionEvents.len
+  gConnectionEvents[gConnectionEventCount] = HotpathEvent(
+    paramId: paramId,
+    boolValue: boolValue,
+    note: note
+  )
+  inc gConnectionEventCount
+
 suite "API 热路径优化":
   setup:
     clearDiagnosticsHooks()
+    gDiagNoteCount = 0
+    gConnectionEventCount = 0
 
   teardown:
     clearDiagnosticsHooks()
 
   test "Datagram 快速路径与 C Shim 保持一致":
-    var diagNotes: seq[string] = @[]
     registerDiagnosticsHook(proc (event: DiagnosticsEvent) {.gcsafe.} =
       if event.kind == diagConnectionParamSet and
           (event.paramId == QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED or
           event.paramId == QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED):
-        diagNotes.add(event.note)
+        pushDiagNote(classifyHotpathNote(event.note))
     )
 
     var apiPtr: pointer
@@ -53,10 +97,13 @@ suite "API 热路径优化":
     check table.ConnectionOpen(registration, noopConnectionCallback, nil,
       addr connection) == QUIC_STATUS_SUCCESS
 
-    var connectionEvents: seq[(uint32, bool, string)] = @[]
     registerConnectionEventHandler(connection, proc (event: ConnectionEvent) {.gcsafe.} =
       if event.kind == ceDatagramStateChanged:
-        connectionEvents.add((event.paramId, event.boolValue, event.note))
+        pushConnectionEvent(
+          event.paramId,
+          event.boolValue,
+          classifyHotpathNote(event.note)
+        )
     )
 
     let contextValue = cast[pointer](0xDEADBEEF'i64)
@@ -89,10 +136,17 @@ suite "API 热路径优化":
     table.RegistrationClose(registration)
     MsQuicClose(apiPtr)
 
-    check diagNotes == @["receive=true", "receive=false", "send=true", "send=false"]
-    check connectionEvents == @[
-      (QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED, true, "receive=true"),
-      (QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED, false, "receive=false"),
-      (QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED, true, "send=true"),
-      (QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED, false, "send=false")
+    check gDiagNoteCount == 4
+    check gDiagNotes.toSeq()[0 ..< gDiagNoteCount] == @[
+      hnReceiveTrue,
+      hnReceiveFalse,
+      hnSendTrue,
+      hnSendFalse
+    ]
+    check gConnectionEventCount == 4
+    check gConnectionEvents.toSeq()[0 ..< gConnectionEventCount] == @[
+      HotpathEvent(paramId: QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED, boolValue: true, note: hnReceiveTrue),
+      HotpathEvent(paramId: QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED, boolValue: false, note: hnReceiveFalse),
+      HotpathEvent(paramId: QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED, boolValue: true, note: hnSendTrue),
+      HotpathEvent(paramId: QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED, boolValue: false, note: hnSendFalse)
     ]

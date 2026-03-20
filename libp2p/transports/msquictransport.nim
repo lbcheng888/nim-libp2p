@@ -12,6 +12,7 @@ import ../crypto/crypto
 import ../multiaddress, ../multicodec, ../peerid
 import ../multibase
 import ../multihash
+import ../muxers/muxer
 import ../upgrademngrs/upgrade
 import ../stream/connection
 from ../stream/lpstream import LPStreamError
@@ -56,6 +57,10 @@ proc bytesToString(data: seq[byte]): string =
   result = newString(data.len)
   for i, b in data:
     result[i] = char(b)
+
+proc splitTransportAddress(
+    ma: MultiAddress
+): MaResult[(MultiAddress, bool, seq[seq[byte]])] {.gcsafe, raises: [].}
 
 proc detectAddressFamily(host: string): uint16 =
   if host.len == 0:
@@ -205,6 +210,198 @@ type
   QuicTransportError* = object of basetransport.TransportError
   QuicTransportDialError* = object of basetransport.TransportDialError
   QuicTransportAcceptStopped* = object of QuicTransportError
+
+  MsQuicChannel = ref object of Connection
+    stream: MsQuicStream
+
+  MsQuicMuxer = ref object of Muxer
+    session: MsQuicConnection
+    bootstrapInbound: Connection
+    bootstrapOutbound: Connection
+    handleFut: Future[void]
+
+method initStream*(s: MsQuicChannel) {.gcsafe, raises: [].} =
+  if s.objName.len == 0:
+    s.objName = "MsQuicChannel"
+  try:
+    procCall Connection(s).initStream()
+  except CatchableError as exc:
+    trace "MsQuic channel base init raised", error = exc.msg
+
+proc newMsQuicChannel(
+    session: MsQuicConnection, stream: MsQuicStream
+): MsQuicChannel {.gcsafe, raises: [].} =
+  try:
+    let channel = MsQuicChannel(
+      stream: stream,
+      peerId: session.peerId,
+      dir: stream.dir,
+      observedAddr: session.observedAddr,
+      localAddr: session.localAddr,
+      protocol: session.protocol,
+      negotiatedMuxer: "msquic",
+      multistreamVersion: msv1,
+    )
+    if not session.bandwidthManager.isNil:
+      channel.bandwidthManager = session.bandwidthManager
+      stream.setBandwidthManager(session.bandwidthManager)
+    channel.initStream()
+    channel
+  except CatchableError as exc:
+    trace "MsQuic channel init raised", error = exc.msg
+    nil
+
+method readOnce*(
+    s: MsQuicChannel, pbytes: pointer, nbytes: int
+): Future[int] {.async: (raises: [CancelledError, LPStreamError]).} =
+  let count = await s.stream.readOnce(pbytes, nbytes)
+  if count > 0:
+    s.activity = true
+  count
+
+method write*(
+    s: MsQuicChannel, bytes: seq[byte]
+): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
+  await s.stream.write(bytes)
+  if bytes.len > 0:
+    s.activity = true
+
+method closeWrite*(s: MsQuicChannel) {.async: (raises: []).} =
+  await s.stream.closeWrite()
+
+method closeImpl*(s: MsQuicChannel) {.async: (raises: []).} =
+  try:
+    await s.stream.closeImpl()
+  except CatchableError:
+    discard
+  await procCall Connection(s).closeImpl()
+
+method getWrapped*(s: MsQuicChannel): Connection =
+  nil
+
+proc closePendingMsQuicState(
+    handle: msquicdrv.MsQuicTransportHandle,
+    state: msquicdrv.MsQuicStreamState
+) {.gcsafe, raises: [].} =
+  if handle.isNil or state.isNil or state.stream.isNil:
+    return
+  try:
+    msquicSafe:
+      msquicdrv.closeStream(handle, cast[pointer](state.stream), state)
+  except Exception as exc:
+    trace "MsQuic close pending stream raised", err = exc.msg
+
+proc channelFromState(
+    muxer: MsQuicMuxer,
+    state: msquicdrv.MsQuicStreamState,
+    dir: Direction
+): Connection {.gcsafe, raises: [].} =
+  if muxer.isNil or muxer.session.isNil or state.isNil:
+    return nil
+  try:
+    let stream = newMsQuicStream(
+      state,
+      muxer.session.transportHandle(),
+      dir,
+      peerId = muxer.session.peerId,
+      protocol = muxer.session.protocol
+    )
+    newMsQuicChannel(muxer.session, stream)
+  except CatchableError as exc:
+    trace "MsQuic channel creation failed", error = exc.msg
+    nil
+
+proc nextIncomingChannel(
+    muxer: MsQuicMuxer
+): Future[Connection] {.async: (raises: [CancelledError, QuicTransportError]).} =
+  if muxer.isNil or muxer.session.isNil or muxer.session.connectionState().isNil:
+    raise (ref QuicTransportError)(msg: "MsQuic muxer session unavailable")
+  let connState = muxer.session.connectionState()
+  warn "MsQuic muxer waiting for incoming stream",
+    peerId = muxer.session.peerId,
+    protocol = muxer.session.protocol
+  while true:
+    var pending = msquicdrv.popPendingStreamState(connState)
+    if pending.isNone:
+      try:
+        discard await msquicdrv.awaitPendingStreamState(connState)
+      except CancelledError as exc:
+        raise exc
+      except CatchableError as exc:
+        raise (ref QuicTransportError)(
+          msg: "MsQuic pending stream wait failed: " & exc.msg
+        )
+      pending = msquicdrv.popPendingStreamState(connState)
+      if pending.isNone:
+        continue
+    let state = pending.get()
+    if state.isNil:
+      continue
+    if msquicdrv.isLocalInitiated(state):
+      warn "MsQuic muxer skipped local-initiated pending stream",
+        peerId = muxer.session.peerId,
+        protocol = muxer.session.protocol
+      continue
+    warn "MsQuic muxer accepted pending peer stream",
+      peerId = muxer.session.peerId,
+      protocol = muxer.session.protocol
+    let channel = muxer.channelFromState(state, Direction.In)
+    if channel.isNil:
+      closePendingMsQuicState(muxer.session.transportHandle(), state)
+      continue
+    return channel
+
+method newStream*(
+    m: MsQuicMuxer, name: string = "", lazy: bool = false
+): Future[Connection] {.async: (raises: [CancelledError, LPStreamError, MuxerError]).} =
+  try:
+    let stream = m.session.openMsQuicStream(false, Direction.Out)
+    return newMsQuicChannel(m.session, stream)
+  except LPStreamError as exc:
+    raise exc
+  except CatchableError as exc:
+    raise newException(MuxerError, "MsQuic newStream failed: " & exc.msg, exc)
+
+method handle*(m: MsQuicMuxer): Future[void] {.async: (raises: []).} =
+  warn "MsQuic muxer handle loop start",
+    peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId)
+  proc handleStream(ch: Connection) {.async: (raises: []).} =
+    warn "MsQuic muxer dispatching inbound stream",
+      peerId = ch.peerId,
+      protocol = ch.protocol,
+      negotiated = ch.negotiatedMuxer
+    await m.streamHandler(ch)
+    doAssert(ch.closed, "connection not closed by handler!")
+
+  while not m.session.isNil and not m.session.closed and not m.session.atEof:
+    try:
+      let stream = await m.nextIncomingChannel()
+      if not stream.isNil:
+        asyncSpawn handleStream(stream)
+    except CancelledError:
+      break
+    except msquicdrv.MsQuicEventQueueClosed:
+      break
+    except CatchableError as exc:
+      trace "MsQuic muxer handle raised", error = exc.msg
+      break
+  warn "MsQuic muxer handle loop stop",
+    peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId)
+
+method close*(m: MsQuicMuxer) {.async: (raises: []).} =
+  if not m.bootstrapInbound.isNil:
+    await m.bootstrapInbound.close()
+    m.bootstrapInbound = nil
+  if not m.bootstrapOutbound.isNil:
+    await m.bootstrapOutbound.close()
+    m.bootstrapOutbound = nil
+  if not m.session.isNil:
+    await m.session.close()
+  if not m.handleFut.isNil and not m.handleFut.finished():
+    m.handleFut.cancelSoon()
+
+method getStreams*(m: MsQuicMuxer): seq[Connection] =
+  @[]
 
 proc initWebtransportDefaults(transport: MsQuicTransport) =
   transport.webtransportPath = DefaultWebtransportPath
@@ -828,7 +1025,7 @@ proc closeAllListeners(self: MsQuicTransport) {.raises: [].} =
   self.listeners.setLen(0)
   self.listenerFuts.setLen(0)
 
-proc extractHostPort(address: MultiAddress): (string, string) =
+proc extractHostPort(address: MultiAddress): (string, string) {.gcsafe, raises: [].} =
   let text = address.toString().valueOr:
     return ("", "")
   if text.len == 0:
@@ -852,6 +1049,54 @@ proc extractHostPort(address: MultiAddress): (string, string) =
       discard
     inc idx
   (host, port)
+
+proc isIpv4WildcardHost(host: string): bool {.inline, gcsafe, raises: [].} =
+  host.len == 0 or host == "0.0.0.0"
+
+proc isIpv6WildcardHost(host: string): bool {.inline, gcsafe, raises: [].} =
+  let lower = host.toLowerAscii()
+  lower.len == 0 or lower == "::" or lower == "0" or lower == "0:0:0:0:0:0:0:0"
+
+proc listenerVariantKey(baseAddr: MultiAddress; webtransport: bool): string {.gcsafe, raises: [].} =
+  let (_, port) = extractHostPort(baseAddr)
+  if port.len == 0:
+    return ""
+  (if webtransport: "webtransport" else: "quic") & ":" & port
+
+proc filterRedundantWildcardListeners(addrs: seq[MultiAddress]): seq[MultiAddress] {.gcsafe, raises: [].} =
+  if addrs.len <= 1:
+    return addrs
+  var ipv6WildcardKeys = initHashSet[string]()
+  var splitCache = newSeq[(bool, MultiAddress, bool)](addrs.len)
+  for idx, ma in addrs:
+    let split = try:
+      splitTransportAddress(ma)
+    except Exception:
+      continue
+    if split.isErr:
+      continue
+    let (baseAddr, hasWebtransport, _) = split.get()
+    splitCache[idx] = (true, baseAddr, hasWebtransport)
+    let (host, _) = extractHostPort(baseAddr)
+    if isIpv6WildcardHost(host):
+      let key = listenerVariantKey(baseAddr, hasWebtransport)
+      if key.len > 0:
+        ipv6WildcardKeys.incl(key)
+  if ipv6WildcardKeys.len == 0:
+    return addrs
+  for idx, ma in addrs:
+    let cached = splitCache[idx]
+    if not cached[0]:
+      result.add(ma)
+      continue
+    let baseAddr = cached[1]
+    let hasWebtransport = cached[2]
+    let (host, _) = extractHostPort(baseAddr)
+    let key = listenerVariantKey(baseAddr, hasWebtransport)
+    if key.len > 0 and isIpv4WildcardHost(host) and ipv6WildcardKeys.contains(key):
+      trace "MsQuic skip redundant IPv4 wildcard listener", address = $ma, key = key
+      continue
+    result.add(ma)
 
 proc makeClientHandshakeInfo(
     transport: MsQuicTransport,
@@ -1144,7 +1389,9 @@ proc makeTlsConfig(transport: MsQuicTransport): mstls.TlsConfig =
       resumptionTicket: none(seq[uint8]),
       enableZeroRtt: false,
       useSharedSessionCache: true,
-      disableCertificateValidation: true
+      disableCertificateValidation: false,
+      requireClientAuth: true,
+      indicateCertificateReceived: true
     )
     if transport.tlsTempDir.len > 0:
       cfg.tempDirectory = some(transport.tlsTempDir)
@@ -1152,7 +1399,7 @@ proc makeTlsConfig(transport: MsQuicTransport): mstls.TlsConfig =
 
 proc splitTransportAddress(
     ma: MultiAddress
-): MaResult[(MultiAddress, bool, seq[seq[byte]])] =
+): MaResult[(MultiAddress, bool, seq[seq[byte]])] {.gcsafe, raises: [].} =
   ## 拆分 QUIC 多地址：返回基础地址、是否标注 WebTransport，以及显式的 certhash 序列。
   var prefixParts: seq[MultiAddress]
   let total = ?len(ma)
@@ -2041,6 +2288,7 @@ proc awaitMsQuicDial(
   if state.isNil:
     return (false, "MsQuic connection state unavailable")
   var attempt = 0
+  var timeoutCount = 0
   while attempt < MsQuicDialMaxEvents:
     inc attempt
     trace "MsQuic dial awaiting connection event", attempt = attempt
@@ -2049,8 +2297,9 @@ proc awaitMsQuicDial(
     let winner = await race(cast[FutureBase](fut), cast[FutureBase](timeoutFut))
     if winner == cast[FutureBase](timeoutFut):
       fut.cancel()
-      trace "MsQuic dial event timeout", attempt = attempt
-      return (false, "timeout waiting for MsQuic connection event")
+      inc timeoutCount
+      trace "MsQuic dial event timeout", attempt = attempt, timeoutCount = timeoutCount
+      continue
     timeoutFut.cancel()
     let event =
       try:
@@ -2069,7 +2318,10 @@ proc awaitMsQuicDial(
       return (false, "MsQuic connection shutdown complete")
     else:
       discard
-  (false, "MsQuic dial exceeded event budget")
+  if timeoutCount > 0:
+    (false, "timeout waiting for MsQuic connection event")
+  else:
+    (false, "MsQuic dial exceeded event budget")
 
 proc newMsQuicTransport*(
     upgrader: Upgrade,
@@ -2163,11 +2415,15 @@ method start*(
         discard
     created.setLen(0)
 
+  let effectiveAddrs = filterRedundantWildcardListeners(addrs)
   var listenerPlans: seq[(Option[MultiAddress], bool)] = @[]
-  if addrs.len == 0:
+  if effectiveAddrs.len == 0:
     listenerPlans.add((none(MultiAddress), false))
   else:
-    for ma in addrs:
+    for ma in effectiveAddrs:
+      if not self.handles(ma):
+        trace "MsQuic skip non-quic listen address", address = $ma
+        continue
       let split = splitTransportAddress(ma)
       if split.isErr:
         cleanupCreated()
@@ -2331,9 +2587,9 @@ method handles*(
 ): bool {.gcsafe, raises: [].} =
   if not procCall basetransport.Transport(transport).handles(address):
     return false
-  if QUIC_V1.match(address):
+  if QUIC_V1.matchPartial(address):
     return true
-  WebTransport.match(address)
+  WebTransport.matchPartial(address)
 
 # ...
 
@@ -2709,3 +2965,34 @@ method dial*(
         exc
       )
   connection
+
+method upgrade*(
+    self: MsQuicTransport, conn: Connection, peerId: Opt[PeerId]
+): Future[Muxer] {.async: (raises: [CancelledError, LPError]).} =
+  let session =
+    if conn of MsQuicConnection:
+      MsQuicConnection(conn)
+    else:
+      raise (ref QuicTransportError)(msg: "MsQuic upgrade requires MsQuicConnection")
+
+  if peerId.isSome:
+    session.peerId = peerId.get()
+
+  session.activateNativeMux()
+  let detached = session.detachPrimaryStreamState()
+  let muxer = MsQuicMuxer(session: session, connection: conn)
+  if not detached.state.isNil:
+    closePendingMsQuicState(session.transportHandle(), detached.state)
+
+  muxer.streamHandler = proc(streamConn: Connection) {.async: (raises: []).} =
+    try:
+      await self.upgrader.ms.handle(streamConn)
+    except CancelledError:
+      return
+    except CatchableError as exc:
+      trace "MsQuic muxer stream handler raised", error = exc.msg
+    finally:
+      await streamConn.closeWithEOF()
+
+  muxer.handleFut = muxer.handle()
+  return muxer

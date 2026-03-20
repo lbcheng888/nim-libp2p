@@ -22,10 +22,10 @@ import ./protocols/graphsync/graphsync
 import ./protocols/bitswap/ledger
 import ./providers/bitswapadvertiser
 import ./utility
+when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
+  {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
 when defined(libp2p_msquic_experimental):
   import ./transports/msquictransport as quictransport
-elif defined(libp2p_quic_support):
-  import ./transports/quictransport
 
 const
   BitswapAdvertTargets = ["dht", "delegated"]

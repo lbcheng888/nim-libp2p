@@ -88,6 +88,9 @@ object NimBridge {
     fun fetchFeedSnapshot(handle: Long): String? =
         nativeFetchFeedSnapshot(handle)
 
+    fun uiFrameSnapshot(handle: Long, maxEvents: Int = 32, discoveryLimit: Int = 64): String? =
+        nativeUiFrameSnapshot(handle, maxEvents, discoveryLimit)
+
     fun registerPeerHints(handle: Long, peerId: String, addressesJson: String, source: String? = null): Boolean =
         nativeRegisterPeerHints(handle, peerId, addressesJson, source)
 
@@ -197,6 +200,7 @@ object NimBridge {
     private external fun nativeSendDirect(handle: Long, peerId: String?, payload: ByteArray?): Boolean
     private external fun nativePublishFeed(handle: Long, jsonPayload: String?): Boolean
     private external fun nativeFetchFeedSnapshot(handle: Long): String?
+    private external fun nativeUiFrameSnapshot(handle: Long, maxEvents: Int, discoveryLimit: Int): String?
     private external fun nativeUpsertLivestream(handle: Long, streamKey: String?, configJson: String?): Boolean
     private external fun nativePublishLivestreamFrame(handle: Long, streamKey: String?, payload: ByteArray?): Boolean
     private external fun nativeGetLastDirectError(handle: Long): String?

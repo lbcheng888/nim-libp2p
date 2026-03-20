@@ -1,22 +1,15 @@
 import ../config.nims
 import strutils, os
 
---threads:
-  on
---d:
-  metrics
---d:
-  withoutPCRE
---d:
-  libp2p_agents_metrics
---d:
-  libp2p_protobuf_metrics
---d:
-  libp2p_network_protocols_metrics
---d:
-  libp2p_mplex_metrics
---d:
-  unittestPrintTime
+switch("threads", "on")
+switch("define", "withoutPCRE")
+switch("define", "unittestPrintTime")
+when defined(libp2p_test_metrics):
+  switch("define", "metrics")
+  switch("define", "libp2p_agents_metrics")
+  switch("define", "libp2p_protobuf_metrics")
+  switch("define", "libp2p_network_protocols_metrics")
+  switch("define", "libp2p_mplex_metrics")
 
 # Only add chronicles param if the
 # user didn't specify any

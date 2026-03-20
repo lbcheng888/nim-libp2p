@@ -1,4 +1,4 @@
-import std/[options, os, strformat, strutils, unittest]
+import std/[options, os, strformat, strutils, times, unittest]
 
 import ../api/tls_bridge
 import ../tls/common
@@ -24,7 +24,7 @@ suite "MsQuic TLS Bridge (F3)":
     check cCfg.Certificate.isNil
     check cCfg.Principal != nil
     check $cCfg.Principal == "example.com"
-    check cast[pointer](binding) == cCfg.Reserved
+    check cCfg.Reserved.isNil
 
   test "server config writes PEM artifacts and triggers handlers":
     var credentialStatus: uint32 = 1
@@ -201,7 +201,7 @@ suite "MsQuic TLS Bridge (F3)":
     let cfgPtr = binding.credentialConfigPtr()
     require cfgPtr != nil
     let cCfg = cfgPtr[]
-    check includesFlag(cCfg.Flags, QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION)
+    check not includesFlag(cCfg.Flags, QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION)
     check includesFlag(cCfg.Flags, QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION)
     check includesFlag(cCfg.Flags, QUIC_CREDENTIAL_FLAG_ENABLE_OCSP)
     check includesFlag(cCfg.Flags, QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED)

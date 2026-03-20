@@ -23,8 +23,10 @@ import
   ../upgrademngrs/upgrade,
   ../wire
 
-when not defined(libp2p_quic_support):
-  {.error: "WebRTC direct transport requires -d:libp2p_quic_support".}
+when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
+  {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
+when not defined(libp2p_msquic_experimental):
+  {.error: "WebRTC direct transport requires -d:libp2p_msquic_experimental".}
 
 # The libdatachannel Nim bindings do not expose the complete C surface yet.
 # We reuse their base definitions and extend the missing procedures here.

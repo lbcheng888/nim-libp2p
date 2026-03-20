@@ -32,10 +32,10 @@ when libp2pDataTransferEnabled:
 import libp2p/protocols/rendezvous/rendezvous
 import libp2p/stream/lpstream
 import bearssl/[rand, hash]
+when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
+  {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
 when defined(libp2p_msquic_experimental):
   import libp2p/transports/msquictransport as msquictransport
-when defined(libp2p_quic_support):
-  import libp2p/transports/msquicwrapper as msquicwrapper
 
 # Production Crypto Imports
 import libp2p/crypto/coinjoin/[secp_utils, types]
@@ -633,18 +633,6 @@ when defined(libp2p_msquic_experimental):
     event["reason"] = %reason
     event["aggregate"] = aggregate
     event["transports"] = transportsArr
-    when defined(libp2p_quic_support):
-      var blueprintArr = newJArray()
-      let connections = n.switchInstance.connManager.getConnections()
-      for _, muxers in connections.pairs:
-        for mux in muxers:
-          if mux.isNil or mux.connection.isNil:
-            continue
-          let sessionJson = msquicwrapper.msquicSessionInfoJson(mux.connection)
-          if sessionJson.kind != JNull:
-            blueprintArr.add(sessionJson)
-      if blueprintArr.len > 0:
-        event["blueprint_sessions"] = blueprintArr
     recordEvent(n, "network_event", $event)
 proc ensureJson(node: var JsonNode) =
   if node.isNil:
@@ -2602,10 +2590,6 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
   when defined(libp2p_msquic_experimental):
     builder = builder.withMsQuicTransport()
     debugLog("[nimlibp2p] buildSwitch applied MsQuic transport")
-  else:
-    when defined(libp2p_quic_support):
-      builder = builder.withQuicTransport()
-      debugLog("[nimlibp2p] buildSwitch applied QUIC transport")
   builder = builder.withYamux()
   debugLog("[nimlibp2p] buildSwitch applied Yamux")
   builder = builder.withNoise()
@@ -3528,8 +3512,9 @@ proc runCommand(
           command.errorMsg = "livestream publish failed: " & exc.msg
           return
         if delivered == 0:
-          command.resultCode = NimResultError
-          command.errorMsg = "no subscribers for livestream topic"
+          warn "cmdPublishLivestream skipped without subscribers", streamKey = command.streamKey, size = command.payload.len
+          command.resultCode = NimResultOk
+          command.errorMsg = ""
           return
         info "cmdPublishLivestream delivered", streamKey = command.streamKey, delivered = delivered, size = command.payload.len
         command.resultCode = NimResultOk

@@ -4,6 +4,7 @@ import unittest
 import std/sequtils
 
 import ../congestion/validation_suite
+import ../tooling/perf_ci_pipeline
 
 proc makeReferenceSnapshot(): PerfSnapshot =
   PerfSnapshot(

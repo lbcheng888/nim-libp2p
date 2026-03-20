@@ -65,3 +65,15 @@ examples/dex/dex_order_demo
 examples/nim_quic_demo
 libp2p/dialer
 *.out
+protocol_tls_core_test
+congestion_strategy_test
+api_stateless_reset_test
+api_loss_recovery_test
+api_preferred_address_test
+protocol_connection_close_test
+protocol_tls_core_test
+test_api_events
+test_api_settings
+api_connection_id_frames_test
+tests/
+wan_bootstrap_host_harness

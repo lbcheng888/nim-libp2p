@@ -317,13 +317,42 @@ proc identify*(
     )
 .} =
   # new stream for identify
+  warn "peerStore.identify newStream begin",
+    peerId = muxer.connection.peerId,
+    protocol = muxer.connection.protocol,
+    negotiated = muxer.connection.negotiatedMuxer
   var stream = await muxer.newStream()
   if stream == nil:
+    warn "peerStore.identify newStream nil",
+      peerId = muxer.connection.peerId,
+      protocol = muxer.connection.protocol,
+      negotiated = muxer.connection.negotiatedMuxer
     return
+  warn "peerStore.identify newStream done",
+    peerId = muxer.connection.peerId,
+    streamPeerId = stream.peerId,
+    protocol = stream.protocol,
+    negotiated = stream.negotiatedMuxer
 
   try:
+    warn "peerStore.identify multistream select begin",
+      peerId = muxer.connection.peerId,
+      streamPeerId = stream.peerId,
+      codec = peerStore.identify.codec()
     if (await MultistreamSelect.select(stream, peerStore.identify.codec())):
+      warn "peerStore.identify multistream select done",
+        peerId = muxer.connection.peerId,
+        streamPeerId = stream.peerId,
+        codec = peerStore.identify.codec()
       let info = await peerStore.identify.identify(stream, stream.peerId)
+      warn "peerStore.identify identify payload done",
+        peerId = info.peerId,
+        addrs = info.addrs.len,
+        protos = info.protos.len
+      if not muxer.isNil and not muxer.connection.isNil and info.peerId.len > 0:
+        muxer.connection.peerId = info.peerId
+      if info.peerId.len > 0:
+        stream.peerId = info.peerId
 
       when defined(libp2p_agents_metrics):
         var
@@ -335,6 +364,11 @@ proc identify*(
         muxer.setShortAgent(knownAgent)
 
       peerStore.updatePeerInfo(info, stream.observedAddr)
+    else:
+      warn "peerStore.identify multistream select rejected",
+        peerId = muxer.connection.peerId,
+        streamPeerId = stream.peerId,
+        codec = peerStore.identify.codec()
   finally:
     await stream.closeWithEOF()
 

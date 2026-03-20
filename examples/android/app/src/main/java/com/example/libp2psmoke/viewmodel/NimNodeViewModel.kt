@@ -19,7 +19,10 @@ import com.example.libp2psmoke.dex.BINANCE_SPOT_SYMBOL
 import com.example.libp2psmoke.domain.MarketDataUseCase
 import com.example.libp2psmoke.domain.P2PUseCase
 import com.example.libp2psmoke.domain.WalletUseCase
+import com.example.libp2psmoke.model.FeedEntry
+import com.example.libp2psmoke.model.LanEndpoint
 import com.example.libp2psmoke.model.NodeUiState
+import com.example.libp2psmoke.model.PeerState
 import com.example.libp2psmoke.ui.UiIntent
 import com.example.libp2psmoke.dex.BtcAddressType
 import com.example.libp2psmoke.dex.BtcWalletManager
@@ -35,9 +38,12 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.math.BigDecimal
 import java.math.RoundingMode
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * NimNodeViewModel V2 (MVI Architecture)
@@ -69,6 +75,7 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     
     private var marketLoopJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private val uiFrameRefreshInFlight = AtomicBoolean(false)
     
     init {
         dexRepository.init(getApplication())
@@ -458,6 +465,188 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
             )
         }
     }
+
+    fun onUiFrame(frameTimeNanos: Long, frameDeltaNanos: Long) {
+        if (!p2pUseCase.hasNodeHandle()) return
+        if (!uiFrameRefreshInFlight.compareAndSet(false, true)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val snapshot = p2pUseCase.fetchUiFrameSnapshot(
+                    maxEvents = 32,
+                    discoveryLimit = 64
+                ) ?: return@launch
+                applyUiFrameSnapshot(snapshot)
+            } finally {
+                uiFrameRefreshInFlight.set(false)
+            }
+        }
+    }
+
+    private fun applyUiFrameSnapshot(snapshot: JSONObject) {
+        val discovery = snapshot.optJSONObject("discovery")
+        val lanEndpoints = parseLanEndpoints(snapshot.optJSONObject("lanEndpoints"))
+        val feedEntries = parseFeedEntries(snapshot.optJSONObject("feed"))
+        val listenAddresses = jsonStringList(discovery?.optJSONArray("listenAddresses"))
+        val dialableAddresses = jsonStringList(discovery?.optJSONArray("dialableAddresses"))
+        val allAddresses = (listenAddresses + dialableAddresses).distinct()
+        val ipv4Addresses = allAddresses.filter { it.contains("/ip4/") }
+        val ipv6Addresses = allAddresses.filter { it.contains("/ip6/") }
+        val peers = parsePeerStates(
+            discovery?.optJSONArray("connectedPeersInfo"),
+            discovery?.optJSONObject("discoveredPeers")?.optJSONArray("peers")
+        )
+        val resolvedPeerId =
+            snapshot.optString("peerId")
+                .ifBlank { discovery?.optString("peerId").orEmpty() }
+        val connectedCount = discovery?.optInt(
+            "connectedCount",
+            peers.values.count { it.connected }
+        ) ?: peers.values.count { it.connected }
+        val running = snapshot.optBoolean("running", _state.value.running)
+        _state.update { state ->
+            state.copy(
+                running = running,
+                localPeerId = if (resolvedPeerId.isNotBlank()) resolvedPeerId else state.localPeerId,
+                peerCount = connectedCount,
+                ipv4Addresses = ipv4Addresses,
+                ipv6Addresses = ipv6Addresses,
+                lanEndpoints = lanEndpoints,
+                peers = peers,
+                feed = feedEntries
+            )
+        }
+    }
+
+    private fun parseLanEndpoints(payload: JSONObject?): List<LanEndpoint> {
+        val timestampMs = payload?.optLong("timestamp_ms", System.currentTimeMillis())
+            ?: System.currentTimeMillis()
+        val endpoints = payload?.optJSONArray("endpoints") ?: return emptyList()
+        return buildList {
+            for (index in 0 until endpoints.length()) {
+                val row = endpoints.optJSONObject(index) ?: continue
+                val peerId = row.optString("peer_id").ifBlank { row.optString("peerId") }
+                if (peerId.isBlank()) continue
+                val addresses =
+                    jsonStringList(row.optJSONArray("multiaddrs"))
+                        .ifEmpty { jsonStringList(row.optJSONArray("addresses")) }
+                add(
+                    LanEndpoint(
+                        peerId = peerId,
+                        addresses = addresses,
+                        isLocal = row.optBoolean("is_local", row.optBoolean("isLocal")),
+                        timestampMs = row.optLong("timestamp_ms", timestampMs)
+                    )
+                )
+            }
+        }
+    }
+
+    private fun parsePeerStates(
+        connectedPeersInfo: JSONArray?,
+        discoveredPeers: JSONArray?
+    ): Map<String, PeerState> {
+        val peers = LinkedHashMap<String, PeerState>()
+
+        fun merge(peerId: String, addresses: List<String>, lastSeenMs: Long, connected: Boolean) {
+            if (peerId.isBlank()) return
+            val existing = peers[peerId]
+            val mergedAddresses =
+                ((existing?.addresses ?: emptyList()) + addresses)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinct()
+            peers[peerId] = PeerState(
+                peerId = peerId,
+                addresses = mergedAddresses,
+                lastSeenMs = maxOf(existing?.lastSeenMs ?: 0L, lastSeenMs),
+                connected = (existing?.connected == true) || connected,
+                lastMessagePreview = existing?.lastMessagePreview,
+                incoming = existing?.incoming
+            )
+        }
+
+        if (connectedPeersInfo != null) {
+            for (index in 0 until connectedPeersInfo.length()) {
+                val row = connectedPeersInfo.optJSONObject(index) ?: continue
+                val peerId = row.optString("peerId").ifBlank { row.optString("peer_id") }
+                val addresses =
+                    jsonStringList(row.optJSONArray("addresses"))
+                        .ifEmpty { jsonStringList(row.optJSONArray("multiaddrs")) }
+                val lastSeenMs = row.optLong("lastSeenAt", 0L)
+                merge(peerId, addresses, lastSeenMs, connected = true)
+            }
+        }
+
+        if (discoveredPeers != null) {
+            for (index in 0 until discoveredPeers.length()) {
+                val row = discoveredPeers.optJSONObject(index) ?: continue
+                val peerId = row.optString("peerId").ifBlank { row.optString("peer_id") }
+                val addresses =
+                    jsonStringList(row.optJSONArray("multiaddrs"))
+                        .ifEmpty { jsonStringList(row.optJSONArray("addresses")) }
+                val lastSeenMs = row.optLong("lastSeenAt", 0L)
+                merge(peerId, addresses, lastSeenMs, connected = false)
+            }
+        }
+
+        return peers
+    }
+
+    private fun parseFeedEntries(payload: JSONObject?): List<FeedEntry> {
+        val items = payload?.optJSONArray("items") ?: return emptyList()
+        return buildList {
+            for (index in 0 until items.length()) {
+                val row = items.optJSONObject(index) ?: continue
+                val entryPayload = row.opt("payload")
+                val rawJson =
+                    when (entryPayload) {
+                        null, JSONObject.NULL -> ""
+                        is JSONObject -> entryPayload.toString()
+                        is JSONArray -> entryPayload.toString()
+                        else -> entryPayload.toString()
+                    }
+                val summary =
+                    summarizeFeedPayload(entryPayload)
+                        .ifBlank { rawJson }
+                        .take(160)
+                add(
+                    FeedEntry(
+                        id = row.optString("id").ifBlank {
+                            "${row.optString("author")}:${row.optLong("timestamp_ms", 0L)}:$index"
+                        },
+                        author = row.optString("author"),
+                        timestampMs = row.optLong("timestamp_ms", 0L),
+                        summary = summary,
+                        rawJson = rawJson
+                    )
+                )
+            }
+        }
+    }
+
+    private fun summarizeFeedPayload(payload: Any?): String =
+        when (payload) {
+            null, JSONObject.NULL -> ""
+            is JSONObject ->
+                listOf("summary", "text", "body", "content", "title")
+                    .firstNotNullOfOrNull { key ->
+                        payload.optString(key).takeIf { it.isNotBlank() }
+                    }
+                    ?: payload.toString()
+            is JSONArray -> payload.toString()
+            else -> payload.toString()
+        }
+
+    private fun jsonStringList(values: JSONArray?): List<String> =
+        buildList {
+            if (values == null) return@buildList
+            for (index in 0 until values.length()) {
+                val value = values.optString(index)
+                if (value.isNotBlank()) {
+                    add(value)
+                }
+            }
+        }
 
     private fun collectDexState() {
         viewModelScope.launch {

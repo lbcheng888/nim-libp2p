@@ -2,6 +2,7 @@
 
 import std/base64
 import std/dynlib
+import std/locks
 import std/options
 import std/sets
 import std/strutils
@@ -95,9 +96,15 @@ const
   SSL_KEY_UPDATE_REQUESTED = 1
 
 var
-  libSsl {.threadvar.}: LibHandle
-  libCrypto {.threadvar.}: LibHandle
-  sslInitialized {.threadvar.}: bool
+  # Harmony FFRT worker threads can exit frequently during migration. Keep the
+  # OpenSSL loader state process-global so worker teardown does not go through
+  # Nim emutls destructors for these handles.
+  libSsl: LibHandle
+  libCrypto: LibHandle
+  sslInitialized: bool
+  openSslInitLock: Lock
+
+initLock(openSslInitLock)
 
 const SessionLifetimeMs = 5'i64 * 60 * 1000
 
@@ -257,6 +264,9 @@ var
   symOPENSSL_free: OpensslFreeProc
 
 proc ensureOpenSslLoaded() =
+  acquire(openSslInitLock)
+  defer:
+    release(openSslInitLock)
   if sslInitialized:
     return
 

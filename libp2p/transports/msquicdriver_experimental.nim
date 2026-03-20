@@ -50,6 +50,8 @@ type
     peerUnidiStreamCount*: uint16 = DefaultPeerUnidiStreamCount
     appName*: string
     executionProfile*: uint32
+    clientBindHost*: string
+    clientBindPort*: uint16
 
   MsQuicSettings = object
     isSetFlags: uint64
@@ -96,6 +98,11 @@ type
     config*: MsQuicTransportConfig
     tlsBinding*: mstls.TlsCredentialBinding
     clientTlsBinding*: mstls.TlsCredentialBinding
+    retainLock: Lock
+    retainLockInit: bool
+    retainedConnectionStates: seq[MsQuicConnectionState]
+    retainedListenerStates: seq[MsQuicListenerState]
+    retainedStreamStates: seq[MsQuicStreamState]
     closed*: bool
 
   MsQuicConnectionHandler* = proc(event: msevents.ConnectionEvent) {.gcsafe.}
@@ -114,6 +121,7 @@ type
     signal: ThreadSignalPtr
     signalLoop: Future[void]
     closed*: bool
+    retainedForLateCallbacks: bool
     clientContext*: pointer
     externalHandler*: MsQuicConnectionHandler
     droppedEvents*: uint64
@@ -132,6 +140,7 @@ type
     signal: ThreadSignalPtr
     signalLoop: Future[void]
     closed*: bool
+    retainedForLateCallbacks: bool
     userContext*: pointer
     externalHandler*: MsQuicListenerHandler
     droppedEvents*: uint64
@@ -157,6 +166,7 @@ type
     signal: ThreadSignalPtr
     signalLoop: Future[void]
     closed*: bool
+    retainedForLateCallbacks: bool
     userContext*: pointer
     externalHandler*: MsQuicStreamHandler
     droppedEvents*: uint64
@@ -166,8 +176,13 @@ type
     localInitiated: bool
     startComplete: bool
     startWaiters: seq[Future[void]]
+    sendShutdownRequested: bool
+    peerSendShutdown: bool
   MsQuicEventQueueClosed* = object of CatchableError
   MsTlsConfig = mstlstypes.TlsConfig
+
+proc setConnectionLocalAddress*(handle: MsQuicTransportHandle; connection: pointer;
+    address: TransportAddress): string {.raises: [].}
 
 proc close(state: MsQuicStreamState) {.raises: [].}
 proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC;
@@ -176,6 +191,7 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     connState: MsQuicConnectionState; localInitiated: bool
   ): Result[MsQuicStreamState, string]
 proc msquicStreamEventRelay(event: msevents.StreamEvent) {.gcsafe.}
+proc triggerStreamDelivery(state: MsQuicStreamState)
 
 template withStateLock(state: typed; body: untyped) =
   when compiles(state.lock):
@@ -184,6 +200,34 @@ template withStateLock(state: typed; body: untyped) =
       body
     finally:
       release(state.lock)
+
+template withRetainLock(handle: MsQuicTransportHandle; body: untyped) =
+  if handle.isNil or not handle.retainLockInit:
+    body
+  else:
+    acquire(handle.retainLock)
+    try:
+      body
+    finally:
+      release(handle.retainLock)
+
+proc retainForLateCallbacks(handle: MsQuicTransportHandle; state: MsQuicConnectionState) =
+  if handle.isNil or state.isNil:
+    return
+  handle.withRetainLock:
+    handle.retainedConnectionStates.add(state)
+
+proc retainForLateCallbacks(handle: MsQuicTransportHandle; state: MsQuicListenerState) =
+  if handle.isNil or state.isNil:
+    return
+  handle.withRetainLock:
+    handle.retainedListenerStates.add(state)
+
+proc retainForLateCallbacks(handle: MsQuicTransportHandle; state: MsQuicStreamState) =
+  if handle.isNil or state.isNil:
+    return
+  handle.withRetainLock:
+    handle.retainedStreamStates.add(state)
 
 proc resolvedAlpns(cfg: MsQuicTransportConfig): seq[string] =
   if cfg.alpns.len == 0:
@@ -425,16 +469,38 @@ proc peekPendingStreamState*(state: MsQuicConnectionState): Option[MsQuicStreamS
         break
   result
 
+proc popPendingStreamState*(state: MsQuicConnectionState): Option[MsQuicStreamState] =
+  if state.isNil:
+    return none(MsQuicStreamState)
+  var result: Option[MsQuicStreamState]
+  state.withStateLock:
+    for streamPtr, pending in state.pendingStreams.pairs:
+      if pending.isNil:
+        continue
+      result = some(pending)
+      state.pendingStreams.del(streamPtr)
+      break
+  result
+
+proc isLocalInitiated*(state: MsQuicStreamState): bool {.inline.} =
+  if state.isNil:
+    return false
+  state.localInitiated
+
 proc close(state: MsQuicConnectionState) =
   if state.isNil:
     return
   var hadWaiters = false
   var pending: seq[MsQuicStreamState]
   var streamWaiters: seq[Future[MsQuicStreamState]]
+  var shouldRetain = false
   state.withStateLock:
     if state.closed:
       return
     state.closed = true
+    if not state.retainedForLateCallbacks:
+      state.retainedForLateCallbacks = true
+      shouldRetain = true
     hadWaiters = state.waiters.len > 0
     if state.pendingStreams.len > 0:
       pending = toSeq(state.pendingStreams.values)
@@ -442,6 +508,8 @@ proc close(state: MsQuicConnectionState) =
     if state.pendingStreamWaiters.len > 0:
       streamWaiters = state.pendingStreamWaiters
       state.pendingStreamWaiters.setLen(0)
+  if shouldRetain and not state.handle.isNil:
+    state.handle.retainForLateCallbacks(state)
   if hadWaiters:
     triggerConnectionDelivery(state)
   deliverConnectionEvents(state)
@@ -481,6 +549,7 @@ proc newMsQuicConnectionState(handle: MsQuicTransportHandle;
     signal: nil,
     signalLoop: nil,
     closed: false,
+    retainedForLateCallbacks: false,
     clientContext: userContext,
     externalHandler: handler,
     droppedEvents: 0,
@@ -716,12 +785,15 @@ proc deliverStreamReads(state: MsQuicStreamState) =
   while true:
     var fut: Future[seq[byte]] = nil
     var chunk: MsQuicReadChunk
+    var hasChunk = false
     var shouldFail = false
     var queuedLen = 0
     var waiterLen = 0
     state.withStateLock:
       if state.readQueue.len > 0 and state.readWaiters.len > 0:
-        chunk = state.readQueue.popFirst()
+        var nextChunk = state.readQueue.popFirst()
+        chunk = move(nextChunk)
+        hasChunk = true
         fut = state.readWaiters[0]
         state.readWaiters.delete(0)
         queuedLen = state.readQueue.len
@@ -730,7 +802,7 @@ proc deliverStreamReads(state: MsQuicStreamState) =
         shouldFail = true
       else:
         return
-    if not fut.isNil:
+    if hasChunk and not fut.isNil:
       when defined(libp2p_msquic_debug):
         warn "MsQuic stream read waiter fulfilled",
           stream = cast[uint64](state.stream),
@@ -744,6 +816,28 @@ proc deliverStreamReads(state: MsQuicStreamState) =
     elif shouldFail:
       failStreamReadWaiters(state)
       return
+
+proc handoffReadWaiters*(
+    source: MsQuicStreamState, target: MsQuicStreamState
+) {.raises: [].} =
+  if source.isNil or target.isNil or source == target:
+    return
+  var waiters: seq[Future[seq[byte]]]
+  source.withStateLock:
+    if source.readWaiters.len > 0:
+      waiters = source.readWaiters
+      source.readWaiters.setLen(0)
+  if waiters.len == 0:
+    return
+  target.withStateLock:
+    for fut in waiters:
+      if fut.isNil or fut.finished():
+        continue
+      target.readWaiters.add(fut)
+  try:
+    triggerStreamDelivery(target)
+  except Exception as exc:
+    trace "MsQuic triggerStreamDelivery during handoff raised", err = exc.msg
 
 proc streamSignalPump(state: MsQuicStreamState): Future[void] {.async.} =
   try:
@@ -770,17 +864,23 @@ proc streamSignalPump(state: MsQuicStreamState): Future[void] {.async.} =
     state.signalLoop = nil
 
 proc ensureStreamSignalLoop(state: MsQuicStreamState) =
+  if state.isNil or state.closed:
+    return
   if state.signalLoop.isNil:
     let fut = streamSignalPump(state)
     state.signalLoop = fut
     asyncSpawn fut
 
 proc triggerStreamDelivery(state: MsQuicStreamState) =
+  if state.isNil or state.closed:
+    return
   if state.signalLoop.isNil:
+    state.ensureStreamSignalLoop()
+  if state.signal.isNil:
     deliverStreamEvents(state)
     deliverStreamReads(state)
     return
-  if state.signal.isNil:
+  if state.signalLoop.isNil:
     deliverStreamEvents(state)
     deliverStreamReads(state)
     return
@@ -813,6 +913,9 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
     rawEvent: msevents.StreamEvent) =
   if state.isNil:
     return
+  state.withStateLock:
+    if state.closed:
+      return
   var forwarded = rawEvent
   forwarded.userContext = state.userContext
   var completedSend: MsQuicPendingSend = nil
@@ -838,12 +941,23 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
       state.externalHandler(forwarded)
     except Exception as exc:
       trace "MsQuic stream external handler raised", err = exc.msg
-  enqueueStreamEvent(state, forwarded)
+  if forwarded.kind == msevents.seReceive:
+    var queueEvent = forwarded
+    queueEvent.payload = @[]
+    queueEvent.totalBufferLength = forwarded.totalBufferLength
+    var hasEventWaiters = false
+    state.withStateLock:
+      hasEventWaiters = state.waiters.len > 0
+    if hasEventWaiters:
+      enqueueStreamEvent(state, queueEvent)
+  else:
+    enqueueStreamEvent(state, forwarded)
 
   if forwarded.kind == msevents.seReceive:
     var payloadData: seq[byte] = @[]
     if forwarded.payload.len > 0:
-      payloadData = forwarded.payload
+      payloadData = newSeqUninit[byte](forwarded.payload.len)
+      copyMem(addr payloadData[0], unsafeAddr forwarded.payload[0], forwarded.payload.len)
     elif forwarded.totalBufferLength > 0'u64:
       let fallbackLen = int(forwarded.totalBufferLength)
       if fallbackLen > 0:
@@ -868,7 +982,9 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
     var queuedLen = 0
     var waiterLen = 0
     state.withStateLock:
-      state.readQueue.addLast(MsQuicReadChunk(payload: payloadData, receiveLen: receiveLen))
+      state.readQueue.addLast(
+        MsQuicReadChunk(payload: move(payloadData), receiveLen: receiveLen)
+      )
       shouldNotify = state.readWaiters.len > 0
       queuedLen = state.readQueue.len
       waiterLen = state.readWaiters.len
@@ -890,20 +1006,35 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
             break
       elif state.pendingSends.len > 0:
         state.pendingSends.delete(0)
+  elif forwarded.kind == msevents.sePeerSendShutdown:
+    var shouldNotify = false
+    state.withStateLock:
+      if not state.peerSendShutdown:
+        state.peerSendShutdown = true
+        state.readQueue.addLast(MsQuicReadChunk(payload: @[], receiveLen: 0))
+        shouldNotify = state.readWaiters.len > 0
+    if shouldNotify:
+      triggerStreamDelivery(state)
 
 proc close(state: MsQuicStreamState) {.raises: [].} =
   if state.isNil:
     return
   var hadWaiters = false
   var startWaiters: seq[Future[void]]
+  var shouldRetain = false
   state.withStateLock:
     if state.closed:
       return
     state.closed = true
+    if not state.retainedForLateCallbacks:
+      state.retainedForLateCallbacks = true
+      shouldRetain = true
     hadWaiters = state.waiters.len > 0
     if state.startWaiters.len > 0:
       startWaiters = state.startWaiters
       state.startWaiters.setLen(0)
+  if shouldRetain and not state.handle.isNil:
+    state.handle.retainForLateCallbacks(state)
   if hadWaiters:
     triggerStreamDelivery(state)
   if startWaiters.len > 0:
@@ -922,6 +1053,22 @@ proc close(state: MsQuicStreamState) {.raises: [].} =
   # Late runtime callbacks can still observe the connection state after close.
   # Do not deinitialize the lock here; let process teardown reclaim it.
 
+proc markStreamStartComplete*(state: MsQuicStreamState) {.raises: [].} =
+  if state.isNil:
+    return
+  var startWaiters: seq[Future[void]]
+  state.withStateLock:
+    if state.startComplete or state.closed:
+      return
+    state.startComplete = true
+    if state.startWaiters.len > 0:
+      startWaiters = state.startWaiters
+      state.startWaiters.setLen(0)
+  for fut in startWaiters:
+    if fut.isNil or fut.finished():
+      continue
+    fut.complete()
+
 proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC;
     queueLimit: int; pollInterval: Duration;
     handler: MsQuicStreamHandler; userContext: pointer;
@@ -938,6 +1085,7 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     signal: nil,
     signalLoop: nil,
     closed: false,
+    retainedForLateCallbacks: false,
     connectionState: connState,
     userContext: userContext,
     externalHandler: handler,
@@ -947,7 +1095,9 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     pendingSends: @[],
     localInitiated: localInitiated,
     startComplete: not localInitiated,
-    startWaiters: @[]
+    startWaiters: @[],
+    sendShutdownRequested: false,
+    peerSendShutdown: false
   )
   initLock(state.lock)
   state.lockInit = true
@@ -956,6 +1106,7 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     close(state)
     return err("failed to initialize MsQuic stream signal: " & signalRes.error)
   state.signal = signalRes.get()
+  state.ensureStreamSignalLoop()
   ok(state)
 
 proc nextStreamEvent*(state: MsQuicStreamState): Future[msevents.StreamEvent] =
@@ -1126,14 +1277,20 @@ proc close(state: MsQuicListenerState) =
     return
   var hadWaiters = false
   var pending: seq[MsQuicConnectionState]
+  var shouldRetain = false
   state.withStateLock:
     if state.closed:
       return
     state.closed = true
+    if not state.retainedForLateCallbacks:
+      state.retainedForLateCallbacks = true
+      shouldRetain = true
     hadWaiters = state.waiters.len > 0
     if state.pendingConnections.len > 0:
       pending = toSeq(state.pendingConnections.values)
       state.pendingConnections.clear()
+  if shouldRetain and not state.handle.isNil:
+    state.handle.retainForLateCallbacks(state)
   if hadWaiters:
     triggerListenerDelivery(state)
   deliverListenerEvents(state)
@@ -1165,6 +1322,7 @@ proc newMsQuicListenerState(handle: MsQuicTransportHandle; queueLimit: int;
     signal: nil,
     signalLoop: nil,
     closed: false,
+    retainedForLateCallbacks: false,
     userContext: userContext,
     externalHandler: handler,
     droppedEvents: 0,
@@ -1351,20 +1509,25 @@ proc readStream*(state: MsQuicStreamState): Future[seq[byte]] {.gcsafe.} =
     fut.fail(newException(MsQuicEventQueueClosed, "MsQuic stream closed"))
     return fut
   let fut = Future[seq[byte]].init("msquic.stream.read")
-  var immediate: Option[MsQuicReadChunk]
+  var immediateChunk: MsQuicReadChunk
+  var hasImmediate = false
+  var shouldArmSignalLoop = false
   var queuedLen = 0
   var waiterLen = 0
   state.withStateLock:
     if state.readQueue.len > 0:
-      immediate = some(state.readQueue.popFirst())
+      var nextChunk = state.readQueue.popFirst()
+      immediateChunk = move(nextChunk)
+      hasImmediate = true
       queuedLen = state.readQueue.len
       waiterLen = state.readWaiters.len
     else:
       state.readWaiters.add(fut)
+      shouldArmSignalLoop = true
       queuedLen = state.readQueue.len
       waiterLen = state.readWaiters.len
-  if immediate.isSome:
-    let chunk = immediate.get()
+  if hasImmediate:
+    let chunk = move(immediateChunk)
     when defined(libp2p_msquic_debug):
       warn "MsQuic stream read immediate",
         stream = cast[uint64](state.stream),
@@ -1380,6 +1543,8 @@ proc readStream*(state: MsQuicStreamState): Future[seq[byte]] {.gcsafe.} =
       stream = cast[uint64](state.stream),
       queued = queuedLen,
       waiters = waiterLen
+  if shouldArmSignalLoop:
+    state.ensureStreamSignalLoop()
   fut
 
 proc writeStream*(state: MsQuicStreamState; data: seq[byte];
@@ -1458,6 +1623,10 @@ proc shutdown*(handle: MsQuicTransportHandle) {.raises: [].} =
   if not handle.bridge.isNil:
     releaseMsQuicBridge(handle.bridge)
     handle.bridge = nil
+  handle.withRetainLock:
+    handle.retainedConnectionStates.setLen(0)
+    handle.retainedListenerStates.setLen(0)
+    handle.retainedStreamStates.setLen(0)
 
 proc buildMsQuicSettings(cfg: MsQuicTransportConfig): MsQuicSettings =
   var settings: MsQuicSettings
@@ -1566,8 +1735,14 @@ proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
     config: cfg,
     tlsBinding: nil,
     clientTlsBinding: nil,
+    retainLockInit: false,
+    retainedConnectionStates: @[],
+    retainedListenerStates: @[],
+    retainedStreamStates: @[],
     closed: false
   )
+  initLock(handle.retainLock)
+  handle.retainLockInit = true
   (handle, "")
 
 proc loadCredential*(handle: MsQuicTransportHandle; cfg: MsTlsConfig;
@@ -1611,19 +1786,8 @@ proc loadCredential*(handle: MsQuicTransportHandle; cfg: MsTlsConfig;
   var clientCfg = cfg
   clientCfg.role = mstlstypes.tlsClient
   clientCfg.requireClientAuth = false
-  clientCfg.disableCertificateValidation = true
-  clientCfg.certificatePem = none(string)
-  clientCfg.privateKeyPem = none(string)
-  clientCfg.certificateFile = none(string)
-  clientCfg.privateKeyFile = none(string)
-  clientCfg.privateKeyPassword = none(string)
-  clientCfg.pkcs12File = none(string)
-  clientCfg.pkcs12Data = none(seq[uint8])
-  clientCfg.pkcs12Password = none(string)
-  clientCfg.certificateHash = none(mstlstypes.TlsCertificateHash)
-  clientCfg.certificateStore = none(string)
-  clientCfg.certificateStoreFlags = 0'u32
-  clientCfg.certificateContext = none(pointer)
+  clientCfg.disableCertificateValidation = false
+  clientCfg.indicateCertificateReceived = true
 
   let clientBinding =
     try:
@@ -1903,6 +2067,26 @@ proc dialConnection*(handle: MsQuicTransportHandle; serverName: string; port: ui
   let dialConfig =
     if handle.clientConfiguration.isNil: handle.configuration
     else: handle.clientConfiguration
+
+  let bindHost = handle.config.clientBindHost.strip()
+  if bindHost.len > 0 and bindHost != "0.0.0.0" and bindHost != "::":
+    var bindAddr = TransportAddress(family: AddressFamily.None)
+    try:
+      bindAddr = initTAddress(bindHost, Port(handle.config.clientBindPort))
+    except CatchableError:
+      bindAddr = TransportAddress(family: AddressFamily.None)
+    if bindAddr.family == AddressFamily.None:
+      safeShutdownConnection(handle.bridge, connection, 0'u32, 0'u64)
+      safeCloseConnection(handle.bridge, connection)
+      state.close()
+      return (nil, none(MsQuicConnectionState), "MsQuic client bind host invalid: " & bindHost)
+    let bindErr = setConnectionLocalAddress(handle, cast[pointer](connection), bindAddr)
+    if bindErr.len > 0:
+      safeShutdownConnection(handle.bridge, connection, 0'u32, 0'u64)
+      safeCloseConnection(handle.bridge, connection)
+      state.close()
+      return (nil, none(MsQuicConnectionState), bindErr)
+    trace "MsQuic dial local bind applied", bindHost = bindHost, bindPort = handle.config.clientBindPort
 
   let family = msapi.QUIC_ADDRESS_FAMILY(addressFamily)
   try:
@@ -2226,6 +2410,45 @@ proc getConnectionLocalAddress*(handle: MsQuicTransportHandle; connection: point
     Result[TransportAddress, string] {.gcsafe, raises: [].} =
   getConnectionAddress(handle, connection, msparams.QUIC_PARAM_CONN_LOCAL_ADDRESS)
 
+proc setConnectionAddressParam(
+    handle: MsQuicTransportHandle;
+    connection: pointer;
+    paramId: uint32;
+    address: TransportAddress
+): string {.raises: [].} =
+  if handle.isNil or handle.bridge.isNil or connection.isNil:
+    return "MsQuic transport handle unavailable"
+  if address.family == AddressFamily.None:
+    return "MsQuic address unavailable"
+  let api = msruntime.getApiTable(handle.bridge)
+  if api.isNil or api.SetParam.isNil:
+    return "MsQuic API missing SetParam"
+
+  var addrStorage: SockAddr_storage
+  var addrLen: SockLen
+  try:
+    toSAddr(address, addrStorage, addrLen)
+  except CatchableError as exc:
+    return "MsQuic address conversion failed: " & exc.msg
+
+  let status =
+    try:
+      api.SetParam(
+        cast[msapi.HQUIC](connection),
+        paramId,
+        uint32(addrLen),
+        addr addrStorage
+      )
+    except Exception as exc:
+      return "MsQuic ConnectionSetParam raised: " & exc.msg
+  if status != msapi.QUIC_STATUS_SUCCESS:
+    return fmt"MsQuic ConnectionSetParam failed: 0x{status:08x}"
+  ""
+
+proc setConnectionLocalAddress*(handle: MsQuicTransportHandle; connection: pointer;
+    address: TransportAddress): string {.raises: [].} =
+  setConnectionAddressParam(handle, connection, msparams.QUIC_PARAM_CONN_LOCAL_ADDRESS, address)
+
 proc startStream*(handle: MsQuicTransportHandle; stream: pointer;
     flags: uint32 = 0'u32): string {.raises: [].} =
   if handle.isNil or handle.bridge.isNil or stream.isNil:
@@ -2243,6 +2466,40 @@ proc startStream*(handle: MsQuicTransportHandle; stream: pointer;
       return "MsQuic StreamStart raised: " & exc.msg
   if status != msapi.QUIC_STATUS_SUCCESS and status != QuicStatusPending:
     return fmt"MsQuic StreamStart failed: 0x{status:08x}"
+  ""
+
+proc shutdownStream*(handle: MsQuicTransportHandle; stream: pointer;
+    flags: uint32 = msapi.QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL;
+    errorCode: uint64 = 0'u64;
+    state: MsQuicStreamState = nil): string {.gcsafe, raises: [].} =
+  if handle.isNil or handle.bridge.isNil or stream.isNil:
+    return "MsQuic transport handle unavailable"
+  if not state.isNil:
+    var alreadyRequested = false
+    state.withStateLock:
+      if state.closed:
+        alreadyRequested = true
+      elif (flags and msapi.QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL) != 0'u32:
+        alreadyRequested = state.sendShutdownRequested
+        if not alreadyRequested:
+          state.sendShutdownRequested = true
+    if alreadyRequested:
+      return ""
+  let status =
+    try:
+      var tmpStatus = msapi.QUIC_STATUS_INTERNAL_ERROR
+      {.cast(gcsafe).}:
+        tmpStatus = msruntime.shutdownStream(
+          handle.bridge,
+          cast[msapi.HQUIC](stream),
+          msapi.QUIC_STREAM_SHUTDOWN_FLAGS(flags),
+          msapi.QUIC_UINT62(errorCode)
+        )
+      tmpStatus
+    except Exception as exc:
+      return "MsQuic StreamShutdown raised: " & exc.msg
+  if status != msapi.QUIC_STATUS_SUCCESS:
+    return fmt"MsQuic StreamShutdown failed: 0x{status:08x}"
   ""
 
 proc closeStream*(handle: MsQuicTransportHandle; stream: pointer;

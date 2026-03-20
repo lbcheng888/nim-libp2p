@@ -319,6 +319,79 @@ suite "MsQuic API settings":
     api.RegistrationClose(registration)
     MsQuicClose(apiPtr)
 
+  test "ConnectionSendResumptionTicket refreshes ticketAgeAdd for newly issued tickets":
+    let targetHost = "127.0.0.1"
+    let targetPort = 41064'u16
+    let targetAlpn = "hq-29"
+
+    var apiPtr: pointer
+    check MsQuicOpenVersion(2, addr apiPtr) == QUIC_STATUS_SUCCESS
+    let api = cast[ptr QuicApiTable](apiPtr)
+
+    var registration: HQUIC
+    check api.RegistrationOpen(nil, addr registration) == QUIC_STATUS_SUCCESS
+
+    var alpnBuffer = QuicBuffer(
+      Length: uint32(targetAlpn.len),
+      Buffer: cast[ptr uint8](targetAlpn.cstring))
+
+    var configuration: HQUIC
+    check api.ConfigurationOpen(
+      registration,
+      addr alpnBuffer,
+      1,
+      nil,
+      0,
+      nil,
+      addr configuration) == QUIC_STATUS_SUCCESS
+
+    var credentialDummy: uint8
+    check api.ConfigurationLoadCredential(configuration, addr credentialDummy) == QUIC_STATUS_SUCCESS
+
+    var connection: HQUIC
+    check api.ConnectionOpen(registration, nil, nil, addr connection) == QUIC_STATUS_SUCCESS
+    check api.ConnectionSetConfiguration(connection, configuration) == QUIC_STATUS_SUCCESS
+    check api.ConnectionStart(
+      connection,
+      configuration,
+      QUIC_ADDRESS_FAMILY(2),
+      cstring(targetHost),
+      targetPort) == QUIC_STATUS_SUCCESS
+
+    check api.ConnectionSendResumptionTicket(
+      connection,
+      QUIC_SEND_RESUMPTION_FLAGS(0),
+      0'u16,
+      nil) == QUIC_STATUS_SUCCESS
+
+    var firstAgeAdd = 0'u32
+    check getBuiltinResumptionTicketAgeAddForTest(
+      cstring(targetHost),
+      targetPort,
+      cstring(targetAlpn),
+      firstAgeAdd)
+    check firstAgeAdd != 0'u32
+
+    check api.ConnectionSendResumptionTicket(
+      connection,
+      QUIC_SEND_RESUMPTION_FLAGS(0),
+      0'u16,
+      nil) == QUIC_STATUS_SUCCESS
+
+    var secondAgeAdd = 0'u32
+    check getBuiltinResumptionTicketAgeAddForTest(
+      cstring(targetHost),
+      targetPort,
+      cstring(targetAlpn),
+      secondAgeAdd)
+    check secondAgeAdd != 0'u32
+    check secondAgeAdd != firstAgeAdd
+
+    api.ConnectionClose(connection)
+    api.ConfigurationClose(configuration)
+    api.RegistrationClose(registration)
+    MsQuicClose(apiPtr)
+
   test "ConnectionSendResumptionTicket requires started configured connection":
     var apiPtr: pointer
     check MsQuicOpenVersion(2, addr apiPtr) == QUIC_STATUS_SUCCESS

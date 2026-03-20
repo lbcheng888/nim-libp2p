@@ -350,4 +350,4 @@ method dial*(
 method handles*(t: TcpTransport, address: MultiAddress): bool {.raises: [].} =
   if procCall Transport(t).handles(address):
     if address.protocols.isOk:
-      return TCP.match(address)
+      return TCP.matchPartial(address)

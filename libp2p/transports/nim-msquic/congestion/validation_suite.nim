@@ -322,12 +322,14 @@ proc renderReport*(
   for entry in report.sampleResults:
     lines.add fmt"  - {entry.name}: success={entry.success}"
     if entry.issues.len > 0:
-      lines.add fmt"    issues => {entry.issues.join(\"; \")}"
+      let issueSummary = entry.issues.join("; ")
+      lines.add "    issues => " & issueSummary
   lines.add("interop results:")
   for entry in report.interopResults:
     lines.add fmt"  - {entry.scenarioName}: success={entry.success}"
     if entry.issues.len > 0:
-      lines.add fmt"    issues => {entry.issues.join(\"; \")}"
+      let issueSummary = entry.issues.join("; ")
+      lines.add "    issues => " & issueSummary
   lines.add("perf results:")
   for entry in report.perfResults:
     let status = if entry.passed: "pass" else: "fail"

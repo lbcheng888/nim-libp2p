@@ -438,7 +438,57 @@ suite "MsQuic ACK-driven loss recovery":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard api
       discard registration
+      check seedConnectionIdsForTest(connection, @[0x01'u8, 0x02'u8], @[0xAA'u8, 0xBB'u8], false)
       let base = nowUs()
+      check seedSentPacketForTest(connection, packet_model.ceInitial, 1'u64, base - 20_000'u64, 1200'u16)
+      check seedSentPacketForTest(connection, packet_model.ceOneRtt, 1'u64, base - 20_000'u64, 1200'u16)
+      check setConnectionProbeCountForEpochForTest(connection, packet_model.ceInitial, 2'u16)
+      check setConnectionProbeCountForEpochForTest(connection, packet_model.ceOneRtt, 3'u16)
+
+      check applyAckForTest(connection, packet_model.ceInitial, 1'u64)
+
+      var initialProbe = 0'u16
+      var oneRttProbe = 0'u16
+      var aggregateProbe = 0'u16
+      check getConnectionProbeCountForEpoch(connection, packet_model.ceInitial, initialProbe)
+      check getConnectionProbeCountForEpoch(connection, packet_model.ceOneRtt, oneRttProbe)
+      check getConnectionProbeCount(connection, aggregateProbe)
+      check initialProbe == 0'u16
+      check oneRttProbe == 3'u16
+      check aggregateProbe == 3'u16
+    )
+
+  test "client initial ack before handshake complete does not reset PTO backoff":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs()
+      check setConnectionHandshakeStateForTest(connection, false)
+      check seedSentPacketForTest(connection, packet_model.ceInitial, 1'u64, base - 20_000'u64, 1200'u16)
+      check seedSentPacketForTest(connection, packet_model.ceOneRtt, 1'u64, base - 20_000'u64, 1200'u16)
+      check setConnectionProbeCountForEpochForTest(connection, packet_model.ceInitial, 2'u16)
+      check setConnectionProbeCountForEpochForTest(connection, packet_model.ceOneRtt, 3'u16)
+
+      check applyAckForTest(connection, packet_model.ceInitial, 1'u64)
+
+      var initialProbe = 0'u16
+      var oneRttProbe = 0'u16
+      var aggregateProbe = 0'u16
+      check getConnectionProbeCountForEpoch(connection, packet_model.ceInitial, initialProbe)
+      check getConnectionProbeCountForEpoch(connection, packet_model.ceOneRtt, oneRttProbe)
+      check getConnectionProbeCount(connection, aggregateProbe)
+      check initialProbe == 2'u16
+      check oneRttProbe == 3'u16
+      check aggregateProbe == 3'u16
+    )
+
+  test "client initial ack after peer address validation resets initial PTO backoff":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs()
+      check setConnectionHandshakeStateForTest(connection, false)
+      check setConnectionPeerAddressValidatedForTest(connection, true)
       check seedSentPacketForTest(connection, packet_model.ceInitial, 1'u64, base - 20_000'u64, 1200'u16)
       check seedSentPacketForTest(connection, packet_model.ceOneRtt, 1'u64, base - 20_000'u64, 1200'u16)
       check setConnectionProbeCountForEpochForTest(connection, packet_model.ceInitial, 2'u16)
@@ -758,12 +808,13 @@ suite "MsQuic ACK-driven loss recovery":
       check host.contains("10.0.2.33")
     )
 
-  test "pto timeout reuses outstanding zero-rtt frame payload for probe packets":
+  test "pto timeout uses ping probes instead of retransmitting zero-rtt datagram payload":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard api
       discard registration
       let base = nowUs()
       let datagramPayload = proto.encodeDatagramFrame(@[0xAA'u8, 0xBB, 0xCC, 0xDD, 0xEE], true)
+      let pingPayload = @[0x01'u8]
       check prepareConnectionPacketSendForTest(connection, packet_model.ceZeroRtt)
       check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
       check seedSentPacketForTest(
@@ -787,17 +838,18 @@ suite "MsQuic ACK-driven loss recovery":
       check getConnectionLastSentFramePayloadForTest(connection, payload)
       check getConnectionSentPacketCountForTest(connection, count)
       check count == 3'u32
-      check frameKind == sfkDatagram
-      check payloadLen == uint32(datagramPayload.len)
-      check payload == datagramPayload
+      check frameKind == sfkPing
+      check payloadLen == uint32(pingPayload.len)
+      check payload == pingPayload
     )
 
-  test "pto timeout reuses original remote for zero-rtt probes":
+  test "pto timeout preserves original remote for zero-rtt ping probes":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard api
       discard registration
       let base = nowUs()
       let datagramPayload = proto.encodeDatagramFrame(@[0xAA'u8, 0xBB, 0xCC], true)
+      let pingPayload = @[0x01'u8]
       let targetRemote = initTAddress("10.0.2.66", Port(4766))
       check prepareConnectionPacketSendForTest(connection, packet_model.ceZeroRtt)
       check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
@@ -821,8 +873,8 @@ suite "MsQuic ACK-driven loss recovery":
       check getConnectionLastSentFrameKindForTest(connection, frameKind)
       check getConnectionLastSentFramePayloadForTest(connection, payload)
       check getConnectionLastSentTargetRemoteForTest(connection, host, port)
-      check frameKind == sfkDatagram
-      check payload == datagramPayload
+      check frameKind == sfkPing
+      check payload == pingPayload
       check port == 4766'u16
       check host.contains("10.0.2.66")
     )
@@ -861,6 +913,56 @@ suite "MsQuic ACK-driven loss recovery":
       var pos = 0
       let ack = proto.parseAckFrame(payload, pos)
       check ack.largestAcked == 7'u64
+    )
+
+  test "completeServerHandshake flushes queued zero-rtt ack to original remote":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let originalRemoteHost = "10.0.2.177"
+      let originalRemotePort = 5177'u16
+      let migratedRemoteHost = "10.0.2.188"
+      let migratedRemotePort = 5188'u16
+      let datagramPayload = proto.encodeDatagramFrame(@[0xD7'u8, 0xE8, 0xF9], true)
+
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, false)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceZeroRtt)
+      check receiveZeroRttPayloadForTest(
+        connection,
+        17'u64,
+        datagramPayload,
+        originalRemoteHost,
+        originalRemotePort
+      )
+
+      var count = 0'u32
+      check getConnectionSentPacketCountForTest(connection, count)
+      check count == 0'u32
+
+      check setConnectionRemoteAddressForTest(connection, migratedRemoteHost, migratedRemotePort)
+      check completeServerHandshakeForTest(connection)
+
+      check getConnectionSentPacketCountForTest(connection, count)
+      check count >= 2'u32
+
+      var foundAck = false
+      for idx in 0'u32 ..< count:
+        var frameKind = sfkDatagram
+        var payload: seq[byte] = @[]
+        var host = ""
+        var port = 0'u16
+        check getConnectionSentFrameKindAtForTest(connection, idx, frameKind)
+        check getConnectionSentFramePayloadAtForTest(connection, idx, payload)
+        check getConnectionSentTargetRemoteAtForTest(connection, idx, host, port)
+        if frameKind == sfkAck:
+          foundAck = true
+          check port == originalRemotePort
+          check host.contains(originalRemoteHost)
+          var pos = 0
+          let ack = proto.parseAckFrame(payload, pos)
+          check ack.largestAcked == 17'u64
+      check foundAck
     )
 
   test "pending one-rtt ack is consumed after flush and not resent without new packets":
@@ -905,6 +1007,9 @@ suite "MsQuic ACK-driven loss recovery":
       check alreadyWritten
 
       check not flushPendingOneRttAckForTest(connection, remoteHost, remotePort)
+      check getConnectionSentPacketCountForTest(connection, count)
+      check count == 1'u32
+      check not sendAckForTest(connection, packet_model.ceOneRtt, remoteHost, remotePort)
       check getConnectionSentPacketCountForTest(connection, count)
       check count == 1'u32
     )
@@ -1029,7 +1134,7 @@ suite "MsQuic ACK-driven loss recovery":
 
       check prepareConnectionPacketSendForTest(connection, packet_model.ceHandshake)
       check setConnectionHandshakeStateForTest(connection, false)
-      check markPendingAckForTest(connection, 12'u64, nowUs() - 16_000'u64)
+      check markPendingAckForTest(connection, 12'u64, nowUs() - 16_000'u64, packet_model.ceHandshake)
       var handshakePayload: seq[byte] = @[]
       var handshakeFrameKind = sfkDatagram
       check sendAckForTest(connection, packet_model.ceHandshake, remoteHost, remotePort)
@@ -1039,6 +1144,310 @@ suite "MsQuic ACK-driven loss recovery":
       pos = 0
       let handshakeAck = proto.parseAckFrame(handshakePayload, pos)
       check handshakeAck.delay == 0'u64
+    )
+
+  test "first in-order one-rtt packet delays ack until threshold is reached":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let remoteHost = "10.0.2.55"
+      let remotePort = 4555'u16
+      let datagramPayload = proto.encodeDatagramFrame(@[0x11'u8, 0x22, 0x33], true)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+
+      var sentCount = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 0'u32
+
+      check receiveOneRttPayloadForTest(connection, 30'u64, datagramPayload, remoteHost, remotePort)
+
+      var pendingAckRanges = 0'u32
+      var ackPacketsToAck = 0'u16
+      var alreadyWritten = false
+      var ackDeadlineUs = 0'u64
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check getConnectionPendingAckDeadlineForTest(connection, ackDeadlineUs)
+      check pendingAckRanges == 1'u32
+      check ackPacketsToAck == 1'u16
+      check not alreadyWritten
+      check ackDeadlineUs > 0'u64
+
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 1'u32
+      var frameKind = sfkAck
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check frameKind != sfkAck
+
+      check receiveOneRttPayloadForTest(connection, 31'u64, datagramPayload, remoteHost, remotePort)
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 2'u32
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check frameKind == sfkAck
+
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 0'u32
+      check ackPacketsToAck == 0'u16
+      check alreadyWritten
+      check getConnectionPendingAckDeadlineForTest(connection, ackDeadlineUs)
+      check ackDeadlineUs == 0'u64
+    )
+
+  test "gap one-rtt packet after consumed ack flushes ack immediately as reordered":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let remoteHost = "10.0.2.57"
+      let remotePort = 4557'u16
+      let datagramPayload = proto.encodeDatagramFrame(@[0x41'u8, 0x52, 0x63], true)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+
+      check receiveOneRttPayloadForTest(connection, 40'u64, datagramPayload, remoteHost, remotePort)
+      check flushPendingOneRttAckForTest(connection, remoteHost, remotePort)
+
+      var pendingAckRanges = 0'u32
+      var ackPacketsToAck = 0'u16
+      var alreadyWritten = false
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 0'u32
+      check ackPacketsToAck == 0'u16
+      check alreadyWritten
+
+      var sentCount = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      let sentCountAfterFlush = sentCount
+
+      check receiveOneRttPayloadForTest(connection, 42'u64, datagramPayload, remoteHost, remotePort)
+
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount > sentCountAfterFlush
+      var frameKind = sfkDatagram
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check frameKind == sfkAck
+
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 0'u32
+      check ackPacketsToAck == 0'u16
+      check alreadyWritten
+    )
+
+  test "loss recovery tick flushes delayed one-rtt ack after deadline":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let remoteHost = "10.0.2.56"
+      let remotePort = 4556'u16
+      let recvTimeUs = nowUs() - 40_000'u64
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+      check markDelayedPendingAckForTest(connection, 32'u64, recvTimeUs, 10'u32)
+
+      var sentCount = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 0'u32
+
+      var ackDeadlineUs = 0'u64
+      check getConnectionPendingAckDeadlineForTest(connection, ackDeadlineUs)
+      check ackDeadlineUs > 0'u64
+      check ackDeadlineUs <= nowUs()
+
+      check runConnectionLossRecoveryTick(connection)
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 1'u32
+
+      var frameKind = sfkDatagram
+      var payload: seq[byte] = @[]
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check frameKind == sfkAck
+      check getConnectionLastSentFramePayloadForTest(connection, payload)
+      var pos = 0
+      let ack = proto.parseAckFrame(payload, pos)
+      check ack.largestAcked == 32'u64
+
+      var pendingAckRanges = 0'u32
+      var ackPacketsToAck = 0'u16
+      var alreadyWritten = false
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 0'u32
+      check ackPacketsToAck == 0'u16
+      check alreadyWritten
+      check getConnectionPendingAckDeadlineForTest(connection, ackDeadlineUs)
+      check ackDeadlineUs == 0'u64
+    )
+
+  test "loss recovery tick flushes delayed one-rtt ack to original remote after active remote changes":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let originalHost = "10.0.2.156"
+      let originalPort = 5156'u16
+      let migratedHost = "10.0.2.166"
+      let migratedPort = 5166'u16
+      let recvTimeUs = nowUs() - 40_000'u64
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+      check markDelayedPendingAckForTest(connection, 33'u64, recvTimeUs, 10'u32)
+      check setConnectionPendingAckRemoteForTest(connection, packet_model.ceOneRtt, originalHost, originalPort)
+      check setConnectionRemoteAddressForTest(connection, migratedHost, migratedPort)
+
+      check runConnectionLossRecoveryTick(connection)
+
+      var frameKind = sfkDatagram
+      var host = ""
+      var port = 0'u16
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check getConnectionLastSentTargetRemoteForTest(connection, host, port)
+      check frameKind == sfkAck
+      check port == originalPort
+      check host.contains(originalHost)
+    )
+
+  test "one-rtt remote change flushes pending delayed ack before tracking new path":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let originalHost = "10.0.2.171"
+      let originalPort = 5171'u16
+      let migratedHost = "10.0.2.172"
+      let migratedPort = 5172'u16
+      let recvTimeUs = nowUs() - 5_000'u64
+      let datagramPayload = proto.encodeDatagramFrame(@[0x61'u8, 0x72, 0x83], true)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+      check markDelayedPendingAckForTest(connection, 50'u64, recvTimeUs, 25'u32)
+      check setConnectionPendingAckRemoteForTest(connection, packet_model.ceOneRtt, originalHost, originalPort)
+
+      var sentCount = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 0'u32
+
+      check receiveOneRttPayloadForTest(connection, 51'u64, datagramPayload, migratedHost, migratedPort)
+
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 2'u32
+
+      var frameKind = sfkDatagram
+      var payload: seq[byte] = @[]
+      var host = ""
+      var port = 0'u16
+      check getConnectionSentFrameKindAtForTest(connection, 0'u32, frameKind)
+      check frameKind == sfkPathChallenge
+      check getConnectionSentTargetRemoteAtForTest(connection, 0'u32, host, port)
+      check port == migratedPort
+      check host.contains(migratedHost)
+
+      check getConnectionSentFrameKindAtForTest(connection, 1'u32, frameKind)
+      check getConnectionSentTargetRemoteAtForTest(connection, 1'u32, host, port)
+      check getConnectionSentFramePayloadAtForTest(connection, 1'u32, payload)
+      check frameKind == sfkAck
+      check port == originalPort
+      check host.contains(originalHost)
+      var pos = 0
+      let ack = proto.parseAckFrame(payload, pos)
+      check ack.largestAcked == 50'u64
+
+      var pendingAckRanges = 0'u32
+      var ackPacketsToAck = 0'u16
+      var alreadyWritten = false
+      var ackDeadlineUs = 0'u64
+      var pendingHost = ""
+      var pendingPort = 0'u16
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check getConnectionPendingAckDeadlineForTest(connection, ackDeadlineUs)
+      check getConnectionPendingAckRemoteForTest(connection, packet_model.ceOneRtt, pendingHost, pendingPort)
+      check pendingAckRanges == 1'u32
+      check ackPacketsToAck == 1'u16
+      check not alreadyWritten
+      check ackDeadlineUs > 0'u64
+      check pendingPort == migratedPort
+      check pendingHost.contains(migratedHost)
+    )
+
+  test "one-rtt ack send before handshake complete preserves pending ack state":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let remoteHost = "10.0.2.91"
+      let remotePort = 4991'u16
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, false)
+      check markPendingAckForTest(connection, 44'u64, nowUs() - 2_000'u64)
+
+      var pendingAckRanges = 0'u32
+      var ackPacketsToAck = 0'u16
+      var alreadyWritten = false
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 1'u32
+      check ackPacketsToAck == 1'u16
+      check not alreadyWritten
+
+      check not sendAckForTest(connection, packet_model.ceOneRtt, remoteHost, remotePort)
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 1'u32
+      check ackPacketsToAck == 1'u16
+      check not alreadyWritten
+
+      check setConnectionHandshakeStateForTest(connection, true)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check flushPendingOneRttAckForTest(connection, remoteHost, remotePort)
+
+      var sentCount = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check sentCount == 1'u32
+      var frameKind = sfkDatagram
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check frameKind == sfkAck
+
+      check getConnectionPendingAckStateForTest(
+        connection,
+        pendingAckRanges,
+        ackPacketsToAck,
+        alreadyWritten
+      )
+      check pendingAckRanges == 0'u32
+      check ackPacketsToAck == 0'u16
+      check alreadyWritten
     )
 
   test "out-of-order pending ack merges adjacent ranges into one span":
@@ -1124,6 +1533,48 @@ suite "MsQuic ACK-driven loss recovery":
       check frameKind == sfkStream
       check payloadLen == uint32(streamPayload.len)
       check payload == streamPayload
+    )
+
+  test "pto timeout uses ping probes instead of retransmitting one-rtt datagram payload":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs()
+      let datagramPayload = proto.encodeDatagramFrame(@[0x61'u8, 0x72, 0x83], true)
+      let pingPayload = @[0x01'u8]
+      let targetRemote = initTAddress("10.0.2.144", Port(4944))
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
+      check seedSentPacketForTest(
+        connection,
+        packet_model.ceOneRtt,
+        1'u64,
+        base - 500_000'u64,
+        1200'u16,
+        frameKind = sfkDatagram,
+        framePayload = datagramPayload,
+        targetRemote = targetRemote
+      )
+
+      check runConnectionLossRecoveryTick(connection)
+
+      var payloadLen = 0'u32
+      var payload: seq[byte] = @[]
+      var frameKind = sfkAck
+      var count = 0'u32
+      var host = ""
+      var port = 0'u16
+      check getConnectionLastSentFramePayloadLenForTest(connection, payloadLen)
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check getConnectionLastSentTargetRemoteForTest(connection, host, port)
+      check getConnectionSentPacketCountForTest(connection, count)
+      check count == 3'u32
+      check frameKind == sfkPing
+      check payloadLen == uint32(pingPayload.len)
+      check payload == pingPayload
+      check port == 4944'u16
+      check host.contains("10.0.2.144")
     )
 
   test "pto timeout reuses original remote for one-rtt path-challenge probes":
@@ -1289,6 +1740,7 @@ suite "MsQuic ACK-driven loss recovery":
       let base = nowUs()
       let streamPayload = @[0x9A'u8, 0xBC, 0xDE]
       let streamFrame = proto.encodeStreamFrame(0'u64, streamPayload, 0'u64, false)
+      let targetRemote = initTAddress("10.0.0.88", Port(4888))
       check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
 
       var streamHandle: HQUIC
@@ -1304,7 +1756,8 @@ suite "MsQuic ACK-driven loss recovery":
         base - 500_000'u64,
         1200'u16,
         frameKind = sfkStream,
-        framePayload = streamFrame
+        framePayload = streamFrame,
+        targetRemote = targetRemote
       )
       check seedSentPacketForTest(
         connection,
@@ -1323,14 +1776,19 @@ suite "MsQuic ACK-driven loss recovery":
       var payload: seq[byte] = @[]
       var frameKind = sfkAck
       var count = 0'u32
+      var host = ""
+      var port = 0'u16
       check getConnectionLastSentFramePayloadLenForTest(connection, payloadLen)
       check getConnectionLastSentFrameKindForTest(connection, frameKind)
       check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check getConnectionLastSentTargetRemoteForTest(connection, host, port)
       check getConnectionSentPacketCountForTest(connection, count)
       check count == 1'u32
       check frameKind == sfkStream
       check payloadLen == uint32(streamFrame.len)
       check payload == streamFrame
+      check port == 4888'u16
+      check host.contains("10.0.0.88")
     )
 
   test "loss timer retransmits lost one-rtt stream frames immediately":
@@ -1340,6 +1798,7 @@ suite "MsQuic ACK-driven loss recovery":
       let base = nowUs()
       let streamPayload = @[0x55'u8, 0x66, 0x77]
       let streamFrame = proto.encodeStreamFrame(0'u64, streamPayload, 0'u64, false)
+      let targetRemote = initTAddress("10.0.0.99", Port(4999))
       check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
 
       var streamHandle: HQUIC
@@ -1355,7 +1814,8 @@ suite "MsQuic ACK-driven loss recovery":
         base - 500_000'u64,
         1200'u16,
         frameKind = sfkStream,
-        framePayload = streamFrame
+        framePayload = streamFrame,
+        targetRemote = targetRemote
       )
       check attachSentPacketStreamHandleForTest(connection, 1'u64, packet_model.ceOneRtt, streamHandle)
       check setConnectionLossTimeForTest(connection, packet_model.ceOneRtt, base - 10_000'u64)
@@ -1367,14 +1827,19 @@ suite "MsQuic ACK-driven loss recovery":
       var payload: seq[byte] = @[]
       var frameKind = sfkAck
       var count = 0'u32
+      var host = ""
+      var port = 0'u16
       check getConnectionLastSentFramePayloadLenForTest(connection, payloadLen)
       check getConnectionLastSentFrameKindForTest(connection, frameKind)
       check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check getConnectionLastSentTargetRemoteForTest(connection, host, port)
       check getConnectionSentPacketCountForTest(connection, count)
       check count == 1'u32
       check frameKind == sfkStream
       check payloadLen == uint32(streamFrame.len)
       check payload == streamFrame
+      check port == 4999'u16
+      check host.contains("10.0.0.99")
     )
 
   test "ack-driven loss retransmits lost one-rtt reset-stream control frames":
@@ -1581,6 +2046,102 @@ suite "MsQuic ACK-driven loss recovery":
       var count = 0'u32
       check getStreamPendingChunkCountForTest(streamHandle, count)
       check count == 2'u32
+    )
+
+  test "pending stream queue keeps same chunk on different remotes as distinct":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard registration
+      discard api
+
+      var streamHandle: HQUIC
+      check api.StreamOpen(connection, QUIC_STREAM_OPEN_FLAGS(0), nil, nil, addr streamHandle) ==
+        QUIC_STATUS_SUCCESS
+      defer:
+        api.StreamClose(streamHandle)
+
+      let remoteA = initTAddress("10.0.2.201", Port(5201))
+      let remoteB = initTAddress("10.0.2.202", Port(5202))
+      check prependPendingStreamChunkForTest(streamHandle, 0'u64, @[0x10'u8, 0x20], false, remoteA)
+      check prependPendingStreamChunkForTest(streamHandle, 0'u64, @[0x10'u8, 0x20], false, remoteB)
+
+      var count = 0'u32
+      check getStreamPendingChunkCountForTest(streamHandle, count)
+      check count == 2'u32
+    )
+
+  test "flushStream preserves pending stream chunk original remote":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard registration
+      discard api
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+
+      var streamHandle: HQUIC
+      check api.StreamOpen(connection, QUIC_STREAM_OPEN_FLAGS(0), nil, nil, addr streamHandle) ==
+        QUIC_STATUS_SUCCESS
+      defer:
+        api.StreamClose(streamHandle)
+
+      let originalRemote = initTAddress("10.0.2.211", Port(5211))
+      check prependPendingStreamChunkForTest(
+        streamHandle,
+        0'u64,
+        @[0x21'u8, 0x31, 0x41],
+        false,
+        originalRemote
+      )
+      check setConnectionRemoteAddressForTest(connection, "10.0.2.212", 5212'u16)
+      check flushStreamForTest(streamHandle)
+
+      var frameKind = sfkAck
+      var host = ""
+      var port = 0'u16
+      var payload: seq[byte] = @[]
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check getConnectionLastSentTargetRemoteForTest(connection, host, port)
+      check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check frameKind == sfkStream
+      check payload == proto.encodeStreamFrame(0'u64, @[0x21'u8, 0x31, 0x41], 0'u64, false)
+      check port == 5211'u16
+      check host.contains("10.0.2.211")
+    )
+
+  test "flushPendingDatagrams preserves pending datagram original remote":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard registration
+      check MsQuicEnableDatagramSendShim(connection, BOOLEAN(1)) == QUIC_STATUS_SUCCESS
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceZeroRtt)
+      check setConnectionRemoteAddressForTest(connection, "10.0.2.221", 5221'u16)
+
+      var datagramBytes = [byte 0x31, 0x41, 0x51]
+      var datagramBuf = QuicBuffer(
+        Length: 3'u32,
+        Buffer: cast[ptr uint8](unsafeAddr datagramBytes[0])
+      )
+      check api.DatagramSend(
+        connection,
+        addr datagramBuf,
+        1'u32,
+        QUIC_SEND_FLAGS(0x0001'u32),
+        nil
+      ) == QUIC_STATUS_SUCCESS
+
+      check setConnectionRemoteAddressForTest(connection, "10.0.2.222", 5222'u16)
+      check setConnectionHandshakeStateForTest(connection, true)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check flushPendingDatagramsForTest(connection)
+
+      var frameKind = sfkAck
+      var host = ""
+      var port = 0'u16
+      var payload: seq[byte] = @[]
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check getConnectionLastSentTargetRemoteForTest(connection, host, port)
+      check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check frameKind == sfkDatagram
+      check payload == proto.encodeDatagramFrame(@[0x31'u8, 0x41, 0x51], true)
+      check port == 5221'u16
+      check host.contains("10.0.2.221")
     )
 
   test "pto timeout still sends probes when BBR congestion window is exhausted":

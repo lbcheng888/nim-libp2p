@@ -5,8 +5,8 @@ import std/osproc
 import std/strutils
 
 const
-  NimBlueprintDir = "nim-msquic"
-  NimProjectMarker = "project" & DirSep & "nimsquic.nimble"
+  RepoMarker = "libp2p.nimble"
+  MsQuicModuleMarker = joinPath("libp2p", "transports", "nim-msquic", "api", "api_impl.nim")
 
 type
   ValidationResult* = object
@@ -21,20 +21,17 @@ type
     failed*: seq[string]
 
 proc blueprintRoot(): string =
-  ## 从当前目录向上回溯，寻找包含 Nim 蓝图的目录。
+  ## 从当前目录向上回溯，寻找当前仓库根目录。
   var dir = getCurrentDir()
   while true:
-    if fileExists(joinPath(dir, NimProjectMarker)):
+    if fileExists(joinPath(dir, RepoMarker)) and fileExists(joinPath(dir, MsQuicModuleMarker)):
       return dir
-    let nested = joinPath(dir, NimBlueprintDir)
-    if dirExists(nested) and fileExists(joinPath(nested, NimProjectMarker)):
-      return nested
     let parent = parentDir(dir)
     if parent.len == 0 or parent == dir:
       break
     dir = parent
   raise newException(OSError,
-    "无法定位 Nim 蓝图根目录，当前路径: " & getCurrentDir())
+    "无法定位 nim-libp2p 仓库根目录，当前路径: " & getCurrentDir())
 
 proc runNimScriptCase(name: string; scriptRelPath: string;
     extraArgs: seq[string] = @[]): ValidationResult =
@@ -69,7 +66,10 @@ proc runNimScriptCase(name: string; scriptRelPath: string;
 
 proc runProtocolValidationSuite*(): ValidationSummary =
   let results = @[
-    runNimScriptCase("connection-handshake", "tests/connection_handshake_test.nim")
+    runNimScriptCase(
+      "connection-handshake",
+      "libp2p/transports/nim-msquic/tests/connection_handshake_test.nim"
+    )
   ]
   var finalResults = results
   let skipTlsFlag = getEnv("NIM_MSQUIC_SKIP_TLS", "auto").toLowerAscii()
@@ -80,8 +80,14 @@ proc runProtocolValidationSuite*(): ValidationSummary =
       details: @["skipped: TLS 验证已禁用 (NIM_MSQUIC_SKIP_TLS=" & skipTlsFlag & ")"],
       artifacts: @[])
   else:
-    finalResults.add runNimScriptCase("tls-handshake", "tests/tls_handshake_test.nim")
-  finalResults.add runNimScriptCase("fuzz-smoke", "tests/fuzz_smoke_runner.nim")
+    finalResults.add runNimScriptCase(
+      "tls-handshake",
+      "libp2p/transports/nim-msquic/tests/tls_handshake_test.nim"
+    )
+  finalResults.add runNimScriptCase(
+    "fuzz-smoke",
+    "libp2p/transports/nim-msquic/tests/fuzz_smoke_runner.nim"
+  )
   var failed: seq[string] = @[]
   for res in finalResults:
     if not res.passed:

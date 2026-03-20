@@ -86,6 +86,11 @@ when not defined(libp2p_msquic_experimental):
       flags: uint32 = 0'u32): string =
     "MsQuic experimental runtime disabled"
 
+  proc shutdownStream*(handle: MsQuicTransportHandle; stream: pointer;
+      flags: uint32 = 0x0001'u32; errorCode: uint64 = 0'u64;
+      state: MsQuicStreamState = nil): string {.gcsafe.} =
+    "MsQuic experimental runtime disabled"
+
   proc closeStream*(handle: MsQuicTransportHandle; stream: pointer;
       state: MsQuicStreamState = nil) = discard
 

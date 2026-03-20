@@ -36,6 +36,7 @@ class P2PUseCase(
         private const val TAG = "P2PUseCase"
     }
     
+    @Volatile
     private var handle: Long = 0L
     
     // 状态流
@@ -196,7 +197,16 @@ class P2PUseCase(
         dexInitialized.set(false)
         _p2pState.update { it.copy(isRunning = false, localPeerId = null, connectedPeers = 0, error = null) }
     }
-    
+
+    fun hasNodeHandle(): Boolean = handle != 0L
+
+    fun fetchUiFrameSnapshot(maxEvents: Int = 32, discoveryLimit: Int = 64): JSONObject? {
+        val currentHandle = handle
+        if (currentHandle == 0L) return null
+        val raw = NimBridge.uiFrameSnapshot(currentHandle, maxEvents, discoveryLimit) ?: return null
+        return runCatching { JSONObject(raw) }.getOrNull()
+    }
+
     /**
      * 发送直接消息
      */

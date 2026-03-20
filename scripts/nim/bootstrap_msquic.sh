@@ -44,8 +44,11 @@ if [[ "${NIM_MSQUIC_BOOTSTRAP_SKIP:-}" == "1" ]]; then
 fi
 
 declare -a SEARCH_DIRS=()
-IFS=':' read -ra CUSTOM_SEARCH <<<"${MSQUIC_LIB_SEARCH_PATHS:-}"
-for dir in "${CUSTOM_SEARCH[@]}"; do
+declare -a CUSTOM_SEARCH=()
+if [[ -n "${MSQUIC_LIB_SEARCH_PATHS:-}" ]]; then
+  IFS=':' read -ra CUSTOM_SEARCH <<<"${MSQUIC_LIB_SEARCH_PATHS}"
+fi
+for dir in "${CUSTOM_SEARCH[@]:-}"; do
   [[ -n "${dir}" ]] && SEARCH_DIRS+=("${dir}")
 done
 

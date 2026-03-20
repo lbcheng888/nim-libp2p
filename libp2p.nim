@@ -42,6 +42,7 @@ when defined(nimdoc):
       delegatedrouting,
       services/noderesourceservice,
       services/mobilemeshservice,
+      services/wanbootstrapservice,
       services/synccastcontrolservice,
       services/distributedinferenceservice,
       providers/bitswapadvertiser,
@@ -83,6 +84,7 @@ else:
       delegatedrouting,
       services/noderesourceservice,
       services/mobilemeshservice,
+      services/wanbootstrapservice,
       services/synccastcontrolservice,
       services/distributedinferenceservice,
       providers/bitswapadvertiser,
@@ -106,7 +108,8 @@ else:
     minprotobuf, switch, peerid, peerinfo, connection, multiaddress, crypto, lpstream,
     bufferstream, muxer, mplex, transport, tcptransport, noise, errors, cid, multihash,
     multicodec, builders, pubsub, connectiongater, pnet, livestream, record, memorymanager,
-    delegatedrouting, noderesourceservice, mobilemeshservice, synccastcontrolservice,
+    delegatedrouting, noderesourceservice, mobilemeshservice, wanbootstrapservice,
+    synccastcontrolservice,
     distributedinferenceservice, bitswapadvertiser
 
   when libp2pFetchEnabled:
@@ -121,8 +124,10 @@ else:
   when libp2pEpisubEnabled:
     export episub
 
-  when defined(libp2p_quic_support):
-    import libp2p/transports/quictransport
+  when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
+    {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
+  when defined(libp2p_msquic_experimental):
+    import libp2p/transports/msquictransport as quictransport
     export quictransport
     when defined(libp2p_webrtc_support):
       import libp2p/transports/[webrtcdirecttransport, webrtcstartransport]

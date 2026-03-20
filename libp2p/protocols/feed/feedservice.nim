@@ -204,7 +204,10 @@ proc publishFeedItem*(
     return 0
   let payload = encodeEntry(entry)
   let topic = toTopic(svc.topicPrefix, svc.selfPeer)
-  await svc.gossip.publish(topic, payload)
+  discard await svc.gossip.publish(topic, payload)
+  # Gossip publish does not expose downstream subscriber fanout. Once the
+  # publish call succeeds, the local transport handoff is complete.
+  return 1
 
 proc setContentFetcher*(svc: FeedService, fetcher: ContentFetcher) =
   if svc.isNil:
@@ -222,3 +225,9 @@ proc resetSeen*(svc: FeedService) =
   if svc.isNil:
     return
   svc.seenIds.clear()
+
+proc subscriptionTopics*(svc: FeedService): seq[string] =
+  if svc.isNil:
+    return @[]
+  for topic in svc.subscriptions.keys.toSeq:
+    result.add(topic)

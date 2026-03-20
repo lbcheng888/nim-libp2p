@@ -1,6 +1,6 @@
 ## MsQuic 运行时桥接器：把 Nim 端事件处理器接线到真实 MsQuic 回调。
 
-import std/[tables, strformat]
+import std/[locks, tables, strformat]
 import results
 
 from ./ffi_loader import MsQuicRuntime, MsQuicLoadOptions, loadMsQuic,
@@ -154,9 +154,24 @@ type
     runtime: MsQuicRuntime
     api: ptr QuicApiTable
     ownsRuntime: bool
+    lock: Lock
+    lockInit: bool
     connectionContexts: Table[HQUIC, ConnectionCallbackContext]
     streamContexts: Table[HQUIC, StreamCallbackContext]
     listenerContexts: Table[HQUIC, ListenerCallbackContext]
+    retiredConnectionContexts: seq[ConnectionCallbackContext]
+    retiredStreamContexts: seq[StreamCallbackContext]
+    retiredListenerContexts: seq[ListenerCallbackContext]
+
+template withBridgeLock(bridge: RuntimeBridge; body: untyped) =
+  if bridge.isNil or not bridge.lockInit:
+    body
+  else:
+    acquire(bridge.lock)
+    try:
+      body
+    finally:
+      release(bridge.lock)
 
 proc boolFromFlag(value: uint8; mask: uint8): bool {.inline.} =
   (value and mask) != 0
@@ -386,12 +401,18 @@ proc initRuntimeBridge*(runtime: MsQuicRuntime;
     raise newException(ValueError, "MsQuic API 缺少 SetCallbackHandler")
   if apiTable.ConnectionOpen.isNil:
     raise newException(ValueError, "MsQuic API 缺少 ConnectionOpen")
-  RuntimeBridge(runtime: runtime,
+  result = RuntimeBridge(runtime: runtime,
     api: apiTable,
     ownsRuntime: ownsRuntime,
+    lockInit: false,
     connectionContexts: initTable[HQUIC, ConnectionCallbackContext](),
     streamContexts: initTable[HQUIC, StreamCallbackContext](),
-    listenerContexts: initTable[HQUIC, ListenerCallbackContext]())
+    listenerContexts: initTable[HQUIC, ListenerCallbackContext](),
+    retiredConnectionContexts: @[],
+    retiredStreamContexts: @[],
+    retiredListenerContexts: @[])
+  initLock(result.lock)
+  result.lockInit = true
 
 proc loadRuntimeBridge*(options: MsQuicLoadOptions = MsQuicLoadOptions()): RuntimeBridge =
   let loadRes = loadMsQuic(options)
@@ -413,37 +434,52 @@ proc storeConnectionContext(bridge: RuntimeBridge; connection: HQUIC;
     ctx: ConnectionCallbackContext) =
   if bridge.isNil or connection.isNil:
     return
-  bridge.connectionContexts[connection] = ctx
+  bridge.withBridgeLock:
+    bridge.connectionContexts[connection] = ctx
 
 proc dropConnectionContext(bridge: RuntimeBridge; connection: HQUIC) =
   if bridge.isNil or connection.isNil:
     return
-  if bridge.connectionContexts.contains(connection):
-    bridge.connectionContexts.del(connection)
+  bridge.withBridgeLock:
+    if bridge.connectionContexts.contains(connection):
+      let ctx = bridge.connectionContexts[connection]
+      bridge.connectionContexts.del(connection)
+      if not ctx.isNil:
+        bridge.retiredConnectionContexts.add(ctx)
 
 proc storeStreamContext(bridge: RuntimeBridge; stream: HQUIC;
     ctx: StreamCallbackContext) =
   if bridge.isNil or stream.isNil:
     return
-  bridge.streamContexts[stream] = ctx
+  bridge.withBridgeLock:
+    bridge.streamContexts[stream] = ctx
 
 proc dropStreamContext(bridge: RuntimeBridge; stream: HQUIC) =
   if bridge.isNil or stream.isNil:
     return
-  if bridge.streamContexts.contains(stream):
-    bridge.streamContexts.del(stream)
+  bridge.withBridgeLock:
+    if bridge.streamContexts.contains(stream):
+      let ctx = bridge.streamContexts[stream]
+      bridge.streamContexts.del(stream)
+      if not ctx.isNil:
+        bridge.retiredStreamContexts.add(ctx)
 
 proc storeListenerContext(bridge: RuntimeBridge; listener: HQUIC;
     ctx: ListenerCallbackContext) =
   if bridge.isNil or listener.isNil:
     return
-  bridge.listenerContexts[listener] = ctx
+  bridge.withBridgeLock:
+    bridge.listenerContexts[listener] = ctx
 
 proc dropListenerContext(bridge: RuntimeBridge; listener: HQUIC) =
   if bridge.isNil or listener.isNil:
     return
-  if bridge.listenerContexts.contains(listener):
-    bridge.listenerContexts.del(listener)
+  bridge.withBridgeLock:
+    if bridge.listenerContexts.contains(listener):
+      let ctx = bridge.listenerContexts[listener]
+      bridge.listenerContexts.del(listener)
+      if not ctx.isNil:
+        bridge.retiredListenerContexts.add(ctx)
 
 proc connectionCallbackShim(connection: HQUIC; context: pointer;
     event: pointer): QUIC_STATUS {.cdecl.} =
@@ -476,7 +512,7 @@ proc streamCallbackShim(stream: HQUIC; context: pointer;
   if not ctx.handler.isNil:
     ctx.handler(nimEvent)
   case nimEvent.kind
-  of seShutdownComplete, seSendShutdownComplete:
+  of seShutdownComplete:
     bridge.dropStreamContext(stream)
   else:
     discard
@@ -589,10 +625,10 @@ proc shutdownConnection*(bridge: RuntimeBridge; connection: HQUIC;
 proc closeConnection*(bridge: RuntimeBridge; connection: HQUIC) =
   if bridge.isNil or connection.isNil:
     return
-  bridge.dropConnectionContext(connection)
   if bridge.api.isNil or bridge.api.ConnectionClose.isNil:
     return
   bridge.api.ConnectionClose(connection)
+  bridge.dropConnectionContext(connection)
 
 proc openStream*(bridge: RuntimeBridge; connection: HQUIC;
     flags: QUIC_STREAM_OPEN_FLAGS; handler: StreamEventHandler;
@@ -643,10 +679,10 @@ proc adoptStream*(bridge: RuntimeBridge; stream: HQUIC;
 proc closeStream*(bridge: RuntimeBridge; stream: HQUIC) =
   if bridge.isNil or stream.isNil:
     return
-  bridge.dropStreamContext(stream)
   if bridge.api.isNil or bridge.api.StreamClose.isNil:
     return
   bridge.api.StreamClose(stream)
+  bridge.dropStreamContext(stream)
 
 proc getListenerParam*(bridge: RuntimeBridge; listener: HQUIC;
     paramId: uint32; buffer: pointer; bufferLength: var uint32): QUIC_STATUS {.gcsafe.} =
@@ -755,10 +791,10 @@ proc stopListener*(bridge: RuntimeBridge; listener: HQUIC): QUIC_STATUS =
 proc closeListener*(bridge: RuntimeBridge; listener: HQUIC) =
   if bridge.isNil or listener.isNil:
     return
-  bridge.dropListenerContext(listener)
   if bridge.api.isNil or bridge.api.ListenerClose.isNil:
     return
   bridge.api.ListenerClose(listener)
+  bridge.dropListenerContext(listener)
 
 proc sendStream*(bridge: RuntimeBridge; stream: HQUIC; buffers: ptr QuicBuffer;
     bufferCount: uint32; flags: QUIC_SEND_FLAGS; clientContext: pointer): QUIC_STATUS =
@@ -783,9 +819,13 @@ proc sendDatagram*(bridge: RuntimeBridge; connection: HQUIC; buffers: ptr QuicBu
 proc close*(bridge: var RuntimeBridge) =
   if bridge.isNil:
     return
-  bridge.connectionContexts.clear()
-  bridge.streamContexts.clear()
-  bridge.listenerContexts.clear()
+  bridge.withBridgeLock:
+    bridge.connectionContexts.clear()
+    bridge.streamContexts.clear()
+    bridge.listenerContexts.clear()
+    bridge.retiredConnectionContexts.setLen(0)
+    bridge.retiredStreamContexts.setLen(0)
+    bridge.retiredListenerContexts.setLen(0)
   if bridge.ownsRuntime:
     var runtime = bridge.runtime
     unloadMsQuic(runtime)

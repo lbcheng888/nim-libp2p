@@ -81,11 +81,14 @@ proc buildEventSection(): ApiDocSection =
     let description =
       case kind
       of ceConnected: "握手完成并协商 ALPN"
+      of cePeerStreamStarted: "对端创建了新的流，事件中会携带流句柄"
       of ceShutdownInitiated: "应用或对端发起关闭"
       of ceShutdownComplete: "连接资源已释放"
+      of ceDatagramReceived: "收到对端发送的数据报负载"
       of ceSettingsApplied: "MsQuic 设置已生效"
       of ceDatagramStateChanged: "数据报能力或配额变化"
       of ceParameterUpdated: "参数更新事件"
+      of ceUnknown: "未知或尚未映射的底层连接事件"
     lines.add fmt"| `{kind}` | {description} |"
   ApiDocSection(title: "连接事件", lines: lines)
 

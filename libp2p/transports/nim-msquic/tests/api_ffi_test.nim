@@ -1,6 +1,15 @@
-import std/unittest
+import std/[posix, unittest]
+
+import chronos
 
 import "../api/api_impl"
+
+proc waitForPredicate(predicate: proc(): bool; rounds: int = 40): bool =
+  for _ in 0 ..< rounds:
+    if predicate():
+      return true
+    waitFor sleepAsync(50.milliseconds)
+  predicate()
 
 suite "MsQuic Nim API 最小表面":
   test "MsQuicOpenVersion returns table and drives client start":
@@ -30,10 +39,39 @@ suite "MsQuic Nim API 最小表面":
     check table.ConfigurationOpen(registration, addr alpnBuffer, 1'u32, nil, 0'u32,
       nil, addr configuration) == QUIC_STATUS_SUCCESS
     check configuration != nil
+    defer:
+      table.ConfigurationClose(configuration)
 
     var credential = 1'u32
     check table.ConfigurationLoadCredential(configuration,
       cast[pointer](addr credential)) == QUIC_STATUS_SUCCESS
+
+    var listener: HQUIC
+    let listenerCallback = proc(listenerHandle: HQUIC; context: pointer;
+        event: pointer): QUIC_STATUS {.cdecl.} =
+      discard listenerHandle
+      discard context
+      discard event
+      QUIC_STATUS_SUCCESS
+    check table.ListenerOpen(
+      registration,
+      cast[pointer](listenerCallback),
+      nil,
+      addr listener
+    ) == QUIC_STATUS_SUCCESS
+    check listener != nil
+    defer:
+      table.ListenerClose(listener)
+
+    var bindAddress: Sockaddr_in
+    zeroMem(addr bindAddress, sizeof(bindAddress))
+    when declared(bindAddress.sin_len):
+      bindAddress.sin_len = uint8(sizeof(Sockaddr_in))
+    bindAddress.sin_family = uint8(posix.AF_INET)
+    bindAddress.sin_port = htons(41071'u16)
+    discard inet_pton(posix.AF_INET, "0.0.0.0".cstring, addr bindAddress.sin_addr)
+    check table.ListenerStart(listener, addr alpnBuffer, 1'u32, addr bindAddress) ==
+      QUIC_STATUS_SUCCESS
 
     var connection: HQUIC
     var callbackInvoked = false
@@ -66,14 +104,13 @@ suite "MsQuic Nim API 最小表面":
     check table.GetContext(connection) == cast[pointer](addr contextValue)
 
     check table.ConnectionStart(connection, configuration, QUIC_ADDRESS_FAMILY(2),
-      cstring("example.com"), uint16(443)) == QUIC_STATUS_SUCCESS
+      cstring("127.0.0.1"), uint16(41071)) == QUIC_STATUS_SUCCESS
 
-    check callbackInvoked
+    check waitForPredicate(proc(): bool = callbackInvoked, rounds = 120)
     check int(negotiatedLen) == alpnString.len
     check negotiatedAlpn == alpnString
 
     table.ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAGS(0), 0)
     table.ConnectionClose(connection)
-    table.ConfigurationClose(configuration)
     table.RegistrationClose(registration)
     MsQuicClose(apiPtr)

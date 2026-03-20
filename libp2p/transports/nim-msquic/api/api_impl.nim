@@ -4,10 +4,25 @@ import std/tables
 import std/sequtils
 import std/endians
 import std/times
+import std/strutils
 when defined(windows):
   import std/winlean
 else:
   import std/posix
+  when not declared(Ifaddrs):
+    type
+      Ifaddrs {.importc: "struct ifaddrs", header: "<ifaddrs.h>", bycopy.} = object
+        ifa_next: ptr Ifaddrs
+        ifa_name: cstring
+        ifa_flags: cuint
+        ifa_addr: ptr SockAddr
+        ifa_netmask: ptr SockAddr
+        ifa_dstaddr: ptr SockAddr
+        ifa_data: pointer
+  when not declared(getifaddrs):
+    proc getifaddrs(ifap: ptr ptr Ifaddrs): cint {.importc, header: "<ifaddrs.h>".}
+  when not declared(freeifaddrs):
+    proc freeifaddrs(ifa: ptr Ifaddrs) {.importc, header: "<ifaddrs.h>".}
 import chronos
 import chronicles
 
@@ -19,8 +34,8 @@ from "../core/mod" import ConnectionId, QuicConnection, QuicVersion,
     configurePreferredAddress, PreferredAddressState,
     MaxCidLength
 from "../congestion/common" import CongestionAlgorithm, caCubic, caBbr,
-    AckEventSnapshot, LossEventSnapshot, ackTypeAckImmediate,
-    MaxAckDelayDefaultMs, PersistentCongestionThreshold, PacketReorderThreshold,
+    AckEventSnapshot, LossEventSnapshot, ackTypeAckImmediate, ackTypeAckEliciting,
+    MaxAckDelayDefaultMs, MinAckSendNumber, PersistentCongestionThreshold, PacketReorderThreshold,
     timeReorderThreshold
 import "../congestion/ack_tracker_model" as qack
 import "../congestion/loss_detection_model" as qloss
@@ -47,11 +62,13 @@ type
     payload: seq[byte]
     fin: bool
     clientContext: pointer
+    targetRemote: TransportAddress
     zeroRttDispatched: bool
 
   PendingDatagram = object
     payload: seq[byte]
     clientContext: pointer
+    targetRemote: TransportAddress
     zeroRttDispatched: bool
 
   PendingControlFrame = object
@@ -66,6 +83,7 @@ type
     sfkResetStream
     sfkStopSending
     sfkDatagram
+    sfkPing
     sfkAck
     sfkCrypto
     sfkConnectionIdUpdate
@@ -384,6 +402,7 @@ type
     callback: QuicConnectionCallback
     callbackContext: pointer
     started: bool
+    isClient: bool
     partitionId: uint16
     serverName: string
     serverPort: uint16
@@ -411,6 +430,7 @@ type
     clientPrivateKey: Curve25519Key
     transcript: seq[byte]
     handshakeComplete: bool
+    peerAddressValidated: bool
     localTransportParams: tls.QuicTransportParameters
     peerTransportParams: tls.QuicTransportParameters
     sessionResumed: bool
@@ -421,6 +441,7 @@ type
     zeroRttAcceptDeadlineUs: uint64
     incomingStreams: Table[uint64, StreamState]
     ackTracker: qack.AckTrackerModel
+    pendingAckRemotes: array[CryptoEpoch, TransportAddress]
     lossDetection: qloss.LossDetectionModel
     congestionController: qcc.CongestionController
     sentPackets: seq[SentPacketMeta]
@@ -487,6 +508,7 @@ var gBuiltinResumptionCache = initTable[string, BuiltinResumptionEntry]()
 var gBuiltinZeroRttReplayCache = initTable[string, BuiltinZeroRttReplayEntry]()
 var gForceRejectBuiltinZeroRttForTest = false
 var gDropBuiltinEarlyDataRequestForTest = false
+var gDropBuiltinTicketAgeForTest = false
 var gDropBuiltinResumptionBinderForTest = false
 var gTamperBuiltinResumptionBinderForTest = false
 var gTamperBuiltinResumptionTicketForTest = false
@@ -502,6 +524,7 @@ var gHasOverrideBuiltinNewSessionTicketLifetimeSecForTest = false
 var gOverrideBuiltinNewSessionTicketLifetimeSecForTest = 600'u32
 var gHasOverrideBuiltinNewSessionTicketMaxEarlyDataForTest = false
 var gOverrideBuiltinNewSessionTicketMaxEarlyDataForTest = BuiltinDefaultMaxEarlyData
+var gBuiltinTicketAgeAddSalt = 0'u32
 
 proc generateSingleConnectionId(): ConnectionId {.gcsafe.}
 proc cidBytes(cid: ConnectionId): seq[byte] {.gcsafe.}
@@ -853,11 +876,61 @@ proc parseSockAddr(address: pointer; outAddr: var TransportAddress): bool {.gcsa
   except CatchableError:
     false
 
+proc ackRemoteEpoch(epoch: CryptoEpoch): CryptoEpoch {.gcsafe.} =
+  case epoch
+  of ceZeroRtt, ceOneRtt:
+    ceOneRtt
+  else:
+    epoch
+
+proc setPendingAckRemote(conn: ConnectionState; epoch: CryptoEpoch;
+    remote: TransportAddress) {.gcsafe.} =
+  if conn.isNil or remote.family == AddressFamily.None:
+    return
+  conn.pendingAckRemotes[ackRemoteEpoch(epoch)] = remote
+
+proc clearPendingAckRemote(conn: ConnectionState; epoch: CryptoEpoch) {.gcsafe.} =
+  if conn.isNil:
+    return
+  conn.pendingAckRemotes[ackRemoteEpoch(epoch)] =
+    TransportAddress(family: AddressFamily.None)
+
+proc pendingAckRemote(conn: ConnectionState; epoch: CryptoEpoch): ptr TransportAddress {.gcsafe.} =
+  if conn.isNil:
+    return nil
+  let ackEpoch = ackRemoteEpoch(epoch)
+  if conn.pendingAckRemotes[ackEpoch].family == AddressFamily.None:
+    return nil
+  addr conn.pendingAckRemotes[ackEpoch]
+
 proc remoteAddressKey(remote: TransportAddress): string {.gcsafe.}
 proc registerPathRemote(conn: ConnectionState; pathId: uint8;
     remote: TransportAddress) {.gcsafe.}
 proc maybeInitiatePathMigration(conn: ConnectionState;
     remote: TransportAddress) {.gcsafe.}
+proc sendAckFrame(conn: ConnectionState; largestAcked: uint64; epoch: CryptoEpoch;
+    targetRemote: ptr TransportAddress = nil): bool {.gcsafe.}
+
+proc maybeFlushPendingOneRttAckOnRemoteChange(conn: ConnectionState;
+    remote: TransportAddress): bool {.gcsafe.} =
+  if conn.isNil or not conn.handshakeComplete or remote.family == AddressFamily.None:
+    return false
+  let pendingRemote = conn.pendingAckRemote(ceOneRtt)
+  if pendingRemote.isNil or pendingRemote[].family == AddressFamily.None:
+    return false
+  if remoteAddressKey(pendingRemote[]) == remoteAddressKey(remote):
+    return false
+  let hasPendingAck =
+    qack.packetNumbersToAck(conn.ackTracker, ceOneRtt).len > 0 or
+    qack.ackElicitingPacketsToAck(conn.ackTracker, ceOneRtt) > 0'u16
+  if not hasPendingAck:
+    return false
+  discard conn.sendAckFrame(
+    qack.largestPacketNumberAcked(conn.ackTracker, ceOneRtt),
+    ceOneRtt,
+    pendingRemote
+  )
+  true
 
 proc setListenerLocalAddress(state: ListenerState;
     addrValue: TransportAddress): QUIC_STATUS {.gcsafe.} =
@@ -959,7 +1032,8 @@ proc prependPendingChunk(stream: StreamState; chunk: PendingStreamChunk) {.gcsaf
     return
   for existing in stream.pendingChunks:
     if existing.offset == chunk.offset and existing.fin == chunk.fin and
-        existing.payload == chunk.payload:
+        existing.payload == chunk.payload and
+        existing.targetRemote == chunk.targetRemote:
       return
   stream.pendingChunks.insert(chunk, 0)
 
@@ -1083,10 +1157,13 @@ proc buildBuiltinResumptionTicket(serverName: string; serverPort: uint16;
     if preserveTicketAgeAdd:
       ticketAgeAdd
     else:
-      uint32(((ticketIssuedAtUs shr 12) xor
-        (ticketIssuedAtUs shr 37) xor
-        uint64(serverPort) xor
-        0xA5A55A5A'u64) and uint64(high(uint32)))
+      block:
+        inc(gBuiltinTicketAgeAddSalt)
+        uint32(((ticketIssuedAtUs shr 12) xor
+          (ticketIssuedAtUs shr 37) xor
+          uint64(serverPort) xor
+          uint64(gBuiltinTicketAgeAddSalt) xor
+          0xA5A55A5A'u64) and uint64(high(uint32)))
   let cappedDataLen = min(data.len, high(uint16).int)
   let serverNameLen = min(serverName.len, 255)
   let alpnLen = min(alpn.len, 255)
@@ -1387,6 +1464,21 @@ proc removeAcceptedConnection(state: ListenerState; conn: ConnectionState) {.gcs
   for key in staleKeys:
     state.acceptedConnections.del(key)
 
+proc acceptedConnectionCanonicalKey(conn: ConnectionState): string {.gcsafe.} =
+  if conn.isNil:
+    return ""
+  "conn:" & $cast[uint](conn)
+
+proc registerAcceptedConnection(state: ListenerState; remoteKey: string;
+    conn: ConnectionState) {.gcsafe.} =
+  if state.isNil or conn.isNil:
+    return
+  let canonicalKey = acceptedConnectionCanonicalKey(conn)
+  if canonicalKey.len > 0:
+    state.acceptedConnections[canonicalKey] = conn
+  if remoteKey.len > 0:
+    state.acceptedConnections[remoteKey] = conn
+
 proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe.}
 
 proc matchesStatelessResetToken(conn: ConnectionState; data: openArray[byte]): bool {.gcsafe.} =
@@ -1661,6 +1753,9 @@ proc sendZeroRttPacket(conn: ConnectionState; payload: seq[byte];
     targetRemote: ptr TransportAddress = nil): uint64 {.gcsafe.}
 proc maybeSendPendingOneRttAck(conn: ConnectionState;
     targetRemote: ptr TransportAddress = nil): bool {.gcsafe.}
+proc maybeSendExpiredOneRttAck(conn: ConnectionState; nowUs: uint64;
+    targetRemote: ptr TransportAddress = nil): bool {.gcsafe.}
+proc completeServerHandshake(conn: ConnectionState; diagnosticsNote: string)
 
 proc markActivePathValidated(conn: ConnectionState; pathId: uint8) {.gcsafe.} =
   if conn.isNil or conn.quicConn.isNil:
@@ -1804,7 +1899,8 @@ proc requeueLostPacket(conn: ConnectionState; meta: SentPacketMeta) {.gcsafe.} =
         offset: meta.streamOffset,
         payload: meta.streamPayload,
         fin: meta.streamFin,
-        clientContext: meta.clientContext
+        clientContext: meta.clientContext,
+        targetRemote: meta.targetRemote
       ))
   of sfkResetStream, sfkStopSending, sfkCrypto, sfkConnectionIdUpdate,
       sfkPathChallenge, sfkPathResponse, sfkHandshakeDone, sfkConnectionClose:
@@ -1884,7 +1980,7 @@ proc detectAckDrivenLosses(conn: ConnectionState; ack: proto.AckFrame; epoch: Cr
   nextLossTime
 
 proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
-  if conn.isNil or conn.sentPackets.len == 0 or conn.inLossDetectionTick:
+  if conn.isNil or conn.inLossDetectionTick:
     if not conn.isNil and not conn.quicConn.isNil:
       conn.quicConn.model.timers.lossDetectionTimer = 0'u64
     return
@@ -1892,6 +1988,11 @@ proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
   defer:
     conn.inLossDetectionTick = false
   let nowUs = nowMicros()
+  discard conn.maybeSendExpiredOneRttAck(nowUs)
+  if conn.sentPackets.len == 0:
+    if not conn.quicConn.isNil:
+      conn.quicConn.model.timers.lossDetectionTimer = 0'u64
+    return
   var selectedEpoch = ceInitial
   var scheduledUs = 0'u64
   var dueToLossTime = false
@@ -2210,6 +2311,79 @@ proc cidBytes(cid: ConnectionId): seq[byte] {.gcsafe.} =
 
 proc remoteAddressKey(remote: TransportAddress): string {.gcsafe.} =
   $remote
+
+proc wildcardLocalForRemote(remote: TransportAddress): TransportAddress {.gcsafe.} =
+  case remote.family
+  of AddressFamily.IPv6:
+    initTAddress("::", Port(0))
+  of AddressFamily.IPv4:
+    initTAddress("0.0.0.0", Port(0))
+  else:
+    initTAddress("0.0.0.0", Port(0))
+
+proc localBindMatchesRemote(localAddr, remoteAddr: TransportAddress): bool {.gcsafe.} =
+  if localAddr.family == AddressFamily.None or remoteAddr.family == AddressFamily.None:
+    return false
+  localAddr.family == remoteAddr.family
+
+proc isRoutableGlobalIpv6(ip: string): bool {.gcsafe.} =
+  let normalized = ip.strip().toLowerAscii()
+  if normalized.len == 0:
+    return false
+  if normalized in ["::", "::1", "0:0:0:0:0:0:0:0"]:
+    return false
+  if normalized.startsWith("fe80:") or normalized.startsWith("fc") or normalized.startsWith("fd"):
+    return false
+  if normalized.startsWith("ff"):
+    return false
+  true
+
+proc preferredIpv6LocalBindForDial(): TransportAddress {.gcsafe.} =
+  when defined(macosx):
+    when declared(getifaddrs):
+      var ifap: ptr Ifaddrs = nil
+      if getifaddrs(addr ifap) == 0:
+        defer:
+          freeifaddrs(ifap)
+        var cursor = ifap
+        while cursor != nil:
+          when declared(cursor.ifa_flags) and declared(IFF_LOOPBACK):
+            if (cursor.ifa_flags and IFF_LOOPBACK) != 0:
+              cursor = cursor.ifa_next
+              continue
+          let addrPtr = cursor.ifa_addr
+          when declared(posix.AF_INET6):
+            if addrPtr != nil and cint(addrPtr.sa_family) == posix.AF_INET6:
+              let sin6 = cast[ptr Sockaddr_in6](addrPtr)
+              var buffer: array[64, char]
+              when declared(inet_ntop):
+                if inet_ntop(posix.AF_INET6, addr sin6.sin6_addr, cast[ptr char](addr buffer[0]), buffer.len.cint) != nil:
+                  var ip = $cast[cstring](addr buffer[0])
+                  let zoneIdx = ip.find('%')
+                  if zoneIdx >= 0:
+                    ip = ip[0 ..< zoneIdx]
+                  if isRoutableGlobalIpv6(ip):
+                    return initTAddress(ip, Port(0))
+          cursor = cursor.ifa_next
+  TransportAddress(family: AddressFamily.None)
+
+proc selectClientLocalBind(state: ConnectionState): TransportAddress {.gcsafe.} =
+  if state.isNil:
+    return TransportAddress(family: AddressFamily.None)
+  if state.remoteAddress.family == AddressFamily.None:
+    if state.localAddress.family != AddressFamily.None:
+      return state.localAddress
+    return wildcardLocalForRemote(state.remoteAddress)
+  if localBindMatchesRemote(state.localAddress, state.remoteAddress):
+    return state.localAddress
+  if state.remoteAddress.family == AddressFamily.IPv6:
+    let preferredIpv6 = preferredIpv6LocalBindForDial()
+    if preferredIpv6.family != AddressFamily.None:
+      state.localAddress = preferredIpv6
+      return preferredIpv6
+  result = wildcardLocalForRemote(state.remoteAddress)
+  if result.family != AddressFamily.None:
+    state.localAddress = result
 
 proc buildCryptoFrame(data: seq[byte]): seq[byte] =
   result = @[0x06'u8]
@@ -2822,7 +2996,21 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
     largestAckAppLimited: ackedMetaFound and ackedMeta.appLimited,
     minRttValid: true
   )
+  let preserveEpochProbeBackoff =
+    epoch == ceInitial and conn.isClient and not conn.peerAddressValidated and
+    ackedBytes > 0'u32
+  let savedEpochProbeCount =
+    if preserveEpochProbeBackoff:
+      conn.lossDetection.probeCountByEpoch[epoch]
+    else:
+      0'u16
   qloss.onAckReceived(conn.lossDetection, ackEvent)
+  if preserveEpochProbeBackoff:
+    conn.lossDetection.probeCountByEpoch[epoch] = savedEpochProbeCount
+    conn.lossDetection.probeCount = 0'u16
+    for candidate in CryptoEpoch:
+      conn.lossDetection.probeCount =
+        max(conn.lossDetection.probeCount, conn.lossDetection.probeCountByEpoch[candidate])
   qcc.onAcked(conn.congestionController, ackEvent)
   if lostBytes > 0:
     let loss = LossEventSnapshot(
@@ -2841,6 +3029,9 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
         " lostBytes=" & $lostBytes &
         " persistent=" & $persistentCongestion
     ))
+  for stream in conn.localStreams:
+    flushStream(stream)
+  flushPendingDatagrams(conn)
   conn.updateLossDetectionTimer()
   if epoch == ceOneRtt and conn.handshakeComplete and conn.pendingAutoLocalCidAdvertisement:
     if conn.sendLocalNewConnectionId():
@@ -2853,9 +3044,12 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
         ))
 
 proc sendAckFrame(conn: ConnectionState; largestAcked: uint64; epoch: CryptoEpoch;
-    targetRemote: ptr TransportAddress = nil) {.gcsafe.} =
+    targetRemote: ptr TransportAddress = nil): bool {.gcsafe.} =
   if conn.isNil:
-    return
+    return false
+  let effectiveTargetRemote =
+    if targetRemote.isNil: conn.pendingAckRemote(epoch)
+    else: targetRemote
   var ackDelay = 0'u64
   if epoch == ceOneRtt and conn.handshakeComplete and
       qack.largestPacketNumberRecvTime(conn.ackTracker, epoch) > 0'u64:
@@ -2880,21 +3074,34 @@ proc sendAckFrame(conn: ConnectionState; largestAcked: uint64; epoch: CryptoEpoc
     if ackRanges.len > 0:
       proto.encodeAckFrame(ackRanges, ackDelay)
     else:
-      proto.encodeAckFrame(largestAcked, ackDelay)
+      @[]
   let sentCountBefore = conn.sentPackets.len
+  let hadPendingAck =
+    qack.ackElicitingPacketsToAck(conn.ackTracker, epoch) > 0'u16 or
+    qack.packetNumbersToAck(conn.ackTracker, epoch).len > 0
+  if not hadPendingAck or ackPayload.len == 0:
+    return false
+  if hadPendingAck:
+    qack.setAlreadyWrittenAckFrame(conn.ackTracker, epoch, true)
   case epoch
   of ceInitial:
-    discard conn.sendInitialPacket(ackPayload, sfkAck, false, targetRemote = targetRemote)
+    discard conn.sendInitialPacket(ackPayload, sfkAck, false, targetRemote = effectiveTargetRemote)
   of ceHandshake:
-    discard conn.sendHandshakePacket(ackPayload, sfkAck, false, targetRemote = targetRemote)
+    discard conn.sendHandshakePacket(ackPayload, sfkAck, false, targetRemote = effectiveTargetRemote)
   of ceOneRtt:
     if not conn.handshakeComplete:
+      if hadPendingAck:
+        qack.setAlreadyWrittenAckFrame(conn.ackTracker, epoch, false)
       return
-    discard conn.sendOneRttPacket(ackPayload, sfkAck, false, targetRemote = targetRemote)
+    discard conn.sendOneRttPacket(ackPayload, sfkAck, false, targetRemote = effectiveTargetRemote)
   else:
     discard
   if conn.sentPackets.len > sentCountBefore:
     qack.consumePendingAck(conn.ackTracker, epoch)
+    conn.clearPendingAckRemote(epoch)
+  elif hadPendingAck:
+    qack.setAlreadyWrittenAckFrame(conn.ackTracker, epoch, false)
+  conn.sentPackets.len > sentCountBefore
 
 proc maybeSendPendingOneRttAck(conn: ConnectionState;
     targetRemote: ptr TransportAddress = nil): bool {.gcsafe.} =
@@ -2902,11 +3109,115 @@ proc maybeSendPendingOneRttAck(conn: ConnectionState;
     return false
   if qack.ackElicitingPacketsToAck(conn.ackTracker, ceOneRtt) == 0'u16:
     return false
-  conn.sendAckFrame(
+  result = conn.sendAckFrame(
     qack.largestPacketNumberAcked(conn.ackTracker, ceOneRtt),
     ceOneRtt,
     targetRemote)
-  true
+
+proc maybeSendExpiredOneRttAck(conn: ConnectionState; nowUs: uint64;
+    targetRemote: ptr TransportAddress = nil): bool {.gcsafe.} =
+  if conn.isNil or not conn.handshakeComplete:
+    return false
+  if qack.ackElicitingPacketsToAck(conn.ackTracker, ceOneRtt) == 0'u16:
+    return false
+  if qack.alreadyWrittenAckFrame(conn.ackTracker, ceOneRtt):
+    return false
+  let deadlineUs = qack.ackDeadlineUs(conn.ackTracker, ceOneRtt)
+  if deadlineUs == 0'u64 or nowUs < deadlineUs:
+    return false
+  result = conn.sendAckFrame(
+    qack.largestPacketNumberAcked(conn.ackTracker, ceOneRtt),
+    ceOneRtt,
+    targetRemote)
+
+proc completeServerHandshake(conn: ConnectionState; diagnosticsNote: string) =
+  if conn.isNil or conn.handshakeComplete:
+    return
+  conn.handshakeComplete = true
+  conn.markActivePathValidated(0)
+  for stream in conn.localStreams:
+    flushStream(stream)
+  flushPendingDatagrams(conn)
+  emitNativeConnected(conn)
+  let negotiatedAlpn =
+    if conn.configuration.isNil or conn.configuration.alpns.len == 0: ""
+    else: conn.configuration.alpns[0]
+  var connectedEvent = ConnectionEvent(
+    kind: ceConnected,
+    sessionResumed: conn.sessionResumed,
+    negotiatedAlpn: negotiatedAlpn,
+    note: "server handshake complete"
+  )
+  when defined(msquic_diag_test):
+    {.cast(gcsafe).}:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: cast[pointer](conn),
+        note: "server emit ceConnected resumed=" & $conn.sessionResumed
+      ))
+  emitConnectionEvent(conn, connectedEvent)
+  if conn.resumptionTicket.len == 0:
+    conn.resumptionTicket = buildBuiltinResumptionTicket(conn, conn.resumptionData)
+  var postHandshakePayload = proto.encodeHandshakeDoneFrame()
+  if conn.resumptionTicket.len > 0:
+    let ticketLifetimeSec = currentBuiltinNewSessionTicketLifetimeSec()
+    let ticketMaxEarlyData = currentBuiltinNewSessionTicketMaxEarlyData(conn)
+    var ticketMeta: BuiltinResumptionTicketMeta
+    let haveTicketMeta = parseBuiltinResumptionTicket(conn.resumptionTicket, ticketMeta)
+    let issuedAtUs = nowMicros()
+    let expiresAtUs =
+      if ticketLifetimeSec == 0'u32: issuedAtUs
+      else: issuedAtUs + uint64(ticketLifetimeSec) * 1_000_000'u64
+    conn.resumptionTicket = buildBuiltinResumptionTicket(
+      if haveTicketMeta and ticketMeta.serverName.len > 0:
+        ticketMeta.serverName
+      else:
+        conn.serverName,
+      if haveTicketMeta and ticketMeta.serverPort != 0'u16:
+        ticketMeta.serverPort
+      else:
+        conn.serverPort,
+      if haveTicketMeta and ticketMeta.alpn.len > 0:
+        ticketMeta.alpn
+      else:
+        alpnForConnection(conn),
+      if haveTicketMeta: ticketMeta.data else: conn.resumptionData,
+      issuedAtUs = issuedAtUs,
+      expiresAtUs = expiresAtUs,
+      maxEarlyData = ticketMaxEarlyData
+    )
+    var refreshedTicketMeta: BuiltinResumptionTicketMeta
+    discard parseBuiltinResumptionTicket(conn.resumptionTicket, refreshedTicketMeta)
+    {.cast(gcsafe).}:
+      storeBuiltinResumptionEntry(
+        conn,
+        conn.resumptionTicket,
+        conn.resumptionData,
+        int64(ticketLifetimeSec)
+      )
+    postHandshakePayload.add(buildCryptoFrame(
+      tls.encodeNewSessionTicket(
+        conn.resumptionTicket,
+        maxEarlyData = ticketMaxEarlyData,
+        ticketAgeAdd = refreshedTicketMeta.ticketAgeAdd,
+        ticketLifetimeSec = ticketLifetimeSec
+      )
+    ))
+  discard conn.sendOneRttPacket(postHandshakePayload, sfkHandshakeDone, true)
+  discard conn.maybeSendPendingOneRttAck()
+  conn.pendingAutoLocalCidAdvertisement = true
+  {.cast(gcsafe).}:
+    emitDiagnostics(DiagnosticsEvent(
+      kind: diagConnectionEvent,
+      handle: cast[pointer](conn),
+      note: diagnosticsNote
+    ))
+
+proc currentLocalAckDelayMs(conn: ConnectionState): uint32 {.gcsafe.} =
+  if conn.isNil:
+    return MaxAckDelayDefaultMs
+  let configured = uint32(min(conn.localTransportParams.maxAckDelayMs, high(uint32).uint64))
+  if configured == 0'u32: MaxAckDelayDefaultMs else: configured
 
 proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsafe.} =
   if conn.isNil:
@@ -2914,18 +3225,43 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
   let genericProbePayload = @[0x01'u8] # PING
   var probeMeta: SentPacketMeta
   let haveProbeMeta = conn.newestAckElicitingSentPacket(epoch, probeMeta)
+  let reuseOriginalFrame =
+    haveProbeMeta and probeMeta.framePayload.len > 0 and probeMeta.frameKind != sfkDatagram
   let probePayload =
-    if haveProbeMeta and probeMeta.framePayload.len > 0:
-      probeMeta.framePayload
+    if reuseOriginalFrame: probeMeta.framePayload
+    else: genericProbePayload
+  let probeFrameKind =
+    if reuseOriginalFrame: probeMeta.frameKind
+    else: sfkPing
+  let probeStream =
+    if reuseOriginalFrame and probeMeta.frameKind == sfkStream:
+      cast[StreamState](probeMeta.stream)
     else:
-      genericProbePayload
+      nil
+  let probeStreamOffset =
+    if reuseOriginalFrame and probeMeta.frameKind == sfkStream:
+      probeMeta.streamOffset
+    else:
+      0'u64
+  let probeStreamPayload =
+    if reuseOriginalFrame and probeMeta.frameKind == sfkStream:
+      probeMeta.streamPayload
+    else:
+      @[]
+  let probeStreamFin =
+    reuseOriginalFrame and probeMeta.frameKind == sfkStream and probeMeta.streamFin
+  let probeClientContext =
+    if reuseOriginalFrame and probeMeta.frameKind in {sfkStream, sfkDatagram}:
+      probeMeta.clientContext
+    else:
+      nil
   for _ in 0 ..< 2:
     let packetNumber =
       case epoch
       of ceInitial:
         conn.sendInitialPacket(
           probePayload,
-          (if haveProbeMeta: probeMeta.frameKind else: sfkCrypto),
+          probeFrameKind,
           true,
           (if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
             addr probeMeta.targetRemote
@@ -2935,7 +3271,7 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
       of ceHandshake:
         conn.sendHandshakePacket(
           probePayload,
-          (if haveProbeMeta: probeMeta.frameKind else: sfkCrypto),
+          probeFrameKind,
           true,
           (if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
             addr probeMeta.targetRemote
@@ -2950,12 +3286,12 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
             nil
         conn.sendZeroRttPacket(
           probePayload,
-          (if haveProbeMeta: probeMeta.frameKind else: sfkDatagram),
-          stream = cast[StreamState](probeMeta.stream),
-          streamOffset = probeMeta.streamOffset,
-          streamPayload = probeMeta.streamPayload,
-          streamFin = probeMeta.streamFin,
-          clientContext = probeMeta.clientContext,
+          probeFrameKind,
+          stream = probeStream,
+          streamOffset = probeStreamOffset,
+          streamPayload = probeStreamPayload,
+          streamFin = probeStreamFin,
+          clientContext = probeClientContext,
           targetRemote = probeTarget
         )
       of ceOneRtt:
@@ -2964,18 +3300,18 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
         else:
           let probeTarget =
             if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
-              addr probeMeta.targetRemote
-            else:
-              nil
+            addr probeMeta.targetRemote
+          else:
+            nil
           conn.sendOneRttPacket(
             probePayload,
-            (if haveProbeMeta: probeMeta.frameKind else: sfkDatagram),
+            probeFrameKind,
             true,
-            stream = cast[StreamState](probeMeta.stream),
-            streamOffset = probeMeta.streamOffset,
-            streamPayload = probeMeta.streamPayload,
-            streamFin = probeMeta.streamFin,
-            clientContext = probeMeta.clientContext,
+            stream = probeStream,
+            streamOffset = probeStreamOffset,
+            streamPayload = probeStreamPayload,
+            streamFin = probeStreamFin,
+            clientContext = probeClientContext,
             targetRemote = probeTarget
           )
     if packetNumber == 0'u64:
@@ -2991,11 +3327,15 @@ proc flushPendingDatagrams(conn: ConnectionState) {.gcsafe.} =
     if conn.quicConn.model.handshake.zeroRttAccepted and datagram.zeroRttDispatched:
       continue
     let frame = proto.encodeDatagramFrame(datagram.payload, true)
+    var targetRemote = datagram.targetRemote
     discard conn.sendOneRttPacket(
       frame,
       sfkDatagram,
       true,
-      clientContext = datagram.clientContext
+      clientContext = datagram.clientContext,
+      targetRemote =
+        (if targetRemote.family == AddressFamily.None: nil
+        else: unsafeAddr targetRemote)
     )
 
 proc flushPendingControlFrames(conn: ConnectionState) {.gcsafe.} =
@@ -3519,6 +3859,7 @@ proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress
   conn.callbackContext = nil
   conn.context = nil
   conn.started = true
+  conn.isClient = false
   conn.partitionId = 0'u16
   conn.serverName = ""
   conn.serverPort = uint16(local.port)
@@ -3543,6 +3884,7 @@ proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress
   conn.handshakeServerSecret = @[]
   conn.transcript = @[]
   conn.handshakeComplete = false
+  conn.peerAddressValidated = true
   conn.localTransportParams = tls.defaultQuicTransportParameters(serverCidSeq)
   conn.peerTransportParams = tls.QuicTransportParameters()
   conn.sessionResumed = false
@@ -3624,6 +3966,22 @@ proc findAnyStream(conn: ConnectionState; streamId: uint64): StreamState {.gcsaf
     return conn.incomingStreams[streamId]
   nil
 
+proc isLocalStreamId(conn: ConnectionState; streamId: uint64): bool {.gcsafe.} =
+  if conn.isNil or conn.quicConn.isNil:
+    return false
+  let initiatorBit = streamId and 0x1'u64
+  if conn.quicConn.role == crClient:
+    initiatorBit == 0'u64
+  else:
+    initiatorBit == 1'u64
+
+proc resolveStreamState(conn: ConnectionState; streamId: uint64): StreamState =
+  if conn.isNil:
+    return nil
+  if conn.isLocalStreamId(streamId):
+    return conn.findAnyStream(streamId)
+  ensureIncomingStream(conn, streamId)
+
 proc emitPeerSendAborted(state: StreamState; errorCode: uint64) {.gcsafe.} =
   if state.isNil:
     return
@@ -3680,7 +4038,17 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
     packetNumber: uint64; plaintext: seq[byte]) =
   if conn.isNil:
     return
+  proc maybeCompleteServerHandshakeFromOneRtt() =
+    if conn.quicConn.isNil or conn.quicConn.role != crServer or conn.handshakeComplete:
+      return
+    let note =
+      if conn.sessionResumed:
+        "Resumed server handshake confirmed by 1-RTT packet."
+      else:
+        "Server handshake confirmed by 1-RTT packet."
+    conn.completeServerHandshake(note)
   conn.maybeInitiatePathMigration(remote)
+  let previousLargest = qack.largestPacketNumberAcked(conn.ackTracker, ceOneRtt)
   if qack.wasPacketReceived(conn.ackTracker, ceOneRtt, packetNumber):
     let nowUs = nowMicros()
     {.cast(gcsafe).}:
@@ -3690,23 +4058,30 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
         note: "RX duplicate 1-RTT pn=" & $packetNumber
       ))
     if payloadContainsAckElicitingFrame(plaintext):
+      conn.setPendingAckRemote(ceOneRtt, remote)
       qack.markForAck(conn.ackTracker, ceOneRtt, packetNumber, nowUs, ackTypeAckImmediate)
-      conn.sendAckFrame(packetNumber, ceOneRtt, unsafeAddr remote)
+      discard conn.sendAckFrame(packetNumber, ceOneRtt, unsafeAddr remote)
     return
   qack.trackIncomingPacket(conn.ackTracker, ceOneRtt, packetNumber)
   let nowUs = nowMicros()
+  let reordered =
+    previousLargest > 0'u64 and
+    (packetNumber < previousLargest or
+      (packetNumber > previousLargest and packetNumber != previousLargest + 1'u64))
   var pos = 0
   var ackEliciting = false
   while pos < plaintext.len:
     let frameType = plaintext[pos]
     if (frameType and 0xF8'u8) == 0x08'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parseStreamFrame(plaintext, pos)
-      let stream = ensureIncomingStream(conn, frame.streamId)
+      let stream = resolveStreamState(conn, frame.streamId)
       if not stream.isNil:
         emitStreamReceive(stream, frame.offset, frame.data, frame.fin)
     elif frameType == 0x30'u8 or frameType == 0x31'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parseDatagramFrame(plaintext, pos)
       if conn.datagramReceiveEnabled:
         var ev = ConnectionEvent(
@@ -3745,83 +4120,9 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
               ))
             continue
           conn.transcript.add(message.raw)
-          conn.handshakeComplete = true
-          conn.markActivePathValidated(0)
-          for stream in conn.localStreams:
-            flushStream(stream)
-          flushPendingDatagrams(conn)
-          emitNativeConnected(conn)
-          let negotiatedAlpn =
-            if conn.configuration.isNil or conn.configuration.alpns.len == 0: ""
-            else: conn.configuration.alpns[0]
-          var connectedEvent = ConnectionEvent(
-            kind: ceConnected,
-            sessionResumed: conn.sessionResumed,
-            negotiatedAlpn: negotiatedAlpn,
-            note: "server handshake complete"
+          conn.completeServerHandshake(
+            "Client Finished verified. 1-RTT confirmed; local CID advertisement queued."
           )
-          emitConnectionEvent(conn, connectedEvent)
-          if conn.resumptionTicket.len == 0:
-            conn.resumptionTicket = buildBuiltinResumptionTicket(conn, conn.resumptionData)
-          var postHandshakePayload = proto.encodeHandshakeDoneFrame()
-          if conn.resumptionTicket.len > 0:
-            let ticketLifetimeSec = currentBuiltinNewSessionTicketLifetimeSec()
-            let ticketMaxEarlyData = currentBuiltinNewSessionTicketMaxEarlyData(conn)
-            var ticketMeta: BuiltinResumptionTicketMeta
-            let haveTicketMeta = parseBuiltinResumptionTicket(conn.resumptionTicket, ticketMeta)
-            let issuedAtUs = nowMicros()
-            let expiresAtUs =
-              if ticketLifetimeSec == 0'u32: issuedAtUs
-              else: issuedAtUs + uint64(ticketLifetimeSec) * 1_000_000'u64
-            conn.resumptionTicket = buildBuiltinResumptionTicket(
-              if haveTicketMeta and ticketMeta.serverName.len > 0:
-                ticketMeta.serverName
-              else:
-                conn.serverName,
-              if haveTicketMeta and ticketMeta.serverPort != 0'u16:
-                ticketMeta.serverPort
-              else:
-                conn.serverPort,
-              if haveTicketMeta and ticketMeta.alpn.len > 0:
-                ticketMeta.alpn
-              else:
-                alpnForConnection(conn),
-              if haveTicketMeta: ticketMeta.data else: conn.resumptionData,
-              issuedAtUs = issuedAtUs,
-              expiresAtUs = expiresAtUs,
-              maxEarlyData = ticketMaxEarlyData,
-              ticketAgeAdd = ticketMeta.ticketAgeAdd,
-              preserveTicketAgeAdd = haveTicketMeta
-            )
-            var refreshedTicketMeta: BuiltinResumptionTicketMeta
-            discard parseBuiltinResumptionTicket(conn.resumptionTicket, refreshedTicketMeta)
-            storeBuiltinResumptionEntry(
-              conn,
-              conn.resumptionTicket,
-              conn.resumptionData,
-              int64(ticketLifetimeSec)
-            )
-            postHandshakePayload.add(buildCryptoFrame(
-              tls.encodeNewSessionTicket(
-                conn.resumptionTicket,
-                maxEarlyData = ticketMaxEarlyData,
-                ticketAgeAdd = refreshedTicketMeta.ticketAgeAdd,
-                ticketLifetimeSec = ticketLifetimeSec
-              )
-            ))
-          discard conn.sendOneRttPacket(
-            postHandshakePayload,
-            sfkHandshakeDone,
-            true
-          )
-          discard conn.maybeSendPendingOneRttAck()
-          conn.pendingAutoLocalCidAdvertisement = true
-          {.cast(gcsafe).}:
-            emitDiagnostics(DiagnosticsEvent(
-              kind: diagConnectionEvent,
-              handle: cast[pointer](conn),
-              note: "Client Finished verified. 1-RTT confirmed; local CID advertisement queued."
-            ))
           break
       elif conn.handshakeComplete and frame.data.len > 0:
         let messages = tls.splitHandshakeMessages(frame.data)
@@ -3869,6 +4170,7 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
             ))
     elif frameType == 0x04'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parseResetStreamFrame(plaintext, pos)
       let stream = conn.findAnyStream(frame.streamId)
       if not stream.isNil:
@@ -3878,12 +4180,14 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
         emitPeerSendAborted(stream, frame.applicationErrorCode)
     elif frameType == 0x05'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parseStopSendingFrame(plaintext, pos)
       let stream = conn.findAnyStream(frame.streamId)
       if not stream.isNil:
         emitPeerReceiveAborted(stream, frame.applicationErrorCode)
     elif frameType == 0x1A'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parsePathChallengeFrame(plaintext, pos)
       discard conn.sendOneRttPacket(
         proto.encodePathResponseFrame(frame.data),
@@ -3893,14 +4197,17 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
       )
     elif frameType == 0x1B'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parsePathResponseFrame(plaintext, pos)
       conn.applyPathResponse(frame.data)
     elif frameType == 0x18'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parseNewConnectionIdFrame(plaintext, pos)
       discard conn.applyPeerNewConnectionId(frame)
     elif frameType == 0x19'u8:
       ackEliciting = true
+      maybeCompleteServerHandshakeFromOneRtt()
       let frame = proto.parseRetireConnectionIdFrame(plaintext, pos)
       discard conn.applyPeerRetireConnectionId(frame.sequence)
     elif frameType == 0x1E'u8:
@@ -3937,8 +4244,25 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
     else:
       inc pos
   if ackEliciting:
-    qack.markForAck(conn.ackTracker, ceOneRtt, packetNumber, nowUs, ackTypeAckImmediate)
-    conn.sendAckFrame(packetNumber, ceOneRtt, unsafeAddr remote)
+    discard conn.maybeFlushPendingOneRttAckOnRemoteChange(remote)
+    conn.setPendingAckRemote(ceOneRtt, remote)
+    qack.markForAck(
+      conn.ackTracker,
+      ceOneRtt,
+      packetNumber,
+      nowUs,
+      ackTypeAckEliciting,
+      conn.currentLocalAckDelayMs()
+    )
+    if qack.shouldSendAck(
+        conn.ackTracker,
+        ceOneRtt,
+        MinAckSendNumber,
+        ackTypeAckEliciting,
+        reordered,
+        nowUs
+      ):
+      discard conn.sendAckFrame(packetNumber, ceOneRtt, unsafeAddr remote)
 
 proc handleZeroRttPayload(conn: ConnectionState; remote: TransportAddress;
     packetNumber: uint64; plaintext: seq[byte]) =
@@ -3953,6 +4277,7 @@ proc handleZeroRttPayload(conn: ConnectionState; remote: TransportAddress;
         note: "RX duplicate 0-RTT pn=" & $packetNumber
       ))
     if payloadContainsAckElicitingFrame(plaintext):
+      conn.setPendingAckRemote(ceZeroRtt, remote)
       qack.markForAck(conn.ackTracker, ceZeroRtt, packetNumber, nowUs, ackTypeAckImmediate)
       discard conn.maybeSendPendingOneRttAck(unsafeAddr remote)
     return
@@ -3965,7 +4290,7 @@ proc handleZeroRttPayload(conn: ConnectionState; remote: TransportAddress;
     if (frameType and 0xF8'u8) == 0x08'u8:
       ackEliciting = true
       let frame = proto.parseStreamFrame(plaintext, pos)
-      let stream = ensureIncomingStream(conn, frame.streamId)
+      let stream = resolveStreamState(conn, frame.streamId)
       if not stream.isNil:
         emitStreamReceive(stream, frame.offset, frame.data, frame.fin)
     elif frameType == 0x30'u8 or frameType == 0x31'u8:
@@ -3992,6 +4317,7 @@ proc handleZeroRttPayload(conn: ConnectionState; remote: TransportAddress;
       note: "RX 0-RTT pn=" & $packetNumber
     ))
   if ackEliciting:
+    conn.setPendingAckRemote(ceZeroRtt, remote)
     qack.markForAck(conn.ackTracker, ceZeroRtt, packetNumber, nowUs, ackTypeAckImmediate)
     discard conn.maybeSendPendingOneRttAck(unsafeAddr remote)
 
@@ -4169,6 +4495,8 @@ proc handleHandshakePacket(conn: ConnectionState; remote: TransportAddress; data
   )
   if plaintext.len == 0 and ciphertext.len > 0:
     return
+  if conn.isClient:
+    conn.peerAddressValidated = true
   if qack.wasPacketReceived(conn.ackTracker, ceHandshake, uint64(pnVal)):
     {.cast(gcsafe).}:
       emitDiagnostics(DiagnosticsEvent(
@@ -4178,7 +4506,7 @@ proc handleHandshakePacket(conn: ConnectionState; remote: TransportAddress; data
       ))
     if payloadContainsAckElicitingFrame(plaintext):
       qack.markForAck(conn.ackTracker, ceHandshake, uint64(pnVal), nowUs, ackTypeAckImmediate)
-      conn.sendAckFrame(uint64(pnVal), ceHandshake, unsafeAddr remote)
+      discard conn.sendAckFrame(uint64(pnVal), ceHandshake, unsafeAddr remote)
     return
   qack.trackIncomingPacket(conn.ackTracker, ceHandshake, uint64(pnVal))
   var ackEliciting = false
@@ -4215,79 +4543,9 @@ proc handleHandshakePacket(conn: ConnectionState; remote: TransportAddress; data
                 ))
               continue
             conn.transcript.add(message.raw)
-            conn.handshakeComplete = true
-            conn.markActivePathValidated(0)
-            for stream in conn.localStreams:
-              flushStream(stream)
-            flushPendingDatagrams(conn)
-            emitNativeConnected(conn)
-            let negotiatedAlpn =
-              if conn.configuration.isNil or conn.configuration.alpns.len == 0: ""
-              else: conn.configuration.alpns[0]
-            var connectedEvent = ConnectionEvent(
-              kind: ceConnected,
-              sessionResumed: conn.sessionResumed,
-              negotiatedAlpn: negotiatedAlpn,
-              note: "server handshake complete"
+            conn.completeServerHandshake(
+              "Client Finished verified via Handshake packet; local CID advertisement queued."
             )
-            emitConnectionEvent(conn, connectedEvent)
-            if conn.resumptionTicket.len == 0:
-              conn.resumptionTicket = buildBuiltinResumptionTicket(conn, conn.resumptionData)
-            var postHandshakePayload = proto.encodeHandshakeDoneFrame()
-            if conn.resumptionTicket.len > 0:
-              let ticketLifetimeSec = currentBuiltinNewSessionTicketLifetimeSec()
-              let ticketMaxEarlyData = currentBuiltinNewSessionTicketMaxEarlyData(conn)
-              var ticketMeta: BuiltinResumptionTicketMeta
-              let haveTicketMeta = parseBuiltinResumptionTicket(conn.resumptionTicket, ticketMeta)
-              let issuedAtUs = nowMicros()
-              let expiresAtUs =
-                if ticketLifetimeSec == 0'u32: issuedAtUs
-                else: issuedAtUs + uint64(ticketLifetimeSec) * 1_000_000'u64
-              conn.resumptionTicket = buildBuiltinResumptionTicket(
-                if haveTicketMeta and ticketMeta.serverName.len > 0:
-                  ticketMeta.serverName
-                else:
-                  conn.serverName,
-                if haveTicketMeta and ticketMeta.serverPort != 0'u16:
-                  ticketMeta.serverPort
-                else:
-                  conn.serverPort,
-                if haveTicketMeta and ticketMeta.alpn.len > 0:
-                  ticketMeta.alpn
-                else:
-                  alpnForConnection(conn),
-                if haveTicketMeta: ticketMeta.data else: conn.resumptionData,
-                issuedAtUs = issuedAtUs,
-                expiresAtUs = expiresAtUs,
-                maxEarlyData = ticketMaxEarlyData,
-                ticketAgeAdd = ticketMeta.ticketAgeAdd,
-                preserveTicketAgeAdd = haveTicketMeta
-              )
-              var refreshedTicketMeta: BuiltinResumptionTicketMeta
-              discard parseBuiltinResumptionTicket(conn.resumptionTicket, refreshedTicketMeta)
-              storeBuiltinResumptionEntry(
-                conn,
-                conn.resumptionTicket,
-                conn.resumptionData,
-                int64(ticketLifetimeSec)
-              )
-              postHandshakePayload.add(buildCryptoFrame(
-                tls.encodeNewSessionTicket(
-                  conn.resumptionTicket,
-                  maxEarlyData = ticketMaxEarlyData,
-                  ticketAgeAdd = refreshedTicketMeta.ticketAgeAdd,
-                  ticketLifetimeSec = ticketLifetimeSec
-                )
-              ))
-            discard conn.sendOneRttPacket(postHandshakePayload, sfkHandshakeDone, true)
-            discard conn.maybeSendPendingOneRttAck()
-            conn.pendingAutoLocalCidAdvertisement = true
-            {.cast(gcsafe).}:
-              emitDiagnostics(DiagnosticsEvent(
-                kind: diagConnectionEvent,
-                handle: cast[pointer](conn),
-                note: "Client Finished verified via Handshake packet; local CID advertisement queued."
-              ))
             break
           else:
             if not tls.verifyFinished(conn.handshakeServerSecret, transcriptHash, message.raw):
@@ -4347,7 +4605,7 @@ proc handleHandshakePacket(conn: ConnectionState; remote: TransportAddress; data
       inc pos
   if ackEliciting:
     qack.markForAck(conn.ackTracker, ceHandshake, uint64(pnVal), nowUs, ackTypeAckImmediate)
-    conn.sendAckFrame(uint64(pnVal), ceHandshake, unsafeAddr remote)
+    discard conn.sendAckFrame(uint64(pnVal), ceHandshake, unsafeAddr remote)
 
 proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; data: seq[byte]) =
   let header = proto.parseUnprotectedHeader(data)
@@ -4404,13 +4662,21 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
     elif frameType == 0x02'u8 or frameType == 0x03'u8:
       let frame = proto.parseAckFrame(plaintext, pos)
       let remoteKey = remoteAddressKey(remote)
-      let ackConn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+      let ackConn =
+        block:
+          let byCid = state.findAcceptedConnectionByDestCid(data)
+          if not byCid.isNil: byCid
+          else: state.acceptedConnections.getOrDefault(remoteKey, nil)
       if not ackConn.isNil:
         ackConn.applyAckFrame(frame, ceInitial)
     elif frameType == 0x1C'u8 or frameType == 0x1D'u8:
       let frame = proto.parseConnectionCloseFrame(plaintext, pos)
       let remoteKey = remoteAddressKey(remote)
-      let closeConn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+      let closeConn =
+        block:
+          let byCid = state.findAcceptedConnectionByDestCid(data)
+          if not byCid.isNil: byCid
+          else: state.acceptedConnections.getOrDefault(remoteKey, nil)
       if not closeConn.isNil:
         closeConn.handleRemoteConnectionClose(
           frame.errorCode,
@@ -4426,13 +4692,19 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
 
   let remoteKey = remoteAddressKey(remote)
   var conn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+  if not conn.isNil and
+      not conn.initialPacketMatchesConnection(header.srcConnectionId, header.destConnectionId):
+    let byCid = state.findAcceptedConnectionByDestCid(data)
+    if not byCid.isNil:
+      conn = byCid
+      state.registerAcceptedConnection(remoteKey, conn)
   let isNewConnection =
     conn.isNil or
     not conn.initialPacketMatchesConnection(header.srcConnectionId, header.destConnectionId)
   if isNewConnection:
     conn = newAcceptedConnection(state, remote, local, header.srcConnectionId, header.destConnectionId)
     conn.initialSecrets = initialSecrets
-    state.acceptedConnections[remoteKey] = conn
+    state.registerAcceptedConnection(remoteKey, conn)
     emitListenerNewConnection(state, cast[HQUIC](conn))
   elif qack.wasPacketReceived(conn.ackTracker, ceInitial, uint64(pnVal)):
     emitDiagnostics(DiagnosticsEvent(
@@ -4442,7 +4714,7 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
     ))
     if payloadContainsAckElicitingFrame(plaintext):
       qack.markForAck(conn.ackTracker, ceInitial, uint64(pnVal), nowMicros(), ackTypeAckImmediate)
-      conn.sendAckFrame(uint64(pnVal), ceInitial, unsafeAddr remote)
+      discard conn.sendAckFrame(uint64(pnVal), ceInitial, unsafeAddr remote)
     return
   qack.trackIncomingPacket(conn.ackTracker, ceInitial, uint64(pnVal))
 
@@ -4505,6 +4777,14 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
           if acceptedZeroRtt:
             conn.zeroRttMaterial = tls.deriveBuiltinZeroRttMaterial(offered.ticket)
             conn.quicConn.model.handshake.zeroRttAccepted = true
+      when defined(msquic_diag_test):
+        {.cast(gcsafe).}:
+          emitDiagnostics(DiagnosticsEvent(
+            kind: diagConnectionEvent,
+            handle: cast[pointer](conn),
+            note: "server resumption accepted=" & $acceptedResumption &
+              " zeroRtt=" & $acceptedZeroRtt
+          ))
     let clientKeyShare = tls.findClientKeyShare(clientHello)
     if clientKeyShare.len != 32:
       return
@@ -4600,10 +4880,12 @@ proc listenerOnReceive(state: ListenerState; transp: DatagramTransport; remote: 
       if packet.isLongHeader and packet.longHeader.packetType == pt0RTT:
         let remoteKey = remoteAddressKey(remote)
         var conn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+        if not conn.isNil and not conn.connectionMatchesDestCid(data):
+          conn = nil
         if conn.isNil:
           conn = state.findAcceptedConnectionByDestCid(data)
           if not conn.isNil:
-            state.acceptedConnections[remoteKey] = conn
+            state.registerAcceptedConnection(remoteKey, conn)
         if conn.isNil or not conn.quicConn.model.handshake.zeroRttAccepted or
             not conn.connectionZeroRttMaterialReady():
           state.queuePendingZeroRtt(remote, data)
@@ -4613,10 +4895,12 @@ proc listenerOnReceive(state: ListenerState; transp: DatagramTransport; remote: 
         return
       let remoteKey = remoteAddressKey(remote)
       var conn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+      if not conn.isNil and not conn.connectionMatchesDestCid(data):
+        conn = nil
       if conn.isNil:
         conn = state.findAcceptedConnectionByDestCid(data)
         if not conn.isNil:
-          state.acceptedConnections[remoteKey] = conn
+          state.registerAcceptedConnection(remoteKey, conn)
       if not conn.isNil:
         {.cast(gcsafe).}:
           handleShortHeaderPacket(conn, remote, data)
@@ -4691,6 +4975,7 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
   state.callback = handler
   state.callbackContext = context
   state.context = context
+  state.isClient = true
   state.eventHandlers = @[]
   state.streamSchedulingScheme = 0
   state.settingsOverlay = defaultQuicSettingsOverlay()
@@ -4705,6 +4990,7 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
   state.handshakeClientSecret = @[]
   state.handshakeServerSecret = @[]
   state.handshakeComplete = false
+  state.peerAddressValidated = false
   state.localTransportParams = tls.QuicTransportParameters()
   state.peerTransportParams = tls.QuicTransportParameters()
   state.sessionResumed = false
@@ -5007,11 +5293,7 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
           except Exception:
             discard
         ),
-        local =
-          (if state.localAddress.family != AddressFamily.None:
-             state.localAddress
-           else:
-             initTAddress("0.0.0.0", Port(0)))
+        local = state.selectClientLocalBind()
       )
       state.localAddress = state.transport.localAddress
       transportEnabled = true
@@ -5055,7 +5337,9 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
     if offeredResumptionTicket.len > 0:
       var ticketMeta: BuiltinResumptionTicketMeta
       if parseBuiltinResumptionTicket(offeredResumptionTicket, ticketMeta):
-        includeBuiltinTicketAge = ticketMeta.version >= 3'u8
+        includeBuiltinTicketAge =
+          ticketMeta.version >= 3'u8 and
+          not gDropBuiltinTicketAgeForTest
         builtinTicketAge = computeBuiltinTicketAge(nowMicros(), ticketMeta)
         if gHasOverrideBuiltinTicketAgeDeltaMsForTest:
           builtinTicketAge = applyBuiltinTicketAgeDelta(
@@ -5325,7 +5609,10 @@ proc flushStream(state: StreamState) {.gcsafe.} =
     streamOffset = chunk.offset,
     streamPayload = chunk.payload,
     streamFin = chunk.fin,
-    clientContext = chunk.clientContext
+    clientContext = chunk.clientContext,
+    targetRemote =
+      (if chunk.targetRemote.family == AddressFamily.None: nil
+      else: unsafeAddr chunk.targetRemote)
   )
   if pn == 0'u64:
     return
@@ -5361,6 +5648,7 @@ proc msquicStreamSend(stream: HQUIC; buffers: ptr QuicBuffer;
     payload: payload,
     fin: fin,
     clientContext: clientContext,
+    targetRemote: TransportAddress(family: AddressFamily.None),
     zeroRttDispatched: false
   ))
   state.sentOffset += uint64(payload.len)
@@ -5441,13 +5729,15 @@ proc msquicDatagramSend(connection: HQUIC; buffers: ptr QuicBuffer;
     state.pendingDatagrams.add(PendingDatagram(
       payload: payload,
       clientContext: clientContext,
+      targetRemote: state.remoteAddress,
       zeroRttDispatched: false
     ))
     let zeroRttFrame = proto.encodeDatagramFrame(payload, true)
     if state.sendZeroRttPacket(
         zeroRttFrame,
         sfkDatagram,
-        clientContext = clientContext
+        clientContext = clientContext,
+        targetRemote = unsafeAddr state.pendingDatagrams[^1].targetRemote
       ) > 0'u64:
       state.pendingDatagrams[^1].zeroRttDispatched = true
     return QUIC_STATUS_SUCCESS
@@ -5524,6 +5814,18 @@ proc registerConnectionEventHandler*(connection: HQUIC; handler: ConnectionEvent
   if state.eventHandlers.len == 0:
     state.eventHandlers = @[]
   state.eventHandlers.add(handler)
+  if state.handshakeComplete:
+    let negotiatedAlpn =
+      if state.configuration.isNil or state.configuration.alpns.len == 0: ""
+      else: state.configuration.alpns[0]
+    var connectedEvent = ConnectionEvent(
+      kind: ceConnected,
+      sessionResumed: state.sessionResumed,
+      negotiatedAlpn: negotiatedAlpn,
+      note: "connected replay"
+    )
+    connectedEvent.connection = connection
+    handler(connectedEvent)
 
 proc registerStreamEventHandler*(stream: HQUIC; handler: StreamEventHandler) {.exportc.} =
   let state = toStream(stream)
@@ -5664,8 +5966,12 @@ proc expireBuiltinResumptionEntryForTest*(serverName: cstring; serverPort: uint1
   let serverNameText = if serverName.isNil: "" else: $serverName
   let alpnText = if alpn.isNil: "" else: $alpn
   let key = resumptionCacheKey(serverNameText, serverPort, alpnText)
-  if key.len == 0 or not gBuiltinResumptionCache.hasKey(key):
+  if key.len == 0:
     return false
+  if not gBuiltinResumptionCache.hasKey(key):
+    # Test helper semantics are idempotent: an already-invalidated / absent entry
+    # is treated as successfully expired.
+    return true
   var entry = gBuiltinResumptionCache[key]
   entry.expiresAtUs = 1'u64
   gBuiltinResumptionCache[key] = entry
@@ -5754,6 +6060,19 @@ proc getBuiltinResumptionTicketMetaForTest*(serverName: cstring; serverPort: uin
   maxEarlyData = meta.maxEarlyData
   true
 
+proc getBuiltinResumptionTicketAgeAddForTest*(serverName: cstring; serverPort: uint16;
+    alpn: cstring; ticketAgeAdd: var uint32): bool =
+  let serverNameText = if serverName.isNil: "" else: $serverName
+  let alpnText = if alpn.isNil: "" else: $alpn
+  let key = resumptionCacheKey(serverNameText, serverPort, alpnText)
+  if key.len == 0 or not gBuiltinResumptionCache.hasKey(key):
+    return false
+  var meta: BuiltinResumptionTicketMeta
+  if not parseBuiltinResumptionTicket(gBuiltinResumptionCache[key].ticket, meta):
+    return false
+  ticketAgeAdd = meta.ticketAgeAdd
+  true
+
 proc setBuiltinResumptionTicketForTest*(serverName: cstring; serverPort: uint16;
     alpn: cstring; ticket: seq[byte]): bool =
   let serverNameText = if serverName.isNil: "" else: $serverName
@@ -5781,6 +6100,9 @@ proc setForceRejectBuiltinZeroRttForTest*(enabled: bool) =
 
 proc setDropBuiltinEarlyDataRequestForTest*(enabled: bool) =
   gDropBuiltinEarlyDataRequestForTest = enabled
+
+proc setDropBuiltinTicketAgeForTest*(enabled: bool) =
+  gDropBuiltinTicketAgeForTest = enabled
 
 proc setDropBuiltinResumptionBinderForTest*(enabled: bool) =
   gDropBuiltinResumptionBinderForTest = enabled
@@ -5871,6 +6193,8 @@ proc seedConnectionIdsForTest*(connection: HQUIC; localCidBytes: seq[byte];
     state.peerCid,
     QuicVersion(1)
   )
+  state.isClient = isClient
+  state.peerAddressValidated = not isClient
   state.initLocalStreamIds()
   true
 
@@ -5928,6 +6252,14 @@ proc getConnectionSessionResumedForTest*(connection: HQUIC; resumed: var bool): 
   resumed = state.sessionResumed
   true
 
+proc setConnectionPeerAddressValidatedForTest*(connection: HQUIC;
+    validated: bool): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  state.peerAddressValidated = validated
+  true
+
 proc getConnectionZeroRttBudgetForTest*(connection: HQUIC; maxData: var uint32;
     sentBytes: var uint64; deadlineUs: var uint64): bool =
   let state = toConnection(connection)
@@ -5979,6 +6311,159 @@ proc getConnectionLastSentTargetRemoteForTest*(connection: HQUIC;
     return false
   host = $remote
   port = uint16(remote.port)
+  true
+
+proc getConnectionSentFrameKindAtForTest*(connection: HQUIC; index: uint32;
+    frameKind: var SentFrameKind): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  let idx = int(index)
+  if idx < 0 or idx >= state.sentPackets.len:
+    return false
+  frameKind = state.sentPackets[idx].frameKind
+  true
+
+proc getConnectionSentTargetRemoteAtForTest*(connection: HQUIC; index: uint32;
+    host: var string; port: var uint16): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  let idx = int(index)
+  if idx < 0 or idx >= state.sentPackets.len:
+    return false
+  let remote = state.sentPackets[idx].targetRemote
+  if remote.family == AddressFamily.None:
+    return false
+  host = $remote
+  port = uint16(remote.port)
+  true
+
+proc getConnectionSentFramePayloadAtForTest*(connection: HQUIC; index: uint32;
+    payload: var seq[byte]): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  let idx = int(index)
+  if idx < 0 or idx >= state.sentPackets.len:
+    return false
+  payload = state.sentPackets[idx].framePayload
+  true
+
+proc setConnectionRemoteAddressForTest*(connection: HQUIC; remoteHost: cstring;
+    remotePort: uint16): bool =
+  let state = toConnection(connection)
+  if state.isNil or remoteHost.isNil or remoteHost.len == 0:
+    return false
+  let remote = initTAddress($remoteHost, Port(remotePort))
+  if remote.family == AddressFamily.None:
+    return false
+  state.remoteAddress = remote
+  state.activeRemoteKey = remoteAddressKey(remote)
+  true
+
+proc setConnectionPendingAckRemoteForTest*(connection: HQUIC; epoch: CryptoEpoch;
+    remoteHost: cstring; remotePort: uint16): bool =
+  let state = toConnection(connection)
+  if state.isNil or remoteHost.isNil or remoteHost.len == 0:
+    return false
+  let remote = initTAddress($remoteHost, Port(remotePort))
+  if remote.family == AddressFamily.None:
+    return false
+  state.setPendingAckRemote(epoch, remote)
+  true
+
+proc getConnectionPendingAckRemoteForTest*(connection: HQUIC; epoch: CryptoEpoch;
+    host: var string; port: var uint16): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  let remote = state.pendingAckRemote(epoch)
+  if remote.isNil or remote[].family == AddressFamily.None:
+    return false
+  host = $remote[]
+  port = uint16(remote[].port)
+  true
+
+proc createAcceptedConnectionForTest*(listener: HQUIC;
+    remoteHost: cstring; remotePort: uint16;
+    localHost: cstring; localPort: uint16;
+    clientCidPtr: ptr uint8; clientCidLen: uint32;
+    serverCidPtr: ptr uint8; serverCidLen: uint32;
+    connection: var HQUIC): bool =
+  let state = toListener(listener)
+  if state.isNil or remoteHost.isNil or localHost.isNil or
+      clientCidPtr.isNil or serverCidPtr.isNil:
+    return false
+  if clientCidLen == 0'u32 or serverCidLen == 0'u32:
+    return false
+  var clientCid = newSeq[byte](clientCidLen.int)
+  var serverCid = newSeq[byte](serverCidLen.int)
+  copyMem(addr clientCid[0], clientCidPtr, clientCid.len)
+  copyMem(addr serverCid[0], serverCidPtr, serverCid.len)
+  let remote = initTAddress($remoteHost, Port(remotePort))
+  let local = initTAddress($localHost, Port(localPort))
+  if remote.family == AddressFamily.None or local.family == AddressFamily.None:
+    return false
+  let conn = newAcceptedConnection(state, remote, local, clientCid, serverCid)
+  state.registerAcceptedConnection(remoteAddressKey(remote), conn)
+  connection = cast[HQUIC](conn)
+  true
+
+proc getListenerAcceptedConnectionUniqueCountForTest*(listener: HQUIC;
+    count: var uint32): bool =
+  let state = toListener(listener)
+  if state.isNil:
+    return false
+  var seen: seq[uint] = @[]
+  for conn in state.acceptedConnections.values:
+    let key = cast[uint](conn)
+    if key notin seen:
+      seen.add(key)
+  count = uint32(seen.len)
+  true
+
+proc findListenerAcceptedConnectionByDestCidForTest*(listener: HQUIC;
+    destCidPtr: ptr uint8; destCidLen: uint32; connection: var HQUIC): bool =
+  let state = toListener(listener)
+  if state.isNil or destCidPtr.isNil or destCidLen == 0'u32:
+    return false
+  var destCid = newSeq[byte](destCidLen.int)
+  copyMem(addr destCid[0], destCidPtr, destCid.len)
+  let incomingCid = initConnectionId(destCid)
+  for conn in state.acceptedConnections.values:
+    if not conn.isNil and conn.localCidAccepted(incomingCid):
+      connection = cast[HQUIC](conn)
+      return true
+  false
+
+proc resolveListenerAcceptedConnectionForRemoteAndDestCidForTest*(listener: HQUIC;
+    remoteHost: cstring; remotePort: uint16;
+    destCidPtr: ptr uint8; destCidLen: uint32; connection: var HQUIC): bool =
+  let state = toListener(listener)
+  if state.isNil or remoteHost.isNil or remoteHost.len == 0 or
+      destCidPtr.isNil or destCidLen == 0'u32:
+    return false
+  let remote = initTAddress($remoteHost, Port(remotePort))
+  if remote.family == AddressFamily.None:
+    return false
+  var destCid = newSeq[byte](destCidLen.int)
+  copyMem(addr destCid[0], destCidPtr, destCid.len)
+  let incomingCid = initConnectionId(destCid)
+  let remoteKey = remoteAddressKey(remote)
+  var conn = state.acceptedConnections.getOrDefault(remoteKey, nil)
+  if not conn.isNil and not conn.localCidAccepted(incomingCid):
+    conn = nil
+  if conn.isNil:
+    for candidate in state.acceptedConnections.values:
+      if not candidate.isNil and candidate.localCidAccepted(incomingCid):
+        conn = candidate
+        break
+    if not conn.isNil:
+      state.registerAcceptedConnection(remoteKey, conn)
+  if conn.isNil:
+    return false
+  connection = cast[HQUIC](conn)
   true
 
 proc receiveZeroRttPayloadForTest*(connection: HQUIC; packetNumber: uint64;
@@ -6037,6 +6522,14 @@ proc getConnectionPendingAckStateForTest*(connection: HQUIC;
   alreadyWrittenAckFrame = qack.alreadyWrittenAckFrame(state.ackTracker, epoch)
   true
 
+proc getConnectionPendingAckDeadlineForTest*(connection: HQUIC;
+    deadlineUs: var uint64; epoch: CryptoEpoch = ceOneRtt): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  deadlineUs = qack.ackDeadlineUs(state.ackTracker, epoch)
+  true
+
 proc markPendingAckForTest*(connection: HQUIC; packetNumber: uint64;
     recvTimeUs: uint64 = 0'u64; epoch: CryptoEpoch = ceOneRtt): bool =
   let state = toConnection(connection)
@@ -6046,6 +6539,25 @@ proc markPendingAckForTest*(connection: HQUIC; packetNumber: uint64;
     if recvTimeUs > 0'u64: recvTimeUs
     else: nowMicros()
   qack.markForAck(state.ackTracker, epoch, packetNumber, effectiveRecvTime, ackTypeAckImmediate)
+  true
+
+proc markDelayedPendingAckForTest*(connection: HQUIC; packetNumber: uint64;
+    recvTimeUs: uint64 = 0'u64; ackDelayMs: uint32 = MaxAckDelayDefaultMs;
+    epoch: CryptoEpoch = ceOneRtt): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  let effectiveRecvTime =
+    if recvTimeUs > 0'u64: recvTimeUs
+    else: nowMicros()
+  qack.markForAck(
+    state.ackTracker,
+    epoch,
+    packetNumber,
+    effectiveRecvTime,
+    ackTypeAckEliciting,
+    ackDelayMs
+  )
   true
 
 proc sendAckForTest*(connection: HQUIC; epoch: CryptoEpoch; remoteHost: cstring = nil;
@@ -6062,8 +6574,11 @@ proc sendAckForTest*(connection: HQUIC; epoch: CryptoEpoch; remoteHost: cstring 
     remote = state.remoteAddress
   if remote.family == AddressFamily.None:
     return false
-  state.sendAckFrame(qack.largestPacketNumberAcked(state.ackTracker, epoch), epoch, unsafeAddr remote)
-  state.sentPackets.len > 0
+  result = state.sendAckFrame(
+    qack.largestPacketNumberAcked(state.ackTracker, epoch),
+    epoch,
+    unsafeAddr remote
+  )
 
 proc getConnectionClientHelloRequestsEarlyDataForTest*(connection: HQUIC;
     requested: var bool): bool =
@@ -6084,6 +6599,17 @@ proc getConnectionResumptionTicketMetaForTest*(connection: HQUIC;
   issuedAtUs = meta.issuedAtUs
   expiresAtUs = meta.expiresAtUs
   maxEarlyData = meta.maxEarlyData
+  true
+
+proc getConnectionResumptionTicketAgeAddForTest*(connection: HQUIC;
+    ticketAgeAdd: var uint32): bool =
+  let state = toConnection(connection)
+  if state.isNil or state.resumptionTicket.len == 0:
+    return false
+  var meta: BuiltinResumptionTicketMeta
+  if not parseBuiltinResumptionTicket(state.resumptionTicket, meta):
+    return false
+  ticketAgeAdd = meta.ticketAgeAdd
   true
 
 proc getConnectionLossTimeForTest*(connection: HQUIC; epoch: CryptoEpoch; lossTimeUs: var uint64): bool =
@@ -6153,6 +6679,13 @@ proc setConnectionHandshakeStateForTest*(connection: HQUIC;
   if state.isNil:
     return false
   state.handshakeComplete = handshakeComplete
+  true
+
+proc completeServerHandshakeForTest*(connection: HQUIC): bool {.exportc.} =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  state.completeServerHandshake("test server handshake complete")
   true
 
 proc prepareConnectionPacketSendForTest*(connection: HQUIC; epoch: CryptoEpoch): bool {.exportc.} =
@@ -6478,7 +7011,8 @@ proc getConnectionPendingControlFrameCountForTest*(connection: HQUIC;
   true
 
 proc prependPendingStreamChunkForTest*(stream: HQUIC; offset: uint64;
-    payload: seq[byte]; fin = false): bool =
+    payload: seq[byte]; fin = false;
+    targetRemote = TransportAddress(family: AddressFamily.None)): bool =
   let state = toStream(stream)
   if state.isNil:
     return false
@@ -6487,9 +7021,30 @@ proc prependPendingStreamChunkForTest*(stream: HQUIC; offset: uint64;
     payload: payload,
     fin: fin,
     clientContext: nil,
+    targetRemote: targetRemote,
     zeroRttDispatched: false
   ))
   true
+
+proc flushPendingDatagramsForTest*(connection: HQUIC): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  let beforeCount = state.sentPackets.len
+  flushPendingDatagrams(state)
+  state.sentPackets.len > beforeCount
+
+proc flushStreamForTest*(stream: HQUIC): bool =
+  let state = toStream(stream)
+  if state.isNil:
+    return false
+  let beforeCount =
+    if state.connection.isNil: 0
+    else: state.connection.sentPackets.len
+  flushStream(state)
+  if state.connection.isNil:
+    return false
+  state.connection.sentPackets.len > beforeCount
 
 proc getStreamPendingChunkCountForTest*(stream: HQUIC; count: var uint32): bool =
   let state = toStream(stream)

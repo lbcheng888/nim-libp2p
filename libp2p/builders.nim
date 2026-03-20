@@ -78,7 +78,7 @@ import protocols/[
   providers/bitswapadvertiser
 import services/[wildcardresolverservice, metricsservice, otelmetricsservice,
   noderesourceservice, mobilemeshservice, synccastcontrolservice,
-  distributedinferenceservice, autorelayservice, hpservice]
+  distributedinferenceservice, autorelayservice, hpservice, wanbootstrapservice]
 when libp2pDataTransferEnabled:
   import services/[otellogsservice, oteltracesservice]
 
@@ -144,6 +144,7 @@ type
     privKey: Opt[PrivateKey]
     addresses: seq[MultiAddress]
     secureManagers: seq[SecureProtocol]
+    allowImplicitSecureDefault: bool
     muxers: seq[MuxerProvider]
     transports: seq[TransportBuilder]
     rng: ref HmacDrbgContext
@@ -200,6 +201,7 @@ proc new*(T: type[SwitchBuilder]): T {.public.} =
     privKey: Opt.none(PrivateKey),
     addresses: @[address],
     secureManagers: @[],
+    allowImplicitSecureDefault: true,
     muxers: @[],
     transports: @[],
     rng: nil,
@@ -293,6 +295,7 @@ proc withYamux*(
     b: SwitchBuilder,
     maxChannCount: int = MaxChannelCount,
     windowSize: int = YamuxDefaultWindowSize,
+    maxSendQueueSize: int = 256000,
     inTimeout: Duration = 5.minutes,
     outTimeout: Duration = 5.minutes,
 ): SwitchBuilder =
@@ -301,6 +304,7 @@ proc withYamux*(
       conn,
       maxChannCount = maxChannCount,
       windowSize = windowSize,
+      maxSendQueueSize = maxSendQueueSize,
       inTimeout = inTimeout,
       outTimeout = outTimeout,
     )
@@ -387,6 +391,10 @@ proc withTransport*(
   b.transports.add(prov)
   b
 
+proc withoutImplicitSecureDefault*(b: SwitchBuilder): SwitchBuilder {.public.} =
+  b.allowImplicitSecureDefault = false
+  b
+
 proc withTransport*(
     b: SwitchBuilder, prov: TransportProvider
 ): SwitchBuilder {.deprecated: "Use TransportBuilder instead".} =
@@ -425,6 +433,9 @@ when not defined(libp2p_no_tls):
           config.upgr, tlsPrivateKey, tlsCertificate, config.autotls, tlsFlags, flags
         )
     )
+
+when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
+  {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental and use MsQuic transport.".}
 
 when defined(libp2p_msquic_experimental):
   import transports/msquictransport
@@ -517,105 +528,7 @@ when defined(libp2p_msquic_experimental):
     b
 
 else:
-  when defined(libp2p_quic_support):
-    import transports/quictransport
-    when defined(libp2p_webrtc_support):
-      import transports/[webrtcdirecttransport, webrtcstartransport]
-
-    type
-      QuicTransportHook* = proc(transport: QuicTransport) {.gcsafe, raises: [].}
-      QuicTransportConfig* = object
-        certGenerator*: Opt[CertGenerator]
-        webtransportCerthashHistoryLimit*: Opt[int]
-        webtransportRotationInterval*: Opt[Duration]
-        webtransportRotationKeepHistory*: Opt[int]
-        onTransport*: Opt[QuicTransportHook]
-        webtransportMaxSessions*: Opt[uint32]
-        webtransportPath*: Opt[string]
-        webtransportQuery*: Opt[string]
-        webtransportDraft*: Opt[string]
-
-    proc init*(_: type QuicTransportConfig): QuicTransportConfig =
-      QuicTransportConfig(
-        certGenerator: Opt.none(CertGenerator),
-        webtransportCerthashHistoryLimit: Opt.none(int),
-        webtransportRotationInterval: Opt.none(chronos.Duration),
-        webtransportRotationKeepHistory: Opt.none(int),
-        onTransport: Opt.none(QuicTransportHook),
-        webtransportMaxSessions: Opt.none(uint32),
-        webtransportPath: Opt.none(string),
-        webtransportQuery: Opt.none(string),
-        webtransportDraft: Opt.none(string),
-      )
-
-    proc withQuicTransport*(b: SwitchBuilder): SwitchBuilder {.public.} =
-      b.withTransport(
-        proc(config: TransportConfig): Transport =
-          QuicTransport.new(config.upgr, config.privateKey)
-      )
-
-    proc withQuicTransport*(
-        b: SwitchBuilder, cfg: QuicTransportConfig
-    ): SwitchBuilder {.public.} =
-      let localCfg = cfg
-      localCfg.webtransportRotationInterval.withValue(interval):
-        if interval <= chronos.ZeroDuration:
-          b.webtransportRotation = Opt.none(WebtransportRotationSettings)
-        else:
-          var sanitizedHistory = quictransport.DefaultWebtransportCerthashHistory
-          localCfg.webtransportRotationKeepHistory.withValue(history):
-            sanitizedHistory = if history < 1: 1 else: history
-          b.webtransportRotation = Opt.some(
-            WebtransportRotationSettings(
-              interval: interval, keepHistory: sanitizedHistory
-            )
-          )
-      b.withTransport(
-        proc(config: TransportConfig): Transport =
-          let generator = localCfg.certGenerator.get(otherwise = nil)
-          var transport =
-            if generator != nil:
-              QuicTransport.new(config.upgr, config.privateKey, generator)
-            else:
-              QuicTransport.new(config.upgr, config.privateKey)
-
-          localCfg.webtransportCerthashHistoryLimit.withValue(limit):
-            let sanitized = if limit < 1: 1 else: limit
-            transport.setWebtransportCerthashHistoryLimit(sanitized)
-
-          localCfg.webtransportMaxSessions.withValue(maxSessions):
-            transport.setWebtransportMaxSessions(maxSessions)
-
-          localCfg.webtransportPath.withValue(path):
-            transport.setWebtransportPath(path)
-
-          localCfg.webtransportQuery.withValue(query):
-            transport.setWebtransportQuery(query)
-
-          localCfg.webtransportDraft.withValue(draft):
-            transport.setWebtransportDraft(draft)
-
-          localCfg.onTransport.withValue(hook):
-            hook(transport)
-
-          transport
-      )
-
-    proc withWebtransportCertificateRotation*(
-        b: SwitchBuilder,
-        interval: Duration,
-        keepHistory: int = quictransport.DefaultWebtransportCerthashHistory,
-    ): SwitchBuilder {.public.} =
-      if interval <= chronos.ZeroDuration:
-        b.webtransportRotation = Opt.none(WebtransportRotationSettings)
-      else:
-        let sanitizedHistory = if keepHistory < 1: 1 else: keepHistory
-        b.webtransportRotation = Opt.some(
-          WebtransportRotationSettings(
-            interval: interval, keepHistory: sanitizedHistory
-          )
-        )
-      b
+  discard
 when defined(libp2p_webrtc_support):
   proc withWebRtcDirectTransport*(b: SwitchBuilder): SwitchBuilder {.public.} =
     b.withTransport(
@@ -845,6 +758,38 @@ proc withMobileMeshService*(
   b.services.add(svc)
   b
 
+proc withWanBootstrapService*(
+    b: SwitchBuilder,
+    config: WanBootstrapConfig = WanBootstrapConfig.init(),
+): SwitchBuilder {.public.} =
+  let svc = WanBootstrapService.new(config = config)
+  b.services.keepItIf(not (it of WanBootstrapService))
+  b.services.add(svc)
+  b
+
+proc withWanBootstrapProfile*(
+    b: SwitchBuilder,
+    config: WanBootstrapConfig = WanBootstrapConfig.init(),
+): SwitchBuilder {.public.} =
+  if b.rng.isNil:
+    b.rng = newRng()
+  let next = b.withSignedPeerRecord(true).withWanBootstrapService(config)
+  case config.role
+  of WanBootstrapRole.anchor:
+    if next.autonatV2ServerConfig.isNone:
+      discard next.withAutonatV2Server()
+    if next.circuitRelay.isNone:
+      discard next.withCircuitRelay(Relay.new())
+  of WanBootstrapRole.publicNode:
+    if next.autonatV2Client.isNil and next.autonatV2ServerConfig.isNone:
+      discard next.withAutonatV2()
+  of WanBootstrapRole.mobileEdge:
+    if next.autonatV2Client.isNil and next.autonatV2ServerConfig.isNone:
+      discard next.withAutonatV2()
+    if next.circuitRelay.isNone:
+      discard next.withCircuitRelay(RelayClient.new())
+  next
+
 proc withMobileFullP2PProfile*(
     b: SwitchBuilder,
     dataDir = "",
@@ -874,14 +819,10 @@ proc withMobileFullP2PProfile*(
   b.transports.setLen(0)
   when defined(libp2p_msquic_experimental):
     discard b.withMsQuicTransport()
-    if b.muxers.len == 0:
-      discard b.withMplex()
-  elif defined(libp2p_quic_support):
-    discard b.withQuicTransport()
   else:
     raise newException(
       LPError,
-      "mobile full P2P profile requires QUIC support (-d:libp2p_msquic_experimental or -d:libp2p_quic_support)",
+      "mobile full P2P profile requires QUIC support (-d:libp2p_msquic_experimental)",
     )
 
   discard b.withNodeResourceService(
@@ -1224,7 +1165,7 @@ proc build*(b: SwitchBuilder): Switch {.raises: [LPError], public.} =
   let pkRes = PrivateKey.random(b.rng[])
   let seckey = b.privKey.get(otherwise = pkRes.expect("Expected default Private Key"))
 
-  if b.secureManagers.len == 0:
+  if b.secureManagers.len == 0 and b.allowImplicitSecureDefault:
     debug "no secure managers defined. Adding noise by default"
     b.secureManagers.add(SecureProtocol.Noise)
 
@@ -1491,10 +1432,6 @@ proc newStandardSwitchBuilder*(
       b = b.withMsQuicTransport().withAddresses(addrs).withMplex(
         inTimeout, outTimeout
       )
-    elif defined(libp2p_quic_support):
-      if addrs.len == 0:
-        addrs = @[MultiAddress.init("/ip4/0.0.0.0/udp/0/quic-v1").tryGet()]
-      b = b.withQuicTransport().withAddresses(addrs)
     else:
       raiseAssert "QUIC not supported in this build"
   of TransportType.TCP:

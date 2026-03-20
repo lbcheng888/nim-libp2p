@@ -48,10 +48,10 @@ import
   delegatedrouting,
   delegatedrouting/store
 
+when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
+  {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
 when defined(libp2p_msquic_experimental):
   import transports/msquictransport as quictransport
-elif defined(libp2p_quic_support):
-  import transports/quictransport
 when not defined(libp2p_disable_datatransfer):
   from protocols/datatransfer/protobuf import DataTransferExtension
 
@@ -91,7 +91,7 @@ type
     delegatedRouting*: DelegatedRoutingClient
     delegatedRoutingStore*: DelegatedRoutingStore
     dataTransferManager*: DataTransferChannelManager
-    when defined(libp2p_msquic_experimental) or defined(libp2p_quic_support):
+    when defined(libp2p_msquic_experimental):
       webtransportRotationTask*: Future[void]
       webtransportRotationInterval*: Duration
       webtransportRotationKeepHistory*: int
@@ -1012,8 +1012,16 @@ proc upgrader(
         raise newException(
           UpgradeError, "Connection denied by connection gater after upgrade"
         )
-    switch.connManager.storeMuxer(muxed)
+    warn "incoming upgrader identify begin",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
     await switch.peerStore.identify(muxed)
+    warn "incoming upgrader identify done",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
+    switch.connManager.storeMuxer(muxed)
     await switch.connManager.triggerPeerEvents(
       muxed.connection.peerId,
       PeerEvent(kind: PeerEventKind.Identified, initiator: false),
@@ -1125,7 +1133,7 @@ proc stop*(s: Switch) {.public, async: (raises: [CancelledError]).} =
   except CatchableError as exc:
     debug "Cannot cancel accepts", description = exc.msg
 
-  when defined(libp2p_quic_support):
+  when defined(libp2p_msquic_experimental):
     let cancelFut = s.cancelWebtransportRotationTask()
     if cancelFut.isNil:
       warn "cancelWebtransportRotationTask returned nil Future"
@@ -1238,7 +1246,7 @@ proc startAsyncImpl(s: Switch) {.async: (raises: [CancelledError, LPError]).} =
   await s.ms.start()
   s.started = true
 
-  when defined(libp2p_quic_support):
+  when defined(libp2p_msquic_experimental):
     if s.webtransportRotationInterval > chronos.ZeroDuration:
       await s.scheduleWebtransportCertificateRotation(
         s.webtransportRotationInterval, s.webtransportRotationKeepHistory
@@ -1279,7 +1287,13 @@ proc newSwitch*(
     bitswap: BitswapService = nil,
 ): Switch {.raises: [LPError].} =
   if secureManagers.len == 0:
-    raise newException(LPError, "Provide at least one secure manager")
+    var allowNativeQuicOnly = false
+    when defined(libp2p_msquic_experimental):
+      allowNativeQuicOnly =
+        transports.len > 0 and transports.allIt(it of quictransport.MsQuicTransport)
+    if not allowNativeQuicOnly:
+      raise newException(LPError, "Provide at least one secure manager")
+    debug "Switch starting without external secure managers for native QUIC transports"
 
   let bwManager = if bandwidthManager.isNil: BandwidthManager.new() else: bandwidthManager
   let rm = resourceManager
@@ -1309,7 +1323,7 @@ proc newSwitch*(
     bitswap: bitswap,
   )
 
-  when defined(libp2p_quic_support):
+  when defined(libp2p_msquic_experimental):
     switch.webtransportRotationTask = nil
     switch.webtransportRotationInterval = chronos.ZeroDuration
     switch.webtransportRotationKeepHistory = quictransport.DefaultWebtransportCerthashHistory

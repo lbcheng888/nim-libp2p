@@ -191,7 +191,7 @@ proc performDialerHandshake(
 ): Future[MultistreamVersion] {.
     async: (raises: [CancelledError, LPStreamError, MultiStreamError])
 .} =
-  trace "initiating handshake", conn, attemptV2
+  warn "multistream dialer handshake begin", conn, attemptV2
   await conn.writeLp(CodecV1 & "\n")
   when defined(libp2p_msquic_debug):
     debug "multistream dialer sent v1", conn
@@ -203,6 +203,7 @@ proc performDialerHandshake(
       debug "multistream dialer sent v2", conn
 
   let response1 = await conn.readLp(MsgSize)
+  warn "multistream dialer got handshake response1", conn, bytes = response1.len
   var handshake = string.fromBytes(response1)
   when defined(libp2p_msquic_debug):
     debug "multistream dialer got response1", conn, msg = handshake
@@ -216,6 +217,7 @@ proc performDialerHandshake(
 
   if attemptV2:
     let response2 = await conn.readLp(MsgSize)
+    warn "multistream dialer got handshake response2", conn, bytes = response2.len
     var v2Response = string.fromBytes(response2)
     when defined(libp2p_msquic_debug):
       debug "multistream dialer got response2", conn, msg = v2Response
@@ -536,6 +538,7 @@ proc processListenerHandshake(
 ): Future[tuple[version: MultistreamVersion, pending: seq[byte]]] {.
     async: (raises: [CancelledError, LPStreamError, MultiStreamError])
 .} =
+  warn "multistream listener handshake begin", conn, bytes = firstMessage.len
   if firstMessage.len == 0:
     raise (ref MultiStreamError)(
       msg: "MultistreamSelect handling failed, empty handshake"
@@ -552,6 +555,7 @@ proc processListenerHandshake(
     )
 
   await conn.writeLp(CodecV1 & "\n")
+  warn "multistream listener sent handshake v1", conn
   when defined(libp2p_msquic_debug):
     debug "multistream listener sent v1", conn
 
@@ -559,6 +563,7 @@ proc processListenerHandshake(
   var version = msv1
 
   let nextMessage = await conn.readLp(MsgSize)
+  warn "multistream listener got post-handshake message", conn, bytes = nextMessage.len
   if nextMessage.len > 0:
     var nextStr = string.fromBytes(nextMessage)
     when defined(libp2p_msquic_debug):
@@ -624,7 +629,7 @@ proc handle*(
     matchers = newSeq[Matcher](),
     active: bool = false,
 ): Future[string] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
-  trace "Starting multistream negotiation", conn, handshaked = active
+  warn "multistream handle begin", conn, handshaked = active
 
   let negotiated =
     if active:
@@ -646,14 +651,16 @@ proc handle*(
         await handleProtocolSelect(conn, protos, matchers, first)
 
   if negotiated.len > 0:
+    warn "multistream handle negotiated", conn, protocol = negotiated
     return negotiated
 
+  warn "multistream handle empty result", conn
   ""
 
 proc handle*(
     m: MultistreamSelect, conn: Connection, active: bool = false
 ) {.async: (raises: [CancelledError]).} =
-  trace "Starting multistream handler", conn, handshaked = active
+  warn "multistream handler begin", conn, handshaked = active
   var
     protos: seq[string]
     matchers: seq[Matcher]
@@ -668,6 +675,7 @@ proc handle*(
     for h in m.handlers:
       if (h.match != nil and h.match(ms)) or h.protos.contains(ms):
         trace "found handler", conn, protocol = ms
+        warn "multistream handler dispatch protocol", conn, protocol = ms
 
         var protocolHolder = h
         if not m.resourceManager.isNil:
@@ -699,11 +707,11 @@ proc handle*(
   except CancelledError as exc:
     raise exc
   except CatchableError as exc:
-    trace "Exception in multistream", conn, description = exc.msg
+    warn "Exception in multistream", conn, description = exc.msg
   finally:
     await conn.close()
 
-  trace "Stopped multistream handler", conn
+  warn "multistream handler stop", conn
 
 proc addHandler*(
     m: MultistreamSelect,

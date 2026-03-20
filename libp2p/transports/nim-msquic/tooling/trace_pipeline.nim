@@ -1,6 +1,6 @@
 ## 诊断/trace 管道：将 Nim 版 MsQuic 事件整理为可读序列。
 
-import std/sequtils
+import std/[algorithm, sequtils]
 import std/monotimes
 
 import "../api/diagnostics_model"
@@ -86,7 +86,9 @@ proc records*(collector: TraceCollector): seq[TraceRecord] =
   if collector.isNil:
     @[]
   else:
-    collector.records.sortedByIt(it.tick)
+    sorted(collector.records, proc(a, b: TraceRecord): int =
+      cmp(a.tick, b.tick)
+    )
 
 proc summarize*(collector: TraceCollector): seq[string] =
   collector.records().mapIt(
