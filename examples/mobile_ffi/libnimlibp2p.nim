@@ -37,6 +37,7 @@ import bearssl/[rand, hash]
 when defined(libp2p_msquic_experimental):
   import libp2p/transports/msquicruntime
   import libp2p/transports/msquictransport
+  import libp2p/transports/quicruntime
   import "libp2p/transports/nim-msquic/api/diagnostics_model"
 
 import examples/dex/dex_node as dex_node
@@ -2825,7 +2826,9 @@ proc tcpAvailable(addrs: openArray[string]): bool =
       return true
   false
 
-proc buildTransportHealthPayload(n: NimNode, listenAddrs, dialableAddrs: openArray[string]): JsonNode =
+proc buildTransportHealthPayload(
+    n: NimNode, listenAddrs, dialableAddrs: openArray[string]
+): JsonNode {.gcsafe.} =
   let hostNetwork = currentHostNetworkStatus(n)
   let quicEnabled = quicAvailable(listenAddrs) or quicAvailable(dialableAddrs)
   let tcpEnabled = tcpAvailable(listenAddrs) or tcpAvailable(dialableAddrs)
@@ -2853,11 +2856,42 @@ proc buildTransportHealthPayload(n: NimNode, listenAddrs, dialableAddrs: openArr
       "tcp"
     else:
       "none"
+  when defined(libp2p_msquic_experimental):
+    let runtimeInfo =
+      block:
+        if not n.isNil and not n.switchInstance.isNil:
+          let stats = n.switchInstance.msquicTransportStats()
+          if stats.len > 0:
+            stats[0].runtime
+          else:
+            quicruntime.currentQuicRuntimeInfo()
+        else:
+          quicruntime.currentQuicRuntimeInfo()
+    let runtimePayload = %* {
+      "kind": quicruntime.kindLabel(runtimeInfo.kind),
+      "implementation": runtimeInfo.implementation,
+      "path": runtimeInfo.path,
+      "loaded": runtimeInfo.loaded,
+      "compileTimeBuiltin": runtimeInfo.compileTimeBuiltin,
+      "requestedVersion": runtimeInfo.requestedVersion,
+      "negotiatedVersion": runtimeInfo.negotiatedVersion,
+    }
+  else:
+    let runtimePayload = %* {
+      "kind": "unavailable",
+      "implementation": "unavailable",
+      "path": "",
+      "loaded": false,
+      "compileTimeBuiltin": false,
+      "requestedVersion": 0'u32,
+      "negotiatedVersion": 0'u32,
+    }
   %* {
     "transportPolicy": transportPolicy,
     "transport": transportMode,
     "tcpNoDelay": true,
     "quicAvailable": quicEnabled,
+    "quicRuntime": runtimePayload,
     "muxerPreference": muxerPreference,
     "physicalAddressPrefixes": physicalPrefixes,
     "latencySampling": {

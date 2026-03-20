@@ -20,6 +20,7 @@ import ./transport as basetransport
 import ./msquicdriver as msquicdrv
 import ./msquicconnection
 import ./msquicstream
+import ./quicruntime
 import ./webtransport_common
 when defined(libp2p_pure_crypto):
   import tls/certificate_pure
@@ -191,6 +192,7 @@ type
     observedAddr*: Option[string]
     localAddr*: Option[string]
   MsQuicTransportStats* = object
+    runtime*: QuicRuntimeInfo
     listenerCount*: int
     connectionCount*: int
     datagramEnabled*: int
@@ -1264,6 +1266,11 @@ proc collectMsQuicTransportStats*(
     transport: MsQuicTransport
 ): MsQuicTransportStats {.gcsafe.} =
   var stats = MsQuicTransportStats()
+  if not transport.isNil and not transport.handle.isNil:
+    try:
+      stats.runtime = quicRuntimeInfo(transport.handle.bridge)
+    except CatchableError as exc:
+      trace "failed to fetch QUIC runtime info", error = exc.msg
   stats.listenerCount = transport.listeners.len
   try:
     stats.currentCerthash = transport.currentWebtransportCerthash()
