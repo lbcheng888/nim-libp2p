@@ -12,6 +12,7 @@
 import tables, sequtils, sugar, options
 import metrics except collect
 import chronos, chronicles, bearssl/rand, stew/[byteutils, objects]
+import ../../utils/semaphore as lpSemaphore
 import
   ./protobuf,
   ../protocol,
@@ -21,7 +22,6 @@ import
   ../../utils/heartbeat,
   ../../stream/connection,
   ../../utils/offsettedseq,
-  ../../utils/semaphore,
   ../../discovery/discoverymngr,
   ../../utility
 
@@ -111,7 +111,7 @@ type
     registerDeletionLoop: Future[void]
     #registerEvent: AsyncEvent # TODO: to raise during the heartbeat
     # + make the heartbeat sleep duration "smarter"
-    sema: AsyncSemaphore
+    sema: lpSemaphore.AsyncSemaphore
     peers: seq[PeerId]
     cookiesSaved*: Table[PeerId, Table[string, seq[byte]]]
     switch*: Switch
@@ -684,7 +684,7 @@ proc new*(
     registered: initOffsettedSeq[RegisteredData](),
     expiredDT: Moment.now() - 1.days,
     #registerEvent: newAsyncEvent(),
-    sema: newAsyncSemaphore(SemaphoreDefaultSize),
+    sema: lpSemaphore.newAsyncSemaphore(SemaphoreDefaultSize),
     minDuration: minDuration,
     maxDuration: maxDuration,
     minTTL: minTTL,
