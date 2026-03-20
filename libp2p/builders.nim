@@ -774,6 +774,33 @@ proc withWanBootstrapProfile*(
   if b.rng.isNil:
     b.rng = newRng()
   let next = b.withSignedPeerRecord(true).withWanBootstrapService(config)
+
+  proc ensureHolePunchProfile(nextBuilder: SwitchBuilder): SwitchBuilder =
+    if nextBuilder.isNil:
+      return nextBuilder
+    if nextBuilder.rng.isNil:
+      nextBuilder.rng = newRng()
+    if nextBuilder.services.anyIt(it of HPService):
+      return nextBuilder
+
+    var relayClient: RelayClient = nil
+    if nextBuilder.circuitRelay.isSome and nextBuilder.circuitRelay.get() of RelayClient:
+      relayClient = RelayClient(nextBuilder.circuitRelay.get())
+    else:
+      relayClient = RelayClient.new()
+      discard nextBuilder.withCircuitRelay(relayClient)
+
+    if relayClient.isNil or nextBuilder.rng.isNil:
+      return nextBuilder
+
+    let autoRelaySvc = AutoRelayService.new(1, relayClient, nil, nextBuilder.rng)
+    let autonatSvc =
+      AutonatService.new(AutonatClient(), nextBuilder.rng, enableAddressMapper = false)
+    let hpSvc = HPService.new(autonatSvc, autoRelaySvc)
+    nextBuilder.services.keepItIf(not (it of HPService))
+    nextBuilder.services.add(hpSvc)
+    nextBuilder
+
   case config.role
   of WanBootstrapRole.anchor:
     if next.autonatV2ServerConfig.isNone:
@@ -788,6 +815,7 @@ proc withWanBootstrapProfile*(
       discard next.withAutonatV2()
     if next.circuitRelay.isNone:
       discard next.withCircuitRelay(RelayClient.new())
+    discard ensureHolePunchProfile(next)
   next
 
 proc withMobileFullP2PProfile*(

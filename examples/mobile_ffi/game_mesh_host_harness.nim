@@ -157,6 +157,36 @@ proc testIdentity(): JsonNode =
     "source": "host_harness"
   }
 
+proc seededIdentity(seedText: string; source = "host_harness_seeded"): JsonNode =
+  let normalized = seedText.strip()
+  if normalized.len == 0:
+    return testIdentity()
+  var seedBytes = newSeq[byte](normalized.len)
+  for idx, ch in normalized:
+    seedBytes[idx] = byte(ord(ch) and 0xff)
+  let payload =
+    if seedBytes.len > 0:
+      safeJsonFromCString(
+        libp2p_identity_from_seed(
+          cast[ptr uint8](unsafeAddr seedBytes[0]),
+          csize_t(seedBytes.len)
+        )
+      )
+    else:
+      newJObject()
+  if payload.kind == JObject and strField(payload, "peerId").len > 0:
+    result = payload
+    result["source"] = %source
+    return result
+  testIdentity()
+
+proc stableWanBootstrapIdentity(label, role, networkId: string): JsonNode =
+  seededIdentity(
+    "wan_bootstrap_host|" & label.strip() & "|" & role.strip().toLowerAscii() & "|" &
+      networkId.strip(),
+    source = "host_harness_stable_wan_bootstrap"
+  )
+
 proc dualStackLoopbackListenAddrs(port: int): JsonNode =
   %*[
     "/ip4/127.0.0.1/udp/" & $port & "/quic-v1",
@@ -225,19 +255,20 @@ proc firstDialAddrFromJson(
       let hasTcp = "/tcp/" in lower
       let hasIpv6 = "/ip6/" in lower and "/ip6/fe80:" notin lower
       let hasIpv4 = "/ip4/" in lower
+      let hasPhysical = isPhysicalPrefixedAddr(multiaddr)
       if hasQuic and hasIpv6:
-        return 0
+        return (if hasPhysical: 1 else: 0)
       if hasQuic and hasIpv4:
-        return 1
+        return (if hasPhysical: 3 else: 2)
       if hasTcp and hasIpv6:
-        return 2
+        return (if hasPhysical: 5 else: 4)
       if hasTcp and hasIpv4:
-        return 3
+        return (if hasPhysical: 7 else: 6)
       if hasIpv6:
-        return 4
+        return (if hasPhysical: 9 else: 8)
       if hasIpv4:
-        return 5
-      6
+        return (if hasPhysical: 11 else: 10)
+      12
     let rankA = dialRank(a)
     let rankB = dialRank(b)
     if rankA < rankB:
@@ -368,7 +399,7 @@ proc createWanBootstrapNode*(
 ): HostNode =
   let dataDir = hostHarnessDataDir(label)
   var config = %*{
-    "identity": testIdentity(),
+    "identity": stableWanBootstrapIdentity(label, role, networkId),
     "dataDir": dataDir,
     "listenAddresses": listenAddressesForMode(transportMode, listenPort),
     "extra": {

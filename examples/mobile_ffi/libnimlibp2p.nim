@@ -12,7 +12,7 @@ when defined(posix):
   import posix
 import libp2p/[bandwidthmanager, builders, connmanager, features, memorymanager, multiaddress,
                muxers/mplex/mplex, muxers/muxer, muxers/yamux/yamux, peerid, peerstore, protocols/connectivity/relay/client,
-               resourcemanager, switch]
+               resourcemanager, switch, wire]
 import libp2p/discovery/discoverymngr
 import libp2p/discovery/mdns
 import libp2p/crypto/[crypto, ed25519/ed25519]
@@ -21,6 +21,9 @@ import libp2p/protocols/pubsub/[gossipsub, pubsub, peertable]
 import libp2p/protocols/dm/dmservice
 import libp2p/protocols/feed/feedservice
 import libp2p/protocols/ping
+import libp2p/protocols/connectivity/autonat/types as autonat_types
+import libp2p/protocols/connectivity/autonat/service as autonat_service
+import libp2p/protocols/connectivity/autonatv2/service as autonatv2_service
 import libp2p/services/wanbootstrapservice
 import nimcrypto/sha2 as nimsha2
 when libp2pFetchEnabled:
@@ -71,7 +74,7 @@ proc nim_thread_detach*() {.exportc, cdecl, dynlib.} =
   ## Optional counterpart for tests; production currently keeps threads pinned.
   tearDownForeignThreadGc()
 
-proc canonicalizeMultiaddrText(text: string): string =
+proc canonicalizeMultiaddrText(text: string): string {.gcsafe, raises: [].} =
   if text.len == 0:
     return text
   let maRes = MultiAddress.init(text)
@@ -159,6 +162,9 @@ const
   ProbeWindowTailMs = 600
   ProbeSendTimeoutMs = 3_500
   ProbeSessionRetentionMs = 180_000
+  UdpEchoProbePort = 4002
+  UdpEchoProbeTimeoutDefaultMs = 2_500
+  UdpEchoProbeMagic = "um_udp_echo_v1:"
   PublicIpProbeRefreshMs = 60_000'i64
   PublicIpProbeRetryMs = 15_000'i64
   PublicIpProbeTimeoutMs = 2_500
@@ -378,6 +384,7 @@ type
     cmdGetRandomBootstrapPeers,
     cmdJoinViaRandomBootstrap,
     cmdJoinViaSeedBootstrap,
+    cmdUdpEchoProbe,
     cmdSendDirect,
     cmdSendChatAck,
     cmdGetLastDirectError,
@@ -538,6 +545,8 @@ type
     hostNetworkStatusUpdatedAt: int64
     publicIpProbeState: PublicIpProbeState
     publicIpProbeLock: Lock
+    udpEchoSock4: DatagramTransport
+    udpEchoSock6: DatagramTransport
     lastConnectedPeersInfo: JsonNode
     lastConnectedPeersInfoUpdatedAt: int64
     probeInboundTraffic: Table[string, ProbeSessionTraffic]
@@ -1474,9 +1483,38 @@ proc isWanProviderIpv4Addr(addrText: string): bool {.gcsafe.} =
   let ip = multiaddrIpComponent(lower, "/ip4/")
   isProviderPublicIpv4Text(ip)
 
+proc isRelayBackedWanSeedAddr(addrText: string): bool {.gcsafe.} =
+  let lower = addrText.toLowerAscii()
+  if "/p2p-circuit" notin lower or "/quic-v1" notin lower:
+    return false
+  isWanProviderIpv6QuicAddr(addrText) or isWanProviderIpv4QuicAddr(addrText)
+
 proc replaceIpv4(addrStr: string, ip: string): Option[string] {.gcsafe.}
 proc replaceIpv6(addrStr: string, ip: string): Option[string] {.gcsafe.}
 proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.}
+
+proc extraMultiaddrTexts(extra: JsonNode, keys: openArray[string]): seq[string] {.gcsafe.} =
+  if extra.isNil or extra.kind != JObject:
+    return @[]
+  var seen = initHashSet[string]()
+  for key in keys:
+    let node = extra.getOrDefault(key)
+    if node.isNil or node.kind != JArray:
+      continue
+    for item in node:
+      if item.kind != JString:
+        continue
+      let value = item.getStr().strip()
+      if value.len == 0:
+        continue
+      let parsed = MultiAddress.init(value)
+      if parsed.isErr():
+        continue
+      let canonical = $parsed.get()
+      if canonical.len == 0 or canonical in seen:
+        continue
+      seen.incl(canonical)
+      result.add(canonical)
 
 proc canonicalizeWanProviderAddr(
     addrText: string,
@@ -1522,28 +1560,17 @@ proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
       hostNetwork["publicIpv4"].getStr().strip()
     else:
       ""
+  # WAN provider publication must be keyed off reflected public endpoints.
+  # Falling back to preferred/local interface addresses mis-publishes
+  # unverified home-broadband or cellular locators as direct seeds.
   let preferredIpv6 =
     if isProviderGlobalIpv6Text(observedPublicIpv6):
       observedPublicIpv6
-    elif hostNetwork.kind == JObject and hostNetwork.hasKey("preferredIpv6") and hostNetwork["preferredIpv6"].kind == JString:
-      hostNetwork["preferredIpv6"].getStr().strip()
-    elif hostNetwork.kind == JObject and hostNetwork.hasKey("localIpv6") and hostNetwork["localIpv6"].kind == JString:
-      hostNetwork["localIpv6"].getStr().strip()
-    else:
-      ""
-  let directPreferredIpv4 =
-    if hostNetwork.kind == JObject and hostNetwork.hasKey("preferredIpv4") and hostNetwork["preferredIpv4"].kind == JString:
-      hostNetwork["preferredIpv4"].getStr().strip()
-    elif hostNetwork.kind == JObject and hostNetwork.hasKey("localIpv4") and hostNetwork["localIpv4"].kind == JString:
-      hostNetwork["localIpv4"].getStr().strip()
     else:
       ""
   let preferredIpv4 =
-    if isProviderPublicIpv4Text(directPreferredIpv4):
-      if isProviderPublicIpv4Text(observedPublicIpv4):
-        observedPublicIpv4
-      else:
-        directPreferredIpv4
+    if isProviderPublicIpv4Text(observedPublicIpv4):
+      observedPublicIpv4
     else:
       ""
   var localSeedAddrs = prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node))
@@ -1563,6 +1590,45 @@ proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
     seen.incl(canonical)
     result.add(canonical)
 
+proc configuredRelayReservationAddrs(node: NimNode): seq[string] {.gcsafe.} =
+  if node.isNil:
+    return @[]
+  extraMultiaddrTexts(node.cfg.extra, ["relayMultiaddrs"])
+
+proc configuredAnchorSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
+  if node.isNil:
+    return @[]
+  var addrs = extraMultiaddrTexts(
+    node.cfg.extra,
+    [
+      "bootstrapMultiaddrs",
+      "wanBootstrapMultiaddrs",
+      "bootstrap_multiaddrs",
+      "static_bootstrap",
+      "bootstrap_nodes",
+    ],
+  )
+  addrs = addrs.filterIt(
+    isWanProviderIpv6QuicAddr(it) or isWanProviderIpv4QuicAddr(it)
+  )
+  prioritizeGameSeedAddrs(addrs)
+
+proc collectRelayBackedProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
+  if node.isNil:
+    return @[]
+  let localSeedAddrs = prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node))
+  var seen = initHashSet[string]()
+  for addr in localSeedAddrs:
+    let canonical = canonicalizeMultiaddrText(addr)
+    if canonical.len == 0 or canonical in seen:
+      continue
+    if not isRelayBackedWanSeedAddr(canonical):
+      continue
+    seen.incl(canonical)
+    result.add(canonical)
+
+proc extractPeerIdFromMultiaddrStr(ma: string): Option[string] {.gcsafe, raises: [].}
+
 proc currentConnectedPeerCount(node: NimNode): int {.gcsafe.} =
   if node.isNil or node.switchInstance.isNil:
     return 0
@@ -1576,6 +1642,65 @@ proc currentConnectedPeerCount(node: NimNode): int {.gcsafe.} =
     return 0
   seen.len
 
+proc currentConnectedPeerIds(node: NimNode): HashSet[string] {.gcsafe.} =
+  result = initHashSet[string]()
+  if node.isNil or node.switchInstance.isNil:
+    return
+  try:
+    for pid in node.switchInstance.connectedPeers(Direction.Out):
+      result.incl($pid)
+    for pid in node.switchInstance.connectedPeers(Direction.In):
+      result.incl($pid)
+  except CatchableError:
+    result.clear()
+
+proc anyConfiguredAnchorConnected(
+    anchorSeedAddrs: seq[string],
+    connectedPeerIds: HashSet[string]
+): bool {.gcsafe.} =
+  if anchorSeedAddrs.len == 0 or connectedPeerIds.len == 0:
+    return false
+  for addr in anchorSeedAddrs:
+    let peerOpt = extractPeerIdFromMultiaddrStr(addr)
+    if peerOpt.isSome() and peerOpt.get() in connectedPeerIds:
+      return true
+  false
+
+proc reachabilityLabel(value: autonat_types.NetworkReachability): string {.gcsafe.} =
+  case value
+  of autonat_types.NetworkReachability.Reachable:
+    "reachable"
+  of autonat_types.NetworkReachability.NotReachable:
+    "not_reachable"
+  else:
+    "unknown"
+
+proc currentReachabilityEvidence(
+    node: NimNode
+): tuple[value: autonat_types.NetworkReachability, source: string] {.gcsafe.} =
+  result = (autonat_types.NetworkReachability.Unknown, "")
+  if node.isNil or node.switchInstance.isNil:
+    return
+  for service in node.switchInstance.services:
+    if service of autonatv2_service.AutonatV2Service:
+      let reachability = autonatv2_service.AutonatV2Service(service).networkReachability
+      if reachability == autonat_types.NetworkReachability.Reachable:
+        return (reachability, "autonat_v2")
+      if reachability == autonat_types.NetworkReachability.NotReachable and result.source.len == 0:
+        result = (reachability, "autonat_v2")
+    elif service of autonat_service.AutonatService:
+      let reachability = autonat_service.AutonatService(service).networkReachability
+      if reachability == autonat_types.NetworkReachability.Reachable:
+        return (reachability, "autonat")
+      if reachability == autonat_types.NetworkReachability.NotReachable and result.source.len == 0:
+        result = (reachability, "autonat")
+  for transport in node.switchInstance.transports:
+    let reachability = transport.networkReachability
+    if reachability == autonat_types.NetworkReachability.Reachable:
+      return (reachability, "transport")
+    if reachability == autonat_types.NetworkReachability.NotReachable and result.source.len == 0:
+      result = (reachability, "transport")
+
 proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
   var payload = newJObject()
   let running = not node.isNil and node.started
@@ -1586,11 +1711,21 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       @[]
     else:
       prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node))
-  let providerSeedAddrs =
+  let directProviderSeedAddrs =
     if node.isNil:
       @[]
     else:
       collectWanProviderSeedAddrs(node)
+  let relayProviderSeedAddrs =
+    if node.isNil:
+      @[]
+    else:
+      collectRelayBackedProviderSeedAddrs(node)
+  let anchorSeedAddrs =
+    if node.isNil:
+      @[]
+    else:
+      configuredAnchorSeedAddrs(node)
   let localHasGlobalIpv6 = localSeedAddrs.anyIt(isWanProviderIpv6Addr(it))
   let localHasPublicIpv4 = localSeedAddrs.anyIt(isWanProviderIpv4Addr(it))
   let localHasQuic = localSeedAddrs.anyIt("/quic-v1" in it.toLowerAscii())
@@ -1628,16 +1763,53 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
         directPreferredIpv4
     else:
       ""
-  let hasPublicWanQuicSeed = providerSeedAddrs.len > 0
-  let providerAdvertisable = running and switchReady and hasPublicWanQuicSeed
+  let hasDirectPublicWanQuicSeed = directProviderSeedAddrs.len > 0
+  let hasRelayBackedSeed = relayProviderSeedAddrs.len > 0
+  let hasAnchorSeed = anchorSeedAddrs.len > 0
+  let providerDirectAdvertisable = running and switchReady and hasDirectPublicWanQuicSeed
+  let connectedPeerIds = currentConnectedPeerIds(node)
   let providerConnectedPeerCount =
-    if node.isNil:
-      0
-    else:
-      currentConnectedPeerCount(node)
-  let providerVerifiedReachable = providerAdvertisable and providerConnectedPeerCount > 0
-  let providerEligible = providerVerifiedReachable
+    connectedPeerIds.len
+  let providerReachabilityEvidence = currentReachabilityEvidence(node)
+  let providerReachability = reachabilityLabel(providerReachabilityEvidence.value)
+  let providerDirectVerifiedReachable =
+    providerDirectAdvertisable and (
+      providerConnectedPeerCount > 0 or
+        providerReachabilityEvidence.value == autonat_types.NetworkReachability.Reachable
+    )
+  let providerRelayVerifiedReachable = hasRelayBackedSeed
+  let providerAnchorVerifiedReachable =
+    hasAnchorSeed and anyConfiguredAnchorConnected(anchorSeedAddrs, connectedPeerIds)
+  let providerVerifiedReachable =
+    providerDirectVerifiedReachable or
+      providerRelayVerifiedReachable or
+      providerAnchorVerifiedReachable
   let publicIpv4RequiresHolePunching = observedPublicIpv4.len > 0 and not localHasPublicIpv4
+  let providerPublicationMode =
+    if providerDirectVerifiedReachable and hasDirectPublicWanQuicSeed:
+      "direct_verified"
+    elif hasRelayBackedSeed:
+      "relay_reserved"
+    elif hasAnchorSeed and publicIpv4RequiresHolePunching:
+      "anchor_assisted_hole_punch"
+    elif hasAnchorSeed and hasDirectPublicWanQuicSeed:
+      "anchor_assisted_unverified_direct"
+    elif hasAnchorSeed:
+      "anchor_only"
+    else:
+      "unpublished"
+  let providerSeedAddrs =
+    case providerPublicationMode
+    of "direct_verified":
+      directProviderSeedAddrs
+    of "relay_reserved":
+      relayProviderSeedAddrs
+    of "anchor_assisted_hole_punch", "anchor_assisted_unverified_direct", "anchor_only":
+      anchorSeedAddrs
+    else:
+      @[]
+  let providerAdvertisable = running and switchReady and providerSeedAddrs.len > 0
+  let providerEligible = providerAdvertisable
   let providerReason =
     if not running:
       "node_not_started"
@@ -1652,20 +1824,43 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
         "missing_public_wan_seed"
     elif not localHasQuic:
       "missing_quic_seed"
-    elif not hasPublicWanQuicSeed:
+    elif not hasDirectPublicWanQuicSeed and not hasRelayBackedSeed and not hasAnchorSeed:
       "missing_public_wan_quic_seed"
+    elif providerPublicationMode == "relay_reserved":
+      "relay_reserved_for_hole_punch"
+    elif providerPublicationMode == "anchor_assisted_hole_punch":
+      "anchor_required_for_ipv4_hole_punch"
+    elif providerPublicationMode == "anchor_assisted_unverified_direct":
+      "anchor_required_for_unverified_direct"
+    elif providerPublicationMode == "anchor_only":
+      "anchor_only_publication"
+    elif providerReachabilityEvidence.value == autonat_types.NetworkReachability.NotReachable:
+      "wan_public_ip_quic_not_reachable"
     elif not providerVerifiedReachable:
-      "wan_public_ip_quic_unverified_no_connected_peer"
+      if providerReachabilityEvidence.source.len > 0:
+        "wan_public_ip_quic_reachability_unknown"
+      else:
+        "wan_public_ip_quic_unverified_no_connected_peer"
     else:
       "wan_public_ip_quic_verified"
   payload["reported"] = %true
   payload["providerPolicy"] = %"wan_public_ip_quic"
+  payload["providerPublicationMode"] = %providerPublicationMode
   payload["providerAdvertisable"] = %providerAdvertisable
+  payload["providerDirectAdvertisable"] = %providerDirectAdvertisable
   payload["providerVerifiedReachable"] = %providerVerifiedReachable
+  payload["providerDirectVerifiedReachable"] = %providerDirectVerifiedReachable
+  payload["providerRelayVerifiedReachable"] = %providerRelayVerifiedReachable
+  payload["providerAnchorVerifiedReachable"] = %providerAnchorVerifiedReachable
   payload["providerConnectedPeerCount"] = %providerConnectedPeerCount
   payload["providerEligible"] = %providerEligible
   payload["providerReason"] = %providerReason
+  payload["providerReachability"] = %providerReachability
+  payload["providerReachabilitySource"] = %providerReachabilityEvidence.source
   payload["providerSeedAddrs"] = %providerSeedAddrs
+  payload["providerDirectSeedAddrs"] = %directProviderSeedAddrs
+  payload["providerRelaySeedAddrs"] = %relayProviderSeedAddrs
+  payload["anchorSeedAddrs"] = %anchorSeedAddrs
   payload["seedAddrs"] = %localSeedAddrs
   payload["localHasGlobalIpv6"] = %localHasGlobalIpv6
   payload["localHasPublicIpv4"] = %localHasPublicIpv4
@@ -1675,8 +1870,15 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
   payload["hostPublicIpv6"] = %observedPublicIpv6
   payload["hostPublicIpv4"] = %observedPublicIpv4
   payload["publicIpv4RequiresHolePunching"] = %publicIpv4RequiresHolePunching
+  payload["providerNeedsHolePunching"] = %publicIpv4RequiresHolePunching
   if providerSeedAddrs.len > 0:
     payload["preferredSeedAddr"] = %providerSeedAddrs[0]
+  if directProviderSeedAddrs.len > 0:
+    payload["preferredDirectSeedAddr"] = %directProviderSeedAddrs[0]
+  if relayProviderSeedAddrs.len > 0:
+    payload["preferredRelaySeedAddr"] = %relayProviderSeedAddrs[0]
+  if anchorSeedAddrs.len > 0:
+    payload["preferredAnchorSeedAddr"] = %anchorSeedAddrs[0]
   payload
 
 proc attachBootstrapProvider(
@@ -1691,13 +1893,26 @@ proc attachBootstrapProvider(
   for key in [
     "reported",
     "providerPolicy",
+    "providerPublicationMode",
     "providerAdvertisable",
+    "providerDirectAdvertisable",
     "providerVerifiedReachable",
+    "providerDirectVerifiedReachable",
+    "providerRelayVerifiedReachable",
+    "providerAnchorVerifiedReachable",
     "providerConnectedPeerCount",
     "providerEligible",
     "providerReason",
+    "providerReachability",
+    "providerReachabilitySource",
     "providerSeedAddrs",
+    "providerDirectSeedAddrs",
+    "providerRelaySeedAddrs",
+    "anchorSeedAddrs",
     "preferredSeedAddr",
+    "preferredDirectSeedAddr",
+    "preferredRelaySeedAddr",
+    "preferredAnchorSeedAddr",
     "localHasGlobalIpv6",
     "localHasPublicIpv4",
     "localHasQuic",
@@ -1706,6 +1921,7 @@ proc attachBootstrapProvider(
     "hostPublicIpv6",
     "hostPublicIpv4",
     "publicIpv4RequiresHolePunching",
+    "providerNeedsHolePunching",
   ]:
     if providerNode.hasKey(key):
       bootstrapNode[key] = providerNode[key]
@@ -3492,6 +3708,178 @@ proc ensureMessageId(mid: string): string {.gcsafe, raises: [].} =
     messageIdLock.release()
   return "msg-" & $ts & "-" & toHex(cast[uint64](nonce), 8)
 
+proc stripPeerIdSuffixFromMultiaddr(text: string): string {.gcsafe, raises: [].}
+
+proc udpEchoPayload(nonce: string): seq[byte] {.gcsafe, raises: [].} =
+  stringToBytes(UdpEchoProbeMagic & nonce)
+
+proc deriveUdpEchoTargetMultiaddr(addrText: string): Result[string, string] {.gcsafe, raises: [].} =
+  let canonical = try:
+      stripPeerIdSuffixFromMultiaddr(addrText)
+    except CatchableError as exc:
+      return err("canonicalize_failed:" & exc.msg)
+    except Exception:
+      return err("canonicalize_failed")
+  if canonical.len == 0:
+    return err("empty_multiaddr")
+  let lower = canonical.toLowerAscii()
+  var host = ""
+  if "/ip6/" in lower:
+    let startIdx = canonical.toLowerAscii().find("/ip6/") + 5
+    var endIdx = canonical.find('/', startIdx)
+    if endIdx < 0:
+      endIdx = canonical.len
+    host = canonical[startIdx ..< endIdx].strip()
+    if host.len == 0:
+      return err("missing_ipv6_host")
+    let target = "/ip6/" & host & "/udp/" & $UdpEchoProbePort
+    let parsed = MultiAddress.init(target)
+    if parsed.isErr():
+      return err("invalid_udp_target:" & parsed.error)
+    return ok($parsed.get())
+  if "/ip4/" in lower:
+    let startIdx = canonical.toLowerAscii().find("/ip4/") + 5
+    var endIdx = canonical.find('/', startIdx)
+    if endIdx < 0:
+      endIdx = canonical.len
+    host = canonical[startIdx ..< endIdx].strip()
+    if host.len == 0:
+      return err("missing_ipv4_host")
+    let target = "/ip4/" & host & "/udp/" & $UdpEchoProbePort
+    let parsed = MultiAddress.init(target)
+    if parsed.isErr():
+      return err("invalid_udp_target:" & parsed.error)
+    return ok($parsed.get())
+  err("missing_ip_protocol")
+
+proc stopUdpEchoResponder(n: NimNode): Future[void] {.async.} =
+  if n.isNil:
+    return
+  if not n.udpEchoSock4.isNil:
+    try:
+      await n.udpEchoSock4.closeWait()
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] stopUdpEchoResponder ipv4 err=" & exc.msg)
+    n.udpEchoSock4 = nil
+  if not n.udpEchoSock6.isNil:
+    try:
+      await n.udpEchoSock6.closeWait()
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] stopUdpEchoResponder ipv6 err=" & exc.msg)
+    n.udpEchoSock6 = nil
+
+proc startUdpEchoResponder(n: NimNode): Future[void] {.async.} =
+  if n.isNil:
+    return
+
+  proc onUdpEchoDatagram(transp: DatagramTransport, remote: TransportAddress): Future[void] {.async: (raises: []).} =
+    try:
+      let message = transp.getMessage()
+      if message.len == 0:
+        return
+      let text = bytesToString(message)
+      if not text.startsWith(UdpEchoProbeMagic):
+        return
+      await transp.sendTo(remote, unsafeAddr message[0], message.len)
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] udp echo responder err=" & exc.msg)
+
+  if n.udpEchoSock4.isNil:
+    try:
+      n.udpEchoSock4 = newDatagramTransport(
+        onUdpEchoDatagram,
+        local = initTAddress("0.0.0.0", Port(UdpEchoProbePort)),
+        flags = {ServerFlags.ReuseAddr},
+      )
+      debugLog("[nimlibp2p] udp echo responder ipv4 bound port=" & $UdpEchoProbePort)
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] udp echo responder ipv4 bind failed err=" & exc.msg)
+  if n.udpEchoSock6.isNil:
+    try:
+      n.udpEchoSock6 = newDatagramTransport6(
+        onUdpEchoDatagram,
+        local = initTAddress("::", Port(UdpEchoProbePort)),
+        flags = {ServerFlags.ReuseAddr},
+      )
+      debugLog("[nimlibp2p] udp echo responder ipv6 bound port=" & $UdpEchoProbePort)
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] udp echo responder ipv6 bind failed err=" & exc.msg)
+
+proc runUdpEchoProbe(n: NimNode, addrText: string, timeoutMs: int): Future[JsonNode] {.async.} =
+  var payload = newJObject()
+  payload["probeTransport"] = %"udp_echo"
+  payload["probePort"] = %UdpEchoProbePort
+  payload["requestedAddr"] = %addrText
+  payload["timestampMs"] = %nowMillis()
+  let targetText = deriveUdpEchoTargetMultiaddr(addrText).valueOr:
+    payload["ok"] = %false
+    payload["error"] = %error
+    payload["attemptedAddr"] = %""
+    return payload
+  payload["attemptedAddr"] = %targetText
+  let targetMa = MultiAddress.init(targetText).valueOr:
+    payload["ok"] = %false
+    payload["error"] = %("invalid_target_multiaddr:" & error)
+    return payload
+  let remoteAddr = wire.initTAddress(targetMa).valueOr:
+    payload["ok"] = %false
+    payload["error"] = %("invalid_target_transport_address:" & error)
+    return payload
+  let nonce = ensureMessageId("")
+  let message = udpEchoPayload(nonce)
+  let receivedFuture = newFuture[void]("nimlibp2p.udpEchoProbe")
+  var responseRemote = ""
+
+  proc onProbeDatagram(transp: DatagramTransport, remote: TransportAddress): Future[void] {.async: (raises: []).} =
+    try:
+      let received = transp.getMessage()
+      if received.len != message.len:
+        return
+      var matched = true
+      for idx in 0 ..< message.len:
+        if received[idx] != message[idx]:
+          matched = false
+          break
+      if not matched:
+        return
+      responseRemote = $remote
+      if not receivedFuture.finished():
+        receivedFuture.complete()
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] udp echo probe callback err=" & exc.msg)
+
+  let startedAtMs = nowMillis()
+  let safeTimeoutMs = max(250, if timeoutMs > 0: timeoutMs else: UdpEchoProbeTimeoutDefaultMs)
+  var sock: DatagramTransport = nil
+  try:
+    if remoteAddr.family == AddressFamily.IPv6:
+      sock = newDatagramTransport6(onProbeDatagram)
+    else:
+      sock = newDatagramTransport(onProbeDatagram)
+    await sock.sendTo(remoteAddr, unsafeAddr message[0], message.len)
+    try:
+      await receivedFuture.wait(chronos.milliseconds(safeTimeoutMs))
+      payload["ok"] = %true
+      payload["error"] = %""
+      payload["rttMs"] = %(nowMillis() - startedAtMs)
+      payload["responseRemote"] = %responseRemote
+    except AsyncTimeoutError:
+      payload["ok"] = %false
+      payload["error"] = %"timeout"
+    except CatchableError as exc:
+      payload["ok"] = %false
+      payload["error"] = %exc.msg
+  except CatchableError as exc:
+    payload["ok"] = %false
+    payload["error"] = %exc.msg
+  finally:
+    if not sock.isNil:
+      try:
+        await sock.closeWait()
+      except CatchableError as exc:
+        debugLog("[nimlibp2p] udp echo probe close err=" & exc.msg)
+  payload
+
 proc newDirectWaiter(timeoutMs: int): DirectWaiter =
   DirectWaiter(
     future: newFuture[bool]("nimlibp2p.directAck"),
@@ -4958,7 +5346,7 @@ proc configuredWanBootstrapConfig(cfg: NodeConfig): WanBootstrapConfig =
     fallbackDnsAddrs = configuredWanBootstrapAddrs(cfg),
   )
 
-proc extractPeerIdFromMultiaddrStr(ma: string): Option[string] =
+proc extractPeerIdFromMultiaddrStr(ma: string): Option[string] {.gcsafe, raises: [].} =
   const marker = "/p2p/"
   let idx = ma.rfind(marker)
   if idx < 0:
@@ -4974,7 +5362,7 @@ proc extractPeerIdFromMultiaddrStr(ma: string): Option[string] =
     return none(string)
   some(peerId)
 
-proc stripPeerIdSuffixFromMultiaddr(text: string): string =
+proc stripPeerIdSuffixFromMultiaddr(text: string): string {.gcsafe, raises: [].} =
   let canonical = canonicalizeMultiaddrText(text.strip())
   if canonical.len == 0:
     return ""
@@ -7033,11 +7421,26 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           debugLog("[nimlibp2p] cmdStart: switch started")
           await setupDefaultTopics(n)
           debugLog("[nimlibp2p] cmdStart: default topics configured")
+          await startUdpEchoResponder(n)
+          debugLog("[nimlibp2p] cmdStart: udp echo responder ready")
           if n.peerHints.len > 0:
             proc delayedBoost() {.async.} =
               await sleepAsync(chronos.seconds(1))
               await boostConnectivity(n)
             asyncSpawn(delayedBoost())
+          let relayReservationAddrs = configuredRelayReservationAddrs(n)
+          if relayReservationAddrs.len > 0:
+            proc delayedRelayReservation() {.async.} =
+              await sleepAsync(chronos.seconds(1))
+              var reservedTotal = 0
+              for relayAddr in relayReservationAddrs:
+                reservedTotal += await reserveOnRelayAsync(n, relayAddr)
+              debugLog(
+                "[nimlibp2p] cmdStart: relay reservation attempted count=" &
+                $relayReservationAddrs.len &
+                " reserved=" & $reservedTotal
+              )
+            asyncSpawn(delayedRelayReservation())
           scheduleStartMdns(n)
           debugLog("[nimlibp2p] cmdStart: mdns start scheduled")
           if n.mdnsRestartPending:
@@ -7060,6 +7463,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             debugLog("[nimlibp2p] cmdStart: treating discovery advertise failure as non-fatal")
             n.started = true
             await setupDefaultTopics(n)
+            await startUdpEchoResponder(n)
             scheduleStartMdns(n)
             if n.mdnsRestartPending:
               info "cmdStart: applying deferred mdns restart", ipv4 = n.mdnsPreferredIpv4
@@ -7087,6 +7491,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.resultCode = NimResultOk
       else:
         await n.switchInstance.stop()
+        await stopUdpEchoResponder(n)
         await stopMdns(n)
         if not n.dmService.isNil and n.dmService.started:
           try:
@@ -7827,6 +8232,20 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         else:
           command.resultCode = NimResultInvalidState
           command.errorMsg = "switch not initialized"
+    of cmdUdpEchoProbe:
+      if not n.started:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "node not started"
+      elif command.multiaddr.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing target multiaddr"
+      else:
+        let probePayload = await runUdpEchoProbe(n, command.multiaddr, command.timeoutMs)
+        command.stringResult = $probePayload
+        command.boolResult = jsonBool(probePayload, "ok", false)
+        if not command.boolResult:
+          command.errorMsg = jsonGetStr(probePayload, "error", "udp_echo_probe_failed")
+        command.resultCode = NimResultOk
     of cmdSendDirect:
       if not n.started:
         command.resultCode = NimResultInvalidState
@@ -16334,6 +16753,25 @@ proc libp2p_join_via_seed_bootstrap*(
       allocCString(cloneOwnedString(result.stringResult))
     else:
       allocCString("{\"ok\":false,\"attemptCount\":0,\"attemptedCount\":0,\"connectedCount\":0,\"attempts\":[],\"attempted\":[]}")
+  destroyCommand(cmd)
+  output
+
+proc libp2p_udp_echo_probe*(handle: pointer, multiaddr: cstring, timeoutMs: cint): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_not_initialized\",\"probeTransport\":\"udp_echo\"}")
+  let safeMultiaddr = (if multiaddr.isNil: "" else: $multiaddr).strip()
+  if safeMultiaddr.len == 0:
+    return allocCString("{\"ok\":false,\"error\":\"missing_target_multiaddr\",\"probeTransport\":\"udp_echo\"}")
+  let cmd = makeCommand(cmdUdpEchoProbe)
+  cmd.multiaddr = safeMultiaddr
+  cmd.timeoutMs = int(timeoutMs)
+  let result = submitCommand(node, cmd)
+  let output =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      allocCString(cloneOwnedString(result.stringResult))
+    else:
+      allocCString("{\"ok\":false,\"error\":\"udp_echo_probe_failed\",\"probeTransport\":\"udp_echo\"}")
   destroyCommand(cmd)
   output
 

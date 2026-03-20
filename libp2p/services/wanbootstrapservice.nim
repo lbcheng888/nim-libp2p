@@ -2041,6 +2041,7 @@ proc bootstrapRoleConfig*(
       fallbackDnsAddrs = fallbackDnsAddrs,
       maxConcurrentBootstrapDials = 2,
       stopAfterConnected = 1,
+      connectTimeout = 3.seconds,
     )
 
 proc syncLoop(svc: WanBootstrapService) {.async: (raises: [CancelledError]).} =
