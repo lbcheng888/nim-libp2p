@@ -16,6 +16,7 @@ import libp2p/crypto/curve25519
 import nimcrypto/sysrand
 
 type
+  ConstBlockCtrClass {.importc: "const br_block_ctr_class", header: "bearssl_block.h", bycopy.} = object
   Secret = seq[byte]
   Iv = seq[byte]
   Key = seq[byte]
@@ -95,6 +96,10 @@ const
   TpDisableActiveMigration = 0x0C'u64
   TpActiveConnectionIdLimit = 0x0E'u64
   TpInitialSourceConnectionId = 0x0F'u64
+
+proc gcmInitConst(
+    ctx: var GcmContext, bctx: ptr ptr ConstBlockCtrClass, gh: Ghash
+) {.cdecl, gcsafe, noSideEffect, raises: [], importc: "br_gcm_init", header: "bearssl_aead.h".}
 
 proc appendVarInt(buf: var seq[byte]; val: uint64) =
   if val <= 63:
@@ -391,7 +396,9 @@ proc encryptPacket*(key, iv: openArray[byte], packetNumber: uint64,
   var ctrCtx: AesCtCtrKeys
   aesCtCtrInit(ctrCtx, unsafeAddr key[0], uint(key.len))
   var gcmCtx: GcmContext
-  gcmInit(gcmCtx, cast[ptr ptr BlockCtrClass](addr ctrCtx), ghashCtmul32)
+  gcmInitConst(
+    gcmCtx, cast[ptr ptr ConstBlockCtrClass](addr ctrCtx), ghashCtmul32
+  )
   gcmReset(gcmCtx, unsafeAddr nonce[0], uint(nonce.len))
   if header.len > 0:
     gcmAadInject(gcmCtx, unsafeAddr header[0], uint(header.len))
@@ -456,7 +463,9 @@ proc decryptPacket*(key, iv: openArray[byte], packetNumber: uint64,
   var ctrCtx: AesCtCtrKeys
   aesCtCtrInit(ctrCtx, unsafeAddr key[0], uint(key.len))
   var gcmCtx: GcmContext
-  gcmInit(gcmCtx, cast[ptr ptr BlockCtrClass](addr ctrCtx), ghashCtmul32)
+  gcmInitConst(
+    gcmCtx, cast[ptr ptr ConstBlockCtrClass](addr ctrCtx), ghashCtmul32
+  )
   gcmReset(gcmCtx, unsafeAddr nonce[0], uint(nonce.len))
   if header.len > 0:
     gcmAadInject(gcmCtx, unsafeAddr header[0], uint(header.len))

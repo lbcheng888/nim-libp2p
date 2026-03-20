@@ -9,12 +9,12 @@
 
 import std/options
 import chronos, chronicles
+import ../../utils/semaphore as lpSemaphore
 
 import ../../errors
 import ../../dialer
 import ../../peerid
 import ../../stream/connection
-import ../../utils/semaphore
 import ../../protocols/protocol
 import ./protobuf
 
@@ -49,7 +49,7 @@ type
   DataTransferService* = ref object of LPProtocol
     messageHandler*: DataTransferHandler
     config*: DataTransferConfig
-    streamLimiter: AsyncSemaphore
+    streamLimiter: lpSemaphore.AsyncSemaphore
 
   DataTransferDialer* = proc(
       peerId: PeerId, protos: seq[string]
@@ -85,7 +85,7 @@ proc new*(
   validate(config)
   let limiter =
     if config.maxConcurrentStreams > 0:
-      newAsyncSemaphore(config.maxConcurrentStreams)
+      lpSemaphore.newAsyncSemaphore(config.maxConcurrentStreams)
     else:
       nil
   let svc = DataTransferService(

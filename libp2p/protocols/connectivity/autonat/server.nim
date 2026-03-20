@@ -12,13 +12,14 @@
 import std/[sets, sequtils]
 import results
 import chronos, chronicles
+import ../../../utils/semaphore as lpSemaphore
 import
   ../../protocol,
   ../../../switch,
   ../../../multiaddress,
   ../../../multicodec,
   ../../../peerid,
-  ../../../utils/[semaphore, future],
+  ../../../utils/future,
   ../../../errors
 import types
 
@@ -28,7 +29,7 @@ logScope:
   topics = "libp2p autonat"
 
 type Autonat* = ref object of LPProtocol
-  sem: AsyncSemaphore
+  sem: lpSemaphore.AsyncSemaphore
   switch*: Switch
   dialTimeout: Duration
 
@@ -163,7 +164,11 @@ proc new*(
     T: typedesc[Autonat], switch: Switch, semSize: int = 1, dialTimeout = 15.seconds
 ): T =
   let autonat =
-    T(switch: switch, sem: newAsyncSemaphore(semSize), dialTimeout: dialTimeout)
+    T(
+      switch: switch,
+      sem: lpSemaphore.newAsyncSemaphore(semSize),
+      dialTimeout: dialTimeout,
+    )
   proc handleStream(
       conn: Connection, proto: string
   ) {.async: (raises: [CancelledError]).} =

@@ -77,3 +77,5 @@ test_api_settings
 api_connection_id_frames_test
 tests/
 wan_bootstrap_host_harness
+rust-libp2p-4002
+ipv6_bootstrap_node

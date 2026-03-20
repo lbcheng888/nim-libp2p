@@ -16,6 +16,7 @@
 import std/[tables, options, sequtils, sets, oids, typetraits]
 
 import chronos, chronicles, metrics
+import utils/semaphore as lpSemaphore
 
 import
   stream/connection,
@@ -24,7 +25,7 @@ import
   upgrademngrs/upgrade,
   multistream,
   multiaddress,
-  cid,
+  cid, 
   protocols/protocol,
   protocols/secure/secure,
   protocols/bitswap/bitswap,
@@ -32,7 +33,6 @@ import
   protocols/datatransfer/channelmanager,
   protocols/datatransfer/datatransfer,
   peerinfo,
-  utils/semaphore,
   ./muxers/muxer,
   connmanager,
   nameresolving/nameresolver,
@@ -1032,7 +1032,10 @@ proc upgrader(
     raise newException(UpgradeError, "catchable error upgrader: " & e.msg, e)
 
 proc upgradeMonitor(
-    switch: Switch, trans: Transport, conn: Connection, upgrades: AsyncSemaphore
+    switch: Switch,
+    trans: Transport,
+    conn: Connection,
+    upgrades: lpSemaphore.AsyncSemaphore,
 ) {.async: (raises: []).} =
   var upgradeSuccessful = false
   try:
@@ -1056,7 +1059,7 @@ proc accept(s: Switch, transport: Transport) {.async: (raises: []).} =
   ## switch accept loop, ran for every transport
   ##
 
-  let upgrades = newAsyncSemaphore(ConcurrentUpgrades)
+  let upgrades = lpSemaphore.newAsyncSemaphore(ConcurrentUpgrades)
   while transport.running:
     var conn: Connection
     try:

@@ -11,12 +11,12 @@
 
 import std/[tables, sequtils, sets]
 import pkg/[chronos, chronicles, metrics]
+import utils/semaphore as lpSemaphore
 import
   peerinfo,
   peerstore,
   stream/connection,
   muxers/muxer,
-  utils/semaphore,
   errors,
   resourcemanager
 
@@ -71,8 +71,8 @@ type
 
   ConnManager* = ref object of RootObj
     maxConnsPerPeer: int
-    inSema*: AsyncSemaphore
-    outSema*: AsyncSemaphore
+    inSema*: lpSemaphore.AsyncSemaphore
+    outSema*: lpSemaphore.AsyncSemaphore
     muxed: Table[PeerId, seq[Muxer]]
     connEvents: array[ConnEventKind, OrderedSet[ConnEventHandler]]
     peerEvents: array[PeerEventKind, OrderedSet[PeerEventHandler]]
@@ -94,12 +94,12 @@ proc new*(
     maxIn = -1,
     maxOut = -1,
 ): ConnManager =
-  var inSema, outSema: AsyncSemaphore
+  var inSema, outSema: lpSemaphore.AsyncSemaphore
   if maxIn > 0 or maxOut > 0:
-    inSema = newAsyncSemaphore(maxIn)
-    outSema = newAsyncSemaphore(maxOut)
+    inSema = lpSemaphore.newAsyncSemaphore(maxIn)
+    outSema = lpSemaphore.newAsyncSemaphore(maxOut)
   elif maxConnections > 0:
-    inSema = newAsyncSemaphore(maxConnections)
+    inSema = lpSemaphore.newAsyncSemaphore(maxConnections)
     outSema = inSema
   else:
     raiseAssert "Invalid connection counts!"
@@ -382,7 +382,7 @@ proc getOutgoingSlot*(
     raise newTooManyConnectionsError()
   return ConnectionSlot(connManager: c, direction: Out)
 
-func semaphore(c: ConnManager, dir: Direction): AsyncSemaphore {.inline.} =
+func semaphore(c: ConnManager, dir: Direction): lpSemaphore.AsyncSemaphore {.inline.} =
   return if dir == In: c.inSema else: c.outSema
 
 proc slotsAvailable*(c: ConnManager, dir: Direction): int =
