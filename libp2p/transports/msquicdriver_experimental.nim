@@ -2689,3 +2689,30 @@ proc closeListener*(handle: MsQuicTransportHandle; listener: pointer;
     msruntime.closeListener(handle.bridge, cast[msapi.HQUIC](listener))
   except Exception:
     discard
+
+proc listenerTransportActiveForTest*(listener: pointer): bool =
+  if listener.isNil:
+    return false
+  msapi.listenerTransportActiveForTest(cast[msapi.HQUIC](listener))
+
+proc createAcceptedConnectionForTest*(listener: pointer;
+    remoteHost: cstring; remotePort: uint16;
+    localHost: cstring; localPort: uint16;
+    clientCidPtr: ptr uint8; clientCidLen: uint32;
+    serverCidPtr: ptr uint8; serverCidLen: uint32;
+    connection: var pointer): bool =
+  var hquic: msapi.HQUIC = nil
+  let ok = msapi.createAcceptedConnectionForTest(
+    cast[msapi.HQUIC](listener),
+    remoteHost,
+    remotePort,
+    localHost,
+    localPort,
+    clientCidPtr,
+    clientCidLen,
+    serverCidPtr,
+    serverCidLen,
+    hquic
+  )
+  connection = cast[pointer](hquic)
+  ok

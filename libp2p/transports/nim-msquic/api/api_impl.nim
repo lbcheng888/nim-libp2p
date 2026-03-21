@@ -418,6 +418,7 @@ type
     closeReason: string
     disable1RttEncryption: bool
     transport: DatagramTransport
+    transportOwned: bool
     localAddress: TransportAddress
     remoteAddress: TransportAddress
 
@@ -1544,9 +1545,10 @@ proc handleRemoteConnectionClose(conn: ConnectionState; errorCode: uint64;
   conn.closeReason = reasonPhrase
   if not owner.isNil:
     owner.removeAcceptedConnection(conn)
-  if not conn.transport.isNil:
+  if conn.transportOwned and not conn.transport.isNil:
     asyncCheck conn.transport.closeWait()
     conn.transport = nil
+    conn.transportOwned = false
   var initiated = ConnectionEvent(
     kind: ceShutdownInitiated,
     errorCode: errorCode,
@@ -3884,6 +3886,7 @@ proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress
   conn.closeReason = ""
   conn.disable1RttEncryption = false
   conn.transport = state.transport
+  conn.transportOwned = false
   conn.localAddress = local
   conn.remoteAddress = remote
   conn.initialSecrets = tls.deriveInitialSecrets(serverCidSeq)
@@ -5054,9 +5057,10 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
 proc msquicConnectionClose(connection: HQUIC) {.cdecl.} =
   let state = toConnection(connection)
   if not state.isNil:
-    if not state.transport.isNil:
+    if state.transportOwned and not state.transport.isNil:
       asyncCheck state.transport.closeWait()
       state.transport = nil
+      state.transportOwned = false
     var ev = ConnectionEvent(kind: ceShutdownComplete, note: state.closeReason)
     emitConnectionEvent(state, ev)
     state.eventHandlers.setLen(0)
@@ -5317,6 +5321,7 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
         local = state.selectClientLocalBind()
       )
       state.localAddress = state.transport.localAddress
+      state.transportOwned = true
       transportEnabled = true
     except CatchableError:
       state.remoteAddress = TransportAddress()
@@ -5474,7 +5479,10 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
       ))
 
   except CatchableError as exc:
+    if state.transportOwned and not state.transport.isNil:
+      asyncCheck state.transport.closeWait()
     state.transport = nil
+    state.transportOwned = false
     emitDiagnostics(DiagnosticsEvent(
        kind: diagConnectionStarted,
        handle: connection,
@@ -6721,6 +6729,7 @@ proc prepareConnectionPacketSendForTest*(connection: HQUIC; epoch: CryptoEpoch):
       discard transp
       discard raddr
     state.transport = newDatagramTransport(discardPacket)
+    state.transportOwned = true
     state.localAddress = state.transport.localAddress
   if state.remoteAddress.family == AddressFamily.None or state.remoteAddress.port == Port(0):
     state.remoteAddress = initTAddress("127.0.0.1", Port(44444))
@@ -6758,6 +6767,12 @@ proc prepareConnectionPacketSendForTest*(connection: HQUIC; epoch: CryptoEpoch):
     state.handshakeComplete = true
   else:
     discard
+  true
+
+proc listenerTransportActiveForTest*(listener: HQUIC): bool =
+  let state = toListener(listener)
+  if state.isNil or state.transport.isNil:
+    return false
   true
 
 proc sendConnectionEpochPacketForTest*(connection: HQUIC; epoch: CryptoEpoch;

@@ -75,6 +75,7 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
     .withRng(rng)
     .withAddresses(listenAddrs)
     .withTcpTransport()
+    .withYamux()
     .withMplex()
     .withNoise()
     .withRendezVous(rdv)

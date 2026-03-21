@@ -502,6 +502,7 @@ type
     peerHints: Table[string, seq[string]]
     peerHintSources: Table[string, seq[string]]
     authoritativeBootstrapPeerIds: seq[string]
+    lastAuthoritativeBootstrapKickMs: int64
     bootstrapLastSeen: Table[string, int64]
     mdnsEnabled: bool
     mdnsIntervalSeconds: int
@@ -772,7 +773,9 @@ proc sendProbeDirectMessage(
 ): Future[(bool, string)] {.async.}
 proc registerInitialPeerHints(n: NimNode, multiaddrs: seq[string], source: string) {.gcsafe.}
 proc preferStableAddrStrings(addrs: seq[string]): seq[string] {.gcsafe.}
+proc libp2p_connect_peer_timeout*(handle: pointer, peerId: cstring, timeoutMs: cint): cint {.exportc, cdecl, dynlib.}
 proc libp2p_connect_multiaddr*(handle: pointer, multiaddr: cstring): cint {.exportc, cdecl, dynlib.}
+proc social_connect_peer_timeout*(handle: pointer, peerId: cstring, multiaddr: cstring, timeoutMs: cint): bool {.exportc, cdecl, dynlib.}
 proc social_connect_peer*(handle: pointer, peerId: cstring, multiaddr: cstring): bool {.exportc, cdecl, dynlib.}
 proc social_dm_send*(handle: pointer, peerId: cstring, conversationId: cstring, messageJson: cstring): bool {.exportc, cdecl, dynlib.}
 
@@ -5657,6 +5660,65 @@ proc syncPeerHintsIntoBootstrapService(n: NimNode, source = "initial_sync") {.gc
     except CatchableError as exc:
       warn "sync peer hints into bootstrap service failed", peer = peerId, source = hintSource, err = exc.msg
 
+proc exactBootstrapReconnectAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] {.gcsafe.} =
+  var seen = initHashSet[string]()
+  for addr in addrs:
+    let text = $addr
+    if text.contains("/p2p/") or text.contains("/ipfs/"):
+      let key = $addr
+      if key.len == 0 or key in seen:
+        continue
+      seen.incl(key)
+      result.add(addr)
+  if result.len == 0:
+    for addr in addrs:
+      let key = $addr
+      if key.len == 0 or key in seen:
+        continue
+      seen.incl(key)
+      result.add(addr)
+  if result.len > 1:
+    result = preferStableMultiaddrs(result)
+
+proc reconnectAuthoritativeBootstrapExact(
+    n: NimNode, source = "auto_authoritative_seed"
+): Future[void] {.async.} =
+  if n.isNil or n.switchInstance.isNil or n.authoritativeBootstrapPeerIds.len == 0:
+    return
+  for peerId in n.authoritativeBootstrapPeerIds:
+    let peerRes = PeerId.init(peerId)
+    if peerRes.isErr():
+      continue
+    var parsed: seq[MultiAddress] = @[]
+    for addrStr in n.peerHints.getOrDefault(peerId):
+      let maRes = parseDialableMultiaddr(addrStr)
+      if maRes.isErr():
+        continue
+      parsed.add(maRes.get())
+    parsed = exactBootstrapReconnectAddrs(parsed)
+    if parsed.len == 0:
+      continue
+    try:
+      let joinResult = await joinViaSeedBootstrap(
+        n.switchInstance,
+        peerRes.get(),
+        parsed,
+        source,
+      )
+      debugLog(
+        "[nimlibp2p] reconnectAuthoritativeBootstrapExact peer=" & peerId &
+        " ok=" & $joinResult.ok &
+        " connectedCount=" & $joinResult.connectedCount &
+        " attemptedCount=" & $joinResult.attemptedCount
+      )
+      if joinResult.ok:
+        return
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] reconnectAuthoritativeBootstrapExact failed peer=" & peerId &
+        " err=" & exc.msg
+      )
+
 proc applyAuthoritativeBootstrapConfig(n: NimNode) {.gcsafe.} =
   if n.isNil or n.switchInstance.isNil or n.authoritativeBootstrapPeerIds.len == 0:
     return
@@ -6088,15 +6150,61 @@ proc mergeLocalBootstrapStatus(node: NimNode, payload: var JsonNode, limit: int)
   var selectedNode = newJArray()
   for item in selected:
     selectedNode.add(bootstrapCandidateToJson(item))
+  let hasServiceSnapshot =
+    payload.kind == JObject and (
+      payload.hasKey("running") or
+      payload.hasKey("candidateCount") or
+      payload.hasKey("selectedCandidates") or
+      payload.hasKey("metrics") or
+      payload.hasKey("hasLastJoinResult")
+    )
+  if not hasServiceSnapshot:
+    payload["networkId"] = %configuredWanNetworkId(node.cfg)
+    payload["role"] = %($configuredWanBootstrapRole(node.cfg))
+    payload["running"] = %(not node.switchInstance.isNil)
+    payload["hintPeerCount"] = %candidates.len
+    payload["candidateCount"] = %candidates.len
+    payload["connectedPeerCount"] = %connected.len
+    payload["selectedCandidates"] = selectedNode
+    payload["selectedCandidateCount"] = %selected.len
+  payload["localHintPeerCount"] = %candidates.len
+  payload["localCandidateCount"] = %candidates.len
+  payload["localConnectedPeerCount"] = %connected.len
+  payload["localSelectedCandidates"] = selectedNode
+  payload["localSelectedCandidateCount"] = %selected.len
 
-  payload["networkId"] = %configuredWanNetworkId(node.cfg)
-  payload["role"] = %($configuredWanBootstrapRole(node.cfg))
-  payload["running"] = %(not node.switchInstance.isNil)
-  payload["hintPeerCount"] = %candidates.len
-  payload["candidateCount"] = %candidates.len
-  payload["connectedPeerCount"] = %connected.len
-  payload["selectedCandidates"] = selectedNode
-  payload["selectedCandidateCount"] = %selected.len
+proc hasConnectedAuthoritativeBootstrap(node: NimNode): bool {.gcsafe.} =
+  if node.isNil or node.switchInstance.isNil or node.authoritativeBootstrapPeerIds.len == 0:
+    return false
+  var connected = initHashSet[string]()
+  try:
+    for pid in node.switchInstance.connectedPeers(Direction.Out):
+      connected.incl($pid)
+    for pid in node.switchInstance.connectedPeers(Direction.In):
+      connected.incl($pid)
+  except CatchableError:
+    return false
+  for peerId in node.authoritativeBootstrapPeerIds:
+    if peerId in connected:
+      return true
+  false
+
+proc maybeKickAuthoritativeBootstrap(
+    node: NimNode,
+    source = "auto_authoritative_seed_status",
+    minIntervalMs = 5_000'i64,
+) {.gcsafe.} =
+  if node.isNil or not node.started or node.switchInstance.isNil:
+    return
+  if node.authoritativeBootstrapPeerIds.len == 0:
+    return
+  if hasConnectedAuthoritativeBootstrap(node):
+    return
+  let nowMs = nowMillis()
+  if nowMs - node.lastAuthoritativeBootstrapKickMs < minIntervalMs:
+    return
+  node.lastAuthoritativeBootstrapKickMs = nowMs
+  asyncSpawn(reconnectAuthoritativeBootstrapExact(node, source))
 
 proc addBootstrapSource(target: var seq[string], source: string) =
   if source.len > 0 and source notin target:
@@ -6877,7 +6985,25 @@ proc refreshPeerConnections(n: NimNode) {.async.} =
   await boostConnectivity(n)
 
 proc boostConnectivity(n: NimNode): Future[void] {.async.} =
+  var bootstrapReconnectTriggered = false
   for peerId, addresses in n.peerHints.pairs:
+    if peerId in n.authoritativeBootstrapPeerIds:
+      if not bootstrapReconnectTriggered and not n.switchInstance.isNil:
+        bootstrapReconnectTriggered = true
+        try:
+          let joinResult = await bootstrapReconnect(n.switchInstance, BootstrapCandidateCap)
+          debugLog(
+            "[nimlibp2p] boostConnectivity authoritative bootstrapReconnect peer=" & peerId &
+            " ok=" & $joinResult.ok &
+            " connectedCount=" & $joinResult.connectedCount &
+            " attemptedCount=" & $joinResult.attemptedCount
+          )
+        except CatchableError as exc:
+          debugLog(
+            "[nimlibp2p] boostConnectivity authoritative bootstrapReconnect failed peer=" &
+            peerId & " err=" & exc.msg
+          )
+      continue
     let peerRes = PeerId.init(peerId)
     var parsed: seq[MultiAddress] = @[]
     for addrStr in addresses:
@@ -7976,6 +8102,7 @@ proc buildNetworkDiscoverySnapshotPayload(
   payload["hostNetworkStatus"] = currentHostNetworkStatus(node)
   payload["networkResources"] = networkResources
   payload["mdnsProbeOk"] = %true
+  maybeKickAuthoritativeBootstrap(node, "auto_authoritative_seed_snapshot")
   var bootstrapNode = newJObject()
   try:
     if not node.switchInstance.isNil:
@@ -8039,6 +8166,17 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           debugLog("[nimlibp2p] cmdStart: default topics configured")
           await startUdpEchoResponder(n)
           debugLog("[nimlibp2p] cmdStart: udp echo responder ready")
+          if n.authoritativeBootstrapPeerIds.len > 0 and not n.switchInstance.isNil:
+            proc delayedAuthoritativeBootstrapReconnect() {.async.} =
+              await sleepAsync(chronos.seconds(1))
+              try:
+                await reconnectAuthoritativeBootstrapExact(n, "auto_authoritative_seed_startup")
+              except CatchableError as exc:
+                debugLog(
+                  "[nimlibp2p] delayed authoritative bootstrapReconnect failed err=" &
+                  exc.msg
+                )
+            asyncSpawn(delayedAuthoritativeBootstrapReconnect())
           if n.peerHints.len > 0:
             proc delayedBoost() {.async.} =
               await sleepAsync(chronos.seconds(1))
@@ -8221,14 +8359,36 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             n.lastDirectError = errMsg
             debugLog("[nimlibp2p] cmdConnectPeer no dialable addr peer=" & command.peerId)
           else:
-            let maxAttempts = 3
+            let timeoutMs =
+              if command.timeoutMs > 0:
+                max(command.timeoutMs, 250)
+              else:
+                5_000
+            let maxAttempts =
+              if command.timeoutMs > 0 and command.timeoutMs <= 2_000:
+                1
+              else:
+                3
             var attempt = 0
             var success = false
             var lastError = ""
             while attempt < maxAttempts and not success:
               try:
-                await n.switchInstance.connect(peer, dialable, forceDial = true)
-                success = true
+                let dialFut = n.switchInstance.connect(peer, dialable, forceDial = true)
+                let completed = await withTimeout(dialFut, chronos.milliseconds(timeoutMs))
+                if not completed:
+                  dialFut.cancelSoon()
+                  lastError = "connect timeout"
+                  let attemptNum = attempt + 1
+                  warn "cmdConnectPeer timeout", peer = command.peerId, attempt = attemptNum
+                  debugLog(
+                    "[nimlibp2p] cmdConnectPeer timeout peer=" & command.peerId &
+                    " attempt=" & $attemptNum &
+                    " timeoutMs=" & $timeoutMs
+                  )
+                else:
+                  await dialFut
+                  success = true
               except CatchableError as exc:
                 let errMsg = if exc.msg.len > 0: exc.msg else: $exc.name
                 lastError = errMsg
@@ -8282,9 +8442,15 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         let requestedTimeoutMs = if command.timeoutMs > 0: command.timeoutMs else: 0
         let timeoutMs =
           if quicDial:
-            max(if requestedTimeoutMs > 0: requestedTimeoutMs else: 30_000, 30_000)
+            if requestedTimeoutMs > 0:
+              max(requestedTimeoutMs, 250)
+            else:
+              30_000
           else:
-            if requestedTimeoutMs > 0: requestedTimeoutMs else: 10_000
+            if requestedTimeoutMs > 0:
+              max(requestedTimeoutMs, 250)
+            else:
+              10_000
         let maxAttempts =
           if quicDial:
             1
@@ -8373,7 +8539,37 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           n.lastDirectError = ""
           let peerOpt = extractPeerIdFromMultiaddrStr(command.multiaddr)
           if peerOpt.isSome():
-            n.bootstrapLastSeen[peerOpt.get()] = nowMillis()
+            let peerText = peerOpt.get()
+            n.bootstrapLastSeen[peerText] = nowMillis()
+            let shouldPromoteBootstrap =
+              peerText in n.authoritativeBootstrapPeerIds or
+              n.peerHints.hasKey(peerText)
+            if shouldPromoteBootstrap and not n.switchInstance.isNil:
+              let peerRes = PeerId.init(peerText)
+              if peerRes.isOk():
+                var bootstrapAddrs: seq[MultiAddress] = @[]
+                let normalizedAddr = stripPeerIdSuffixFromMultiaddr(command.multiaddr)
+                let directAddrRes = parseDialableMultiaddr(normalizedAddr)
+                if directAddrRes.isOk():
+                  bootstrapAddrs.add(directAddrRes.get())
+                for addrStr in n.peerHints.getOrDefault(peerText):
+                  let parsedAddr = parseDialableMultiaddr(stripPeerIdSuffixFromMultiaddr(addrStr))
+                  if parsedAddr.isOk():
+                    bootstrapAddrs.add(parsedAddr.get())
+                let svc = getWanBootstrapService(n.switchInstance)
+                if not svc.isNil and bootstrapAddrs.len > 0:
+                  try:
+                    discard await svc.recordConnectedBootstrapPeer(
+                      peerRes.get(),
+                      bootstrapAddrs,
+                      "direct_exact_connect",
+                    )
+                  except CatchableError as exc:
+                    debugLog(
+                      "[nimlibp2p] cmdConnectMultiaddr bootstrap promote failed peer=" &
+                      peerText &
+                      " err=" & exc.msg
+                    )
           let successMsg = "[nimlibp2p] cmdConnectMultiaddr success addr=" & command.multiaddr
           info "cmdConnectMultiaddr success", addr = command.multiaddr
           debugLog(successMsg)
@@ -10813,6 +11009,9 @@ proc libp2p_pubsub_unsubscribe*(
   rc
 
 proc libp2p_connect_peer*(handle: pointer, peerId: cstring): cint {.exportc, cdecl, dynlib.} =
+  libp2p_connect_peer_timeout(handle, peerId, 5_000)
+
+proc libp2p_connect_peer_timeout*(handle: pointer, peerId: cstring, timeoutMs: cint): cint {.exportc, cdecl, dynlib.} =
   if peerId.isNil:
     return NimResultInvalidArgument
   let node = nodeFromHandle(handle)
@@ -10820,6 +11019,7 @@ proc libp2p_connect_peer*(handle: pointer, peerId: cstring): cint {.exportc, cde
     return NimResultInvalidArgument
   let cmd = makeCommand(cmdConnectPeer)
   cmd.peerId = $peerId
+  cmd.timeoutMs = max(int(timeoutMs), 250)
   let result = submitCommand(node, cmd)
   let rc = result.resultCode
   let err = result.errorMsg
@@ -12786,6 +12986,9 @@ proc libp2p_network_discovery_snapshot*(handle: pointer, sourceFilter: cstring, 
   allocCString(payload)
 
 proc social_connect_peer*(handle: pointer, peerId: cstring, multiaddr: cstring): bool =
+  social_connect_peer_timeout(handle, peerId, multiaddr, 5_000)
+
+proc social_connect_peer_timeout*(handle: pointer, peerId: cstring, multiaddr: cstring, timeoutMs: cint): bool =
   if peerId.isNil:
     return false
   let node = nodeFromHandle(handle)
@@ -12793,11 +12996,12 @@ proc social_connect_peer*(handle: pointer, peerId: cstring, multiaddr: cstring):
     return false
   let peer = $peerId
   let dialAddr = if multiaddr == nil: "" else: $multiaddr
+  let safeTimeoutMs = max(int(timeoutMs), 250)
   var connected = false
   if dialAddr.len > 0:
-    connected = libp2p_connect_multiaddr(handle, dialAddr.cstring) == NimResultOk
+    connected = libp2p_connect_multiaddr_timeout(handle, dialAddr.cstring, safeTimeoutMs.cint) == NimResultOk
   if not connected:
-    connected = libp2p_connect_peer(handle, peer.cstring) == NimResultOk
+    connected = libp2p_connect_peer_timeout(handle, peer.cstring, safeTimeoutMs.cint) == NimResultOk
   var payload = newJObject()
   payload["peerId"] = %peer
   payload["multiaddr"] = %dialAddr
@@ -17279,6 +17483,7 @@ proc libp2p_get_bootstrap_status*(handle: pointer): cstring {.exportc, cdecl, dy
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{}")
+  maybeKickAuthoritativeBootstrap(node, "auto_authoritative_seed_status")
   let providerNode = buildWanProviderPayload(node)
   try:
     if node.switchInstance != nil:

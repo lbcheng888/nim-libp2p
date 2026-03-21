@@ -106,7 +106,52 @@ when defined(libp2p_msquic_experimental):
             let addr6 = addr6Res.get()
             check addr6.family == AddressFamily.IPv6
             check addr6.port == addr4.port
+
+      test "closing accepted connection does not close builtin listener transport":
+        let (handle, initErr) = msdriver.initMsQuicTransport()
+        if initErr.len > 0 or handle.isNil:
+          echo "MsQuic runtime unavailable: ", initErr
+          skip()
+        else:
+          defer:
+            if not handle.isNil:
+              msdriver.shutdown(handle)
+
+          let (listenerPtr, listenerStateOpt, createErr) = msdriver.createListener(handle)
+          if createErr.len > 0 or listenerStateOpt.isNone:
+            echo "MsQuic listener unavailable: ", createErr
+            skip()
+          else:
+            let listenerState = listenerStateOpt.get()
+            defer:
+              discard msdriver.stopListener(handle, listenerPtr)
+              msdriver.closeListener(handle, listenerPtr, listenerState)
+
+            let startErr = msdriver.startListener(handle, listenerPtr)
+            check startErr.len == 0
+            check msdriver.listenerTransportActiveForTest(listenerPtr)
+
+            var connection: pointer = nil
+            var clientCid = [0x01'u8, 0x02, 0x03, 0x04]
+            var serverCid = [0x0A'u8, 0x0B, 0x0C, 0x0D]
+            check msdriver.createAcceptedConnectionForTest(
+              listenerPtr,
+              "127.0.0.1",
+              40123'u16,
+              "127.0.0.1",
+              4001'u16,
+              addr clientCid[0],
+              uint32(clientCid.len),
+              addr serverCid[0],
+              uint32(serverCid.len),
+              connection
+            )
+            check connection != nil
+            check msdriver.listenerTransportActiveForTest(listenerPtr)
+
+            msdriver.closeConnection(handle, connection)
+            check msdriver.listenerTransportActiveForTest(listenerPtr)
 else:
   suite "MsQuic listener lifecycle":
     test "experimental features disabled":
-      skip("libp2p_msquic_experimental not enabled")
+      skip()

@@ -346,6 +346,8 @@ proc exactBootstrapDialAddrs(addrs: openArray[MultiAddress]): seq[MultiAddress] 
   result = dedupeAddrs(result)
   if result.len == 0:
     result = dedupeAddrs(addrs)
+  if result.len > 1:
+    sortBootstrapDialAddrs(result)
 
 proc isBootstrapInfraHint(source: string): bool =
   let normalized = source.strip().toLowerAscii()
@@ -905,9 +907,12 @@ proc bootstrapExactConnectBudget(
     svc: WanBootstrapService, ma: MultiAddress
 ): Duration =
   if svc.isNil:
-    return chronos.seconds(30)
-  if isQuicBootstrapDial(ma) and svc.config.connectTimeout < chronos.seconds(30):
-    return chronos.seconds(30)
+    return chronos.seconds(5)
+  if isQuicBootstrapDial(ma):
+    return min(
+      max(svc.config.connectTimeout, chronos.seconds(4)),
+      chronos.seconds(5),
+    )
   svc.config.connectTimeout
 
 proc peerCurrentlyConnected(
@@ -1253,6 +1258,21 @@ proc bootstrapStateJson*(
   result["selectedCandidates"] = candidatesNode
   result["lastRefresh"] = refreshReportToJson(snapshot.lastRefresh)
   result["metrics"] = metricsSnapshotToJson(snapshot.metrics)
+  ## Keep key counters flattened for mobile automation/status readers that still
+  ## look at the root bootstrap object instead of the nested metrics payload.
+  result["refreshRuns"] = %snapshot.metrics.refreshRuns
+  result["dnsaddrRefreshRuns"] = %snapshot.metrics.dnsaddrRefreshRuns
+  result["rendezvousAdvertiseRuns"] = %snapshot.metrics.rendezvousAdvertiseRuns
+  result["rendezvousRefreshRuns"] = %snapshot.metrics.rendezvousRefreshRuns
+  result["snapshotRefreshRuns"] = %snapshot.metrics.snapshotRefreshRuns
+  result["dnsaddrImported"] = %snapshot.metrics.dnsaddrImported
+  result["rendezvousAdvertised"] = %snapshot.metrics.rendezvousAdvertised
+  result["rendezvousImported"] = %snapshot.metrics.rendezvousImported
+  result["snapshotImported"] = %snapshot.metrics.snapshotImported
+  result["joinRuns"] = %snapshot.metrics.joinRuns
+  result["joinAttempts"] = %snapshot.metrics.joinAttempts
+  result["joinConnected"] = %snapshot.metrics.joinConnected
+  result["joinFailed"] = %snapshot.metrics.joinFailed
   result["hasLastJoinResult"] = %snapshot.hasLastJoinResult
   if snapshot.hasLastJoinResult:
     result["lastJoinResult"] = joinResultToJson(snapshot.lastJoinResult)
@@ -1804,7 +1824,6 @@ proc connectBootstrapCandidateExact(
   if svc.isNil or svc.switch.isNil or candidate.addrs.len == 0:
     return WanBootstrapDialOutcome(connected: false, error: "no_candidate_addrs")
   var ordered = exactBootstrapDialAddrs(candidate.addrs)
-  sortBootstrapDialAddrs(ordered)
   var lastError = ""
   var attemptedAddr = ""
   for addr in ordered:
@@ -1975,6 +1994,79 @@ proc joinViaSeedBootstrapImpl(
   if result.ok and svc.journalDirty:
     discard svc.saveBootstrapJournal()
   svc.updateObservability()
+
+proc recordConnectedBootstrapPeer*(
+    svc: WanBootstrapService,
+    peerId: PeerId,
+    addrs: seq[MultiAddress],
+    source = "direct_exact_connect",
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or addrs.len == 0 or peerId == svc.switch.peerInfo.peerId:
+    return false
+  if not svc.peerCurrentlyConnected(peerId):
+    return false
+
+  var normalized = dedupeAddrs(addrs)
+  if not svc.config.enableDnsaddrFallback:
+    normalized.keepItIf(not isLegacyPublicBootstrapAddr(it))
+  if normalized.len == 0:
+    return false
+
+  let hintSource = source.strip()
+  let effectiveSource =
+    if hintSource.len > 0:
+      hintSource
+    else:
+      "direct_exact_connect"
+  discard svc.registerBootstrapHint(peerId, normalized, effectiveSource, quarantine)
+
+  let signedPeerRecordSeen = svc.hasSignedPeerRecord(peerId)
+  let candidateSources = @["Connected", "Hints", "Hint:" & effectiveSource]
+  let candidate = WanBootstrapCandidate(
+    peerId: peerId,
+    addrs: normalized,
+    lastSeenAtMs: nowMillis(),
+    sources: candidateSources,
+    selectionReason: "direct_exact_connect",
+    trust: svc.candidateTrust(peerId, candidateSources, signedPeerRecordSeen),
+    relayCapable: relayCapableFromAddrs(normalized),
+    signedPeerRecordSeen: signedPeerRecordSeen,
+  )
+
+  let attemptedAddr = if normalized.len > 0: $normalized[0] else: ""
+  let outcome = await svc.finalizeBootstrapConnectedCandidate(
+    candidate,
+    "direct_exact_connect",
+    attemptedAddr,
+  )
+  if not outcome.connected:
+    return false
+
+  discard await svc.advertiseRendezvousNamespaces()
+  discard await svc.refreshFromRendezvousNamespaces()
+  discard await svc.refreshFromBootstrapSnapshots()
+  discard await svc.bootstrapMountedKadDHTs()
+
+  let joinResult = WanBootstrapJoinResult(
+    attempts: @[
+      WanBootstrapJoinAttempt(
+        stage: "direct_exact_connect",
+        candidate: candidate,
+        connected: true,
+        attemptedAddr: attemptedAddr,
+        error: "",
+      )
+    ],
+    attemptedCount: 1,
+    connectedCount: 1,
+    ok: true,
+    timestampMs: nowMillis(),
+  )
+  svc.recordJoinResult(joinResult)
+  if svc.journalDirty:
+    discard svc.saveBootstrapJournal()
+  svc.updateObservability()
+  true
 
 proc joinViaSeedBootstrap*(
     svc: WanBootstrapService,
