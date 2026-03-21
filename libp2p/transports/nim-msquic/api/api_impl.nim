@@ -4934,13 +4934,25 @@ proc msquicListenerStart(listener: HQUIC; alpn: ptr QuicBuffer;
       initTAddress("0.0.0.0", Port(0))
   if not address.isNil:
     discard parseSockAddr(address, bindAddress)
+
+  let listenerDualstack =
+    if bindAddress.family == AddressFamily.IPv6 and bindAddress.isAnyLocal():
+      # Builtin QUIC starts one listener per configured multiaddr. When both
+      # `/ip4/0.0.0.0/udp/...` and `/ip6/::/udp/...` are requested, Chronos'
+      # default dual-stack IPv6 bind would occupy the shared UDP port and make
+      # the explicit IPv4 wildcard listener fail on Linux. Force the IPv6
+      # wildcard listener to be V6ONLY so the two listeners can coexist.
+      DualStackType.Disabled
+    else:
+      DualStackType.Default
   
   try:
     state.transport = newDatagramTransport(
       (proc (transp: DatagramTransport, remote: TransportAddress) {.async.} =
         let data = transp.getMessage()
         asyncCheck listenerOnReceive(state, transp, remote, transp.localAddress, data)),
-      local = bindAddress
+      local = bindAddress,
+      dualstack = listenerDualstack
     )
     state.localAddress = state.transport.localAddress
     state.started = true

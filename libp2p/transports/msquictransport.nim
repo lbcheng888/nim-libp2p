@@ -1196,8 +1196,15 @@ proc listenerVariantKey(baseAddr: MultiAddress; webtransport: bool): string {.gc
     return ""
   (if webtransport: "webtransport" else: "quic") & ":" & port
 
-proc filterRedundantWildcardListeners(addrs: seq[MultiAddress]): seq[MultiAddress] {.gcsafe, raises: [].} =
+proc filterRedundantWildcardListeners(
+    addrs: seq[MultiAddress], runtimeInfo: QuicRuntimeInfo
+): seq[MultiAddress] {.gcsafe, raises: [].} =
   if addrs.len <= 1:
+    return addrs
+  if runtimeInfo.isPureNimRuntime:
+    trace "MsQuic preserve dual wildcard listeners for builtin runtime",
+      runtime = runtimeInfo.implementation,
+      path = runtimeInfo.path
     return addrs
   var ipv6WildcardKeys = initHashSet[string]()
   var splitCache = newSeq[(bool, MultiAddress, bool)](addrs.len)
@@ -2561,7 +2568,7 @@ method start*(
         discard
     created.setLen(0)
 
-  let effectiveAddrs = filterRedundantWildcardListeners(addrs)
+  let effectiveAddrs = filterRedundantWildcardListeners(addrs, quicRuntimeInfo(initHandle))
   var listenerPlans: seq[(Option[MultiAddress], bool)] = @[]
   if effectiveAddrs.len == 0:
     listenerPlans.add((none(MultiAddress), false))

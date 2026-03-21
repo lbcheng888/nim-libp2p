@@ -5,6 +5,9 @@ import chronos
 import libp2p
 import libp2p/protocols/ping
 import libp2p/protocols/rendezvous
+import libp2p/crypto/crypto
+import bearssl/[rand, hash]
+import nimcrypto/sha2 as nimsha2
 
 const
   DefaultTcpListen =
@@ -27,11 +30,39 @@ proc parseListenAddrs(raw: string): seq[MultiAddress] =
   if result.len == 0:
     raise newException(ValueError, "no listen addresses configured")
 
+proc deterministicPrivateKeyFromSeed(seedText: string): PrivateKey =
+  let normalized = seedText.strip()
+  if normalized.len == 0:
+    raise newException(ValueError, "bootstrap identity seed is empty")
+
+  var seedBytes = newSeq[byte](normalized.len)
+  for idx, ch in normalized:
+    seedBytes[idx] = byte(ord(ch) and 0xff)
+
+  let digest = nimsha2.sha256.digest(seedBytes)
+  var entropy = newSeq[byte](digest.data.len)
+  for idx in 0 ..< entropy.len:
+    entropy[idx] = digest.data[idx]
+
+  var rngRef = new(HmacDrbgContext)
+  hmacDrbgInit(
+    rngRef[],
+    addr sha256Vtable,
+    (if entropy.len > 0: cast[pointer](addr entropy[0]) else: nil),
+    uint(entropy.len)
+  )
+
+  let pairRes = KeyPair.random(PKScheme.Ed25519, rngRef[])
+  if pairRes.isErr():
+    raise newException(CatchableError, "failed to derive bootstrap keypair: " & $pairRes.error)
+  pairRes.get().seckey
+
 proc main() {.async: (raises: [CatchableError, Exception]).} =
   let
     rng = newRng()
     rdv = RendezVous.new()
     ping = Ping.new(rng = rng)
+    identitySeed = getEnv("BOOTSTRAP_IDENTITY_SEED").strip()
   var listenAddrs = parseListenAddrs(
     getEnv("BOOTSTRAP_TCP_LISTEN", DefaultTcpListen)
   )
@@ -48,6 +79,9 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
     .withNoise()
     .withRendezVous(rdv)
 
+  if identitySeed.len > 0:
+    builder = builder.withPrivateKey(deterministicPrivateKeyFromSeed(identitySeed))
+
   when defined(libp2p_msquic_experimental):
     builder = builder.withMsQuicTransport()
   else:
@@ -62,6 +96,8 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
   await sw.start()
 
   echo "[bootstrap] peerId: ", $sw.peerInfo.peerId
+  if identitySeed.len > 0:
+    echo "[bootstrap] identity source: env BOOTSTRAP_IDENTITY_SEED"
   echo "[bootstrap] listening on:"
   for addr in sw.peerInfo.addrs:
     echo "  ", $addr, "/p2p/", $sw.peerInfo.peerId
