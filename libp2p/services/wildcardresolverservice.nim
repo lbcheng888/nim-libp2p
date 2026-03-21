@@ -111,24 +111,56 @@ proc getProtocolArgument*(ma: MultiAddress, codec: MultiCodec): MaResult[seq[byt
   err("Multiaddress codec has not been found")
 
 proc getWildcardMultiAddresses(
-    interfaceAddresses: seq[InterfaceAddress], protocol: Protocol, port: Port
+    interfaceAddresses: seq[InterfaceAddress],
+    protocol: Protocol,
+    port: Port,
+    quicV1 = false
 ): seq[MultiAddress] =
+  let quicSuffix =
+    if quicV1:
+      let parsed = MultiAddress.init("/quic-v1")
+      if parsed.isErr:
+        return @[]
+      some(parsed.get())
+    else:
+      none(MultiAddress)
   var addresses: seq[MultiAddress]
   for ifaddr in interfaceAddresses:
     var address = ifaddr.host
     address.port = port
     MultiAddress.init(address, protocol).withValue(maddress):
-      addresses.add(maddress)
+      if quicSuffix.isSome:
+        concat(maddress, quicSuffix.get()).withValue(fullAddr):
+          addresses.add(fullAddr)
+      else:
+        addresses.add(maddress)
   addresses
+
+proc addUniqueAddress(addresses: var seq[MultiAddress], ma: MultiAddress) =
+  if ma notin addresses:
+    addresses.add(ma)
+
+proc addUniqueAddresses(
+  addresses: var seq[MultiAddress], newAddrs: openArray[MultiAddress]
+) =
+  for ma in newAddrs:
+    addresses.addUniqueAddress(ma)
 
 proc getWildcardAddress(
     maddress: MultiAddress,
     addrFamily: AddressFamily,
     port: Port,
     networkInterfaceProvider: NetworkInterfaceProvider,
+    protocol: Protocol,
+    quicV1 = false
 ): seq[MultiAddress] =
   let filteredInterfaceAddresses = networkInterfaceProvider(addrFamily)
-  getWildcardMultiAddresses(filteredInterfaceAddresses, IPPROTO_TCP, port)
+  getWildcardMultiAddresses(
+    filteredInterfaceAddresses,
+    protocol,
+    port,
+    quicV1 = quicV1
+  )
 
 proc expandWildcardAddresses(
     networkInterfaceProvider: NetworkInterfaceProvider, listenAddrs: seq[MultiAddress]
@@ -143,33 +175,91 @@ proc expandWildcardAddresses(
         if IP4.matchPartial(listenAddr):
           listenAddr.getProtocolArgument(multiCodec("ip4")).withValue(ip4):
             if isWildcardIpv4(ip4):
-              addresses.add(
+              addresses.addUniqueAddresses(
                 getWildcardAddress(
-                  listenAddr, AddressFamily.IPv4, port, networkInterfaceProvider
+                  listenAddr,
+                  AddressFamily.IPv4,
+                  port,
+                  networkInterfaceProvider,
+                  IPPROTO_TCP
                 )
               )
             else:
-              addresses.add(listenAddr)
+              addresses.addUniqueAddress(listenAddr)
         elif IP6.matchPartial(listenAddr):
           listenAddr.getProtocolArgument(multiCodec("ip6")).withValue(ip6):
             if isWildcardIpv6(ip6):
-              addresses.add(
+              addresses.addUniqueAddresses(
                 getWildcardAddress(
-                  listenAddr, AddressFamily.IPv6, port, networkInterfaceProvider
+                  listenAddr,
+                  AddressFamily.IPv6,
+                  port,
+                  networkInterfaceProvider,
+                  IPPROTO_TCP
                 )
               )
               # IPv6 dual stack
-              addresses.add(
+              addresses.addUniqueAddresses(
                 getWildcardAddress(
-                  listenAddr, AddressFamily.IPv4, port, networkInterfaceProvider
+                  listenAddr,
+                  AddressFamily.IPv4,
+                  port,
+                  networkInterfaceProvider,
+                  IPPROTO_TCP
                 )
               )
             else:
-              addresses.add(listenAddr)
+              addresses.addUniqueAddress(listenAddr)
         else:
-          addresses.add(listenAddr)
+          addresses.addUniqueAddress(listenAddr)
+    elif QUIC_V1_IP.matchPartial(listenAddr):
+      listenAddr.getProtocolArgument(multiCodec("udp")).withValue(portArg):
+        let port = Port(uint16.fromBytesBE(portArg))
+        if IP4.matchPartial(listenAddr):
+          listenAddr.getProtocolArgument(multiCodec("ip4")).withValue(ip4):
+            if isWildcardIpv4(ip4):
+              addresses.addUniqueAddresses(
+                getWildcardAddress(
+                  listenAddr,
+                  AddressFamily.IPv4,
+                  port,
+                  networkInterfaceProvider,
+                  IPPROTO_UDP,
+                  quicV1 = true
+                )
+              )
+            else:
+              addresses.addUniqueAddress(listenAddr)
+        elif IP6.matchPartial(listenAddr):
+          listenAddr.getProtocolArgument(multiCodec("ip6")).withValue(ip6):
+            if isWildcardIpv6(ip6):
+              addresses.addUniqueAddresses(
+                getWildcardAddress(
+                  listenAddr,
+                  AddressFamily.IPv6,
+                  port,
+                  networkInterfaceProvider,
+                  IPPROTO_UDP,
+                  quicV1 = true
+                )
+              )
+              # IPv6 dual stack QUIC listener can also serve IPv4.
+              addresses.addUniqueAddresses(
+                getWildcardAddress(
+                  listenAddr,
+                  AddressFamily.IPv4,
+                  port,
+                  networkInterfaceProvider,
+                  IPPROTO_UDP,
+                  quicV1 = true
+                )
+              )
+            else:
+              addresses.addUniqueAddress(listenAddr)
+        else:
+          addresses.addUniqueAddress(listenAddr)
     else:
-      addresses.add(listenAddr)
+      addresses.addUniqueAddress(listenAddr)
   addresses
 
 method setup*(
