@@ -2,8 +2,11 @@ import std/[options, unittest]
 
 import chronos
 
+import ./msquic_test_helpers
 import "../libp2p/transports/msquicdriver" as msdriver
-import "../libp2p/transports/nim-msquic/api/event_model" as msevents
+import "../libp2p/transports/quicruntime" as quicrt
+import "../libp2p/transports/nim-msquic/api/api_impl" as msapi
+import "../libp2p/transports/nim-msquic/api/param_catalog" as msparam
 
 when defined(libp2p_msquic_experimental):
   suite "MsQuic experimental driver":
@@ -15,33 +18,59 @@ when defined(libp2p_msquic_experimental):
       else:
         defer:
           if not handle.isNil:
-            handle.shutdown()
+            msdriver.shutdown(handle)
 
-        let (connPtr, stateOpt, dialErr) = handle.dialConnection("example.com", 1443'u16)
-        if dialErr.len > 0 or stateOpt.isNone:
-          echo "MsQuic dial unavailable: ", dialErr
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
           skip()
         else:
-          let connState = stateOpt.get()
-          let connected = waitFor connState.nextConnectionEvent()
-          check connected.kind == msevents.ceConnected
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
 
-          discard handle.shutdownConnection(connPtr, errorCode = 7'u64)
-          let shutdownEvent = waitFor connState.nextConnectionEvent()
-          check shutdownEvent.kind == msevents.ceShutdownInitiated
+          let (connPtr, stateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or stateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = stateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
 
-          handle.closeConnection(connPtr, connState)
-          expect msdriver.MsQuicEventQueueClosed:
-            discard waitFor connState.nextConnectionEvent()
+              let (connectedOpt, connectedErr) =
+                nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              check connectedErr.len == 0
+              check connectedOpt.isSome
+
+              let (serverConnectedOpt, serverConnectedErr) =
+                nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+              check serverConnectedErr.len == 0
+              check serverConnectedOpt.isSome
+
+              discard msdriver.shutdownConnection(handle, connPtr, errorCode = 7'u64)
+              msdriver.closeConnection(handle, connPtr, connState)
+              expect quicrt.QuicRuntimeEventQueueClosed:
+                discard waitFor connState.nextQuicConnectionEvent()
 
     test "dial fails after transport shutdown":
       let (handle, initErr) = msdriver.initMsQuicTransport()
       if initErr.len > 0 or handle.isNil:
         echo "MsQuic runtime unavailable: ", initErr
         skip()
-      handle.shutdown()
+      msdriver.shutdown(handle)
 
-      let (_, stateOpt, dialErr) = handle.dialConnection("example.com", 1'u16)
+      let (_, stateOpt, dialErr) = msdriver.dialConnection(handle, "example.com", 1'u16)
       check dialErr.len > 0
       check stateOpt.isNone
 
@@ -53,40 +82,88 @@ when defined(libp2p_msquic_experimental):
       else:
         defer:
           if not handle.isNil:
-            handle.shutdown()
+            msdriver.shutdown(handle)
 
-        let (connPtr, connStateOpt, dialErr) = handle.dialConnection("stream.test", 9443'u16)
-        if dialErr.len > 0 or connStateOpt.isNone:
-          echo "MsQuic dial unavailable: ", dialErr
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
           skip()
         else:
-          let connState = connStateOpt.get()
-          discard waitFor connState.nextConnectionEvent()
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
 
-          let (streamPtr, streamStateOpt, streamErr) = handle.createStream(
-            connPtr,
-            connectionState = connState
-          )
-          if streamErr.len > 0 or streamStateOpt.isNone:
-            echo "MsQuic stream unavailable: ", streamErr
+          let (connPtr, connStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or connStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
             skip()
           else:
-            let streamState = streamStateOpt.get()
+            let connState = connStateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
 
-            let startErr = handle.startStream(streamPtr)
-            check startErr.len == 0
-            let startEvent = waitFor streamState.nextStreamEvent()
-            check startEvent.kind == msevents.seStartComplete
+              discard nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverState, quicrt.qceConnected)
 
-            let datagramErr = handle.sendDatagram(connPtr, @[byte 0x1, 0x2, 0x3])
-            check datagramErr.len == 0
+              let (streamPtr, streamStateOpt, streamErr) = msdriver.createStream(
+                handle,
+                connPtr,
+                connectionState = connState
+              )
+              if streamErr.len > 0 or streamStateOpt.isNone:
+                echo "MsQuic stream unavailable: ", streamErr
+                skip()
+              else:
+                let streamState = streamStateOpt.get()
 
-            handle.closeStream(streamPtr, streamState)
-            expect msdriver.MsQuicEventQueueClosed:
-              discard waitFor streamState.nextStreamEvent()
+                let startErr = msdriver.startStream(handle, streamPtr)
+                check startErr.len == 0
+                let (startEventOpt, startEventErr) =
+                  nextStreamEventOfKind(streamState, quicrt.qseStartComplete)
+                check startEventErr.len == 0
+                check startEventOpt.isSome
 
-            discard handle.shutdownConnection(connPtr)
-            handle.closeConnection(connPtr, connState)
+                check msapi.MsQuicEnableDatagramReceiveShim(
+                  cast[msapi.HQUIC](serverConnPtr), msapi.BOOLEAN(1)
+                ) == msapi.QUIC_STATUS_SUCCESS
+                check msapi.MsQuicEnableDatagramReceiveShim(
+                  cast[msapi.HQUIC](connPtr), msapi.BOOLEAN(1)
+                ) == msapi.QUIC_STATUS_SUCCESS
+                check msapi.MsQuicEnableDatagramSendShim(
+                  cast[msapi.HQUIC](connPtr), msapi.BOOLEAN(1)
+                ) == msapi.QUIC_STATUS_SUCCESS
+
+                var receiveEnabled = false
+                var sendEnabled = false
+                check msapi.getConnectionDatagramState(
+                  cast[msapi.HQUIC](connPtr), receiveEnabled, sendEnabled
+                )
+                check receiveEnabled
+                check sendEnabled
+
+                let datagramErr = msdriver.sendDatagram(handle, connPtr, @[byte 0x1, 0x2, 0x3])
+                check datagramErr.len == 0
+                let (datagramEventOpt, datagramEventErr) =
+                  nextConnectionEventOfKind(connState, quicrt.qceParameterUpdated)
+                check datagramEventErr.len == 0
+                check datagramEventOpt.isSome
+                if datagramEventOpt.isSome:
+                  check datagramEventOpt.get().paramId == msparam.QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED
+
+                msdriver.closeStream(handle, streamPtr, streamState)
+
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
 else:
   suite "MsQuic experimental driver":
     test "experimental features disabled":

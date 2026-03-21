@@ -25,6 +25,7 @@ import libp2p/protocols/dm/dmservice
 import libp2p/protocols/feed/feedservice
 import nimcrypto/sha2 as nimsha2
 import nimcrypto/sysrand
+import results
 when libp2pFetchEnabled:
   import libp2p/protocols/fetch/[fetch, protobuf]
 when libp2pDataTransferEnabled:
@@ -35,7 +36,9 @@ import bearssl/[rand, hash]
 when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
   {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
 when defined(libp2p_msquic_experimental):
+  import libp2p/transports/msquicruntime
   import libp2p/transports/msquictransport as msquictransport
+  import libp2p/transports/quicruntime
 
 # Production Crypto Imports
 import libp2p/crypto/coinjoin/[secp_utils, types]
@@ -383,6 +386,11 @@ proc resetCommandFields(cmd: Command) =
   cmd.streamKey = ""
   cmd.done = false
 
+proc jsonGetStr(
+    node: JsonNode, key: string, defaultValue: string = ""
+): string {.gcsafe.}
+proc lockAddr(lock: var Lock): string
+
 proc acquireCommand(kind: CommandKind): Command =
   var cmd: Command = nil
   commandPoolLock.acquire()
@@ -398,7 +406,7 @@ proc acquireCommand(kind: CommandKind): Command =
   resetCommandFields(cmd)
   cmd.kind = kind
   if fresh:
-    info "makeCommand init lock", ptr = lockAddr(cmd.lock)
+    debugLog("[nimlibp2p] makeCommand init lock ptr=" & lockAddr(cmd.lock))
   result = cmd
 
 proc logMemoryLoop(n: NimNode) {.async.}
@@ -418,13 +426,13 @@ proc stringToBytes(text: string): seq[byte] =
   result = newSeq[byte](text.len)
   copyMem(addr result[0], unsafeAddr text[0], text.len)
 
-proc emitEvent(topic, payload: string) =
+proc emitEvent(topic, payload: string) {.gcsafe.} =
   try:
     nim_bridge_emit_event(topic.cstring, payload.cstring)
   except CatchableError as exc:
     warn "emitEvent failed", err = exc.msg, topic = topic
 
-proc recordEvent(n: NimNode, topic, payload: string) =
+proc recordEvent(n: NimNode, topic, payload: string) {.gcsafe.} =
   if n.isNil:
     emitEvent(topic, payload)
     return
@@ -532,15 +540,127 @@ when defined(libp2p_msquic_experimental):
   const MsQuicConnectionSampleLimit = 16
   const MsQuicCerthashSampleLimit = 8
 
-  proc optionToJson(value: Option[int64]): JsonNode {.inline.} =
+  proc optionToJson(value: Option[int64]): JsonNode {.inline, gcsafe.} =
     if value.isSome:
       %value.get()
     else:
       newJNull()
 
+  proc unavailableQuicRuntimeInfo(): quicruntime.QuicRuntimeInfo {.inline, gcsafe.} =
+    quicruntime.QuicRuntimeInfo(
+      kind: quicruntime.qrkUnavailable,
+      implementation: quicruntime.kindLabel(quicruntime.qrkUnavailable),
+      path: "",
+      requestedVersion: 0'u32,
+      negotiatedVersion: 0'u32,
+      compileTimeBuiltin: false,
+      loaded: false
+    )
+
+  proc quicRuntimePreferenceLabel(
+      pref: quicruntime.QuicRuntimePreference
+  ): string {.raises: [], gcsafe.} =
+    case pref
+    of quicruntime.qrpAuto:
+      "auto"
+    of quicruntime.qrpNativeOnly:
+      "native_only"
+    of quicruntime.qrpBuiltinPreferred:
+      "builtin_preferred"
+    of quicruntime.qrpBuiltinOnly:
+      "builtin_only"
+
+  proc parseQuicRuntimePreferenceValue(
+      value: string
+  ): Result[Option[quicruntime.QuicRuntimePreference], string] {.raises: [], gcsafe.} =
+    let normalized = value.strip().toLowerAscii().replace("-", "_")
+    if normalized.len == 0:
+      return ok(none(quicruntime.QuicRuntimePreference))
+    case normalized
+    of "auto", "default":
+      ok(some(quicruntime.qrpAuto))
+    of "native", "native_only", "msquic_native":
+      ok(some(quicruntime.qrpNativeOnly))
+    of "builtin_preferred", "prefer_builtin", "prefer_pure_nim", "prefer_nim":
+      ok(some(quicruntime.qrpBuiltinPreferred))
+    of "builtin", "builtin_only", "pure_nim", "nim", "nim_quic", "msquic_builtin":
+      ok(some(quicruntime.qrpBuiltinOnly))
+    else:
+      err("invalid QUIC runtime preference: " & value)
+
+  proc configuredQuicRuntimePreference(
+      extra: JsonNode
+  ): Result[Option[quicruntime.QuicRuntimePreference], string] {.raises: [], gcsafe.} =
+    if extra.isNil or extra.kind != JObject:
+      return ok(none(quicruntime.QuicRuntimePreference))
+    parseQuicRuntimePreferenceValue(
+      jsonGetStr(
+        extra,
+        "quicRuntimePreference",
+        jsonGetStr(
+          extra,
+          "quic_runtime_preference",
+          jsonGetStr(
+            extra,
+            "quicRuntime",
+            jsonGetStr(
+              extra,
+              "quic_runtime",
+              jsonGetStr(
+                extra,
+                "msquicRuntime",
+                jsonGetStr(extra, "msquic_runtime", "")
+              )
+            )
+          )
+        )
+      )
+    )
+
+  proc configuredQuicRuntimeLibraryPath(
+      extra: JsonNode
+  ): string {.raises: [], gcsafe.} =
+    if extra.isNil or extra.kind != JObject:
+      return ""
+    jsonGetStr(
+      extra,
+      "quicRuntimeLibraryPath",
+      jsonGetStr(
+        extra,
+        "quic_runtime_library_path",
+        jsonGetStr(
+          extra,
+          "msquicLibraryPath",
+          jsonGetStr(extra, "msquic_library_path", "")
+        )
+      )
+    ).strip()
+
+  proc quicRuntimeInfoToJson(
+      runtimeInfo: quicruntime.QuicRuntimeInfo, extra: JsonNode
+  ): JsonNode {.gcsafe.} =
+    let prefRes = configuredQuicRuntimePreference(extra)
+    let requestedPreference =
+      if prefRes.isOk and prefRes.get().isSome:
+        quicRuntimePreferenceLabel(prefRes.get().get())
+      else:
+        quicRuntimePreferenceLabel(quicruntime.qrpAuto)
+    %* {
+      "kind": quicruntime.kindLabel(runtimeInfo.kind),
+      "implementation": runtimeInfo.implementation,
+      "path": runtimeInfo.path,
+      "loaded": runtimeInfo.loaded,
+      "compileTimeBuiltin": runtimeInfo.compileTimeBuiltin,
+      "requestedVersion": runtimeInfo.requestedVersion,
+      "negotiatedVersion": runtimeInfo.negotiatedVersion,
+      "pureNim": quicruntime.isPureNimRuntime(runtimeInfo),
+      "requestedPreference": requestedPreference,
+      "requestedLibraryPath": configuredQuicRuntimeLibraryPath(extra),
+    }
+
   proc rejectionStatsToJson(
       stats: msquictransport.WebtransportRejectionStats
-  ): JsonNode =
+  ): JsonNode {.gcsafe.} =
     result = newJObject()
     result["session_limit"] = %stats.sessionLimit
     result["missing_connect_protocol"] = %stats.missingConnectProtocol
@@ -551,7 +671,7 @@ when defined(libp2p_msquic_experimental):
 
   proc connectionSnapshotToJson(
       snapshot: msquictransport.MsQuicConnectionSnapshot
-  ): JsonNode =
+  ): JsonNode {.gcsafe.} =
     result = newJObject()
     result["peer_id"] = %snapshot.peerId
     result["protocol"] = %snapshot.protocol
@@ -572,7 +692,7 @@ when defined(libp2p_msquic_experimental):
     snapshot.localAddr.withValue(addrStr):
       result["local_addr"] = %addrStr
 
-  proc emitMsQuicStats(n: NimNode; reason: string) =
+  proc emitMsQuicStats(n: NimNode; reason: string) {.gcsafe.} =
     if n.isNil or n.switchInstance.isNil:
       return
     let transportStats = n.switchInstance.msquicTransportStats()
@@ -588,6 +708,7 @@ when defined(libp2p_msquic_experimental):
     for idx, stats in transportStats:
       var entry = newJObject()
       entry["index"] = %idx
+      entry["runtime"] = quicRuntimeInfoToJson(stats.runtime, n.cfg.extra)
       entry["listener_count"] = %stats.listenerCount
       entry["connection_count"] = %stats.connectionCount
       entry["datagram_enabled"] = %stats.datagramEnabled
@@ -1509,7 +1630,7 @@ proc extractPreferredIpv4(cfg: NodeConfig): string =
       debugLog("[nimlibp2p] extractPreferredIpv4 preferredLanIpv4=" & value)
       return value
   let mdnsNode = cfg.extra.getOrDefault("mdns")
-  if mdnsNode.kind == JObject:
+  if not mdnsNode.isNil and mdnsNode.kind == JObject:
     let nested = jsonGetStr(mdnsNode, "preferredIpv4")
     if nested.len > 0:
       debugLog("[nimlibp2p] extractPreferredIpv4 mdns.preferredIpv4=" & nested)
@@ -1526,7 +1647,7 @@ proc computeMdnsServiceName(n: NimNode): string =
       if explicit.len > 0:
         return explicit
     let mdnsNode = n.cfg.extra.getOrDefault("mdns")
-    if mdnsNode.kind == JObject:
+    if not mdnsNode.isNil and mdnsNode.kind == JObject:
       let nested = jsonGetStr(mdnsNode, "service")
       if nested.len > 0:
         return nested
@@ -2588,7 +2709,25 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
   builder = builder.withTcpTransport()
   debugLog("[nimlibp2p] buildSwitch applied TCP transport")
   when defined(libp2p_msquic_experimental):
-    builder = builder.withMsQuicTransport()
+    var msquicBuilderCfg = MsQuicTransportBuilderConfig.init()
+    let prefRes = configuredQuicRuntimePreference(cfg.extra)
+    if prefRes.isErr:
+      return err(prefRes.error)
+    if prefRes.get().isSome:
+      msquicBuilderCfg.config.setRuntimePreference(prefRes.get().get())
+      debugLog(
+        "[nimlibp2p] buildSwitch applied QUIC runtime preference=" &
+        quicRuntimePreferenceLabel(prefRes.get().get())
+      )
+    let explicitRuntimePath = configuredQuicRuntimeLibraryPath(cfg.extra)
+    if explicitRuntimePath.len > 0:
+      msquicBuilderCfg.config.loadOptions.explicitPath = explicitRuntimePath
+      msquicBuilderCfg.config.loadOptions.allowFallback = false
+      debugLog(
+        "[nimlibp2p] buildSwitch applied QUIC runtime library path=" &
+        explicitRuntimePath
+      )
+    builder = builder.withMsQuicTransport(msquicBuilderCfg)
     debugLog("[nimlibp2p] buildSwitch applied MsQuic transport")
   builder = builder.withYamux()
   debugLog("[nimlibp2p] buildSwitch applied Yamux")
@@ -2759,6 +2898,7 @@ proc runCommand(
             command.errorMsg = errMsg
     of cmdStop:
       if not n.started:
+        n.stopRequested = true
         info "cmdStop: node already stopped"
         command.resultCode = NimResultOk
       else:
@@ -2996,6 +3136,11 @@ proc runCommand(
         if ident.keyPath.isSome:
           diagnostics["identityKeyPath"] = %ident.keyPath.get()
       when defined(libp2p_msquic_experimental):
+        let transportStats = n.switchInstance.msquicTransportStats()
+        let runtimeInfo =
+          if transportStats.len > 0: transportStats[0].runtime
+          else: unavailableQuicRuntimeInfo()
+        diagnostics["quicRuntime"] = quicRuntimeInfoToJson(runtimeInfo, n.cfg.extra)
         emitMsQuicStats(n, "diagnostics")
       command.stringResult = $diagnostics
       command.resultCode = NimResultOk
@@ -3868,6 +4013,33 @@ proc submitCommand(node: NimNode, cmd: Command): Command =
   )
   cmd
 
+proc submitCommandAsync(node: NimNode, cmd: Command): cint =
+  node.stateLock.acquire()
+  let active = node.running
+  node.stateLock.release()
+  if not active:
+    warn "submitCommandAsync rejected: node not running", kind = $cmd.kind
+    cmd.resultCode = NimResultInvalidState
+    return NimResultInvalidState
+  info "submitCommandAsync", kind = $cmd.kind, pending = node.pendingCommands
+  node.commandLock.acquire()
+  node.commandQueue.add(cmd)
+  let queueLen = node.commandQueue.len
+  node.commandLock.release()
+  let fired = node.signal.fireSync()
+  if fired.isErr():
+    warn "failed to fire thread signal", err = fired.error
+    cmd.resultCode = NimResultError
+    return NimResultError
+  elif fired.get():
+    debugLog(
+      "[nimlibp2p] submitCommandAsync fireSync ok node=" & $cast[int](node) &
+      " kind=" & $cmd.kind &
+      " queued=" & $queueLen
+    )
+  cmd.resultCode = NimResultOk
+  NimResultOk
+
 proc makeCommand(kind: CommandKind): Command =
   acquireCommand(kind)
 
@@ -4004,7 +4176,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
     )
     initLock(node.stateLock)
     debugLog("[nimlibp2p] init stateLock ptr=" & lockAddr(node.stateLock))
-    info "init stateLock", ptr = lockAddr(node.stateLock)
+    debugLog("[nimlibp2p] init stateLock ready")
     initCond(node.stateCond)
     initLock(node.commandLock)
     initLock(node.eventLogLock)
@@ -4013,7 +4185,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
     initLock(node.feedItemsLock)
     initLock(node.peerMultiaddrsLock)
     debugLog("[nimlibp2p] init commandLock ptr=" & lockAddr(node.commandLock))
-    info "init commandLock", ptr = lockAddr(node.commandLock)
+    debugLog("[nimlibp2p] init commandLock ready")
     node.commandQueue = @[]
     node.mdnsEnabled = true
     node.mdnsIntervalSeconds = 2
@@ -5415,10 +5587,13 @@ proc libp2p_adapter_extract_secret*(adaptorSig: cstring, validSig: cstring): cst
 import examples/mpc_crypto
 
 proc libp2p_mpc_keygen_init*(): cstring {.exportc, cdecl, dynlib.} =
-  let (sec, pub) = mpc_keygen_init()
-  let secHex = blindToHex(sec)
-  let pubHex = toHex(secp256k1.SkPublicKey(pub).toRawCompressed())
-  result = cstring(secHex & "|" & pubHex)
+  try:
+    let (sec, pub) = mpc_keygen_init()
+    let secHex = blindToHex(sec)
+    let pubHex = toHex(secp256k1.SkPublicKey(pub).toRawCompressed())
+    result = cstring(secHex & "|" & pubHex)
+  except CatchableError:
+    result = cstring("")
 
 proc libp2p_mpc_keygen_finalize*(localPubHex: cstring, remotePubHex: cstring): cstring {.exportc, cdecl, dynlib.} =
   let lPubBytes = hexToSeqByte($localPubHex)

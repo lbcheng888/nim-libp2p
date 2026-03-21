@@ -261,6 +261,30 @@ suite "GossipSub Integration - Message Handling":
 
     check (await validatorFut) and (await handlerFut)
 
+  asyncTest "GossipSub inbound-created peer can send reverse subscription updates":
+    let nodes =
+      generateNodes(2, gossip = true, verifySignature = false, sign = false)
+
+    startNodesAndDeferStop(nodes)
+
+    # Only dial one way so the receiver first learns this peer via an inbound
+    # pubsub stream. Later subscription updates must still be able to reverse
+    # dial using the negotiated protocol.
+    await connectNodes(nodes[1], nodes[0])
+
+    let handlerFut = newFuture[bool]()
+    proc handler(topic: string, data: seq[byte]) {.async.} =
+      check topic == "foobar"
+      check data == "Hello!".toBytes()
+      if not handlerFut.finished:
+        handlerFut.complete(true)
+
+    nodes[0].subscribe("foobar", handler)
+
+    await waitSub(nodes[1], nodes[0], "foobar")
+    check (await nodes[1].publish("foobar", "Hello!".toBytes())) == 1
+    check await handlerFut.withTimeout(5.seconds)
+
   asyncTest "GossipSub validation should fail (reject)":
     proc handler(topic: string, data: seq[byte]) {.async.} =
       check false # if we get here, it should fail
@@ -535,6 +559,39 @@ suite "GossipSub Integration - Message Handling":
     await connectNodesStar(nodes)
 
     # nodes[0].subscribe("foobar", handler)
+    nodes[1].subscribe("foobar", handler)
+    await waitSub(nodes[0], nodes[1], "foobar")
+
+    tryPublish await nodes[0].publish("foobar", "Hello!".toBytes()), 1
+
+    check await passed.wait(10.seconds)
+
+    check:
+      "foobar" in gossip1.gossipsub
+      "foobar" notin gossip2.gossipsub
+      not gossip1.mesh.hasPeerId("foobar", gossip2.peerInfo.peerId)
+
+  asyncTest "GossipSub send over floodPublish A -> B with unsigned messages":
+    var passed: Future[bool] = newFuture[bool]()
+    proc handler(topic: string, data: seq[byte]) {.async.} =
+      check topic == "foobar"
+      passed.complete(true)
+
+    let nodes = generateNodes(
+      2,
+      gossip = true,
+      triggerSelf = false,
+      verifySignature = false,
+      sign = false,
+      floodPublish = true,
+    )
+
+    startNodesAndDeferStop(nodes)
+    await connectNodesStar(nodes)
+
+    let gossip1 = GossipSub(nodes[0])
+    let gossip2 = GossipSub(nodes[1])
+
     nodes[1].subscribe("foobar", handler)
     await waitSub(nodes[0], nodes[1], "foobar")
 

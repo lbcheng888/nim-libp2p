@@ -34,6 +34,8 @@ type
     decoder: FeedDecoder
     subscriptions: Table[string, TopicSubscription]
     selfPeer: PeerId
+    selfTopicSubscribed: bool
+    selfTopicHandler: TopicHandler
     seenIds: HashSet[string]
     contentFetcher: ContentFetcher
     deduplicate: bool
@@ -101,6 +103,22 @@ proc encodeEntry*(entry: FeedEntry): seq[byte] =
 proc toTopic*(prefix: string, peer: PeerId): string =
   prefix & "/" & $peer
 
+proc ensureSelfTopicSubscription(svc: FeedService) =
+  if svc.isNil or svc.gossip.isNil or svc.selfTopicSubscribed:
+    return
+
+  let topic = toTopic(svc.topicPrefix, svc.selfPeer)
+  if svc.subscriptions.hasKey(topic):
+    svc.selfTopicSubscribed = true
+    return
+
+  let handler: TopicHandler = proc(t: string, payload: seq[byte]) {.async, gcsafe.} =
+    discard
+
+  svc.gossip.subscribe(topic, handler)
+  svc.selfTopicSubscribed = true
+  svc.selfTopicHandler = handler
+
 proc newFeedService*(
     gossip: GossipSub,
     selfPeer: PeerId,
@@ -108,17 +126,20 @@ proc newFeedService*(
     decoder: FeedDecoder = nil,
     topicPrefix = "/content-feed"
 ): FeedService =
-  FeedService(
+  result = FeedService(
     gossip: gossip,
     topicPrefix: topicPrefix,
     handler: handler,
     decoder: (if decoder.isNil: FeedDecoder(defaultDecode) else: decoder),
     subscriptions: initTable[string, TopicSubscription](),
     selfPeer: selfPeer,
+    selfTopicSubscribed: false,
+    selfTopicHandler: nil,
     seenIds: initHashSet[string](),
     contentFetcher: nil,
     deduplicate: true,
   )
+  result.ensureSelfTopicSubscription()
 
 proc subscribeToPeer*(
     svc: FeedService, peer: PeerId
@@ -129,7 +150,7 @@ proc subscribeToPeer*(
   if svc.subscriptions.hasKey(topic):
     return
 
-  let handler = proc(t: string, payload: seq[byte]) {.async.} =
+  let handler: TopicHandler = proc(t: string, payload: seq[byte]) {.async, gcsafe.} =
     var entryOpt: Option[FeedEntry]
     try:
       entryOpt =
@@ -187,6 +208,10 @@ proc subscribeToPeer*(
 
   svc.gossip.subscribe(topic, handler)
   svc.subscriptions[topic] = TopicSubscription(handler: handler)
+  if peer != svc.selfPeer:
+    # A feed subscriber may only have an inbound libp2p connection. Ensure an
+    # outbound pubsub stream exists so the subscription update is actually sent.
+    svc.gossip.subscribePeer(peer)
 
 proc unsubscribeFromPeer*(svc: FeedService, peer: PeerId) =
   if svc.isNil:
@@ -202,12 +227,10 @@ proc publishFeedItem*(
 ): Future[int] {.async.} =
   if svc.isNil:
     return 0
+  svc.ensureSelfTopicSubscription()
   let payload = encodeEntry(entry)
   let topic = toTopic(svc.topicPrefix, svc.selfPeer)
-  discard await svc.gossip.publish(topic, payload)
-  # Gossip publish does not expose downstream subscriber fanout. Once the
-  # publish call succeeds, the local transport handoff is complete.
-  return 1
+  return await svc.gossip.publish(topic, payload)
 
 proc setContentFetcher*(svc: FeedService, fetcher: ContentFetcher) =
   if svc.isNil:

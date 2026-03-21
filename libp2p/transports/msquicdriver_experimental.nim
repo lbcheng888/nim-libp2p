@@ -253,55 +253,61 @@ proc buildAlpnBuffers(alpns: seq[string]): seq[msapi.QuicBuffer] =
         Buffer: cast[ptr uint8](alpn.cstring)
       )
 
-proc safeCloseConfiguration(bridge: RuntimeBridge; configuration: msapi.HQUIC) {.inline.} =
+proc safeCloseConfiguration(bridge: RuntimeBridge; configuration: msapi.HQUIC) {.gcsafe, inline.} =
   if bridge.isNil or configuration.isNil:
     return
-  try:
-    msruntime.closeConfiguration(bridge, configuration)
-  except Exception:
-    discard
+  {.gcsafe.}:
+    try:
+      msruntime.closeConfiguration(bridge, configuration)
+    except Exception:
+      discard
 
-proc safeCloseRegistration(bridge: RuntimeBridge; registration: msapi.HQUIC) {.inline.} =
+proc safeCloseRegistration(bridge: RuntimeBridge; registration: msapi.HQUIC) {.gcsafe, inline.} =
   if bridge.isNil or registration.isNil:
     return
-  try:
-    msruntime.closeRegistration(bridge, registration)
-  except Exception:
-    discard
+  {.gcsafe.}:
+    try:
+      msruntime.closeRegistration(bridge, registration)
+    except Exception:
+      discard
 
-proc safeCloseConnection(bridge: RuntimeBridge; connection: msapi.HQUIC) {.inline.} =
+proc safeCloseConnection(bridge: RuntimeBridge; connection: msapi.HQUIC) {.gcsafe, inline.} =
   if bridge.isNil or connection.isNil:
     return
-  try:
-    msruntime.closeConnection(bridge, connection)
-  except Exception:
-    discard
+  {.gcsafe.}:
+    try:
+      msruntime.closeConnection(bridge, connection)
+    except Exception:
+      discard
 
 proc safeShutdownConnection(
     bridge: RuntimeBridge; connection: msapi.HQUIC; flags: uint32 = 0'u32; errorCode: uint64 = 0'u64
-) {.inline.} =
+) {.gcsafe, inline.} =
   if bridge.isNil or connection.isNil:
     return
-  try:
-    discard msruntime.shutdownConnection(bridge, connection, flags, errorCode)
-  except Exception:
-    discard
+  {.gcsafe.}:
+    try:
+      discard msruntime.shutdownConnection(bridge, connection, flags, errorCode)
+    except Exception:
+      discard
 
-proc safeCloseListener(bridge: RuntimeBridge; listener: msapi.HQUIC) {.inline.} =
+proc safeCloseListener(bridge: RuntimeBridge; listener: msapi.HQUIC) {.gcsafe, inline.} =
   if bridge.isNil or listener.isNil:
     return
-  try:
-    msruntime.closeListener(bridge, listener)
-  except Exception:
-    discard
+  {.gcsafe.}:
+    try:
+      msruntime.closeListener(bridge, listener)
+    except Exception:
+      discard
 
-proc safeCloseStream(bridge: RuntimeBridge; stream: msapi.HQUIC) {.inline.} =
+proc safeCloseStream(bridge: RuntimeBridge; stream: msapi.HQUIC) {.gcsafe, inline.} =
   if bridge.isNil or stream.isNil:
     return
-  try:
-    msruntime.closeStream(bridge, stream)
-  except Exception:
-    discard
+  {.gcsafe.}:
+    try:
+      msruntime.closeStream(bridge, stream)
+    except Exception:
+      discard
 
 proc startListener*(handle: MsQuicTransportHandle; listener: pointer;
     alpns: ptr msapi.QuicBuffer = nil; alpnCount: uint32 = 0;
@@ -1596,7 +1602,7 @@ proc streamId*(state: MsQuicStreamState): Result[uint64, string] {.raises: [].} 
     return err("MsQuic stream state unavailable")
   state.handle.bridge.streamId(state.stream)
 
-proc releaseRegistration(handle: MsQuicTransportHandle) {.raises: [].} =
+proc releaseRegistration(handle: MsQuicTransportHandle) {.gcsafe, raises: [].} =
   if handle.bridge.isNil:
     return
   if not handle.clientConfiguration.isNil:
@@ -1744,6 +1750,77 @@ proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
   initLock(handle.retainLock)
   handle.retainLockInit = true
   (handle, "")
+
+proc ensureClientCredentialLoaded(handle: MsQuicTransportHandle): string {.raises: [].} =
+  if handle.isNil or handle.bridge.isNil or handle.clientConfiguration.isNil or handle.closed:
+    return "MsQuic client configuration unavailable"
+  if not handle.clientTlsBinding.isNil:
+    return ""
+
+  let clientCfg = mstlstypes.TlsConfig(
+    role: mstlstypes.tlsClient,
+    alpns: resolvedAlpns(handle.config),
+    transportParameters: @[],
+    serverName: none(string),
+    certificatePem: none(string),
+    privateKeyPem: none(string),
+    certificateFile: none(string),
+    privateKeyFile: none(string),
+    privateKeyPassword: none(string),
+    pkcs12File: none(string),
+    pkcs12Data: none(seq[uint8]),
+    pkcs12Password: none(string),
+    certificateHash: none(mstlstypes.TlsCertificateHash),
+    certificateStore: none(string),
+    certificateStoreFlags: 0'u32,
+    certificateContext: none(pointer),
+    caCertificateFile: none(string),
+    resumptionTicket: none(seq[uint8]),
+    enableZeroRtt: false,
+    useSharedSessionCache: true,
+    disableCertificateValidation: false,
+    requireClientAuth: false,
+    enableOcsp: false,
+    indicateCertificateReceived: true,
+    deferCertificateValidation: false,
+    useBuiltinCertificateValidation: false,
+    allowedCipherSuites: none(uint32),
+    tempDirectory: none(string)
+  )
+
+  let clientBinding =
+    try:
+      mstls.newTlsCredentialBinding(clientCfg)
+    except CatchableError as exc:
+      return "MsQuic client credential binding failed: " & exc.msg
+    except Exception as exc:
+      return "MsQuic client credential binding raised: " & exc.msg
+
+  let clientCredPtr = mstls.credentialConfigPtr(clientBinding)
+  if clientCredPtr.isNil:
+    clientBinding.cleanup()
+    return "MsQuic client credential config unavailable"
+
+  let apiTable = msruntime.getApiTable(handle.bridge)
+  if apiTable.isNil or apiTable.ConfigurationLoadCredential.isNil:
+    clientBinding.cleanup()
+    return "MsQuic API missing ConfigurationLoadCredential"
+
+  let clientStatus =
+    try:
+      apiTable.ConfigurationLoadCredential(
+        handle.clientConfiguration,
+        cast[pointer](clientCredPtr)
+      )
+    except Exception as exc:
+      clientBinding.cleanup()
+      return "MsQuic client credential load raised: " & exc.msg
+  if clientStatus != msapi.QUIC_STATUS_SUCCESS:
+    clientBinding.cleanup()
+    return fmt"MsQuic client credential load failed: 0x{clientStatus:08x}"
+
+  handle.clientTlsBinding = clientBinding
+  ""
 
 proc loadCredential*(handle: MsQuicTransportHandle; cfg: MsTlsConfig;
     tempDir: string = ""): string {.raises: [].} =
@@ -1906,6 +1983,7 @@ proc createListener*(handle: MsQuicTransportHandle;
   (cast[pointer](listenerHandle), some(state), "")
 
 proc attachIncomingConnection*(handle: MsQuicTransportHandle; connection: pointer;
+    handler: MsQuicConnectionHandler = nil; userContext: pointer = nil;
     queueLimit: int = 0; pollInterval: Duration = DefaultEventPollInterval):
     tuple[state: Option[MsQuicConnectionState], error: string] {.raises: [].} =
   if handle.isNil or handle.bridge.isNil or handle.closed:
@@ -1922,8 +2000,8 @@ proc attachIncomingConnection*(handle: MsQuicTransportHandle; connection: pointe
     handle,
     effectiveQueueLimit,
     effectivePoll,
-    handler = nil,
-    userContext = nil
+    handler = handler,
+    userContext = userContext
   )
   if stateRes.isErr():
     return (none(MsQuicConnectionState), stateRes.error)
@@ -1972,6 +2050,7 @@ proc attachIncomingConnection*(handle: MsQuicTransportHandle; connection: pointe
   (some(state), "")
 
 proc attachIncomingConnectionAdopted*(handle: MsQuicTransportHandle; connection: pointer;
+    handler: MsQuicConnectionHandler = nil; userContext: pointer = nil;
     queueLimit: int = 0; pollInterval: Duration = DefaultEventPollInterval):
     tuple[state: Option[MsQuicConnectionState], error: string] {.raises: [].} =
   if handle.isNil or handle.bridge.isNil or handle.closed:
@@ -1988,8 +2067,8 @@ proc attachIncomingConnectionAdopted*(handle: MsQuicTransportHandle; connection:
     handle,
     effectiveQueueLimit,
     effectivePoll,
-    handler = nil,
-    userContext = nil
+    handler = handler,
+    userContext = userContext
   )
   if stateRes.isErr():
     return (none(MsQuicConnectionState), stateRes.error)
@@ -2067,6 +2146,12 @@ proc dialConnection*(handle: MsQuicTransportHandle; serverName: string; port: ui
   let dialConfig =
     if handle.clientConfiguration.isNil: handle.configuration
     else: handle.clientConfiguration
+  if dialConfig == handle.clientConfiguration:
+    let clientCredErr = ensureClientCredentialLoaded(handle)
+    if clientCredErr.len > 0:
+      safeCloseConnection(handle.bridge, connection)
+      state.close()
+      return (nil, none(MsQuicConnectionState), clientCredErr)
 
   let bindHost = handle.config.clientBindHost.strip()
   if bindHost.len > 0 and bindHost != "0.0.0.0" and bindHost != "::":
@@ -2444,6 +2529,54 @@ proc setConnectionAddressParam(
   if status != msapi.QUIC_STATUS_SUCCESS:
     return fmt"MsQuic ConnectionSetParam failed: 0x{status:08x}"
   ""
+
+proc setConnectionBoolParam*(
+    handle: MsQuicTransportHandle;
+    connection: pointer;
+    paramId: uint32;
+    enabled: bool
+): string {.gcsafe, raises: [].} =
+  if handle.isNil or handle.bridge.isNil or connection.isNil:
+    return "MsQuic transport handle unavailable"
+  let api = msruntime.getApiTable(handle.bridge)
+  if api.isNil or api.SetParam.isNil:
+    return "MsQuic API missing SetParam"
+
+  var value = if enabled: uint8(1) else: uint8(0)
+  var status = msapi.QUIC_STATUS_SUCCESS
+  {.gcsafe.}:
+    try:
+      status = api.SetParam(
+        cast[msapi.HQUIC](connection),
+        paramId,
+        uint32(sizeof(value)),
+        addr value
+      )
+    except Exception as exc:
+      return "MsQuic ConnectionSetParam raised: " & exc.msg
+  if status != msapi.QUIC_STATUS_SUCCESS:
+    return fmt"MsQuic ConnectionSetParam failed: 0x{status:08x}"
+  ""
+
+proc enableConnectionDatagramReceive*(
+    handle: MsQuicTransportHandle; connection: pointer; enabled = true
+): string {.inline, gcsafe, raises: [].} =
+  setConnectionBoolParam(
+    handle,
+    connection,
+    msparams.QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED,
+    enabled
+  )
+
+proc enableConnectionDatagramSend*(
+    handle: MsQuicTransportHandle; connection: pointer; enabled = true
+): string {.inline, gcsafe, raises: [].} =
+  setConnectionBoolParam(
+    handle,
+    connection,
+    msparams.QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED,
+    enabled
+  )
 
 proc setConnectionLocalAddress*(handle: MsQuicTransportHandle; connection: pointer;
     address: TransportAddress): string {.raises: [].} =

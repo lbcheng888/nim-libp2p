@@ -12,12 +12,12 @@ when defined(libp2p_msquic_experimental):
       checkTrackers()
 
     asyncTest "certhash history is reloaded during startup":
-      let (handle, initErr) = msdriver.initMsQuicTransport()
+      let (handle, initErr) = initMsQuicTransportForAsync()
       if initErr.len > 0 or handle.isNil:
         echo "MsQuic runtime unavailable: ", initErr
         skip()
         return
-      handle.shutdown()
+      shutdownMsQuicTransportForAsync(handle)
 
       let rng = newRng()
       let keyPair = KeyPair.random(PKScheme.Ed25519, rng[]).get()

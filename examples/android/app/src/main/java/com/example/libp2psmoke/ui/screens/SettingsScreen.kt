@@ -28,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.libp2psmoke.model.NodeUiState
+import com.example.libp2psmoke.model.QuicRuntimePreferenceOption
 import com.example.libp2psmoke.ui.UiIntent
 import com.example.libp2psmoke.ui.components.*
 import com.example.libp2psmoke.ui.theme.*
@@ -188,6 +189,62 @@ fun SettingsScreen(uiState: NodeUiState, viewModel: NimNodeViewModel) {
                         shape = RoundedCornerShape(12.dp)
                     )
                     Spacer(Modifier.height(12.dp))
+                    Text(
+                        "QUIC Runtime",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Active: ${uiState.quicRuntimeStatus.displayName}",
+                        color = if (uiState.quicRuntimeStatus.loaded) DexGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        buildString {
+                            append("Requested: ")
+                            append(uiState.quicRuntimeStatus.requestedPreference.displayName)
+                            if (uiState.quicRuntimeStatus.pureNim) {
+                                append(" · pure Nim active")
+                            } else if (uiState.quicRuntimeStatus.loaded) {
+                                append(" · native runtime active")
+                            }
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp
+                    )
+                    if (uiState.quicRuntimeStatus.activePath.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Loaded library: ${uiState.quicRuntimeStatus.activePath}",
+                            style = AddressStyle,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    QuicRuntimePreferenceChips(
+                        selected = uiState.quicRuntimePreference,
+                        onSelected = {
+                            viewModel.onEvent(UiIntent.UpdateQuicRuntimePreference(it))
+                        }
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = uiState.quicRuntimeLibraryPath,
+                        onValueChange = { viewModel.onEvent(UiIntent.UpdateQuicRuntimeLibraryPath(it)) },
+                        label = { Text("QUIC library path (optional)") },
+                        placeholder = { Text("/data/local/tmp/libmsquic.so") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 1,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Leave blank to use the selected runtime mode's default search order.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp
+                    )
                     Button(
                         onClick = { viewModel.onEvent(UiIntent.ApplyNetworkConfig) },
                         modifier = Modifier.fillMaxWidth(),
@@ -226,6 +283,39 @@ fun SettingsScreen(uiState: NodeUiState, viewModel: NimNodeViewModel) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontSize = 12.sp,
             modifier = Modifier.align(Alignment.CenterHorizontally)
+        )
+    }
+}
+
+@Composable
+private fun QuicRuntimePreferenceChips(
+    selected: QuicRuntimePreferenceOption,
+    onSelected: (QuicRuntimePreferenceOption) -> Unit
+) {
+    val options = QuicRuntimePreferenceOption.values().toList()
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            options.take(2).forEach { option ->
+                FilterChip(
+                    selected = selected == option,
+                    onClick = { onSelected(option) },
+                    label = { Text(option.displayName) }
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            options.drop(2).forEach { option ->
+                FilterChip(
+                    selected = selected == option,
+                    onClick = { onSelected(option) },
+                    label = { Text(option.displayName) }
+                )
+            }
+        }
+        Text(
+            selected.summary,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 12.sp
         )
     }
 }

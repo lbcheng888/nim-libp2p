@@ -21,12 +21,16 @@
   - 若未找到且设置了 `MSQUIC_BOOTSTRAP_URL`，自动下载解压并设定 `NIM_MSQUIC_LIB`。
   使用者也可以直接独立运行 `scripts/nim/bootstrap_msquic.sh env`，然后 `eval` 其输出以持久化环境变量。
 
-### 2.2 纯 Nim Fallback（开发 / CI 场景，可选）
+### 2.2 纯 Nim builtin runtime（开发 / CI / 长期路线）
 
 - 默认 **不会** 自动切换到纯 Nim 版本，未找到原生库时会直接报错，确保线上/联调必走真实 MsQuic。  
-- 若确需使用内置纯 Nim 实现（`api_impl.nim`）进行快速逻辑回归，请显式设置：
+- 若需使用内置纯 Nim 实现（`api_impl.nim`）进行逻辑回归，或沿长期路线推进纯 Nim backend，请显式设置：
   - `NIM_MSQUIC_USE_BUILTIN=1`
-- 该模式只模拟 MsQuic 行为，不提供真实 QUIC 数据面性能。
+- 该 runtime 属于当前仓库内唯一的纯 Nim QUIC backend；它不是单独的第二实现，而是
+  MsQuic-compatible builtin runtime。
+- builtin 是长期默认目标，但当前仍未切为默认。
+- native MsQuic 继续作为当前默认运行路径、行为基线、性能基线和显式回退路径存在。
+- 现阶段 builtin 仍不等价于原生 MsQuic 的真实数据面性能。
 
 ## 3. 验证流程
 
@@ -80,7 +84,9 @@ nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.ni
 
 ## 6. 纯 Nim QUIC 路线图
 
-长期路线与里程碑见 `docs/transports/nim_quic_roadmap.md`。
+长期路线与里程碑见 `docs/transports/nim_quic_roadmap.md`。该文档当前讨论的是
+`nim-msquic` builtin runtime 的演进，而不是仓库外独立 `nim-quic` 实现的接入。
+本文件只保留运维、现状和摘要，不再作为长期计划的主维护位置。
 
 ### 5.1 B1 运行时驱动拆解
 
@@ -156,31 +162,36 @@ nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.ni
 
 > 当前处于设计阶段（B1.b3 ▶）：上表给出了四个正交子任务，后续可以逐项实现并在矩阵中更新状态。
 
-### 5.4 与 `nim-quic` 的融合方案
+### 5.4 builtin 纯 Nim runtime 的长期收敛方案
 
-`nim-libp2p/libp2p/nim-quic/` 维护了一套独立的 QUIC 实现（协议栈、配置、测试齐备），若想与当前 MsQuic 路线融合，可按以下步骤推进：
+当前仓库并不存在单独的 `libp2p/nim-quic/` 源码树。长期纯 Nim 路线直接基于
+`libp2p/transports/nim-msquic` 的 builtin runtime 推进。
 
-| 子任务 | 说明 | 依赖 |
+| 子任务 | 说明 | 状态 |
 | --- | --- | --- |
-| **Q1** 能力盘点与差异分析 | 罗列 `nim-quic` 已实现的协议（QUIC Crypto、Streams、HTTP/3）与 libp2p 需求（WebTransport、Noise/TLS、ResourceManager）；输出差异文档 | ✅（见“5.5 nim-quic vs MsQuic 差异总结”） |
-| **Q2** API 对齐层设计 | 设计一个统一的 `QuicRuntime` 接口，抽象出连接/流、握手、证书、Datagram、metrics，供 MsQuic 与 nim-quic 双实现复用 | ✅（`docs/transports/quic_runtime.md` 设计稿，见下节摘要） |
-| **Q3** 迁移/封装 nim-quic 模块 | 将 `nim-quic` 的 `quic.nim`、配置、事件模型以模块方式引入 `libp2p/transports`，与新 `QuicRuntime` 对齐；保留原项目的测试 | Q2 |
-| **Q4** 互操作验证 | 使用 nim-quic 驱动跑通 libp2p WebTransport/DirectMessage/Feed 测试，与 MsQuic/OpenSSL 结果比对，确认可作为第二实现 | Q3、W1/W2 |
+| **Q1** Runtime 契约收敛 | 用统一 `QuicRuntime` 收口 connect/listen/stream/datagram/event/error | ✅ |
+| **Q2** transport 接线 | 让 `msquictransport` / `msquicconnection` 通过 runtime-neutral façade 工作 | ✅ |
+| **Q3** 协议与业务语义补齐 | 补齐 builtin runtime 的 QUIC core、TLS、HTTP/3、WebTransport、Datagram 语义 | ▶ |
+| **Q4** 性能与生产硬化 | 补齐拥塞恢复、指标、fuzz、soak、多平台稳定性 | ⏳ |
 
-> 该方案与 MsQuic 路线不是互斥关系：MsQuic 侧重官方 QUIC 栈，而 nim-quic 可作为备用实现或实验场。推进 Q1~Q4 需要专门的设计评审与资源投入，建议在 B1/W1 形成稳定基础后启动。
+> 当前长期目标不是“接入第二套实现”，而是把 builtin 纯 Nim runtime 提升为默认 backend，
+> 同时保留 native MsQuic 作为基线和回退。阶段定义与默认切换门槛以
+> `docs/transports/nim_quic_roadmap.md` 为准。
 
-### 5.5 nim-quic vs MsQuic 能力差异（Q1）
+### 5.5 builtin 纯 Nim runtime vs 原生 MsQuic 差异
 
-| 模块 | nim-quic 现状 | libp2p 需求 | 差异/备注 |
+| 模块 | builtin 纯 Nim runtime 现状 | libp2p 需求 | 差异/备注 |
 | --- | --- | --- | --- |
-| 基础 QUIC 栈 | 自研 QUIC 协议实现（握手、crypto、streams）；可编译为纯 Nim 库 | libp2p 目前通过 OpenSSL QUIC 或 MsQuic 获取传输能力 | nim-quic 已有完整 QUIC core，可作为替代 runtime |
-| HTTP/3 / H3 Datagrams | nim-quic 提供 HTTP/3 控制流与数据面（`quic/h3` 模块） | libp2p 依赖 HTTP/3 CONNECT + DATAGRAM 用于 WebTransport | MsQuic 已完成 W1/W3，对照 nim-quic 仍缺 WebTransport 握手/certhash |
-| WebTransport | 无直接实现（需在 HTTP/3 基础上扩展） | libp2p `quictransport` 中已有 WebTransport 握手、certhash、session 限流 | 缺：WebTransport-specific handshake、certhash、会话管理 |
-| Noise/TLS 升级 | nim-quic 以 QUIC crypto 自身握手，未与 libp2p Noise/TLS 交互 | libp2p 使用 Noise/TLS 作为安全层，QUIC 传输只负责底层 bytes | 需定义 `QuicRuntime` 以供 Noise/TLS 复用（Q2） |
-| Resource/Bandwidth 管理 | 无 libp2p ResourceManager/BandwidthManager 钩子 | libp2p 需要 per-conn/stream 计费与限额 | 需在封装层增补 |
-| Diagnostics/metrics | nim-quic 提供自身日志/统计 | libp2p 需要统一 metrics（WebTransport、driver switch 等） | 需在桥接层映射 |
+| Runtime 接口 | 已通过 `QuicRuntime` 暴露统一 connect/listen/stream/event/handler façade | transport 只应感知统一 runtime 契约 | 这层已收敛 |
+| 基础 QUIC 栈 | `nim-msquic` 已有连接、流、TLS、拥塞等模块骨架 | 需要完整状态机、错误语义、参数协商 | 仍需补齐协议细节与回归 |
+| HTTP/3 / WebTransport | 可复用现有 transport 抽象，但 builtin runtime 仍需继续拉齐行为 | 依赖 CONNECT、SETTINGS、Datagram、certhash、session 限额 | 业务语义尚未完全追平 |
+| Resource/Bandwidth 管理 | transport 层已具备接线点 | 需要 per-conn/stream 计费与限额 | 需继续沿 builtin runtime 打通 |
+| Diagnostics/metrics | 已能区分 builtin/native runtime | 需要完整运行时指标与端到端诊断 | 需继续扩展 |
+| 性能 / 稳定性 | 适合逻辑回归与协议演进 | 需要接近原生 MsQuic 的 RTT/吞吐和长期 soak | 这是长期目标的主要缺口 |
 
-> 结论：nim-quic 已具备 QUIC/H3 核心，可作为候选 runtime。但要用于 libp2p，需要在外层补齐 WebTransport、Noise/TLS 集成、ResourceManager/metrics 等功能。设计与实现应按 Q2–Q4 的顺序推进。
+> 结论：builtin runtime 已经是仓库内的纯 Nim QUIC 主线，但距离完整生产 backend
+> 还差协议完备性、业务语义、性能硬化，以及达到“默认切换标准”这四块。具体阈值见
+> `docs/transports/nim_quic_roadmap.md`。
 
 ## 6. 移动端互通排障笔记（2024-11）
 

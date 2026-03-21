@@ -64,6 +64,7 @@ struct NimBridge {
     using CStringHandleIntFn = char *(*)(void *, int);
     using CStringPeerFn = char *(*)(void *, const char *);
     using CStringPeerStringFn = char *(*)(void *, const char *, const char *);
+    using CStringStringIntFn = char *(*)(const char *, int);
     using LastErrorFn = char *(*)();
     using StringFreeFn = void (*)(char *);
     using BoolHandleFn = bool (*)(void *);
@@ -144,6 +145,7 @@ struct NimBridge {
     LastErrorFn getLastError = nullptr;
     StringFreeFn stringFree = nullptr;
     CStringHandleIntFn pollEvents = nullptr;
+    CStringStringIntFn nativeNcProbe = nullptr;
 
     std::mutex mutex;
 } g_nim;
@@ -346,6 +348,7 @@ bool ensureLibraryLoadedLocked()
         !loadSymbol(handle, "libp2p_mdns_set_enabled", g_nim.mdnsSetEnabled) ||
         !loadSymbol(handle, "libp2p_mdns_set_interface", g_nim.mdnsSetInterface) ||
         !loadSymbolOptional(handle, "libp2p_mdns_debug", g_nim.mdnsDebug) ||
+        !loadSymbolOptional(handle, "libp2p_native_nc_probe", g_nim.nativeNcProbe) ||
         !loadSymbol(handle, "libp2p_generate_identity_json", g_nim.generateIdentity) ||
         !loadSymbol(handle, "libp2p_identity_from_seed", g_nim.identityFromSeed) ||
         !loadSymbol(handle, "libp2p_register_peer_hints", g_nim.registerPeerHints) ||
@@ -1518,6 +1521,98 @@ napi_value napiConnectMultiaddrAsync(napi_env env, napi_callback_info info)
     return promise;
 }
 
+napi_value napiPortProbeJson(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        napiThrowError(env, "portProbeJson(targetsJson[, timeoutMs]) required");
+        return nullptr;
+    }
+    ThreadScope scope;
+    const std::string targetsJson = napiValueToString(env, args[0]);
+    int32_t timeoutMs = 15000;
+    if (argc >= 2) {
+        napi_get_value_int32(env, args[1], &timeoutMs);
+    }
+    if (targetsJson.empty() || !g_nim.nativeNcProbe) {
+        napi_value empty;
+        napi_create_string_utf8(env, "{\"ok\":false,\"error\":\"probe_unavailable\",\"results\":[]}", NAPI_AUTO_LENGTH, &empty);
+        return empty;
+    }
+    return wrapString(env, g_nim.nativeNcProbe(targetsJson.c_str(), timeoutMs));
+}
+
+napi_value napiPortProbeJsonAsync(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        napiThrowError(env, "portProbeJsonAsync(targetsJson[, timeoutMs]) required");
+        return nullptr;
+    }
+
+    struct AsyncPortProbeWork {
+        std::string targetsJson;
+        int32_t timeoutMs;
+        napi_deferred deferred;
+        napi_async_work work;
+        std::string result;
+    };
+
+    auto *workData = new AsyncPortProbeWork();
+    workData->targetsJson = napiValueToString(env, args[0]);
+    workData->timeoutMs = 15000;
+    if (argc >= 2) {
+        napi_get_value_int32(env, args[1], &workData->timeoutMs);
+    }
+    workData->deferred = nullptr;
+    workData->work = nullptr;
+    workData->result = "{\"ok\":false,\"error\":\"probe_unavailable\",\"results\":[]}";
+
+    napi_value promise;
+    napi_create_promise(env, &workData->deferred, &promise);
+
+    napi_value resourceName;
+    napi_create_string_utf8(env, "portProbeJsonAsync", NAPI_AUTO_LENGTH, &resourceName);
+
+    auto execute = [](napi_env envExec, void *data) {
+        auto *ctx = static_cast<AsyncPortProbeWork *>(data);
+        ThreadScope scope;
+        if (ctx->targetsJson.empty() || !g_nim.nativeNcProbe) {
+            return;
+        }
+        char *raw = g_nim.nativeNcProbe(ctx->targetsJson.c_str(), ctx->timeoutMs);
+        if (raw != nullptr) {
+            ctx->result.assign(raw);
+            if (g_nim.stringFree) {
+                g_nim.stringFree(raw);
+            }
+        }
+    };
+
+    auto complete = [](napi_env envComp, napi_status status, void *data) {
+        auto *ctx = static_cast<AsyncPortProbeWork *>(data);
+        if (status == napi_ok) {
+            napi_value output;
+            napi_create_string_utf8(envComp, ctx->result.c_str(), NAPI_AUTO_LENGTH, &output);
+            napi_resolve_deferred(envComp, ctx->deferred, output);
+        } else {
+            napi_value error;
+            napi_create_string_utf8(envComp, "portProbeJsonAsync failed", NAPI_AUTO_LENGTH, &error);
+            napi_reject_deferred(envComp, ctx->deferred, error);
+        }
+        napi_delete_async_work(envComp, ctx->work);
+        delete ctx;
+    };
+
+    napi_create_async_work(env, nullptr, resourceName, execute, complete, workData, &workData->work);
+    napi_queue_async_work(env, workData->work);
+    return promise;
+}
+
 napi_value napiKeepAlivePin(napi_env env, napi_callback_info info)
 {
     size_t argc = 2;
@@ -2379,6 +2474,8 @@ napi_value initModule(napi_env env, napi_value exports)
         {"disconnectPeer", nullptr, napiDisconnectPeer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connectMultiaddr", nullptr, napiConnectMultiaddr, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connectMultiaddrAsync", nullptr, napiConnectMultiaddrAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"portProbeJson", nullptr, napiPortProbeJson, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"portProbeJsonAsync", nullptr, napiPortProbeJsonAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendDirect", nullptr, napiSendDirect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendDirectAsync", nullptr, napiSendDirectAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"keepAlivePin", nullptr, napiKeepAlivePin, nullptr, nullptr, nullptr, napi_default, nullptr},

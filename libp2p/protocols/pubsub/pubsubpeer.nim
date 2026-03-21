@@ -127,6 +127,7 @@ type
     codec*: string # the protocol that this peer joined from
     sendConn*: Connection # cached send connection
     connectedFut: Future[void]
+    connecting: bool
     address*: Option[MultiAddress]
     peerId*: PeerId
     handler*: RPCHandler
@@ -336,11 +337,14 @@ proc connectImpl(p: PubSubPeer) {.async: (raises: []).} =
     debug "Could not establish send connection", description = exc.msg
   except GetConnDialError as exc:
     debug "Could not establish send connection", description = exc.msg
+  finally:
+    p.connecting = false
 
 proc connect*(p: PubSubPeer) =
-  if p.connected:
+  if p.connected or p.connecting or p.disconnected:
     return
 
+  p.connecting = true
   asyncSpawn connectImpl(p)
 
 proc hasSendConn*(p: PubSubPeer): bool =
@@ -384,6 +388,7 @@ proc sendMsgSlow(p: PubSubPeer, msg: seq[byte]) {.async: (raises: [CancelledErro
   # Slow path of `sendMsg` where msg is held in memory while send connection is
   # being set up
   if p.sendConn == nil:
+    p.connect()
     # Wait for a send conn to be setup. `connectOnce` will
     # complete this even if the sendConn setup failed
     discard await race(p.connectedFut)
@@ -627,6 +632,7 @@ proc new*(
     codec: codec,
     peerId: peerId,
     connectedFut: newFuture[void](),
+    connecting: false,
     maxMessageSize: maxMessageSize,
     overheadRateLimitOpt: overheadRateLimitOpt,
     rpcmessagequeue: RpcMessageQueue.new(),

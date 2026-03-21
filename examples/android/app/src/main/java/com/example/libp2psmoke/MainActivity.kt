@@ -2,6 +2,7 @@ package com.example.libp2psmoke
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
@@ -54,6 +55,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.libp2psmoke.dex.DexKlineBucket
 import com.example.libp2psmoke.dex.OrderBookEntry
@@ -62,6 +64,7 @@ import com.example.libp2psmoke.mixer.MixerTab
 import com.example.libp2psmoke.model.ChainWallet
 import com.example.libp2psmoke.model.FeedEntry
 import com.example.libp2psmoke.model.NodeUiState
+import com.example.libp2psmoke.native.NimBridge
 import com.example.libp2psmoke.ui.UiIntent
 import com.example.libp2psmoke.ui.NimUiFrameClock
 import com.example.libp2psmoke.ui.components.*
@@ -69,6 +72,8 @@ import com.example.libp2psmoke.ui.theme.*
 import com.example.libp2psmoke.viewmodel.NimNodeViewModel
 import java.math.BigDecimal
 import java.math.RoundingMode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import com.example.libp2psmoke.ui.screens.*
 import com.example.libp2psmoke.ui.utils.*
 
@@ -86,6 +91,45 @@ class MainActivity : ComponentActivity() {
                 ProLibp2pApp(uiState = uiState, viewModel = viewModel, windowSizeClass = windowSizeClass)
             }
         }
+        maybeRunStartupProbe(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        maybeRunStartupProbe(intent)
+    }
+
+    private fun maybeRunStartupProbe(intent: Intent?) {
+        Log.i(
+            PROBE_TAG,
+            "startup probe inspect action=${intent?.action} data=${intent?.dataString} extras=${intent?.extras?.keySet()?.joinToString()} rawTargets=${intent?.extras?.get(EXTRA_PROBE_TARGETS)}"
+        )
+        val targetsJson = intent?.getStringExtra(EXTRA_PROBE_TARGETS)?.trim().orEmpty()
+        if (targetsJson.isEmpty()) {
+            Log.i(PROBE_TAG, "startup probe skipped: targets extra missing or empty")
+            return
+        }
+        val timeoutMs = (intent?.getIntExtra(EXTRA_PROBE_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS)
+            ?: DEFAULT_PROBE_TIMEOUT_MS).coerceAtLeast(1)
+        val label = intent?.getStringExtra(EXTRA_PROBE_LABEL)?.ifBlank { "android" } ?: "android"
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                Log.i(PROBE_TAG, "startup probe begin label=$label timeoutMs=$timeoutMs targets=$targetsJson")
+                val payload = NimBridge.portProbeJson(targetsJson, timeoutMs).orEmpty()
+                Log.i(PROBE_TAG, "startup probe result label=$label payload=$payload")
+            } catch (e: Exception) {
+                Log.e(PROBE_TAG, "startup probe failed label=$label", e)
+            }
+        }
+    }
+
+    companion object {
+        private const val EXTRA_PROBE_TARGETS = "nimProbeTargets"
+        private const val EXTRA_PROBE_TIMEOUT_MS = "nimProbeTimeoutMs"
+        private const val EXTRA_PROBE_LABEL = "nimProbeLabel"
+        private const val DEFAULT_PROBE_TIMEOUT_MS = 15000
+        private const val PROBE_TAG = "NimPortProbe"
     }
 }
 

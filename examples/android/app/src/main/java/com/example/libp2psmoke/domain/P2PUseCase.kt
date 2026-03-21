@@ -3,9 +3,11 @@ package com.example.libp2psmoke.domain
 import com.example.libp2psmoke.BuildConfig
 import com.example.libp2psmoke.core.Constants
 import com.example.libp2psmoke.core.DexError
+import com.example.libp2psmoke.core.QuicRuntimeJson
 import com.example.libp2psmoke.core.SecureLogger
 import com.example.libp2psmoke.dex.DexRepositoryV2
 import com.example.libp2psmoke.model.DirectMessage
+import com.example.libp2psmoke.model.QuicRuntimePreferenceOption
 import com.example.libp2psmoke.mixer.MixerSessionStatus
 import com.example.libp2psmoke.native.NimBridge
 import kotlinx.coroutines.CoroutineScope
@@ -59,7 +61,9 @@ class P2PUseCase(
      */
     fun startNode(
         bootstrapPeers: List<String>,
-        relayPeers: List<String>
+        relayPeers: List<String>,
+        quicRuntimePreference: QuicRuntimePreferenceOption,
+        quicRuntimeLibraryPath: String
     ) {
         if (handle != 0L) return
         dexInitialized.set(false)
@@ -71,6 +75,11 @@ class P2PUseCase(
             val extra = JSONObject().apply {
                 put("bootstrapMultiaddrs", JSONArray(bootstrapPeers))
                 put("relayMultiaddrs", JSONArray(relayPeers))
+                QuicRuntimeJson.applyRequestedConfig(
+                    extra = this,
+                    preference = quicRuntimePreference,
+                    libraryPath = quicRuntimeLibraryPath
+                )
             }
             val config = JSONObject().apply {
                 put("dataDir", dataDir.absolutePath)
@@ -204,6 +213,13 @@ class P2PUseCase(
         val currentHandle = handle
         if (currentHandle == 0L) return null
         val raw = NimBridge.uiFrameSnapshot(currentHandle, maxEvents, discoveryLimit) ?: return null
+        return runCatching { JSONObject(raw) }.getOrNull()
+    }
+
+    fun fetchDiagnostics(): JSONObject? {
+        val currentHandle = handle
+        if (currentHandle == 0L) return null
+        val raw = NimBridge.diagnosticsJson(currentHandle) ?: return null
         return runCatching { JSONObject(raw) }.getOrNull()
     }
 

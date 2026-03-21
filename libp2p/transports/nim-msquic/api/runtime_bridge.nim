@@ -11,12 +11,14 @@ from ./api_impl import QuicApiTable, QUIC_STATUS, QUIC_STATUS_SUCCESS,
     QuicStreamCallback, QuicRegistrationConfigC, QuicBuffer, QUIC_STREAM_OPEN_FLAGS,
     QUIC_STREAM_START_FLAGS, QUIC_STREAM_SHUTDOWN_FLAGS, QUIC_SEND_FLAGS,
     QUIC_CONNECTION_SHUTDOWN_FLAGS, QUIC_UINT62, QuicConnectionEvent,
-    QuicConnectionEventConnectedPayload, QUIC_CONNECTION_EVENT_CONNECTED
+    QuicConnectionEventConnectedPayload, QUIC_CONNECTION_EVENT_CONNECTED,
+    registerConnectionEventHandler
 from ./param_catalog import QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED,
     QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED, QUIC_PARAM_STREAM_ID
 import ./event_model
 
 const
+  BuiltinRuntimeName = "builtin-nim-quic-native"
   QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT = 1'u32
   QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER = 2'u32
   QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE = 3'u32
@@ -183,6 +185,26 @@ proc copyAlpn(payload: ptr QuicConnectionEventConnectedPayload): string =
   let length = int(payload.NegotiatedAlpnLength)
   result = newString(length)
   copyMem(addr result[0], payload.NegotiatedAlpn, length)
+
+proc isBuiltinRuntime(bridge: RuntimeBridge): bool {.inline.} =
+  not bridge.isNil and bridge.runtime.path == BuiltinRuntimeName
+
+proc connectionExtensionEventForwarder(event: ConnectionEvent) {.gcsafe.} =
+  if event.kind notin {
+      ceDatagramStateChanged, ceDatagramReceived, ceSettingsApplied, ceParameterUpdated
+    }:
+    return
+  if event.userContext.isNil:
+    return
+  let ctx = cast[ConnectionCallbackContext](event.userContext)
+  if ctx.isNil or ctx.handler.isNil:
+    return
+  var forwarded = event
+  forwarded.userContext = ctx.userContext
+  try:
+    ctx.handler(forwarded)
+  except Exception:
+    discard
 
 proc convertConnectionEvent(connection: HQUIC;
     eventPtr: ptr QuicConnectionEvent; userContext: pointer): ConnectionEvent =
@@ -594,6 +616,8 @@ proc openConnection*(bridge: RuntimeBridge; registration: HQUIC;
     return QUIC_STATUS_INVALID_STATE
   bridge.storeConnectionContext(tmp, ctx)
   bridge.api.SetCallbackHandler(tmp, cast[pointer](connectionCallbackShim), cast[pointer](ctx))
+  if bridge.isBuiltinRuntime():
+    registerConnectionEventHandler(tmp, connectionExtensionEventForwarder)
   connection = tmp
   QUIC_STATUS_SUCCESS
 
@@ -610,6 +634,8 @@ proc adoptConnection*(bridge: RuntimeBridge; connection: HQUIC;
   )
   bridge.storeConnectionContext(connection, ctx)
   bridge.api.SetCallbackHandler(connection, cast[pointer](connectionCallbackShim), cast[pointer](ctx))
+  if bridge.isBuiltinRuntime():
+    registerConnectionEventHandler(connection, connectionExtensionEventForwarder)
   QUIC_STATUS_SUCCESS
 
 proc shutdownConnection*(bridge: RuntimeBridge; connection: HQUIC;

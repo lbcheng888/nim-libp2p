@@ -2,8 +2,9 @@ import std/[options, unittest]
 
 import chronos
 
+import ./msquic_test_helpers
 import "../libp2p/transports/msquicdriver" as msdriver
-import "../libp2p/transports/nim-msquic/api/event_model" as msevents
+import "../libp2p/transports/quicruntime" as quicrt
 
 when defined(libp2p_msquic_experimental):
   suite "MsQuic dial integration":
@@ -13,34 +14,53 @@ when defined(libp2p_msquic_experimental):
       check not handle.isNil
       defer:
         if not handle.isNil:
-          handle.shutdown()
+          msdriver.shutdown(handle)
 
-      let (connPtr, stateOpt, dialErr) = handle.dialConnection("dial.example", 2443'u16)
+      let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+      check listenerErr.len == 0
+      check listenerOpt.isSome
+      let listener = listenerOpt.get()
+      defer:
+        discard msdriver.stopListener(handle, listener.listener)
+        msdriver.closeListener(handle, listener.listener, listener.state)
+
+      let (connPtr, stateOpt, dialErr) =
+        msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
       check dialErr.len == 0
       check stateOpt.isSome
       let connState = stateOpt.get()
 
-      let connected = waitFor connState.nextConnectionEvent()
-      check connected.kind == msevents.ceConnected
+      let (serverConnPtr, serverStateOpt, acceptErr) =
+        acceptPendingConnection(listener.state)
+      check acceptErr.len == 0
+      check serverStateOpt.isSome
+      let serverState = serverStateOpt.get()
+      defer:
+        discard msdriver.shutdownConnection(handle, serverConnPtr)
+        msdriver.closeConnection(handle, serverConnPtr, serverState)
 
-      check handle.shutdownConnection(connPtr, errorCode = 42'u64).len == 0
-      let shutdownInitiated = waitFor connState.nextConnectionEvent()
-      check shutdownInitiated.kind == msevents.ceShutdownInitiated
+      let (connectedOpt, connectedErr) =
+        nextConnectionEventOfKind(connState, quicrt.qceConnected)
+      check connectedErr.len == 0
+      check connectedOpt.isSome
 
-      handle.closeConnection(connPtr, connState)
-      let shutdownComplete = waitFor connState.nextConnectionEvent()
-      check shutdownComplete.kind == msevents.ceShutdownComplete
+      let (serverConnectedOpt, serverConnectedErr) =
+        nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+      check serverConnectedErr.len == 0
+      check serverConnectedOpt.isSome
 
-      expect msdriver.MsQuicEventQueueClosed:
-        discard waitFor connState.nextConnectionEvent()
+      check msdriver.shutdownConnection(handle, connPtr, errorCode = 42'u64).len == 0
+      msdriver.closeConnection(handle, connPtr, connState)
+      expect quicrt.QuicRuntimeEventQueueClosed:
+        discard waitFor connState.nextQuicConnectionEvent()
 
     test "dial fails after transport shutdown":
       let (handle, initErr) = msdriver.initMsQuicTransport()
       check initErr.len == 0
       check not handle.isNil
-      handle.shutdown()
+      msdriver.shutdown(handle)
 
-      let (_, stateOpt, dialErr) = handle.dialConnection("after.shutdown", 1'u16)
+      let (_, stateOpt, dialErr) = msdriver.dialConnection(handle, "after.shutdown", 1'u16)
       check dialErr.len > 0
       check stateOpt.isNone
 else:

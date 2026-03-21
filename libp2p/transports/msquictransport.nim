@@ -17,7 +17,7 @@ import ../upgrademngrs/upgrade
 import ../stream/connection
 from ../stream/lpstream import LPStreamError
 import ./transport as basetransport
-import ./msquicdriver as msquicdrv
+import ./quicruntime as msquicdrv
 import ./msquicconnection
 import ./msquicstream
 import ./quicruntime
@@ -27,11 +27,34 @@ when defined(libp2p_pure_crypto):
 else:
   import tls/certificate
 import "nim-msquic/tls/common" as mstls
-import "nim-msquic/api/event_model" as msevents
 
 export msquicconnection.MsQuicConnection
 
 export msquicdrv.MsQuicTransportConfig
+export quicruntime.QuicRuntimeInfo
+export quicruntime.QuicRuntimeKind
+export quicruntime.QuicRuntimePreference
+export quicruntime.QuicRuntimeConnectionHandler
+export quicruntime.QuicRuntimeStreamHandler
+export quicruntime.QuicRuntimeListenerHandler
+export quicruntime.QuicConnectionEvent
+export quicruntime.QuicConnectionEventKind
+export quicruntime.QuicStreamEvent
+export quicruntime.QuicStreamEventKind
+export quicruntime.QuicListenerEvent
+export quicruntime.QuicListenerEventKind
+export quicruntime.QuicRuntimeEventQueueClosed
+export quicruntime.currentQuicRuntimeInfo
+export quicruntime.kindLabel
+export quicruntime.isPureNimRuntime
+export quicruntime.nextQuicConnectionEvent
+export quicruntime.nextQuicStreamEvent
+export quicruntime.nextQuicListenerEvent
+export quicruntime.setRuntimePreference
+export quicruntime.useAutoRuntime
+export quicruntime.useNativeRuntime
+export quicruntime.preferBuiltinRuntime
+export quicruntime.useBuiltinRuntime
 
 const
   MsQuicDialEventTimeout = chronos.seconds(2)
@@ -91,22 +114,61 @@ proc quicMultiaddrFromTransport(
   let maRes = MultiAddress.init(transportAddr, IPPROTO_UDP)
   if maRes.isErr:
     return none(MultiAddress)
+  proc appendSuffix(
+      address: var MultiAddress, suffix: string
+  ): bool {.gcsafe, raises: [].} =
+    let suffixRes = MultiAddress.init(suffix)
+    let text = address.toString().valueOr:
+      return false
+    if suffixRes.isOk:
+      let appended = concat(address, suffixRes.get())
+      if appended.isOk:
+        address = appended.get()
+        return true
+    let rebuilt = MultiAddress.init(text & suffix)
+    if rebuilt.isErr:
+      return false
+    address = rebuilt.get()
+    true
+
   var addrMa = maRes.get()
   let protocols = addrMa.protocols.valueOr:
     @[]
   if not protocols.anyIt(it == multiCodec("quic-v1")):
-    let quicSuffix = MultiAddress.init("/quic-v1")
-    if quicSuffix.isOk:
-      let appended = concat(addrMa, quicSuffix.get())
-      if appended.isOk:
-        addrMa = appended.get()
+    if not appendSuffix(addrMa, "/quic-v1"):
+      return none(MultiAddress)
   if webtransport:
-    let wtSuffix = MultiAddress.init("/webtransport")
-    if wtSuffix.isOk:
-      let appended = concat(addrMa, wtSuffix.get())
-      if appended.isOk:
-        addrMa = appended.get()
+    if not appendSuffix(addrMa, "/webtransport"):
+      return none(MultiAddress)
   some(addrMa)
+
+proc addressRequestsWebtransport(ma: MultiAddress): bool {.gcsafe, raises: [].} =
+  if WebTransport.match(ma) or WebTransport.matchPartial(ma):
+    return true
+  let protocols = ma.protocols.valueOr:
+    @[]
+  if protocols.anyIt(it == multiCodec("webtransport")):
+    return true
+  let text = ma.toString().valueOr:
+    return false
+  text.contains("/webtransport")
+
+proc appendAdvertisedSuffix(
+    address: var MultiAddress, suffix: string
+): bool {.gcsafe, raises: [].} =
+  let suffixRes = MultiAddress.init(suffix)
+  let text = address.toString().valueOr:
+    return false
+  if suffixRes.isOk:
+    let appended = concat(address, suffixRes.get())
+    if appended.isOk:
+      address = appended.get()
+      return true
+  let rebuilt = MultiAddress.init(text & suffix)
+  if rebuilt.isErr:
+    return false
+  address = rebuilt.get()
+  true
 
 template msquicSafe(body: untyped) =
   {.cast(gcsafe).}:
@@ -156,7 +218,7 @@ type
     cfg*: msquicdrv.MsQuicTransportConfig
     handle: msquicdrv.MsQuicTransportHandle
     listeners: seq[MsQuicListenerInfo]
-    listenerFuts: seq[Future[msevents.ListenerEvent]]
+    listenerFuts: seq[Future[msquicdrv.QuicListenerEvent]]
     privateKey: PrivateKey
     certGenerator: CertGenerator
     certificate: CertificateX509
@@ -382,7 +444,7 @@ method handle*(m: MsQuicMuxer): Future[void] {.async: (raises: []).} =
         asyncSpawn handleStream(stream)
     except CancelledError:
       break
-    except msquicdrv.MsQuicEventQueueClosed:
+    except msquicdrv.QuicRuntimeEventQueueClosed:
       break
     except CatchableError as exc:
       trace "MsQuic muxer handle raised", error = exc.msg
@@ -391,6 +453,9 @@ method handle*(m: MsQuicMuxer): Future[void] {.async: (raises: []).} =
     peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId)
 
 method close*(m: MsQuicMuxer) {.async: (raises: []).} =
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic muxer close begin",
+      peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId)
   if not m.bootstrapInbound.isNil:
     await m.bootstrapInbound.close()
     m.bootstrapInbound = nil
@@ -401,6 +466,9 @@ method close*(m: MsQuicMuxer) {.async: (raises: []).} =
     await m.session.close()
   if not m.handleFut.isNil and not m.handleFut.finished():
     m.handleFut.cancelSoon()
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic muxer close done",
+      peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId)
 
 method getStreams*(m: MsQuicMuxer): seq[Connection] =
   @[]
@@ -892,6 +960,35 @@ proc webtransportRejectionStats*(
 ): WebtransportRejectionStats =
   transport.webtransportRejection
 
+proc enableWebtransportDatagramPath(
+    conn: MsQuicConnection
+) {.gcsafe, raises: [QuicTransportError].} =
+  if conn.isNil:
+    raise (ref QuicTransportError)(msg: "MsQuic connection unavailable")
+  let handle = conn.transportHandle()
+  let state = conn.connectionState()
+  if handle.isNil or state.isNil or state.connection.isNil:
+    raise (ref QuicTransportError)(
+      msg: "MsQuic connection state unavailable for datagram enable"
+    )
+
+  let receiveErr =
+    msquicdrv.enableConnectionDatagramReceive(handle, cast[pointer](state.connection))
+  if receiveErr.len > 0:
+    raise (ref QuicTransportError)(
+      msg: "failed to enable MsQuic datagram receive: " & receiveErr
+    )
+
+  let sendErr =
+    msquicdrv.enableConnectionDatagramSend(handle, cast[pointer](state.connection))
+  if sendErr.len > 0:
+    raise (ref QuicTransportError)(
+      msg: "failed to enable MsQuic datagram send: " & sendErr
+    )
+
+  # Keep snapshots consistent even if the runtime surfaces the parameter event later.
+  conn.datagramSendEnabled = true
+
 proc count*(
     stats: WebtransportRejectionStats, reason: WebtransportRejectionReason
 ): uint64 =
@@ -1003,12 +1100,12 @@ proc resetListenerFutures(self: MsQuicTransport) {.raises: [].} =
   for idx in 0 ..< self.listeners.len:
     let state = self.listeners[idx].state
     if state.isNil:
-      self.listenerFuts[idx] = Future[msevents.ListenerEvent].init("msquic.listener.closed")
+      self.listenerFuts[idx] = Future[msquicdrv.QuicListenerEvent].init("msquic.listener.closed")
       self.listenerFuts[idx].fail(
-        newException(msquicdrv.MsQuicEventQueueClosed, "listener closed")
+        newException(msquicdrv.QuicRuntimeEventQueueClosed, "listener closed")
       )
     else:
-      self.listenerFuts[idx] = state.nextListenerEvent()
+      self.listenerFuts[idx] = state.nextQuicListenerEvent()
 
 proc closeAllListeners(self: MsQuicTransport) {.raises: [].} =
   for listener in self.listeners:
@@ -1026,6 +1123,40 @@ proc closeAllListeners(self: MsQuicTransport) {.raises: [].} =
       trace "MsQuic closeListener raised", err = exc.msg
   self.listeners.setLen(0)
   self.listenerFuts.setLen(0)
+
+method stop*(self: MsQuicTransport) {.async: (raises: []).} =
+  if self.isNil:
+    return
+
+  let conns = self.connections[0 .. ^1]
+  for conn in conns:
+    try:
+      await conn.close()
+    except CatchableError as exc:
+      trace "MsQuic connection close raised during transport stop", err = exc.msg
+  self.connections.setLen(0)
+
+  if self.listenerFuts.len > 0:
+    for fut in self.listenerFuts:
+      if fut.isNil or fut.finished():
+        continue
+      fut.cancelSoon()
+
+  closeAllListeners(self)
+  try:
+    await sleepAsync(10)
+  except CancelledError:
+    discard
+
+  if not self.handle.isNil:
+    try:
+      msquicSafe:
+        msquicdrv.shutdown(self.handle)
+    except Exception as exc:
+      trace "MsQuic transport shutdown raised", err = exc.msg
+    self.handle = nil
+
+  await procCall basetransport.Transport(self).stop()
 
 proc extractHostPort(address: MultiAddress): (string, string) {.gcsafe, raises: [].} =
   let text = address.toString().valueOr:
@@ -1077,7 +1208,8 @@ proc filterRedundantWildcardListeners(addrs: seq[MultiAddress]): seq[MultiAddres
       continue
     if split.isErr:
       continue
-    let (baseAddr, hasWebtransport, _) = split.get()
+    let (baseAddr, splitHasWebtransport, _) = split.get()
+    let hasWebtransport = splitHasWebtransport or addressRequestsWebtransport(ma)
     splitCache[idx] = (true, baseAddr, hasWebtransport)
     let (host, _) = extractHostPort(baseAddr)
     if isIpv6WildcardHost(host):
@@ -1993,69 +2125,33 @@ proc awaitPeerStreamState(
   if state.isNil:
     raise (ref QuicTransportError)(msg: "MsQuic connection state unavailable")
   while true:
-    let pendingState = msquicdrv.peekPendingStreamState(state)
-    if pendingState.isSome:
-      let streamState = pendingState.get()
-      if not streamState.isNil and not streamState.stream.isNil:
-        let streamPtr = cast[pointer](streamState.stream)
-        var unidirectional = false
-        let idRes = block:
-          var tmp: Result[uint64, string]
-          msquicSafe:
-            tmp = msquicdrv.streamId(streamState)
-          tmp
-        if idRes.isOk:
-          unidirectional = (idRes.get() and 0x2'u64) != 0'u64
-        when defined(libp2p_msquic_debug):
-          warn "MsQuic await peer stream using pending stream",
-            stream = cast[uint64](streamPtr),
-            unidirectional = unidirectional
-        return (streamPtr, unidirectional)
-    let eventFut =
+    let streamState =
       try:
-        state.nextConnectionEvent()
-      except CatchableError as exc:
-        raise (ref QuicTransportError)(
-          msg: "MsQuic connection event queue unavailable: " & exc.msg
-        )
-    let completed =
-      try:
-        await eventFut.withTimeout(chronos.milliseconds(200))
-      except CatchableError as exc:
-        eventFut.cancel()
-        raise (ref QuicTransportError)(
-          msg: "MsQuic connection event wait failed: " & exc.msg, parent: exc
-        )
-    if not completed:
-      eventFut.cancel()
-      continue
-    let event =
-      try:
-        await eventFut
-      except msquicdrv.MsQuicEventQueueClosed:
+        await state.awaitPendingStreamState()
+      except msquicdrv.QuicRuntimeEventQueueClosed:
         raise (ref QuicTransportError)(
           msg: "MsQuic connection closed while awaiting peer stream"
         )
       except CatchableError as exc:
         raise (ref QuicTransportError)(
-          msg: "MsQuic connection event wait failed: " & exc.msg, parent: exc
+          msg: "MsQuic pending stream wait failed: " & exc.msg, parent: exc
         )
-    when defined(libp2p_msquic_debug):
-      warn "MsQuic await peer stream event",
-        kind = event.kind,
-        stream = cast[uint64](event.stream),
-        unidirectional = event.streamIsUnidirectional
-    case event.kind
-    of msevents.cePeerStreamStarted:
-      if event.stream.isNil:
-        continue
-      return (event.stream, event.streamIsUnidirectional)
-    of msevents.ceShutdownInitiated, msevents.ceShutdownComplete:
-      raise (ref QuicTransportError)(
-        msg: "MsQuic connection shutdown during WebTransport handshake"
-      )
-    else:
+    if streamState.isNil or streamState.stream.isNil:
       continue
+    let streamPtr = cast[pointer](streamState.stream)
+    var unidirectional = false
+    let idRes = block:
+      var tmp: Result[uint64, string]
+      msquicSafe:
+        tmp = msquicdrv.streamId(streamState)
+      tmp
+    if idRes.isOk:
+      unidirectional = (idRes.get() and 0x2'u64) != 0'u64
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic await peer stream pending",
+        stream = cast[uint64](streamPtr),
+        unidirectional = unidirectional
+    return (streamPtr, unidirectional)
 
 proc awaitPeerStream(
     conn: MsQuicConnection
@@ -2068,6 +2164,11 @@ proc performClientWebtransportHandshake(
     conn: MsQuicConnection,
     info: WebtransportHandshakeInfo
 ){.async: (raises: [CancelledError, QuicTransportError]).} =
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic client webtransport handshake start",
+      peerId = conn.peerId,
+      authority = info.authority,
+      path = info.path
   var controlSend: MsQuicStream = nil
   var controlRecv: MsQuicStream = nil
   var requestStream: MsQuicStream = nil
@@ -2098,12 +2199,18 @@ proc performClientWebtransportHandshake(
     if validation.isSome:
       raise (ref QuicTransportError)(msg: validation.get())
     conn.setRemoteSettings(remoteSettings)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic client webtransport control received",
+        peerId = conn.peerId,
+        maxSessions = remoteSettings.maxSessions
 
     requestStream = conn.openMsQuicStream(false, Direction.Out)
     let headersBlock = makeClientHeadersBlock(info)
     let headersFrame = encodeHeadersFrame(headersBlock)
     await requestStream.write(headersFrame)
     await requestStream.sendFin()
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic client webtransport request sent", peerId = conn.peerId
 
     var reqCursor = initCursor(requestStream)
     let respType = await reqCursor.readQuicVarInt()
@@ -2112,6 +2219,8 @@ proc performClientWebtransportHandshake(
     let respLen = await reqCursor.readQuicVarInt()
     let payload = await reqCursor.readBytes(int(respLen))
     let headers = decodeHeadersBlock(payload)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic client webtransport response received", peerId = conn.peerId
     let status = headers.getOrDefault(":status", "")
     if status.len == 0 or status != "200":
       raise (ref QuicTransportError)(
@@ -2129,6 +2238,11 @@ proc performClientWebtransportHandshake(
     updatedInfo.draft = draft
     conn.setHandshakeInfo(updatedInfo)
     conn.completeWebtransportHandshake(updatedInfo, sessionId)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic client webtransport handshake complete",
+        peerId = conn.peerId,
+        sessionId = sessionId,
+        draft = updatedInfo.draft
 
     conn.webtransportControlSend = some(controlSend)
     conn.webtransportControlRecv = some(controlRecv)
@@ -2169,6 +2283,10 @@ proc performServerWebtransportHandshake(
     conn: MsQuicConnection,
     info: WebtransportHandshakeInfo
 ){.async: (raises: [CancelledError, QuicTransportError]).} =
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic server webtransport handshake start",
+      peerId = conn.peerId,
+      path = info.path
   var controlRecv: MsQuicStream = nil
   var controlSend: MsQuicStream = nil
   var requestStream: MsQuicStream = nil
@@ -2189,6 +2307,24 @@ proc performServerWebtransportHandshake(
     if validation.isSome:
       raise (ref QuicTransportError)(msg: validation.get())
     conn.setRemoteSettings(remoteSettings)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport control received",
+        peerId = conn.peerId,
+        maxSessions = remoteSettings.maxSessions
+
+    controlSend = conn.openMsQuicStream(true, Direction.Out)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport control send opened", peerId = conn.peerId
+    let settingsPayload = buildSettingsPayload(info)
+    var settingsFrame = encodeQuicVarInt(http3FrameTypeSettings)
+    settingsFrame.appendBytes(encodeQuicVarInt(uint64(settingsPayload.len)))
+    settingsFrame.appendBytes(settingsPayload)
+    var controlPayload = encodeQuicVarInt(http3StreamTypeControl)
+    controlPayload.appendBytes(settingsFrame)
+    await controlSend.write(controlPayload)
+    await controlSend.sendFin()
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport control sent", peerId = conn.peerId
 
     while requestStream.isNil:
       let (streamPtr, uni) = await awaitPeerStream(conn)
@@ -2197,6 +2333,8 @@ proc performServerWebtransportHandshake(
         asyncSpawn discardStream(stray)
       else:
         requestStream = conn.adoptMsQuicStream(streamPtr, false)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport request stream received", peerId = conn.peerId
 
     var reqCursor = initCursor(requestStream)
     let frameType = await reqCursor.readQuicVarInt()
@@ -2205,6 +2343,8 @@ proc performServerWebtransportHandshake(
     let frameLen = await reqCursor.readQuicVarInt()
     let payload = await reqCursor.readBytes(int(frameLen))
     let headers = decodeHeadersBlock(payload)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport request headers received", peerId = conn.peerId
     if headers.getOrDefault(":method", "") != "CONNECT":
       raise (ref QuicTransportError)(msg: "CONNECT method missing")
     if headers.getOrDefault(":protocol", "") != "webtransport":
@@ -2218,19 +2358,11 @@ proc performServerWebtransportHandshake(
     updatedInfo.draft = draft
     conn.setHandshakeInfo(updatedInfo)
 
-    controlSend = conn.openMsQuicStream(true, Direction.Out)
-    let settingsPayload = buildSettingsPayload(updatedInfo)
-    var settingsFrame = encodeQuicVarInt(http3FrameTypeSettings)
-    settingsFrame.appendBytes(encodeQuicVarInt(uint64(settingsPayload.len)))
-    settingsFrame.appendBytes(settingsPayload)
-    var controlPayload = encodeQuicVarInt(http3StreamTypeControl)
-    controlPayload.appendBytes(settingsFrame)
-    await controlSend.write(controlPayload)
-    await controlSend.sendFin()
-
     let responseBlock = makeServerHeadersBlock(draft)
     let responseFrame = encodeHeadersFrame(responseBlock)
     await requestStream.write(responseFrame)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport response sent", peerId = conn.peerId
 
     let sessionIdRes = requestStream.streamId()
     if sessionIdRes.isErr:
@@ -2239,6 +2371,12 @@ proc performServerWebtransportHandshake(
       )
     let sessionId = sessionIdRes.get()
     conn.completeWebtransportHandshake(updatedInfo, sessionId)
+    when defined(libp2p_msquic_debug):
+      warn "MsQuic server webtransport handshake complete",
+        peerId = conn.peerId,
+        sessionId = sessionId,
+        draft = updatedInfo.draft,
+        path = updatedInfo.path
 
     conn.webtransportControlSend = some(controlSend)
     conn.webtransportControlRecv = some(controlRecv)
@@ -2282,6 +2420,7 @@ proc performMsQuicWebtransportHandshake(
   if infoOpt.isNone:
     return
   let info = infoOpt.get()
+  conn.enableWebtransportDatagramPath()
   conn.beginWebtransportHandshake(info)
   case info.mode
   of wtmClient:
@@ -2299,7 +2438,7 @@ proc awaitMsQuicDial(
   while attempt < MsQuicDialMaxEvents:
     inc attempt
     trace "MsQuic dial awaiting connection event", attempt = attempt
-    let fut = state.nextConnectionEvent()
+    let fut = state.nextQuicConnectionEvent()
     let timeoutFut = sleepAsync(MsQuicDialEventTimeout)
     let winner = await race(cast[FutureBase](fut), cast[FutureBase](timeoutFut))
     if winner == cast[FutureBase](timeoutFut):
@@ -2311,16 +2450,16 @@ proc awaitMsQuicDial(
     let event =
       try:
         await fut
-      except msquicdrv.MsQuicEventQueueClosed:
+      except msquicdrv.QuicRuntimeEventQueueClosed:
         return (false, "MsQuic connection event queue closed")
     case event.kind
-    of msevents.ceConnected:
+    of msquicdrv.qceConnected:
       warn "MsQuic dial connected", attempt = attempt
       return (true, "connected")
-    of msevents.ceShutdownInitiated:
+    of msquicdrv.qceShutdownInitiated:
       warn "MsQuic dial shutdown initiated", attempt = attempt
       return (false, "MsQuic connection shutdown initiated")
-    of msevents.ceShutdownComplete:
+    of msquicdrv.qceShutdownComplete:
       warn "MsQuic dial shutdown complete", attempt = attempt
       return (false, "MsQuic connection shutdown complete")
     else:
@@ -2360,7 +2499,7 @@ method start*(
   if self.running:
     return
   let needsWebtransportCerthash =
-    addrs.anyIt(WebTransport.match(it)) or self.webtransportCerthashHistory.len > 0
+    addrs.anyIt(addressRequestsWebtransport(it)) or self.webtransportCerthashHistory.len > 0
   var initHandle: msquicdrv.MsQuicTransportHandle = nil
   var initErr = ""
   try:
@@ -2438,7 +2577,15 @@ method start*(
           basetransport.TransportError,
           "MsQuic listen address invalid: " & split.error
         )
-      let (baseAddr, hasWebtransport, _) = split.get()
+      let (baseAddr, splitHasWebtransport, _) = split.get()
+      let hasWebtransport = splitHasWebtransport or addressRequestsWebtransport(ma)
+      when defined(libp2p_msquic_debug):
+        warn "MsQuic listener plan",
+          requested = $ma,
+          base = $baseAddr,
+          splitHasWebtransport = splitHasWebtransport,
+          addressRequestsWebtransport = addressRequestsWebtransport(ma),
+          hasWebtransport = hasWebtransport
       listenerPlans.add((some(baseAddr), hasWebtransport))
 
   try:
@@ -2529,6 +2676,10 @@ method start*(
           baseAddr: finalAddr
         )
       )
+      when defined(libp2p_msquic_debug):
+        warn "MsQuic listener created",
+          base = (if finalAddr.isSome: $finalAddr.get() else: "<none>"),
+          webtransport = plan[1]
 
     for plan in listenerPlans:
       addListener(plan)
@@ -2545,47 +2696,26 @@ method start*(
     let protocols = advertised.protocols.valueOr:
       @[]
     if not protocols.anyIt(it == multiCodec("quic-v1")):
-      let quicSuffix = MultiAddress.init("/quic-v1")
-      if quicSuffix.isErr:
-        trace "failed to init quic suffix for advertised address", error = quicSuffix.error
-      else:
-        let appended = concat(advertised, quicSuffix.get())
-        if appended.isOk:
-          advertised = appended.get()
-        else:
-          trace "failed to append quic suffix to advertised address", error = appended.error
+      if not appendAdvertisedSuffix(advertised, "/quic-v1"):
+        trace "failed to append quic suffix to advertised address"
 
     if info.webtransport:
-      let wtSuffix = MultiAddress.init("/webtransport")
-      if wtSuffix.isErr:
-        trace "failed to init webtransport suffix for advertised address", error = wtSuffix.error
-      else:
-        let appended = concat(advertised, wtSuffix.get())
-        if appended.isOk:
-          advertised = appended.get()
-        else:
-          trace "failed to append webtransport suffix to advertised address",
-            error = appended.error
+      if not appendAdvertisedSuffix(advertised, "/webtransport"):
+        trace "failed to append webtransport suffix to advertised address"
       self.enforceWebtransportHistoryLimit()
       for hash in self.webtransportCerthashHistory:
         if hash.len == 0:
           continue
-        let chSuffix = MultiAddress.init("/certhash/" & hash)
-        if chSuffix.isErr:
-          trace "failed to init certhash suffix for advertised address", error = chSuffix.error
-          continue
-        let appended = concat(advertised, chSuffix.get())
-        if appended.isOk:
-          advertised = appended.get()
-        else:
-          trace "failed to append certhash suffix to advertised address",
-            error = appended.error
+        if not appendAdvertisedSuffix(advertised, "/certhash/" & hash):
+          trace "failed to append certhash suffix to advertised address"
 
     advertisedAddrs.add(advertised)
   
   self.handle = initHandle
   self.listeners = created
   resetListenerFutures(self)
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic advertised addresses", addrs = advertisedAddrs.mapIt($it)
   await procCall basetransport.Transport(self).start(advertisedAddrs)
 
 # Only claim QUIC/WebTransport multiaddrs; let TCP transports handle /tcp.
@@ -2594,9 +2724,9 @@ method handles*(
 ): bool {.gcsafe, raises: [].} =
   if not procCall basetransport.Transport(transport).handles(address):
     return false
-  if QUIC_V1.matchPartial(address):
+  if QUIC_V1.match(address) or QUIC_V1.matchPartial(address):
     return true
-  WebTransport.matchPartial(address)
+  WebTransport.match(address) or WebTransport.matchPartial(address)
 
 # ...
 
@@ -2622,7 +2752,7 @@ method accept*(
     resetListenerFutures(self)
 
   while true:
-    var finished: Future[msevents.ListenerEvent]
+    var finished: Future[msquicdrv.QuicListenerEvent]
     try:
       finished = await one(self.listenerFuts)
     except CancelledError as exc:
@@ -2639,23 +2769,23 @@ method accept*(
     if idx < 0:
       continue
     let listenerState = self.listeners[idx].state
-    self.listenerFuts[idx] = listenerState.nextListenerEvent()
+    self.listenerFuts[idx] = listenerState.nextQuicListenerEvent()
 
-    var event: msevents.ListenerEvent
+    var event: msquicdrv.QuicListenerEvent
     try:
       event = await finished
-    except msquicdrv.MsQuicEventQueueClosed:
+    except msquicdrv.QuicRuntimeEventQueueClosed:
       if not listenerState.isNil:
-        self.listenerFuts[idx] = listenerState.nextListenerEvent()
+        self.listenerFuts[idx] = listenerState.nextQuicListenerEvent()
       continue
     except Exception as exc:
       trace "MsQuic listener future raised", err = exc.msg
       if not listenerState.isNil:
-        self.listenerFuts[idx] = listenerState.nextListenerEvent()
+        self.listenerFuts[idx] = listenerState.nextQuicListenerEvent()
       continue
 
     case event.kind
-    of msevents.leNewConnection:
+    of msquicdrv.qleNewConnection:
       if event.connection.isNil:
         trace "MsQuic listener delivered nil connection"
         continue
@@ -2804,7 +2934,7 @@ method accept*(
           await noCancel connection.close()
           continue
       return connection
-    of msevents.leStopComplete:
+    of msquicdrv.qleStopComplete:
       trace "MsQuic listener stop complete"
       continue
     else:

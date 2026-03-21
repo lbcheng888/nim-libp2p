@@ -2,6 +2,7 @@ package com.example.libp2psmoke.core
 
 import android.content.Context
 import com.example.libp2psmoke.BuildConfig
+import com.example.libp2psmoke.model.QuicRuntimePreferenceOption
 
 /**
  * Runtime configuration store for the Android example app.
@@ -49,6 +50,22 @@ class AppPreferences(context: Context) {
         prefs.edit().putString(KEY_MARKET_INTERVAL, interval).apply()
     }
 
+    fun getQuicRuntimePreference(): QuicRuntimePreferenceOption =
+        QuicRuntimePreferenceOption.fromStoredValue(
+            prefs.getString(KEY_QUIC_RUNTIME_PREFERENCE, null)
+        ) ?: QuicRuntimePreferenceOption.AUTO
+
+    fun setQuicRuntimePreference(value: QuicRuntimePreferenceOption) {
+        prefs.edit().putString(KEY_QUIC_RUNTIME_PREFERENCE, value.wireValue).apply()
+    }
+
+    fun getQuicRuntimeLibraryPath(): String =
+        prefs.getString(KEY_QUIC_RUNTIME_LIBRARY_PATH, null).orEmpty()
+
+    fun setQuicRuntimeLibraryPath(value: String) {
+        prefs.edit().putString(KEY_QUIC_RUNTIME_LIBRARY_PATH, value.trim()).apply()
+    }
+
     fun clearAll() {
         prefs.edit().clear().apply()
     }
@@ -59,6 +76,7 @@ class AppPreferences(context: Context) {
         private const val KEY_RELAY_PEERS_RAW = "relay_peers_raw"
         private const val KEY_MARKET_ENABLED = "market_enabled"
         private const val KEY_MARKET_INTERVAL = "market_interval"
+        private const val KEY_QUIC_RUNTIME_PREFERENCE = "quic_runtime_preference"
+        private const val KEY_QUIC_RUNTIME_LIBRARY_PATH = "quic_runtime_library_path"
     }
 }
-

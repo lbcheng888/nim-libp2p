@@ -185,6 +185,20 @@ interface NodeExtraConfig {
   mdns: MdnsConfig;
   bootstrapMultiaddrs?: string[];
   relayMultiaddrs?: string[];
+  quicRuntimePreference?: string;
+  quicRuntimeLibraryPath?: string;
+}
+
+type QuicRuntimePreference = 'auto' | 'native_only' | 'builtin_preferred' | 'builtin_only';
+
+interface QuicRuntimeInfo {
+  kind: string;
+  implementation: string;
+  path: string;
+  loaded: boolean;
+  pureNim: boolean;
+  requestedPreference: QuicRuntimePreference;
+  requestedLibraryPath: string;
 }
 
 function isGlobalIpv6(ip: string | undefined): boolean {
@@ -254,6 +268,9 @@ interface LiveFrame {
 
 const LOG_DOMAIN: number = 0xD0B0;
 const LOG_TAG: string = 'nimlib-ui';
+const QUIC_RUNTIME_PREFERENCE_KEY: string = '__nimQuicRuntimePreference';
+const QUIC_RUNTIME_LIBRARY_PATH_KEY: string = '__nimQuicRuntimeLibraryPath';
+const DEFAULT_QUIC_RUNTIME_PREFERENCE: QuicRuntimePreference = 'builtin_preferred';
 
 @Entry
 @Component
@@ -265,6 +282,12 @@ struct Index {
   private chatStore: Map<string, MessageItem[]> = new Map();
   private imageCache: Map<string, image.PixelMap> = new Map();
   private readonly tabLabels: string[] = ['Overview', 'Chat', 'Feed', 'Live'];
+  private readonly quicRuntimeOptions: Array<{ value: QuicRuntimePreference; label: string }> = [
+    { value: 'auto', label: 'Auto' },
+    { value: 'native_only', label: 'Native' },
+    { value: 'builtin_preferred', label: 'Prefer Nim' },
+    { value: 'builtin_only', label: 'Nim only' }
+  ];
   private endpointsRefreshInFlight: boolean = false;
 
   @State selectedTab: number = 0;
@@ -282,6 +305,17 @@ struct Index {
   @State streamKey: string = 'demo-stream';
   @State streamPayload: string = '';
   @State liveFrames: LiveFrame[] = [];
+  @State quicRuntimePreference: QuicRuntimePreference = DEFAULT_QUIC_RUNTIME_PREFERENCE;
+  @State quicRuntimeLibraryPath: string = '';
+  @State quicRuntimeInfo: QuicRuntimeInfo = {
+    kind: 'unavailable',
+    implementation: 'unavailable',
+    path: '',
+    loaded: false,
+    pureNim: false,
+    requestedPreference: DEFAULT_QUIC_RUNTIME_PREFERENCE,
+    requestedLibraryPath: ''
+  };
   private activeIpv4: string = '';
   private lastAppliedIpv4: string = '';
   private dmPending: boolean = false;
@@ -310,9 +344,12 @@ struct Index {
   private endpointsIntervalMs: number = 1600;
   private disableSyncInterfaceLookup: boolean = false;
   private lanEndpointsLogged: boolean = false;
+  private startupProbeInFlight: boolean = false;
+  private lastStartupProbeSignature: string = '';
 
   aboutToAppear() {
     this.startNode();
+    void this.runStartupProbeIfRequested();
   }
 
   aboutToDisappear() {
@@ -323,11 +360,13 @@ struct Index {
     const config = this.buildConfig();
     if (!this.node.start(config)) {
       this.statusMessage = `Init failed: ${this.node.lastInitError()}`;
+      this.refreshQuicRuntimeInfo();
       return;
     }
     this.applyPreferredIpv4();
     const peerLabel = this.localPeer && this.localPeer.length > 0 ? ` (${this.localPeer})` : '';
     this.statusMessage = `Node running${peerLabel}`;
+    this.refreshQuicRuntimeInfo();
     void this.requestInterfaceAddressesAsync(true);
     void this.refreshEndpoints(true);
     this.schedulePoll(50);
@@ -347,6 +386,7 @@ struct Index {
     this.node.stop();
     this.releaseImages();
     this.setDmPending(false);
+    this.quicRuntimeInfo = this.defaultQuicRuntimeInfo(this.quicRuntimePreference, this.quicRuntimeLibraryPath);
   }
 
   private tick() {
@@ -354,6 +394,7 @@ struct Index {
     if (raw && raw.length > 2) {
       this.enqueueNodeEvents(raw);
     }
+    void this.runStartupProbeIfRequested();
     if (this.ipv6List.length === 0 && !this.interfaceRefreshInFlight) {
       void this.requestInterfaceAddressesAsync();
     }
@@ -752,6 +793,36 @@ struct Index {
       return this.uniqueStrings(stored);
     }
     return this.uniqueStrings(fallback);
+  }
+
+  private async runStartupProbeIfRequested(): Promise<void> {
+    if (this.startupProbeInFlight) {
+      return;
+    }
+    const targetsJson = this.readStorageValue('__nimStartupProbeTargets');
+    if (!targetsJson || targetsJson.length === 0) {
+      return;
+    }
+    const timeoutRaw = this.readStorageValue('__nimStartupProbeTimeoutMs');
+    const label = this.readStorageValue('__nimStartupProbeLabel') || 'harmony';
+    const signature = `${label}|${timeoutRaw}|${targetsJson}`;
+    if (signature === this.lastStartupProbeSignature) {
+      return;
+    }
+    this.lastStartupProbeSignature = signature;
+    this.startupProbeInFlight = true;
+    const parsedTimeout = Number(timeoutRaw);
+    const timeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 15000;
+    try {
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'startup probe begin label=%{public}s timeoutMs=%{public}d', label, timeoutMs);
+      const payload = await this.node.portProbeJsonAsync(targetsJson, timeoutMs);
+      hilog.info(LOG_DOMAIN, LOG_TAG, 'startup probe result label=%{public}s payload=%{public}s', label, payload);
+    } catch (err) {
+      const message = err ? `${err}` : 'unknown error';
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'startup probe failed label=%{public}s err=%{public}s', label, message);
+    } finally {
+      this.startupProbeInFlight = false;
+    }
   }
 
   private aggregatePeerHints(multiaddrs: string[]): PeerHint[] {
@@ -1333,6 +1404,116 @@ struct Index {
     }
   }
 
+  private persistStorageValue(key: string, value: string): void {
+    const writer = AppStorage.SetOrCreate;
+    if (typeof writer !== 'function') {
+      return;
+    }
+    try {
+      if (value && value.length > 0) {
+        writer(key, [value]);
+      } else {
+        writer(key, []);
+      }
+    } catch (err) {
+      console.warn(`persistStorageValue failed key=${key}: ${err}`);
+    }
+  }
+
+  private normalizeQuicRuntimePreference(value: string | undefined | null): QuicRuntimePreference {
+    const normalized = value ? value.trim().toLowerCase().replace(/-/g, '_') : '';
+    if (normalized === 'native' || normalized === 'msquic_native') {
+      return 'native_only';
+    }
+    if (normalized === 'builtin' || normalized === 'pure_nim' || normalized === 'nim' || normalized === 'nim_quic' ||
+      normalized === 'msquic_builtin') {
+      return 'builtin_only';
+    }
+    if (normalized === 'prefer_builtin' || normalized === 'prefer_pure_nim' || normalized === 'prefer_nim') {
+      return 'builtin_preferred';
+    }
+    switch (normalized) {
+      case 'auto':
+      case 'native_only':
+      case 'builtin_preferred':
+      case 'builtin_only':
+        return normalized as QuicRuntimePreference;
+      default:
+        return DEFAULT_QUIC_RUNTIME_PREFERENCE;
+    }
+  }
+
+  private defaultQuicRuntimeInfo(
+    requestedPreference: QuicRuntimePreference,
+    requestedLibraryPath: string
+  ): QuicRuntimeInfo {
+    return {
+      kind: 'unavailable',
+      implementation: 'unavailable',
+      path: '',
+      loaded: false,
+      pureNim: false,
+      requestedPreference: requestedPreference,
+      requestedLibraryPath: requestedLibraryPath.trim()
+    };
+  }
+
+  private quicRuntimeDisplayName(): string {
+    const info = this.quicRuntimeInfo;
+    if (info.implementation && info.implementation.length > 0 && info.implementation !== info.kind) {
+      return `${info.implementation} (${info.kind})`;
+    }
+    return info.implementation && info.implementation.length > 0 ? info.implementation : info.kind;
+  }
+
+  private refreshQuicRuntimeInfo(): void {
+    try {
+      const raw = this.node.diagnostics();
+      if (!raw || raw.length === 0) {
+        this.quicRuntimeInfo = this.defaultQuicRuntimeInfo(this.quicRuntimePreference, this.quicRuntimeLibraryPath);
+        return;
+      }
+      const parsed = JSON.parse(raw) as { quicRuntime?: Partial<QuicRuntimeInfo> };
+      const runtime = parsed.quicRuntime;
+      if (!runtime) {
+        this.quicRuntimeInfo = this.defaultQuicRuntimeInfo(this.quicRuntimePreference, this.quicRuntimeLibraryPath);
+        return;
+      }
+      const requestedPreference = this.normalizeQuicRuntimePreference(runtime.requestedPreference);
+      const requestedLibraryPath =
+        runtime.requestedLibraryPath && runtime.requestedLibraryPath.length > 0
+          ? runtime.requestedLibraryPath
+          : this.quicRuntimeLibraryPath.trim();
+      this.quicRuntimeInfo = {
+        kind: runtime.kind && runtime.kind.length > 0 ? runtime.kind : 'unavailable',
+        implementation:
+          runtime.implementation && runtime.implementation.length > 0
+            ? runtime.implementation
+            : (runtime.kind && runtime.kind.length > 0 ? runtime.kind : 'unavailable'),
+        path: runtime.path && runtime.path.length > 0 ? runtime.path : '',
+        loaded: runtime.loaded === true,
+        pureNim: runtime.pureNim === true,
+        requestedPreference: requestedPreference,
+        requestedLibraryPath: requestedLibraryPath
+      };
+      this.quicRuntimePreference = requestedPreference;
+      this.quicRuntimeLibraryPath = requestedLibraryPath;
+    } catch (err) {
+      console.warn(`refreshQuicRuntimeInfo failed: ${err}`);
+      this.quicRuntimeInfo = this.defaultQuicRuntimeInfo(this.quicRuntimePreference, this.quicRuntimeLibraryPath);
+    }
+  }
+
+  private applyQuicRuntimeSettings(): void {
+    this.quicRuntimePreference = this.normalizeQuicRuntimePreference(this.quicRuntimePreference);
+    this.quicRuntimeLibraryPath = this.quicRuntimeLibraryPath.trim();
+    this.persistStorageValue(QUIC_RUNTIME_PREFERENCE_KEY, this.quicRuntimePreference);
+    this.persistStorageValue(QUIC_RUNTIME_LIBRARY_PATH_KEY, this.quicRuntimeLibraryPath);
+    this.statusMessage = `Applying QUIC runtime: ${this.quicRuntimePreference}`;
+    this.stopNode();
+    this.startNode();
+  }
+
   private buildConfig(): string {
     const interfaceAddrs = this.collectInterfaceAddresses();
     const storedIpv4 = this.readStorageArray('__nimActiveIPv4');
@@ -1360,6 +1541,12 @@ struct Index {
     }
     const bootstrapMultiaddrs = this.loadPeerMultiaddrs('__nimBootstrapMultiaddrs', DEFAULT_BOOTSTRAP_MULTIADDRS);
     const relayMultiaddrs = this.loadPeerMultiaddrs('__nimRelayMultiaddrs', DEFAULT_RELAY_MULTIADDRS);
+    const quicRuntimePreference =
+      this.normalizeQuicRuntimePreference(this.readStorageValue(QUIC_RUNTIME_PREFERENCE_KEY));
+    const quicRuntimeLibraryPath = this.readStorageValue(QUIC_RUNTIME_LIBRARY_PATH_KEY).trim();
+    this.quicRuntimePreference = quicRuntimePreference;
+    this.quicRuntimeLibraryPath = quicRuntimeLibraryPath;
+    this.quicRuntimeInfo = this.defaultQuicRuntimeInfo(quicRuntimePreference, quicRuntimeLibraryPath);
     this.bootstrapMultiaddrs = bootstrapMultiaddrs;
     this.relayMultiaddrs = relayMultiaddrs;
     const config: NodeConfig = {
@@ -1379,7 +1566,9 @@ struct Index {
           forceSearchMeta: true
         },
         bootstrapMultiaddrs: bootstrapMultiaddrs,
-        relayMultiaddrs: relayMultiaddrs
+        relayMultiaddrs: relayMultiaddrs,
+        quicRuntimePreference: quicRuntimePreference,
+        quicRuntimeLibraryPath: quicRuntimeLibraryPath
       }
     };
     const persistedIdentity = this.loadPersistedIdentity();
@@ -1419,6 +1608,11 @@ struct Index {
     } catch (_) {
       return [];
     }
+  }
+
+  private readStorageValue(key: string): string {
+    const values = this.readStorageArray(key);
+    return values.length > 0 ? values[0] : '';
   }
 
   private sanitizeIpAddress(address: string | undefined | null): string {
@@ -2234,6 +2428,52 @@ struct Index {
   private renderOverview() {
     Column() {
       Text(`Local peer: ${this.localPeer || 'unknown'}`);
+      Column() {
+        Text('QUIC runtime').fontSize(18).fontWeight(FontWeight.Bold);
+        Text(`Active: ${this.quicRuntimeDisplayName()}`)
+          .fontColor(this.quicRuntimeInfo.loaded ? '#34C759' : '#8E8E93')
+          .margin({ top: 4 });
+        Text(`Requested: ${this.quicRuntimeInfo.requestedPreference}`)
+          .fontColor('#8E8E93')
+          .margin({ top: 2 });
+        if (this.quicRuntimeInfo.pureNim) {
+          Text('Pure Nim runtime active').fontColor('#34C759').margin({ top: 2 });
+        } else if (this.quicRuntimeInfo.loaded) {
+          Text('Native runtime active').fontColor('#8E8E93').margin({ top: 2 });
+        }
+        if (this.quicRuntimeInfo.path && this.quicRuntimeInfo.path.length > 0) {
+          Text(`Loaded library: ${this.quicRuntimeInfo.path}`)
+            .fontSize(12)
+            .fontColor('#8E8E93')
+            .margin({ top: 4 });
+        }
+        Row() {
+          ForEach(this.quicRuntimeOptions.slice(0, 2), (option: { value: QuicRuntimePreference; label: string }, index: number) => {
+            Button(option.label)
+              .margin({ right: 8, top: 8 })
+              .backgroundColor(this.quicRuntimePreference === option.value ? '#0A84FF' : '#1E1E1E')
+              .onClick(() => {
+                this.quicRuntimePreference = option.value;
+              });
+          }, (option: { value: QuicRuntimePreference; label: string }, index: number) => `${index}-${option.value}`);
+        };
+        Row() {
+          ForEach(this.quicRuntimeOptions.slice(2), (option: { value: QuicRuntimePreference; label: string }, index: number) => {
+            Button(option.label)
+              .margin({ right: 8, top: 8 })
+              .backgroundColor(this.quicRuntimePreference === option.value ? '#0A84FF' : '#1E1E1E')
+              .onClick(() => {
+                this.quicRuntimePreference = option.value;
+              });
+          }, (option: { value: QuicRuntimePreference; label: string }, index: number) => `${index + 2}-${option.value}`);
+        };
+        TextInput({ placeholder: 'Optional QUIC library path', text: this.quicRuntimeLibraryPath })
+          .margin({ top: 8 })
+          .onChange((value: string) => this.quicRuntimeLibraryPath = value);
+        Button('Apply QUIC Runtime & Restart')
+          .margin({ top: 8 })
+          .onClick(() => this.applyQuicRuntimeSettings());
+      }.margin({ bottom: 12 });
       Column() {
         Text('IPv4');
         ForEach(this.getIPv4DisplayLines(), (line: string, index: number) => Text(line), (line: string, index: number) => `ipv4-${index}-${line}`);

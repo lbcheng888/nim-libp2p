@@ -15,6 +15,55 @@ data class LanEndpoint(
     val timestampMs: Long
 )
 
+enum class QuicRuntimePreferenceOption(
+    val wireValue: String,
+    val displayName: String,
+    val summary: String
+) {
+    AUTO("auto", "Auto", "Use platform default search order"),
+    NATIVE_ONLY("native_only", "Native only", "Require external MsQuic library"),
+    BUILTIN_PREFERRED("builtin_preferred", "Prefer Nim", "Prefer builtin Nim QUIC runtime"),
+    BUILTIN_ONLY("builtin_only", "Nim only", "Force builtin Nim QUIC runtime");
+
+    companion object {
+        fun fromStoredValue(value: String?): QuicRuntimePreferenceOption? {
+            val normalized =
+                value?.trim()
+                    ?.lowercase()
+                    ?.replace('-', '_')
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: return null
+            return entries.firstOrNull { it.wireValue == normalized }
+                ?: when (normalized) {
+                    "default" -> AUTO
+                    "native", "msquic_native" -> NATIVE_ONLY
+                    "prefer_builtin", "prefer_pure_nim", "prefer_nim" -> BUILTIN_PREFERRED
+                    "builtin", "pure_nim", "nim", "nim_quic", "msquic_builtin" -> BUILTIN_ONLY
+                    else -> null
+                }
+        }
+    }
+}
+
+data class QuicRuntimeStatus(
+    val requestedPreference: QuicRuntimePreferenceOption = QuicRuntimePreferenceOption.AUTO,
+    val requestedLibraryPath: String = "",
+    val activeKind: String = "unavailable",
+    val implementation: String = "unavailable",
+    val activePath: String = "",
+    val pureNim: Boolean = false,
+    val loaded: Boolean = false
+) {
+    val displayName: String
+        get() =
+            when {
+                implementation.isNotBlank() && implementation != activeKind ->
+                    "$implementation ($activeKind)"
+                implementation.isNotBlank() -> implementation
+                else -> activeKind
+            }
+}
+
 data class PeerState(
     val peerId: String,
     val addresses: List<String> = emptyList(),
@@ -88,6 +137,9 @@ data class NodeUiState(
     val marketEnabled: Boolean = BuildConfig.MARKET_AUTOSTART,
     val bootstrapPeersRaw: String = BuildConfig.LIBP2P_BOOTSTRAP_PEERS,
     val relayPeersRaw: String = BuildConfig.LIBP2P_RELAY_PEERS,
+    val quicRuntimePreference: QuicRuntimePreferenceOption = QuicRuntimePreferenceOption.AUTO,
+    val quicRuntimeLibraryPath: String = "",
+    val quicRuntimeStatus: QuicRuntimeStatus = QuicRuntimeStatus(),
     
     // Legacy fields (kept for compat, but prefer multiChainWallets)
     val btcBalance: BigDecimal = BigDecimal.ZERO,

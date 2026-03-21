@@ -1,6 +1,7 @@
 package com.example.libp2psmoke.ui
 
 import com.example.libp2psmoke.dex.BtcAddressType
+import com.example.libp2psmoke.model.QuicRuntimePreferenceOption
 
 /**
  * UI 意图 (UiIntent/UiAction)
@@ -72,6 +73,8 @@ sealed interface UiIntent {
     // ═══════════════════════════════════════════════════════════════════
     data class UpdateBootstrapPeers(val raw: String) : UiIntent
     data class UpdateRelayPeers(val raw: String) : UiIntent
+    data class UpdateQuicRuntimePreference(val preference: QuicRuntimePreferenceOption) : UiIntent
+    data class UpdateQuicRuntimeLibraryPath(val path: String) : UiIntent
     object ApplyNetworkConfig : UiIntent
     data class SetMarketEnabled(val enabled: Boolean) : UiIntent
     object ResetNodeData : UiIntent

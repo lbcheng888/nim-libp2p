@@ -15,6 +15,7 @@ when defined(libp2p_run_feed_tests):
       checkTrackers()
 
     asyncTest "feed entry delivered across peers":
+      const TestTimeout = 5.seconds
       let nodes = generateNodes(
         2,
         gossip = true,
@@ -28,12 +29,11 @@ when defined(libp2p_run_feed_tests):
         await stopNodes(nodes)
 
       let gossip = nodes.toGossipSub()
-      await gossip[1].switch.connect(
-        gossip[0].switch.peerInfo.peerId, gossip[0].switch.peerInfo.addrs
-      )
+      await connectNodes(gossip[1], gossip[0])
 
       let feedReceived = newFuture[FeedItem]("feed-received")
       var fetchCount = 0
+      let feedTopic = toTopic("/content-feed", gossip[1].peerInfo.peerId)
 
       let service0 = newFeedService(
         gossip[0],
@@ -53,7 +53,7 @@ when defined(libp2p_run_feed_tests):
       )
 
       await service0.subscribeToPeer(gossip[1].peerInfo.peerId)
-      await waitSub(gossip[1], gossip[0], toTopic("/content-feed", gossip[1].peerInfo.peerId))
+      await waitSub(gossip[1], gossip[0], feedTopic)
 
       var entry = FeedEntry(
         id: "item-1",
@@ -61,10 +61,11 @@ when defined(libp2p_run_feed_tests):
         summary: "Sunset",
         cover: "cover".toBytes(),
       )
-      discard await service1.publishFeedItem(entry)
-      discard await service1.publishFeedItem(entry) # duplicate should be ignored
+      check (await service1.publishFeedItem(entry)) > 0
+      check (await service1.publishFeedItem(entry)) > 0 # duplicate should be ignored
 
-      let received = await feedReceived
+      check await feedReceived.withTimeout(TestTimeout)
+      let received = feedReceived.read()
       check received.entry.id == "item-1"
       check received.entry.mediaType == "image/jpeg"
       check received.entry.summary == "Sunset"
@@ -92,12 +93,13 @@ when defined(libp2p_run_feed_tests) and defined(libp2p_msquic_experimental):
       checkTrackers()
 
     asyncTest "feed entry delivered across peers (MsQuic transport)":
-      let (handle, initErr) = msdriver.initMsQuicTransport()
+      const TestTimeout = 5.seconds
+      let (handle, initErr) = initMsQuicTransportForAsync()
       if initErr.len > 0 or handle.isNil:
         echo "MsQuic runtime unavailable: ", initErr
         skip()
         return
-      handle.shutdown()
+      shutdownMsQuicTransportForAsync(handle)
 
       let nodes = generateNodes(
         2,
@@ -114,9 +116,8 @@ when defined(libp2p_run_feed_tests) and defined(libp2p_msquic_experimental):
         await stopNodes(nodes)
 
       let gossip = nodes.toGossipSub()
-      await gossip[1].switch.connect(
-        gossip[0].switch.peerInfo.peerId, gossip[0].switch.peerInfo.addrs
-      )
+      await connectNodes(gossip[0], gossip[1])
+      await connectNodes(gossip[1], gossip[0])
 
       let feedReceived = newFuture[FeedItem]("feed-received")
       var fetchCount = 0
@@ -147,10 +148,11 @@ when defined(libp2p_run_feed_tests) and defined(libp2p_msquic_experimental):
         summary: "Sunset MsQuic",
         cover: "cover-msquic".toBytes(),
       )
-      discard await service1.publishFeedItem(entry)
-      discard await service1.publishFeedItem(entry)
+      check (await service1.publishFeedItem(entry)) > 0
+      check (await service1.publishFeedItem(entry)) > 0
 
-      let received = await feedReceived
+      check await feedReceived.withTimeout(TestTimeout)
+      let received = feedReceived.read()
       check received.entry.id == "item-msquic-1"
       check received.entry.mediaType == "image/jpeg"
       check received.entry.summary == "Sunset MsQuic"

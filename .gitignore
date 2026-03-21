@@ -81,3 +81,4 @@ ipv6_bootstrap_node
 examples/dual_stack_bootstrap_node
 examples/quic_ping_client
 target/
+examples/nim_nc_probe

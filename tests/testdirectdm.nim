@@ -233,18 +233,12 @@ when defined(libp2p_run_direct_dm_tests) and defined(libp2p_msquic_experimental)
       checkTrackers()
 
     asyncTest "pubsub delivers direct dm with MsQuic transport":
-      let initRes = block:
-        var tmp: tuple[handle: msdriver.MsQuicTransportHandle, error: string]
-        {.cast(gcsafe).}:
-          tmp = msdriver.initMsQuicTransport()
-        tmp
-      let (handle, initErr) = initRes
+      let (handle, initErr) = initMsQuicTransportForAsync()
       if initErr.len > 0 or handle.isNil:
         echo "MsQuic runtime unavailable: ", initErr
         skip()
         return
-      {.cast(gcsafe).}:
-        handle.shutdown()
+      shutdownMsQuicTransportForAsync(handle)
 
       let nodes = generateNodes(
         2,

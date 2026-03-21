@@ -11,7 +11,10 @@ when defined(libp2p_msquic_experimental):
 
   suite "Quic transport configuration (legacy)":
     test "OpenSSL QUIC disabled under MsQuic build":
-      skip("OpenSSL-based quictransport is not available when libp2p_msquic_experimental is enabled")
+      checkpoint(
+        "OpenSSL-based quictransport is not available when libp2p_msquic_experimental is enabled"
+      )
+      skip()
 else:
   import chronos
   import unittest2

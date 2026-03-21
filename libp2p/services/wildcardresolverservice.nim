@@ -121,9 +121,9 @@ proc getWildcardMultiAddresses(
       let parsed = MultiAddress.init("/quic-v1")
       if parsed.isErr:
         return @[]
-      some(parsed.get())
+      Opt.some(parsed.get())
     else:
-      none(MultiAddress)
+      Opt.none(MultiAddress)
   var addresses: seq[MultiAddress]
   for ifaddr in interfaceAddresses:
     var address = ifaddr.host

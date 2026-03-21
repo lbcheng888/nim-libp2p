@@ -501,6 +501,7 @@ type
     subscriptions: Table[pointer, Subscription]
     peerHints: Table[string, seq[string]]
     peerHintSources: Table[string, seq[string]]
+    authoritativeBootstrapPeerIds: seq[string]
     bootstrapLastSeen: Table[string, int64]
     mdnsEnabled: bool
     mdnsIntervalSeconds: int
@@ -560,6 +561,7 @@ type
     rendezvous: RendezVous
     relayReservations: Table[string, int64]
     discovery: DiscoveryManager
+    configuredMdnsService: string
     mdnsInterface: MdnsInterface
     mdnsService: string
     mdnsServices: seq[string]
@@ -1727,6 +1729,16 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       @[]
     else:
       configuredAnchorSeedAddrs(node)
+  let authoritativePeerIds =
+    if node.isNil:
+      @[]
+    else:
+      node.authoritativeBootstrapPeerIds
+  let localHintPeerIds =
+    if node.isNil:
+      @[]
+    else:
+      toSeq(node.peerHints.keys).sorted(system.cmp[string])
   let localHasGlobalIpv6 = localSeedAddrs.anyIt(isWanProviderIpv6Addr(it))
   let localHasPublicIpv4 = localSeedAddrs.anyIt(isWanProviderIpv4Addr(it))
   let localHasQuic = localSeedAddrs.anyIt("/quic-v1" in it.toLowerAscii())
@@ -1862,6 +1874,10 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
   payload["providerDirectSeedAddrs"] = %directProviderSeedAddrs
   payload["providerRelaySeedAddrs"] = %relayProviderSeedAddrs
   payload["anchorSeedAddrs"] = %anchorSeedAddrs
+  payload["authoritativeBootstrapPeerIds"] = %authoritativePeerIds
+  payload["authoritativeBootstrapPeerIdCount"] = %authoritativePeerIds.len
+  payload["localHintPeerIds"] = %localHintPeerIds
+  payload["localHintPeerCount"] = %localHintPeerIds.len
   payload["seedAddrs"] = %localSeedAddrs
   payload["localHasGlobalIpv6"] = %localHasGlobalIpv6
   payload["localHasPublicIpv4"] = %localHasPublicIpv4
@@ -2826,6 +2842,86 @@ proc tcpAvailable(addrs: openArray[string]): bool =
       return true
   false
 
+when defined(libp2p_msquic_experimental):
+  proc quicRuntimePreferenceLabel(
+      pref: QuicRuntimePreference
+  ): string {.gcsafe, raises: [].} =
+    case pref
+    of qrpAuto:
+      "auto"
+    of qrpNativeOnly:
+      "native_only"
+    of qrpBuiltinPreferred:
+      "builtin_preferred"
+    of qrpBuiltinOnly:
+      "builtin_only"
+
+  proc parseQuicRuntimePreferenceValue(
+      value: string
+  ): Result[Option[QuicRuntimePreference], string] {.gcsafe, raises: [].} =
+    let normalized = value.strip().toLowerAscii().replace("-", "_")
+    if normalized.len == 0:
+      return ok(none(QuicRuntimePreference))
+    case normalized
+    of "auto", "default":
+      ok(some(qrpAuto))
+    of "native", "native_only", "msquic_native":
+      ok(some(qrpNativeOnly))
+    of "builtin_preferred", "prefer_builtin", "prefer_pure_nim", "prefer_nim":
+      ok(some(qrpBuiltinPreferred))
+    of "builtin", "builtin_only", "pure_nim", "nim", "nim_quic", "msquic_builtin":
+      ok(some(qrpBuiltinOnly))
+    else:
+      err("invalid QUIC runtime preference: " & value)
+
+  proc configuredQuicRuntimePreference(
+      extra: JsonNode
+  ): Result[Option[QuicRuntimePreference], string] {.gcsafe, raises: [].} =
+    if extra.kind != JObject:
+      return ok(none(QuicRuntimePreference))
+    parseQuicRuntimePreferenceValue(
+      jsonGetStr(
+        extra,
+        "quicRuntimePreference",
+        jsonGetStr(
+          extra,
+          "quic_runtime_preference",
+          jsonGetStr(
+            extra,
+            "quicRuntime",
+            jsonGetStr(
+              extra,
+              "quic_runtime",
+              jsonGetStr(
+                extra,
+                "msquicRuntime",
+                jsonGetStr(extra, "msquic_runtime", "")
+              )
+            )
+          )
+        )
+      )
+    )
+
+  proc configuredQuicRuntimeLibraryPath(
+      extra: JsonNode
+  ): string {.gcsafe, raises: [].} =
+    if extra.kind != JObject:
+      return ""
+    jsonGetStr(
+      extra,
+      "quicRuntimeLibraryPath",
+      jsonGetStr(
+        extra,
+        "quic_runtime_library_path",
+        jsonGetStr(
+          extra,
+          "msquicLibraryPath",
+          jsonGetStr(extra, "msquic_library_path", "")
+        )
+      )
+    ).strip()
+
 proc buildTransportHealthPayload(
     n: NimNode, listenAddrs, dialableAddrs: openArray[string]
 ): JsonNode {.gcsafe.} =
@@ -2833,9 +2929,58 @@ proc buildTransportHealthPayload(
   let quicEnabled = quicAvailable(listenAddrs) or quicAvailable(dialableAddrs)
   let tcpEnabled = tcpAvailable(listenAddrs) or tcpAvailable(dialableAddrs)
   let physicalPrefixes = %*["/awdl", "/nan", "/nearlink"]
+  when defined(libp2p_msquic_experimental):
+    let runtimeInfo =
+      block:
+        if not n.isNil and not n.switchInstance.isNil:
+          let stats = n.switchInstance.msquicTransportStats()
+          if stats.len > 0:
+            stats[0].runtime
+          else:
+            QuicRuntimeInfo(
+              kind: qrkUnavailable,
+              implementation: quicruntime.kindLabel(qrkUnavailable),
+              path: "",
+              requestedVersion: 0'u32,
+              negotiatedVersion: 0'u32,
+              compileTimeBuiltin: false,
+              loaded: false
+            )
+        else:
+          QuicRuntimeInfo(
+            kind: qrkUnavailable,
+            implementation: quicruntime.kindLabel(qrkUnavailable),
+            path: "",
+            requestedVersion: 0'u32,
+            negotiatedVersion: 0'u32,
+            compileTimeBuiltin: false,
+            loaded: false
+          )
+    let requestedPreference =
+      block:
+        if not n.isNil:
+          let prefRes = configuredQuicRuntimePreference(n.cfg.extra)
+          if prefRes.isOk and prefRes.get().isSome:
+            quicRuntimePreferenceLabel(prefRes.get().get())
+          else:
+            quicRuntimePreferenceLabel(qrpAuto)
+        else:
+          quicRuntimePreferenceLabel(qrpAuto)
+    let requestedLibraryPath =
+      if not n.isNil: configuredQuicRuntimeLibraryPath(n.cfg.extra) else: ""
+    let quicMuxerLabel =
+      case runtimeInfo.kind
+      of qrkMsQuicBuiltin:
+        "msquic-builtin"
+      of qrkMsQuicNative:
+        "msquic-native"
+      else:
+        "quic"
+  else:
+    let quicMuxerLabel = "quic"
   let muxerPreference =
     if quicEnabled and not tcpEnabled:
-      @[%"msquic-native"]
+      @[ %quicMuxerLabel ]
     else:
       @[ %"/yamux/1.0.0", %"/mplex/6.7.0" ]
   let transportPolicy =
@@ -2857,16 +3002,6 @@ proc buildTransportHealthPayload(
     else:
       "none"
   when defined(libp2p_msquic_experimental):
-    let runtimeInfo =
-      block:
-        if not n.isNil and not n.switchInstance.isNil:
-          let stats = n.switchInstance.msquicTransportStats()
-          if stats.len > 0:
-            stats[0].runtime
-          else:
-            quicruntime.currentQuicRuntimeInfo()
-        else:
-          quicruntime.currentQuicRuntimeInfo()
     let runtimePayload = %* {
       "kind": quicruntime.kindLabel(runtimeInfo.kind),
       "implementation": runtimeInfo.implementation,
@@ -2875,6 +3010,9 @@ proc buildTransportHealthPayload(
       "compileTimeBuiltin": runtimeInfo.compileTimeBuiltin,
       "requestedVersion": runtimeInfo.requestedVersion,
       "negotiatedVersion": runtimeInfo.negotiatedVersion,
+      "pureNim": quicruntime.isPureNimRuntime(runtimeInfo),
+      "requestedPreference": requestedPreference,
+      "requestedLibraryPath": requestedLibraryPath,
     }
   else:
     let runtimePayload = %* {
@@ -2885,6 +3023,9 @@ proc buildTransportHealthPayload(
       "compileTimeBuiltin": false,
       "requestedVersion": 0'u32,
       "negotiatedVersion": 0'u32,
+      "pureNim": false,
+      "requestedPreference": "auto",
+      "requestedLibraryPath": "",
     }
   %* {
     "transportPolicy": transportPolicy,
@@ -4639,6 +4780,20 @@ proc collectLanIpv4Addrs(preferred: string = ""): seq[string] {.gcsafe.} =
   debugLog("[nimlibp2p] collectLanIpv4Addrs -> " & filtered.join(","))
   result = filtered
 
+proc mdnsAllowedForHostStatus(hostStatus: JsonNode): bool {.gcsafe.} =
+  let networkType = jsonGetStr(hostStatus, "networkType", "").strip().toLowerAscii()
+  let transport = jsonGetStr(hostStatus, "transport", "").strip().toLowerAscii()
+  if networkType in ["wifi", "ethernet"] or transport in ["wifi", "ethernet"]:
+    return true
+  if networkType in ["cellular", "vpn", "none"] or
+      transport in ["cellular", "5g", "4g", "3g", "2g", "vpn", "none"]:
+    return false
+  let preferredIpv4 = jsonGetStr(hostStatus, "preferredIpv4", jsonGetStr(hostStatus, "localIpv4", "")).strip()
+  collectLanIpv4Addrs(preferredIpv4).len > 0
+
+proc mdnsAllowedForCurrentHost(n: NimNode): bool {.gcsafe.} =
+  mdnsAllowedForHostStatus(currentHostNetworkStatus(n))
+
 proc isLanIpv6(ip: string): bool {.gcsafe.} =
   if ip.len == 0:
     return false
@@ -4948,30 +5103,16 @@ proc addrTransportPortKey(text: string): string {.gcsafe.} =
 proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] {.gcsafe.} =
   if n.switchInstance.isNil or n.switchInstance.peerInfo.isNil:
     return @[]
-  var base = n.switchInstance.peerInfo.listenAddrs
+  var base: seq[MultiAddress] = @[]
+  if n.cfg.listenAddresses.len > 0:
+    for cfgAddr in n.cfg.listenAddresses:
+      let parsed = MultiAddress.init(cfgAddr)
+      if parsed.isOk():
+        base.add(parsed.get())
+  if base.len == 0:
+    base = n.switchInstance.peerInfo.listenAddrs
   if base.len == 0:
     base = n.switchInstance.peerInfo.addrs
-  if n.cfg.listenAddresses.len > 0 and base.len > 0:
-    var activeKeys = initHashSet[string]()
-    var seenBase = initHashSet[string]()
-    for ma in base:
-      let text = $ma
-      let key = addrTransportPortKey(text)
-      if key.len > 0:
-        activeKeys.incl(key)
-      seenBase.incl(text)
-    for cfgAddr in n.cfg.listenAddresses:
-      let key = addrTransportPortKey(cfgAddr)
-      if key.len == 0 or key notin activeKeys:
-        continue
-      let parsed = MultiAddress.init(cfgAddr)
-      if parsed.isErr():
-        continue
-      let normalized = $parsed.get()
-      if normalized in seenBase:
-        continue
-      base.add(parsed.get())
-      seenBase.incl(normalized)
   let preservedBase = base
   let hostNetwork = currentHostNetworkStatus(n)
   let preferredIpv4 = jsonGetStr(
@@ -5241,20 +5382,29 @@ proc noteMdnsDiscovery(
   n: NimNode, peer: PeerId, addrs: seq[MultiAddress]
 ) {.gcsafe, raises: [].}
 
-proc computeMdnsServiceName(n: NimNode): string {.gcsafe.} =
+proc configuredMdnsServiceName(cfg: NodeConfig): string {.gcsafe.} =
   let envService = getEnv("UNIMAKER_MDNS_SERVICE")
   if envService.len > 0:
     return canonicalMdnsServiceName(envService)
-  if not n.cfg.extra.isNil and n.cfg.extra.kind == JObject:
-    if n.cfg.extra.hasKey("mdnsService"):
-      let explicit = jsonGetStr(n.cfg.extra, "mdnsService")
+  if not cfg.extra.isNil and cfg.extra.kind == JObject:
+    if cfg.extra.hasKey("mdnsService"):
+      let explicit = jsonGetStr(cfg.extra, "mdnsService")
       if explicit.len > 0:
         return canonicalMdnsServiceName(explicit)
-    let mdnsNode = n.cfg.extra.getOrDefault("mdns")
-    if mdnsNode.kind == JObject:
+    let mdnsNode = cfg.extra.getOrDefault("mdns")
+    if not mdnsNode.isNil and mdnsNode.kind == JObject:
       let nested = jsonGetStr(mdnsNode, "service")
       if nested.len > 0:
         return canonicalMdnsServiceName(nested)
+  canonicalMdnsServiceName(DefaultMdnsServiceName)
+
+proc computeMdnsServiceName(n: NimNode): string {.gcsafe.} =
+  if n.isNil:
+    return canonicalMdnsServiceName(DefaultMdnsServiceName)
+  if n.mdnsService.len > 0:
+    return canonicalMdnsServiceName(n.mdnsService)
+  if n.configuredMdnsService.len > 0:
+    return canonicalMdnsServiceName(n.configuredMdnsService)
   canonicalMdnsServiceName(DefaultMdnsServiceName)
 
 proc multiaddrsFromExtra(extra: JsonNode, key: string): seq[string] =
@@ -5339,6 +5489,13 @@ proc configuredWanJournalPath(cfg: NodeConfig): string =
   else:
     ""
 
+proc configuredWanBootstrapAuthoritative(cfg: NodeConfig): bool =
+  if cfg.extra.kind == JObject:
+    if jsonGetBool(cfg.extra, "bootstrapAuthoritative", false) or
+        jsonGetBool(cfg.extra, "bootstrap_authoritative", false):
+      return true
+  false
+
 proc configuredWanBootstrapAddrs(cfg: NodeConfig): seq[MultiAddress] =
   var seen = initHashSet[string]()
   for key in [
@@ -5372,11 +5529,26 @@ proc configuredWanBootstrapAddrs(cfg: NodeConfig): seq[MultiAddress] =
 proc effectiveBootstrapHints(cfg: NodeConfig): seq[MultiAddress] =
   configuredWanBootstrapAddrs(cfg)
 
+proc configuredWanBootstrapAuthoritativePeerIds(cfg: NodeConfig): seq[string] =
+  if not configuredWanBootstrapAuthoritative(cfg):
+    return @[]
+  var seen = initHashSet[string]()
+  for addr in configuredWanBootstrapAddrs(cfg):
+    let peerIdOpt = extractPeerIdFromMultiaddrStr($addr)
+    if peerIdOpt.isNone():
+      continue
+    let peerId = peerIdOpt.get().strip()
+    if peerId.len == 0 or peerId in seen:
+      continue
+    seen.incl(peerId)
+    result.add(peerId)
+
 proc configuredWanBootstrapConfig(cfg: NodeConfig): WanBootstrapConfig =
   bootstrapRoleConfig(
     role = configuredWanBootstrapRole(cfg),
     networkId = configuredWanNetworkId(cfg),
     journalPath = configuredWanJournalPath(cfg),
+    authoritativePeerIds = configuredWanBootstrapAuthoritativePeerIds(cfg),
     fallbackDnsAddrs = configuredWanBootstrapAddrs(cfg),
   )
 
@@ -5454,6 +5626,45 @@ proc registerInitialPeerHints(n: NimNode, multiaddrs: seq[string], source: strin
         warn "initial peer hint addAddressesWithTTL failed", peer = peerId, source = source, err = exc.msg
     info "initial peer hints registered", peer = peerId, source = source, hintCount = parsed.len
 
+proc syncPeerHintsIntoBootstrapService(n: NimNode, source = "initial_sync") {.gcsafe.} =
+  if n.isNil or n.switchInstance.isNil or n.peerHints.len == 0:
+    return
+  for peerId, addrs in n.peerHints.pairs:
+    let peerRes = PeerId.init(peerId)
+    if peerRes.isErr():
+      continue
+    var parsed: seq[MultiAddress] = @[]
+    for addrStr in addrs:
+      let maRes = parseDialableMultiaddr(addrStr)
+      if maRes.isErr():
+        continue
+      parsed.add(maRes.get())
+    if parsed.len == 0:
+      continue
+    let sources = n.peerHintSources.getOrDefault(peerId)
+    let hintSource =
+      if sources.len > 0:
+        sources[0]
+      else:
+        source
+    try:
+      discard n.switchInstance.registerBootstrapHint(
+        peerRes.get(),
+        parsed,
+        source = hintSource,
+        trust = WanBootstrapTrust.quarantine
+      )
+    except CatchableError as exc:
+      warn "sync peer hints into bootstrap service failed", peer = peerId, source = hintSource, err = exc.msg
+
+proc applyAuthoritativeBootstrapConfig(n: NimNode) {.gcsafe.} =
+  if n.isNil or n.switchInstance.isNil or n.authoritativeBootstrapPeerIds.len == 0:
+    return
+  let svc = getWanBootstrapService(n.switchInstance)
+  if svc.isNil:
+    return
+  svc.config.authoritativePeerIds = n.authoritativeBootstrapPeerIds
+
 
 proc computeMdnsIntervals(n: NimNode): tuple[queryMs: int, announceMs: int] =
   var queryMs = max(n.mdnsIntervalSeconds, 1) * 1000
@@ -5482,6 +5693,9 @@ proc computeMdnsIntervals(n: NimNode): tuple[queryMs: int, announceMs: int] =
 
 proc prepareMdns(n: NimNode) {.gcsafe.} =
   if n.discovery != nil or not n.mdnsEnabled or n.switchInstance.isNil:
+    return
+  if not mdnsAllowedForCurrentHost(n):
+    debugLog("[nimlibp2p] prepareMdns: skip non-lan host transport")
     return
   let peerInfo = n.switchInstance.peerInfo
   if peerInfo.isNil:
@@ -5843,6 +6057,47 @@ proc wanBootstrapJoinResultToJson(joinResult: WanBootstrapJoinResult): JsonNode 
   result["attempts"] = attemptsNode
   result["attempted"] = attemptedNode
 
+proc bootstrapCandidateToJson(candidate: BootstrapCandidate): JsonNode {.gcsafe.} =
+  result = newJObject()
+  result["peerId"] = %candidate.peerId
+  result["addrs"] = %candidate.multiaddrs
+  result["lastSeenAtMs"] = %candidate.lastSeenAt
+  result["sources"] = %candidate.sources
+  result["selectionReason"] = %candidate.selectionReason
+
+proc collectLocalBootstrapCandidates(n: NimNode): seq[BootstrapCandidate] {.gcsafe.}
+proc selectProgressiveBootstrapCandidates(
+    candidates: seq[BootstrapCandidate], limit: int
+): seq[BootstrapCandidate] {.gcsafe.}
+
+proc mergeLocalBootstrapStatus(node: NimNode, payload: var JsonNode, limit: int) {.gcsafe.} =
+  if node.isNil:
+    return
+  let candidates = collectLocalBootstrapCandidates(node)
+  let selected = selectProgressiveBootstrapCandidates(candidates, limit)
+  var connected = initHashSet[string]()
+  if not node.switchInstance.isNil:
+    try:
+      for pid in node.switchInstance.connectedPeers(Direction.Out):
+        connected.incl($pid)
+      for pid in node.switchInstance.connectedPeers(Direction.In):
+        connected.incl($pid)
+    except CatchableError:
+      discard
+
+  var selectedNode = newJArray()
+  for item in selected:
+    selectedNode.add(bootstrapCandidateToJson(item))
+
+  payload["networkId"] = %configuredWanNetworkId(node.cfg)
+  payload["role"] = %($configuredWanBootstrapRole(node.cfg))
+  payload["running"] = %(not node.switchInstance.isNil)
+  payload["hintPeerCount"] = %candidates.len
+  payload["candidateCount"] = %candidates.len
+  payload["connectedPeerCount"] = %connected.len
+  payload["selectedCandidates"] = selectedNode
+  payload["selectedCandidateCount"] = %selected.len
+
 proc addBootstrapSource(target: var seq[string], source: string) =
   if source.len > 0 and source notin target:
     target.add(source)
@@ -5900,11 +6155,14 @@ proc candidateLastSeen(n: NimNode, peerId: string): int64 =
     ts = max(ts, jsonGetInt64(n.peerSystemProfiles.getOrDefault(peerId), "updatedAtMs", 0))
   ts
 
-proc collectBootstrapCandidates(n: NimNode): seq[BootstrapCandidate] =
+proc collectLocalBootstrapCandidates(n: NimNode): seq[BootstrapCandidate] {.gcsafe.} =
   pruneStaleMdnsPeers(n)
   var candidates = initTable[string, BootstrapCandidate]()
   let localId = localPeerId(n)
   let nowTs = nowMillis()
+  var connected = initHashSet[string]()
+  let authoritativeBootstrapActive =
+    n.authoritativeBootstrapPeerIds.len > 0
 
   proc upsert(peerId: string, addrs: seq[string], source: string, seenAt: int64 = 0'i64) =
     let normalizedPeerId = peerId.strip()
@@ -5931,7 +6189,6 @@ proc collectBootstrapCandidates(n: NimNode): seq[BootstrapCandidate] =
       upsert(peerId, @[], "Hint:" & hintSource)
 
   if not n.switchInstance.isNil:
-    var connected = initHashSet[string]()
     try:
       for pid in n.switchInstance.connectedPeers(Direction.Out):
         connected.incl($pid)
@@ -5958,13 +6215,16 @@ proc collectBootstrapCandidates(n: NimNode): seq[BootstrapCandidate] =
     var entry = item
     if entry.multiaddrs.len == 0:
       continue
+    if authoritativeBootstrapActive and connected.len == 0:
+      if peerId notin n.authoritativeBootstrapPeerIds:
+        continue
     if entry.lastSeenAt <= 0 and "Connected" in entry.sources:
       entry.lastSeenAt = nowTs
     if entry.lastSeenAt <= 0:
       entry.lastSeenAt = nowTs - 1
     result.add(entry)
 
-proc bootstrapSourceScore(candidate: BootstrapCandidate): int =
+proc bootstrapSourceScore(candidate: BootstrapCandidate): int {.gcsafe.} =
   result = min(candidate.multiaddrs.len, 8)
   for source in candidate.sources:
     case source
@@ -5984,7 +6244,7 @@ proc bootstrapSourceScore(candidate: BootstrapCandidate): int =
         elif isBootstrapInfraHint(hintSource):
           result += 120
 
-proc compareBootstrapCandidates(a, b: BootstrapCandidate): int =
+proc compareBootstrapCandidates(a, b: BootstrapCandidate): int {.gcsafe.} =
   result = cmp(b.lastSeenAt, a.lastSeenAt)
   if result == 0:
     result = cmp(bootstrapSourceScore(b), bootstrapSourceScore(a))
@@ -5993,16 +6253,16 @@ proc compareBootstrapCandidates(a, b: BootstrapCandidate): int =
   if result == 0:
     result = cmp(a.peerId, b.peerId)
 
-proc sortBootstrapCandidates(candidates: var seq[BootstrapCandidate]) =
+proc sortBootstrapCandidates(candidates: var seq[BootstrapCandidate]) {.gcsafe.} =
   candidates.sort(compareBootstrapCandidates)
 
-proc clampBootstrapLimit(limit: int, defaultLimit: int, maxLimit: int): int =
+proc clampBootstrapLimit(limit: int, defaultLimit: int, maxLimit: int): int {.gcsafe.} =
   let resolved = if limit > 0: limit else: defaultLimit
   max(1, min(resolved, maxLimit))
 
 proc selectProgressiveBootstrapCandidates(
     candidates: seq[BootstrapCandidate], limit: int
-): seq[BootstrapCandidate] =
+): seq[BootstrapCandidate] {.gcsafe.} =
   let target = clampBootstrapLimit(
     limit, defaultLimit = BootstrapCandidateCap, maxLimit = BootstrapCandidateCap
   )
@@ -6398,7 +6658,7 @@ proc stopMdns(n: NimNode): Future[void] {.async.} =
       warn "mdns close transport failed", err = exc.msg
   n.mdnsInterface = nil
   n.mdnsServices = @[]
-  n.mdnsService = DefaultMdnsServiceName
+  n.mdnsService = n.configuredMdnsService
   pruneStaleMdnsPeers(n, forceAll = true)
   n.mdnsLastSeen = initTable[string, int64]()
   n.mdnsReady = false
@@ -7084,10 +7344,27 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
   when defined(libp2p_msquic_experimental):
     var msquicActivated = false
     if wantsQuic:
-      let bridgeRes = msquicruntime.acquireMsQuicBridge()
+      var msquicBuilderCfg = MsQuicTransportBuilderConfig.init()
+      let prefRes = configuredQuicRuntimePreference(cfg.extra)
+      if prefRes.isErr:
+        return err(prefRes.error)
+      if prefRes.get().isSome:
+        msquicBuilderCfg.config.setRuntimePreference(prefRes.get().get())
+        debugLog(
+          "[nimlibp2p] buildSwitch applied QUIC runtime preference=" &
+          quicRuntimePreferenceLabel(prefRes.get().get())
+        )
+      let explicitRuntimePath = configuredQuicRuntimeLibraryPath(cfg.extra)
+      if explicitRuntimePath.len > 0:
+        msquicBuilderCfg.config.loadOptions.explicitPath = explicitRuntimePath
+        msquicBuilderCfg.config.loadOptions.allowFallback = false
+        debugLog(
+          "[nimlibp2p] buildSwitch applied QUIC runtime library path=" &
+          explicitRuntimePath
+        )
+      let bridgeRes = msquicruntime.acquireMsQuicBridge(msquicBuilderCfg.config.loadOptions)
       if bridgeRes.success and not bridgeRes.bridge.isNil:
         msquicruntime.releaseMsQuicBridge(bridgeRes.bridge)
-        var msquicBuilderCfg = MsQuicTransportBuilderConfig.init()
         if cfg.extra.kind == JObject:
           let preferredClientBindHost = jsonGetStr(
             cfg.extra,
@@ -7283,6 +7560,307 @@ proc allocCString(str: string): cstring =
   buf[str.len] = '\0'
   raw
 
+type NcProbeMode = enum
+  ncpmRawTcp
+  ncpmLibp2p
+
+proc parseNcProbeTargetStrings(raw: string): seq[string] =
+  let trimmed = raw.strip()
+  if trimmed.len == 0:
+    return
+
+  try:
+    let parsed = parseJson(trimmed)
+    case parsed.kind
+    of JArray:
+      for item in parsed.items:
+        if item.kind == JString:
+          let value = item.getStr().strip()
+          if value.len > 0:
+            result.add(value)
+    of JString:
+      let value = parsed.getStr().strip()
+      if value.len > 0:
+        result.add(value)
+    else:
+      discard
+  except CatchableError:
+    discard
+
+  if result.len > 0:
+    return
+
+  for token in trimmed.replace("\r", "\n").replace(",", "\n").splitLines():
+    let value = token.strip()
+    if value.len > 0:
+      result.add(value)
+
+proc parseNcProbeTargets(raw: string): seq[MultiAddress] =
+  for item in parseNcProbeTargetStrings(raw):
+    let parsed = MultiAddress.init(item)
+    if parsed.isErr:
+      raise newException(ValueError, "invalid multiaddr: " & item)
+    result.add(parsed.get())
+  if result.len == 0:
+    raise newException(ValueError, "no probe targets provided")
+
+proc resolveNcProbeTlsTempDir(): string =
+  proc isWritableDir(path: string): bool =
+    let trimmed = path.strip()
+    if trimmed.len == 0:
+      return false
+    try:
+      createDir(trimmed)
+    except CatchableError:
+      return false
+
+    randomize()
+    let probePath = trimmed / (
+      "nim-libp2p-probe-" & $toUnix(getTime()) & "-" & $rand(0x00FF_FFFF) & ".tmp"
+    )
+    try:
+      writeFile(probePath, "probe")
+      removeFile(probePath)
+      true
+    except CatchableError:
+      try:
+        if fileExists(probePath):
+          removeFile(probePath)
+      except CatchableError:
+        discard
+      false
+
+  var candidates: seq[string] = @[]
+  let explicitTempDir = getEnv("UNIMAKER_LIBP2P_TLS_TMP_DIR").strip()
+  if explicitTempDir.len > 0:
+    candidates.add(explicitTempDir)
+
+  let dataDir = getEnv("UNIMAKER_LIBP2P_DATA_DIR").strip()
+  if dataDir.len > 0:
+    candidates.add(dataDir / "tls_tmp")
+
+  let tmpDirEnv = getEnv("TMPDIR").strip()
+  if tmpDirEnv.len > 0:
+    candidates.add(tmpDirEnv / "nim-libp2p" / "tls_tmp")
+
+  let homeDir = getEnv("HOME").strip()
+  if homeDir.len > 0:
+    candidates.add(homeDir / ".cache" / "nim-libp2p" / "tls_tmp")
+    candidates.add(homeDir / "cache" / "nim-libp2p" / "tls_tmp")
+    candidates.add(homeDir / "files" / "nim-libp2p" / "tls_tmp")
+
+  try:
+    let cwd = getCurrentDir().strip()
+    if cwd.len > 0 and cwd != "/":
+      candidates.add(cwd / ".nim-libp2p" / "tls_tmp")
+  except CatchableError:
+    discard
+
+  try:
+    let sysTempDir = getTempDir().strip()
+    if sysTempDir.len > 0:
+      candidates.add(sysTempDir / "nim-libp2p" / "tls_tmp")
+  except CatchableError:
+    discard
+
+  for candidate in candidates:
+    if isWritableDir(candidate):
+      return candidate
+
+  return ""
+
+proc classifyNcProbeTarget(target: MultiAddress): set[NcProbeMode] =
+  let text = $target
+  if "/tcp/" in text:
+    result.incl(ncpmRawTcp)
+    result.incl(ncpmLibp2p)
+  elif "/quic-v1" in text:
+    result.incl(ncpmLibp2p)
+
+proc rawTcpProbeAddress(target: MultiAddress): MultiAddress =
+  if "/p2p/" in $target:
+    return target[0 .. 1].valueOr:
+      raise newException(ValueError, "failed to derive raw tcp address from " & $target)
+  target
+
+proc ncProbeElapsedMs(startedAt: float): int64 =
+  int64(max(0.0, (epochTime() - startedAt) * 1000.0))
+
+proc closeProbeStream(stream: StreamTransport) {.async: (raises: []).} =
+  if stream.isNil:
+    return
+  try:
+    await stream.closeWait()
+  except CatchableError:
+    discard
+
+proc buildNcProbeSwitch(targets: seq[MultiAddress]): Switch =
+  let rng = newRng()
+  var listenAddrs = @[MultiAddress.init("/ip6/::/tcp/0").get()]
+  if targets.anyIt("/quic-v1" in $it):
+    when defined(libp2p_msquic_experimental):
+      listenAddrs.add(MultiAddress.init("/ip6/::/udp/0/quic-v1").get())
+
+  var builder = SwitchBuilder
+    .new()
+    .withRng(rng)
+    .withAddresses(listenAddrs)
+    .withTcpTransport()
+    .withMplex()
+    .withNoise()
+
+  if targets.anyIt("/quic-v1" in $it):
+    when defined(libp2p_msquic_experimental):
+      var msquicBuilderCfg = MsQuicTransportBuilderConfig.init()
+      let tlsTempDir = resolveNcProbeTlsTempDir()
+      if tlsTempDir.len > 0:
+        msquicBuilderCfg.onTransport = Opt.some(MsQuicTransportHook(
+          proc(transport: MsQuicTransport) =
+            transport.setTlsTempDir(tlsTempDir)
+        ))
+      builder = builder.withMsQuicTransport(msquicBuilderCfg)
+
+  builder.build()
+
+proc buildLibp2pProbeFailure(target: MultiAddress; error: string): JsonNode =
+  result = newJObject()
+  result["probe"] = %"libp2p"
+  result["target"] = %($target)
+  result["ok"] = %false
+  result["durationMs"] = %0
+  result["error"] = %(if error.len > 0: error else: "libp2p probe unavailable")
+
+proc runRawTcpProbe(target: MultiAddress; timeoutMs: int): Future[JsonNode] {.async.} =
+  result = newJObject()
+  result["probe"] = %"raw-tcp"
+  let rawTarget =
+    try:
+      rawTcpProbeAddress(target)
+    except CatchableError as exc:
+      result["target"] = %($target)
+      result["ok"] = %false
+      result["durationMs"] = %0
+      result["error"] = %exc.msg
+      return
+
+  result["target"] = %($rawTarget)
+  let startedAt = epochTime()
+  let dialFut = wire.connect(rawTarget)
+  try:
+    let stream = await dialFut.wait(chronos.milliseconds(timeoutMs))
+    defer:
+      await closeProbeStream(stream)
+    result["ok"] = %true
+    result["durationMs"] = %ncProbeElapsedMs(startedAt)
+  except AsyncTimeoutError:
+    if not dialFut.finished():
+      dialFut.cancel()
+    result["ok"] = %false
+    result["durationMs"] = %int64(timeoutMs)
+    result["error"] = %"timeout"
+  except CatchableError as exc:
+    result["ok"] = %false
+    result["durationMs"] = %ncProbeElapsedMs(startedAt)
+    result["error"] = %exc.msg
+
+proc runLibp2pNcProbe(
+    sw: Switch, target: MultiAddress, timeoutMs: int
+): Future[JsonNode] {.async.} =
+  result = newJObject()
+  result["probe"] = %"libp2p"
+  result["target"] = %($target)
+  if sw.isNil:
+    result["ok"] = %false
+    result["durationMs"] = %0
+    result["error"] = %"probe switch unavailable"
+    return
+
+  if "/quic-v1" in $target and not defined(libp2p_msquic_experimental):
+    result["ok"] = %false
+    result["durationMs"] = %0
+    result["error"] = %"quic unavailable in current build"
+    return
+
+  let startedAt = epochTime()
+  let dialFut = sw.connect(target, allowUnknownPeerId = true)
+  try:
+    let peerId = await dialFut.wait(chronos.milliseconds(timeoutMs))
+    result["ok"] = %true
+    result["durationMs"] = %ncProbeElapsedMs(startedAt)
+    result["peerId"] = %($peerId)
+    try:
+      await sw.disconnect(peerId)
+    except CatchableError:
+      discard
+  except AsyncTimeoutError:
+    if not dialFut.finished():
+      dialFut.cancel()
+    result["ok"] = %false
+    result["durationMs"] = %int64(timeoutMs)
+    result["error"] = %"timeout"
+  except CatchableError as exc:
+    result["ok"] = %false
+    result["durationMs"] = %ncProbeElapsedMs(startedAt)
+    result["error"] = %exc.msg
+
+proc runNativeNcProbe(targets: seq[MultiAddress]; timeoutMs: int): Future[JsonNode] {.async.} =
+  result = newJObject()
+  result["ok"] = %false
+  result["timeoutMs"] = %timeoutMs
+  result["targetCount"] = %targets.len
+  var items = newJArray()
+
+  let needLibp2p = targets.anyIt(ncpmLibp2p in classifyNcProbeTarget(it))
+  var sw: Switch = nil
+  var switchError = ""
+  if needLibp2p:
+    try:
+      sw = buildNcProbeSwitch(targets)
+      await sw.start()
+      result["localPeerId"] = %($sw.peerInfo.peerId)
+    except CatchableError as exc:
+      switchError = exc.msg
+
+  try:
+    var anySuccess = false
+    for target in targets:
+      let modes = classifyNcProbeTarget(target)
+      if ncpmRawTcp in modes:
+        let rawProbe = await runRawTcpProbe(target, timeoutMs)
+        anySuccess = anySuccess or jsonBool(rawProbe, "ok", false)
+        items.add(rawProbe)
+      if ncpmLibp2p in modes:
+        let libp2pProbe =
+          if sw.isNil:
+            buildLibp2pProbeFailure(target, switchError)
+          else:
+            await runLibp2pNcProbe(sw, target, timeoutMs)
+        anySuccess = anySuccess or jsonBool(libp2pProbe, "ok", false)
+        items.add(libp2pProbe)
+    result["ok"] = %anySuccess
+    result["results"] = items
+  finally:
+    if not sw.isNil:
+      await sw.stop()
+
+proc libp2p_native_nc_probe*(targetsJson: cstring, timeoutMs: cint): cstring {.exportc, cdecl, dynlib.} =
+  let rawTargets = (if targetsJson.isNil: "" else: $targetsJson).strip()
+  if rawTargets.len == 0:
+    return allocCString("{\"ok\":false,\"error\":\"missing_targets\",\"results\":[]}")
+
+  let safeTimeoutMs = max(int(timeoutMs), 1)
+  try:
+    let payload = waitFor runNativeNcProbe(parseNcProbeTargets(rawTargets), safeTimeoutMs)
+    allocCString($payload)
+  except CatchableError as exc:
+    let payload = %*{
+      "ok": false,
+      "error": exc.msg,
+      "timeoutMs": safeTimeoutMs,
+      "results": []
+    }
+    allocCString($payload)
+
 proc libp2p_get_last_error*(): cstring {.exportc, cdecl, dynlib.} =
   if lastRuntimeError.len > 0:
     return allocCString(lastRuntimeError)
@@ -7404,6 +7982,8 @@ proc buildNetworkDiscoverySnapshotPayload(
       bootstrapNode = bootstrapStateJson(node.switchInstance, BootstrapCandidateCap)
   except CatchableError:
     bootstrapNode = newJObject()
+  if node.authoritativeBootstrapPeerIds.len > 0:
+    mergeLocalBootstrapStatus(node, bootstrapNode, BootstrapCandidateCap)
   attachBootstrapProvider(bootstrapNode, bootstrapProvider)
   payload["bootstrap"] = bootstrapNode
   payload["bootstrapProvider"] = bootstrapProvider
@@ -7450,6 +8030,8 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             n.switchInstance.mount(n.pingProtocol)
           await n.switchInstance.start()
           n.started = true
+          applyAuthoritativeBootstrapConfig(n)
+          syncPeerHintsIntoBootstrapService(n)
           debugLog("[nimlibp2p] cmdStart: switch.start completed")
           info "cmdStart: switch started", listenAddrs = n.switchInstance.peerInfo.listenAddrs.mapIt($it)
           debugLog("[nimlibp2p] cmdStart: switch started")
@@ -8061,7 +8643,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         defaultLimit = BootstrapCandidateCap,
         maxLimit = BootstrapCandidateCap
       )
-      let candidates = collectBootstrapCandidates(n)
+      let candidates = collectLocalBootstrapCandidates(n)
       let selected = selectProgressiveBootstrapCandidates(candidates, limit)
       var peersNode = newJArray()
       for item in selected:
@@ -8567,11 +9149,25 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.errorMsg = "missing host network status payload"
       else:
         try:
+          let previousHost = currentHostNetworkStatus(n)
           let payload = parseJson(command.jsonString)
           var normalized = applyHostNetworkStatus(n, payload)
+          let previousMdnsAllowed = mdnsAllowedForHostStatus(previousHost)
+          let currentMdnsAllowed = mdnsAllowedForHostStatus(normalized)
           if jsonGetBool(normalized, "isConnected", false):
             await refreshPublicIpProbeAsync(n, normalized)
             normalized = currentHostNetworkStatus(n)
+          let mdnsTransportChanged =
+            previousMdnsAllowed != currentMdnsAllowed or
+            jsonGetStr(previousHost, "networkType", "") != jsonGetStr(normalized, "networkType", "") or
+            jsonGetStr(previousHost, "transport", "") != jsonGetStr(normalized, "transport", "") or
+            jsonGetStr(previousHost, "preferredIpv4", "") != jsonGetStr(normalized, "preferredIpv4", "") or
+            jsonGetStr(previousHost, "localIpv4", "") != jsonGetStr(normalized, "localIpv4", "")
+          if n.mdnsEnabled and n.started and mdnsTransportChanged:
+            if currentMdnsAllowed:
+              asyncSpawn(restartMdnsSafe(n, "host_network_status"))
+            else:
+              await stopMdns(n)
           let event = buildHostNetworkEvent(normalized)
           recordEvent(n, "network_event", $event)
           command.stringResult = $normalized
@@ -9951,6 +10547,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       subscriptions: initTable[pointer, Subscription](),
       peerHints: initTable[string, seq[string]](),
       peerHintSources: initTable[string, seq[string]](),
+      authoritativeBootstrapPeerIds: configuredWanBootstrapAuthoritativePeerIds(cfg),
       bootstrapLastSeen: initTable[string, int64](),
       directWaiters: initTable[string, DirectWaiter](),
       pendingFileChunkResponses: initTable[string, FileChunkWaiter](),
@@ -9991,8 +10588,9 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       rendezvous: findRendezvousService(sw),
       relayReservations: initTable[string, int64](),
       discovery: nil,
+      configuredMdnsService: configuredMdnsServiceName(cfg),
       mdnsInterface: nil,
-      mdnsService: DefaultMdnsServiceName,
+      mdnsService: configuredMdnsServiceName(cfg),
       mdnsServices: @[],
       mdnsQueries: @[],
       mdnsWatchers: @[],
@@ -12048,6 +12646,8 @@ proc filteredDiscoveredPeersForNode(
 proc buildMdnsDebugPayload(node: NimNode): JsonNode {.gcsafe.} =
   pruneStaleMdnsPeers(node)
   var obj = newJObject()
+  if not node.isNil and not node.switchInstance.isNil and not node.switchInstance.peerInfo.isNil:
+    discard refreshLanAwareAddrs(node)
   obj["enabled"] = %node.mdnsEnabled
   obj["started"] = %node.started
   obj["preferred_ipv4"] = %node.mdnsPreferredIpv4
@@ -16683,6 +17283,8 @@ proc libp2p_get_bootstrap_status*(handle: pointer): cstring {.exportc, cdecl, dy
   try:
     if node.switchInstance != nil:
       var bootstrap = bootstrapStateJson(node.switchInstance, BootstrapCandidateCap)
+      if node.authoritativeBootstrapPeerIds.len > 0:
+        mergeLocalBootstrapStatus(node, bootstrap, BootstrapCandidateCap)
       attachBootstrapProvider(bootstrap, providerNode)
       if bootstrap.kind == JObject and bootstrap.len > 0:
         return allocCString($bootstrap)

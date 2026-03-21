@@ -8,7 +8,7 @@ import ../peerid
 import ../stream/lpstream
 from ../stream/connection import libp2p_network_bytes
 import ../bandwidthmanager
-import ./msquicdriver as msquicdrv
+import ./quicruntime as msquicdrv
 template msquicSafe(body: untyped) =
   {.cast(gcsafe).}:
     body
@@ -78,7 +78,7 @@ method readOnce*(
     var chunk: seq[byte]
     try:
       chunk = await msquicdrv.readStream(stream.state)
-    except msquicdrv.MsQuicEventQueueClosed as exc:
+    except msquicdrv.QuicRuntimeEventQueueClosed as exc:
       raise newLPStreamConnDownError(exc)
     except CatchableError as exc:
       raise msquicStreamError("MsQuic read failed: " & exc.msg, exc)

@@ -26,8 +26,10 @@ const char *libp2p_connected_peers_info(void *handle);
 const char *libp2p_get_local_peer_id(void *handle);
 const char *libp2p_fetch_feed_snapshot(void *handle);
 const char *libp2p_ui_frame_snapshot(void *handle, int maxEvents, int discoveryLimit);
+const char *libp2p_get_diagnostics_json(void *handle);
 const char *libp2p_get_last_direct_error(void *handle);
 const char *libp2p_identity_from_seed(const uint8_t *seed, size_t seedLen);
+const char *libp2p_native_nc_probe(const char *targetsJson, int timeoutMs);
 bool libp2p_register_peer_hints(void *handle, const char *peerId, const char *addressesJson, const char *source);
 bool libp2p_add_external_address(void *handle, const char *multiaddr);
 bool libp2p_is_peer_connected(void *handle, const char *peerId);
@@ -577,6 +579,16 @@ Java_com_example_libp2psmoke_native_NimBridge_nativePublishLivestreamFrame(JNIEn
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativeGetDiagnosticsJson(JNIEnv *env,
+                                                                       jclass,
+                                                                       jlong handle) {
+  std::lock_guard<std::mutex> nimGuard(g_nim_mutex);
+  ensureThreadAttached();
+  const char *raw = libp2p_get_diagnostics_json(toHandle(handle));
+  return copyAndFree(env, raw);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_libp2psmoke_native_NimBridge_nativeGetLastDirectError(JNIEnv *env,
                                                                        jclass,
                                                                        jlong handle) {
@@ -592,6 +604,18 @@ Java_com_example_libp2psmoke_native_NimBridge_nativeGetLastInitError(JNIEnv *env
   std::lock_guard<std::mutex> nimGuard(g_nim_mutex);
   ensureThreadAttached();
   const char *raw = libp2p_get_last_error();
+  return copyAndFree(env, raw);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_libp2psmoke_native_NimBridge_nativePortProbeJson(JNIEnv *env,
+                                                                  jclass,
+                                                                  jstring targetsJson,
+                                                                  jint timeoutMs) {
+  std::lock_guard<std::mutex> nimGuard(g_nim_mutex);
+  ensureThreadAttached();
+  const std::string rawTargets = jstringToUtf8(env, targetsJson);
+  const char *raw = libp2p_native_nc_probe(rawTargets.c_str(), static_cast<int>(timeoutMs));
   return copyAndFree(env, raw);
 }
 

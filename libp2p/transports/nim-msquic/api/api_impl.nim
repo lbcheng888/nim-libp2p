@@ -1027,6 +1027,9 @@ proc allocLocalStreamId(conn: ConnectionState; unidirectional: bool): uint64 =
     result = conn.nextLocalBidiStreamId
     conn.nextLocalBidiStreamId += 4'u64
 
+proc isUnidirectionalStreamId(streamId: uint64): bool {.inline.} =
+  (streamId and 0x2'u64) != 0'u64
+
 proc prependPendingChunk(stream: StreamState; chunk: PendingStreamChunk) {.gcsafe.} =
   if stream.isNil:
     return
@@ -2117,6 +2120,8 @@ proc listenerFromHandleFast(handle: HQUIC): ListenerState {.quicApiHot.} =
 
 proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe.} =
   event.connection = cast[HQUIC](state)
+  if event.userContext.isNil:
+    event.userContext = state.context
   if state.eventHandlers.len > 0:
     for handler in state.eventHandlers:
       if handler != nil:
@@ -2471,19 +2476,23 @@ proc emitPeerStreamStarted(state: ConnectionState; stream: StreamState) =
   if state.isNil or stream.isNil:
     return
   let streamHandle = cast[HQUIC](stream)
+  let streamIsUnidirectional = isUnidirectionalStreamId(stream.streamId)
   if not state.callback.isNil:
     var native = QuicConnectionEvent(Type: QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED, Padding: 0)
     var payload = QuicConnectionEventPeerStreamStartedPayload(
       Stream: streamHandle,
-      Flags: QUIC_STREAM_OPEN_FLAGS(0)
+      Flags: (if streamIsUnidirectional:
+        QUIC_STREAM_OPEN_FLAGS(StreamOpenFlagUnidirectional)
+      else:
+        QUIC_STREAM_OPEN_FLAGS(0))
     )
     copyMem(addr native.Data[0], addr payload, sizeof(payload))
     discard state.callback(cast[HQUIC](state), state.callbackContext, addr native)
   var ev = ConnectionEvent(
     kind: cePeerStreamStarted,
     stream: streamHandle,
-    streamFlags: 0'u32,
-    streamIsUnidirectional: false,
+    streamFlags: (if streamIsUnidirectional: StreamOpenFlagUnidirectional else: 0'u32),
+    streamIsUnidirectional: streamIsUnidirectional,
     note: "peer stream started")
   emitConnectionEvent(state, ev)
 

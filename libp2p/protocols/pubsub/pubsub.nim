@@ -388,7 +388,14 @@ method getOrCreatePeer*(
       async: (raises: [CancelledError, GetConnDialError])
   .} =
     try:
-      return await p.switch.dial(peerId, protosToDial)
+      let dialProtos =
+        if protosToDial.len > 0:
+          protosToDial
+        elif protoNegotiated.len > 0:
+          @[protoNegotiated]
+        else:
+          @[]
+      return await p.switch.dial(peerId, dialProtos)
     except CancelledError as exc:
       raise exc
     except DialFailedError as e:

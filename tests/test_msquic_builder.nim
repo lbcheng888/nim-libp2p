@@ -20,6 +20,23 @@ when defined(libp2p_msquic_experimental):
       var builder = SwitchBuilder.new()
       builder = builder.withQuicTransport()
       check builder != nil
+
+    test "runtime selection helpers update load policy":
+      var cfg = MsQuicTransportBuilderConfig.init()
+      cfg.useBuiltinRuntime()
+      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
+
+      cfg.preferBuiltinRuntime()
+      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpPrefer
+
+      cfg.useNativeRuntime()
+      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpNever
+
+      cfg.useAutoRuntime()
+      when defined(libp2p_msquic_builtin):
+        check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
+      else:
+        check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpAuto
 else:
   suite "MsQuic switch builder":
     test "experimental feature disabled":

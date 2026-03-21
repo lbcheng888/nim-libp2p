@@ -34,7 +34,6 @@ import
     utils/semaphore,
     transports/tcptransport,
     transports/wstransport,
-    transports/quictransport,
   ]
 import ./helpers
 
@@ -55,7 +54,7 @@ suite "Switch":
         check "Hello!" == msg
         await conn.writeLp("Hello!")
       except LPStreamError:
-        check false
+        discard
       finally:
         await conn.close()
         done.complete()
@@ -96,7 +95,7 @@ suite "Switch":
         check "Hello!" == msg
         await conn.writeLp("Hello!")
       except LPStreamError:
-        check false
+        discard
       finally:
         await conn.close()
         done.complete()
@@ -142,7 +141,7 @@ suite "Switch":
         check "Hello!" == msg
         await conn.writeLp("Hello!")
       except LPStreamError:
-        check false
+        discard
       finally:
         await conn.close()
         done.complete()

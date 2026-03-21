@@ -3,7 +3,7 @@ import std/[options, unittest]
 import chronos
 
 import "../libp2p/transports/msquicdriver" as msdriver
-import "../libp2p/transports/nim-msquic/api/event_model" as msevents
+import "../libp2p/transports/quicruntime" as quicrt
 
 when defined(libp2p_msquic_experimental):
   suite "MsQuic listener lifecycle":
@@ -15,25 +15,25 @@ when defined(libp2p_msquic_experimental):
       else:
         defer:
           if not handle.isNil:
-            handle.shutdown()
+            msdriver.shutdown(handle)
 
-        let (listenerPtr, listenerStateOpt, createErr) = handle.createListener()
+        let (listenerPtr, listenerStateOpt, createErr) = msdriver.createListener(handle)
         if createErr.len > 0 or listenerStateOpt.isNone:
           echo "MsQuic listener unavailable: ", createErr
           skip()
         else:
           let listenerState = listenerStateOpt.get()
-          let startErr = handle.startListener(listenerPtr)
+          let startErr = msdriver.startListener(handle, listenerPtr)
           check startErr.len == 0
 
-          let stopErr = handle.stopListener(listenerPtr)
+          let stopErr = msdriver.stopListener(handle, listenerPtr)
           check stopErr.len == 0
-          let stopEvent = waitFor listenerState.nextListenerEvent()
-          check stopEvent.kind == msevents.leStopComplete
+          let stopEvent = waitFor listenerState.nextQuicListenerEvent()
+          check stopEvent.kind == quicrt.qleStopComplete
 
-          handle.closeListener(listenerPtr, listenerState)
-          expect msdriver.MsQuicEventQueueClosed:
-            discard waitFor listenerState.nextListenerEvent()
+          msdriver.closeListener(handle, listenerPtr, listenerState)
+          expect quicrt.QuicRuntimeEventQueueClosed:
+            discard waitFor listenerState.nextQuicListenerEvent()
 else:
   suite "MsQuic listener lifecycle":
     test "experimental features disabled":

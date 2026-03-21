@@ -18,6 +18,9 @@ import ../libp2p/nameresolving/mockresolver
 import errorhelpers
 import utils/async_tests
 
+when defined(libp2p_msquic_experimental):
+  import ../libp2p/transports/msquicdriver as msdriver
+
 export async_tests, errorhelpers, mockresolver
 
 const
@@ -83,6 +86,20 @@ proc getRng(): ref HmacDrbgContext =
 
 template rng*(): ref HmacDrbgContext =
   getRng()
+
+when defined(libp2p_msquic_experimental):
+  proc initMsQuicTransportForAsync*():
+      tuple[handle: msdriver.MsQuicTransportHandle, error: string] {.raises: [].} =
+    var res: tuple[handle: msdriver.MsQuicTransportHandle, error: string]
+    {.gcsafe.}:
+      res = msdriver.initMsQuicTransport()
+    res
+
+  proc shutdownMsQuicTransportForAsync*(handle: msdriver.MsQuicTransportHandle) {.raises: [].} =
+    if handle.isNil:
+      return
+    {.gcsafe.}:
+      handle.shutdown()
 
 type
   WriteHandler* = proc(data: seq[byte]): Future[void] {.

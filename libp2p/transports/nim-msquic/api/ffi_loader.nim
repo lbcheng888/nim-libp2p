@@ -15,6 +15,12 @@ const
   CompileTimeBuiltinMsQuic* = defined(libp2p_msquic_builtin)
 
 type
+  MsQuicBuiltinPolicy* = enum
+    mbpAuto
+    mbpNever
+    mbpPrefer
+    mbpOnly
+
   MsQuicOpenProc = proc(apiTable: ptr QuicApiTablePtr): MsQuicStatus {.cdecl.}
   MsQuicOpenVersionProc = proc(version: MsQuicVersion;
                                apiTable: ptr QuicApiTablePtr): MsQuicStatus {.cdecl.}
@@ -36,6 +42,8 @@ type
     requestedVersion*: MsQuicVersion = DefaultMsQuicVersion
     preferVersionedOpen*: bool = true
     allowOpenFallback*: bool = true
+    builtinPolicy*: MsQuicBuiltinPolicy =
+      (if CompileTimeBuiltinMsQuic: mbpOnly else: mbpAuto)
 
   MsQuicLoadResult* = object
     success*: bool
@@ -226,24 +234,41 @@ proc tryLoadBuiltin(options: MsQuicLoadOptions;
 proc loadMsQuic*(options: MsQuicLoadOptions = MsQuicLoadOptions()): MsQuicLoadResult =
   var attempted: seq[string] = @[]
   var errors: seq[string] = @[]
+  template tryBuiltinOnce() =
+    let builtinRes = tryLoadBuiltin(options, attempted)
+    attempted = builtinRes.attemptedPaths
+    if builtinRes.success:
+      return builtinRes
+    if builtinRes.error.len > 0:
+      errors.add "builtin: " & builtinRes.error
 
-  if CompileTimeBuiltinMsQuic:
-    return tryLoadBuiltin(options, attempted)
+  template tryNativeCandidates() =
+    let candidates = candidatePaths(options)
+    for path in candidates:
+      let res = tryLoadFromPath(path, options)
+      attempted.add(res.attemptedPaths)
+      if res.success:
+        return res
+      if res.error.len > 0:
+        errors.add path & ": " & res.error
 
-  let candidates = candidatePaths(options)
+  case options.builtinPolicy
+  of mbpOnly:
+    tryBuiltinOnce()
+  of mbpPrefer:
+    tryBuiltinOnce()
+    tryNativeCandidates()
+  of mbpNever:
+    tryNativeCandidates()
+  of mbpAuto:
+    if CompileTimeBuiltinMsQuic:
+      tryBuiltinOnce()
+    tryNativeCandidates()
 
-  for path in candidates:
-    let res = tryLoadFromPath(path, options)
-    attempted.add(res.attemptedPaths)
-    if res.success:
-      return res
-    if res.error.len > 0:
-      errors.add fmt"{path}: {res.error}"
-
-  let useBuiltin =
-    getEnv("NIM_MSQUIC_USE_BUILTIN", "0").toLowerAscii() in ["1", "true", "yes"]
-  if useBuiltin:
-    return tryLoadBuiltin(options, attempted)
+    let useBuiltin =
+      getEnv("NIM_MSQUIC_USE_BUILTIN", "0").toLowerAscii() in ["1", "true", "yes"]
+    if useBuiltin:
+      tryBuiltinOnce()
 
   MsQuicLoadResult(
     success: false,

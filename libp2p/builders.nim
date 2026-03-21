@@ -167,6 +167,7 @@ type
     services: seq[Service]
     bitswapService: BitswapService
     graphSyncService: GraphSyncService
+    fetchService: FetchService
     when libp2pDataTransferEnabled:
       dataTransferService: DataTransferService
       graphSyncAdapterSettings: Opt[GraphSyncAdapterSettings]
@@ -224,6 +225,7 @@ proc new*(T: type[SwitchBuilder]): T {.public.} =
     services: @[],
     bitswapService: nil,
     graphSyncService: nil,
+    fetchService: nil,
     observedAddrManager: nil,
     enableWildcardResolver: true,
     connectionGater: nil,
@@ -438,7 +440,9 @@ when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
   {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental and use MsQuic transport.".}
 
 when defined(libp2p_msquic_experimental):
-  import transports/msquictransport
+  import transports/[msquictransport, quicruntime]
+  export quicruntime.QuicRuntimePreference
+  export quicruntime.QuicRuntimeBuiltinPolicy
 
   type
     MsQuicTransportHook* = proc(transport: MsQuicTransport) {.gcsafe, raises: [].}
@@ -460,6 +464,18 @@ when defined(libp2p_msquic_experimental):
     cfg.certhashHistory.setLen(0)
     for hash in history:
       cfg.certhashHistory.add(hash)
+
+  proc useAutoRuntime*(cfg: var MsQuicTransportBuilderConfig) {.public.} =
+    quicruntime.useAutoRuntime(cfg.config)
+
+  proc useNativeRuntime*(cfg: var MsQuicTransportBuilderConfig) {.public.} =
+    quicruntime.useNativeRuntime(cfg.config)
+
+  proc preferBuiltinRuntime*(cfg: var MsQuicTransportBuilderConfig) {.public.} =
+    quicruntime.preferBuiltinRuntime(cfg.config)
+
+  proc useBuiltinRuntime*(cfg: var MsQuicTransportBuilderConfig) {.public.} =
+    quicruntime.useBuiltinRuntime(cfg.config)
 
   proc withMsQuicTransport*(b: SwitchBuilder): SwitchBuilder {.public.} =
     b.withTransport(
@@ -1023,12 +1039,8 @@ proc withGraphSync*(
     provider: GraphSyncBlockProvider,
     config: GraphSyncConfig = GraphSyncConfig.init(),
 ): SwitchBuilder {.public.} =
-  if not b.graphSyncService.isNil:
-    let prevPtr = cast[pointer](b.graphSyncService)
-    b.services.keepItIf(cast[pointer](it) != prevPtr)
   let svc = GraphSyncService.new(provider = provider, config = config)
   b.graphSyncService = svc
-  b.services.add(cast[Service](svc))
   b
 
 proc withGraphSync*(
@@ -1038,12 +1050,8 @@ proc withGraphSync*(
 ): SwitchBuilder {.public.} =
   if store.isNil():
     raise newException(Defect, "graphsync store must not be nil")
-  if not b.graphSyncService.isNil:
-    let prevPtr = cast[pointer](b.graphSyncService)
-    b.services.keepItIf(cast[pointer](it) != prevPtr)
   let svc = GraphSyncService.new(store = store, config = config)
   b.graphSyncService = svc
-  b.services.add(cast[Service](svc))
   b
 
 when libp2pFetchEnabled:
@@ -1051,8 +1059,7 @@ when libp2pFetchEnabled:
       b: SwitchBuilder, handler: FetchHandler, config: FetchConfig = FetchConfig.init()
   ): SwitchBuilder {.public.} =
     let svc = FetchService.new(handler, config)
-    var baseService = cast[Service](svc)
-    b.services.add(baseService)
+    b.fetchService = svc
     b
 else:
   proc withFetch*(
@@ -1068,12 +1075,8 @@ when libp2pDataTransferEnabled:
       handler: DataTransferHandler,
       config: DataTransferConfig = DataTransferConfig.init(),
   ): SwitchBuilder {.public.} =
-    if not b.dataTransferService.isNil:
-      let prevPtr = cast[pointer](b.dataTransferService)
-      b.services.keepItIf(cast[pointer](it) != prevPtr)
     let svc = DataTransferService.new(handler, config)
     b.dataTransferService = svc
-    b.services.add(cast[Service](svc))
     b
 
   proc withGraphSyncDataTransfer*(
@@ -1138,8 +1141,6 @@ when libp2pHttpEnabled:
       let svc = lpHttp.HttpService.new(defaultHandler, config)
       for (path, handler) in routes:
         svc.registerRoute(path, handler)
-      var baseService = cast[Service](svc)
-      b.services.add(baseService)
       b.httpService = svc
     else:
       let svc = b.httpService
@@ -1391,6 +1392,21 @@ proc build*(b: SwitchBuilder): Switch {.raises: [LPError], public.} =
           OtelLogsService(svc).registerDataTransferManager(manager)
         if svc of OtelTracesService:
           OtelTracesService(svc).registerDataTransferManager(manager)
+
+  if not b.graphSyncService.isNil:
+    switch.mount(b.graphSyncService)
+
+  when libp2pDataTransferEnabled:
+    if not b.dataTransferService.isNil:
+      switch.mount(b.dataTransferService)
+
+  when libp2pFetchEnabled:
+    if not b.fetchService.isNil:
+      switch.mount(b.fetchService)
+
+  when libp2pHttpEnabled:
+    if not b.httpService.isNil:
+      switch.mount(b.httpService)
 
   when defined(libp2p_msquic_experimental) or defined(libp2p_quic_support):
     b.webtransportRotation.withValue(rot):

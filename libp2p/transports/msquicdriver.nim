@@ -157,10 +157,17 @@ when not defined(libp2p_msquic_experimental):
       state: MsQuicListenerState = nil) = discard
 
   proc attachIncomingConnection*(handle: MsQuicTransportHandle; connection: pointer;
+      handler: MsQuicConnectionHandler = nil; userContext: pointer = nil;
       queueLimit: int = 0; pollInterval: Duration = DefaultEventPollInterval):
       tuple[state: Option[MsQuicConnectionState], error: string] =
     (none(MsQuicConnectionState), "MsQuic experimental runtime disabled")
 
-  proc shutdown*(handle: MsQuicTransportHandle) = discard
+  proc attachIncomingConnectionAdopted*(handle: MsQuicTransportHandle; connection: pointer;
+      handler: MsQuicConnectionHandler = nil; userContext: pointer = nil;
+      queueLimit: int = 0; pollInterval: Duration = DefaultEventPollInterval):
+      tuple[state: Option[MsQuicConnectionState], error: string] =
+    (none(MsQuicConnectionState), "MsQuic experimental runtime disabled")
+
+  proc shutdown*(handle: MsQuicTransportHandle) {.gcsafe.} = discard
 else:
   include "msquicdriver_experimental.nim"

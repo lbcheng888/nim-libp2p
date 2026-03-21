@@ -15,6 +15,7 @@ suite "Content loop service":
     checkTrackers()
 
   asyncTest "publishes content, fetches payload, and delivers receipt":
+    const TestTimeout = 5.seconds
     let nodes = generateNodes(
       2,
       gossip = true,
@@ -57,7 +58,7 @@ suite "Content loop service":
     await waitSub(gossip[1], gossip[0], toTopic("/content-feed", gossip[1].peerInfo.peerId))
 
     let payload = @[byte 1, 2, 3, 4, 5]
-    discard await publisher.publishContent(
+    check (await publisher.publishContent(
       ContentAnnouncement(
         id: "doc-1",
         mediaType: "application/markdown",
@@ -66,9 +67,10 @@ suite "Content loop service":
         receiptRequested: true,
       ),
       payload,
-    )
+    )) > 0
 
-    let receivedItem = await contentReceived
+    check await contentReceived.withTimeout(TestTimeout)
+    let receivedItem = contentReceived.read()
     check receivedItem.announcement.id == "doc-1"
     check receivedItem.announcement.contentKey == "cid://doc-1"
     check receivedItem.payload == payload
@@ -77,7 +79,8 @@ suite "Content loop service":
     check receivedItem.fetchedFrom.get() == gossip[1].peerInfo.peerId
     check consumer.hasContent("cid://doc-1")
 
-    let receipt = await receiptReceived
+    check await receiptReceived.withTimeout(TestTimeout)
+    let receipt = receiptReceived.read()
     check receipt.id == "doc-1"
     check receipt.contentKey == "cid://doc-1"
     check receipt.status == crFetched
@@ -85,6 +88,7 @@ suite "Content loop service":
     check receipt.producer == gossip[1].peerInfo.peerId
 
   asyncTest "follows provider and bootstrap hints for fetch and next feed":
+    const TestTimeout = 5.seconds
     let nodes = generateNodes(
       3,
       gossip = true,
@@ -135,7 +139,7 @@ suite "Content loop service":
 
     provider.storeContent("cid://shared-doc", @[byte 9, 8, 7])
 
-    discard await announcer.publishContent(
+    check (await announcer.publishContent(
       ContentAnnouncement(
         id: "shared-doc",
         mediaType: "application/markdown",
@@ -144,9 +148,10 @@ suite "Content loop service":
         providers: @[gossip[2].peerInfo.peerId],
         bootstrapPeers: @[gossip[2].peerInfo.peerId],
       )
-    )
+    )) > 0
 
-    let hinted = await firstItem
+    check await firstItem.withTimeout(TestTimeout)
+    let hinted = firstItem.read()
     check hinted.announcement.id == "shared-doc"
     check hinted.payload == @[byte 9, 8, 7]
     check hinted.fetchError.len == 0
@@ -155,7 +160,7 @@ suite "Content loop service":
 
     await waitSub(gossip[2], gossip[0], toTopic("/content-feed", gossip[2].peerInfo.peerId))
 
-    discard await provider.publishContent(
+    check (await provider.publishContent(
       ContentAnnouncement(
         id: "shared-doc-2",
         mediaType: "application/markdown",
@@ -163,9 +168,10 @@ suite "Content loop service":
         contentKey: "cid://shared-doc-2",
       ),
       @[byte 6, 6, 6],
-    )
+    )) > 0
 
-    let followed = await secondItem
+    check await secondItem.withTimeout(TestTimeout)
+    let followed = secondItem.read()
     check followed.announcement.id == "shared-doc-2"
     check followed.payload == @[byte 6, 6, 6]
     check followed.fetchError.len == 0

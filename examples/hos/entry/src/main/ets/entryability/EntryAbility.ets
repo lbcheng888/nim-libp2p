@@ -75,6 +75,7 @@ export default class EntryAbility extends UIAbility {
     ];
     AppStorage.SetOrCreate('__nimBridgeSearchPaths', searchPaths);
     hilog.info(DOMAIN, 'testTag', 'Bridge search paths: %{public}s', JSON.stringify(searchPaths));
+    this.cacheStartupProbeParams(want);
 
     this.ensurePermissions()
       .then((granted: boolean) => {
@@ -91,6 +92,10 @@ export default class EntryAbility extends UIAbility {
         const message = this.describeError(error);
         hilog.error(DOMAIN, 'testTag', 'ensurePermissions threw: %{public}s', message);
       });
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.cacheStartupProbeParams(want);
   }
 
   onDestroy(): void {
@@ -165,6 +170,39 @@ export default class EntryAbility extends UIAbility {
         hilog.error(DOMAIN, 'testTag', 'requestPermissionsFromUser error %{public}s', message);
         return false;
       });
+  }
+
+  private cacheStartupProbeParams(want: Want): void {
+    const targets = this.readWantStringParam(want, 'nimProbeTargets');
+    const timeoutMs = this.readWantStringParam(want, 'nimProbeTimeoutMs');
+    const label = this.readWantStringParam(want, 'nimProbeLabel');
+    AppStorage.SetOrCreate('__nimStartupProbeTargets', targets.length > 0 ? [targets] : []);
+    AppStorage.SetOrCreate('__nimStartupProbeTimeoutMs', timeoutMs.length > 0 ? [timeoutMs] : []);
+    AppStorage.SetOrCreate('__nimStartupProbeLabel', label.length > 0 ? [label] : []);
+    if (targets.length > 0) {
+      hilog.info(
+        DOMAIN,
+        'testTag',
+        'Startup probe configured label=%{public}s timeoutMs=%{public}s',
+        label.length > 0 ? label : 'harmony',
+        timeoutMs.length > 0 ? timeoutMs : '15000'
+      );
+    }
+  }
+
+  private readWantStringParam(want: Want, key: string): string {
+    const params = want.parameters as Record<string, Object> | undefined;
+    if (!params) {
+      return '';
+    }
+    const value = params[key];
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return `${value}`;
+    }
+    return '';
   }
 
   private async bindDefaultNetwork(): Promise<void> {

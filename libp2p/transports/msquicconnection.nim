@@ -14,10 +14,9 @@ import chronos, chronicles, metrics
 import ../stream/connection
 import ../multiaddress
 import ../bandwidthmanager
-import ./msquicdriver as msquicdrv
+import ./quicruntime as msquicdrv
 import ./msquicstream
 import ./webtransport_common
-import "nim-msquic/api/event_model" as msevents
 
 logScope:
   topics = "libp2p msquicconnection"
@@ -227,7 +226,7 @@ proc monitorConnection(conn: MsQuicConnection): Future[void] {.async.} =
     return
   try:
     while true:
-      let fut = conn.connState.nextConnectionEvent()
+      let fut = conn.connState.nextQuicConnectionEvent()
       let completed = await fut.withTimeout(1.seconds)
       if not completed:
         fut.cancel()
@@ -235,21 +234,21 @@ proc monitorConnection(conn: MsQuicConnection): Future[void] {.async.} =
       let event =
         try:
           await fut
-        except msquicdrv.MsQuicEventQueueClosed:
+        except msquicdrv.QuicRuntimeEventQueueClosed:
           break
       case event.kind
-      of msevents.ceConnected:
+      of msquicdrv.qceConnected:
         trace "MsQuic connection established", resumed = event.sessionResumed
-      of msevents.cePeerStreamStarted:
+      of msquicdrv.qcePeerStreamStarted:
         conn.promotePendingPeerStream()
-      of msevents.ceShutdownInitiated, msevents.ceShutdownComplete:
+      of msquicdrv.qceShutdownInitiated, msquicdrv.qceShutdownComplete:
         trace "MsQuic connection shutdown event", note = event.note
         break
-      of msevents.ceDatagramStateChanged:
+      of msquicdrv.qceDatagramStateChanged:
         conn.datagramSendEnabled = event.boolValue
         if event.maxSendLength > 0'u16:
           conn.datagramMaxSend = event.maxSendLength
-      of msevents.ceDatagramReceived:
+      of msquicdrv.qceDatagramReceived:
         conn.enqueueDatagram(event.datagramPayload)
       else:
         discard
@@ -566,7 +565,7 @@ method readOnce*(
       msquicSafe:
         readFuture = msquicdrv.readStream(conn.streamState)
       chunk = await readFuture
-    except msquicdrv.MsQuicEventQueueClosed as exc:
+    except msquicdrv.QuicRuntimeEventQueueClosed as exc:
       raise newLPStreamConnDownError(exc)
     except Exception as exc:
       raise msquicConnError("MsQuic read failed: " & exc.msg, exc)
@@ -639,9 +638,25 @@ method closeWrite*(conn: MsQuicConnection) {.async: (raises: []).} =
 method closeImpl*(conn: MsQuicConnection) {.async: (raises: []).} =
   if conn.isNil:
     return
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic connection closeImpl begin",
+      peerId = conn.peerId,
+      hasMonitor = not conn.monitor.isNil,
+      monitorFinished = (if conn.monitor.isNil: true else: conn.monitor.finished())
   if not conn.monitor.isNil and not conn.monitor.finished():
-    conn.monitor.cancelSoon()
-  closePrimaryStream(conn)
-  closeShadowStreams(conn)
-  shutdownConnection(conn)
+    try:
+      await conn.monitor.cancelAndWait()
+    except CatchableError as exc:
+      trace "MsQuic connection monitor cancellation raised", err = exc.msg
+  else:
+    try:
+      await noCancel closeWebtransportStreams(conn)
+    except CatchableError as exc:
+      trace "MsQuic close webtransport streams raised", err = exc.msg
+    closePrimaryStream(conn)
+    closeShadowStreams(conn)
+    shutdownConnection(conn)
+  conn.monitor = nil
   await procCall Connection(conn).closeImpl()
+  when defined(libp2p_msquic_debug):
+    warn "MsQuic connection closeImpl done", peerId = conn.peerId

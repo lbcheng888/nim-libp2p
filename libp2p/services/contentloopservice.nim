@@ -516,6 +516,12 @@ proc handleFeedItem(
   except CatchableError as exc:
     loopItem.fetchError = exc.msg
 
+  if not svc.itemHandler.isNil:
+    try:
+      await svc.itemHandler(loopItem)
+    except CatchableError as exc:
+      debug "content item handler failed", id = announcement.id, msg = exc.msg
+
   if announcement.receiptRequested:
     let receipt = ContentReceipt(
       id: announcement.id,
@@ -531,12 +537,6 @@ proc handleFeedItem(
     except CatchableError as exc:
       debug "content loop auto receipt failed",
         id = announcement.id, peer = $item.publisher, msg = exc.msg
-
-  if not svc.itemHandler.isNil:
-    try:
-      await svc.itemHandler(loopItem)
-    except CatchableError as exc:
-      debug "content item handler failed", id = announcement.id, msg = exc.msg
 
 proc handleReceiptMessage(
     svc: ContentLoopService, msg: DirectMessage

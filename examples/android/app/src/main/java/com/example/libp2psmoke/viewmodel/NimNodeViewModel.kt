@@ -11,6 +11,7 @@ import com.example.libp2psmoke.core.AppPreferences
 import com.example.libp2psmoke.core.Constants
 import com.example.libp2psmoke.core.DexError
 import com.example.libp2psmoke.core.MultiaddrListParser
+import com.example.libp2psmoke.core.QuicRuntimeJson
 import com.example.libp2psmoke.core.SecureKeyStore
 import com.example.libp2psmoke.core.SecureLogger
 import com.example.libp2psmoke.dex.DexRepositoryV2
@@ -23,6 +24,7 @@ import com.example.libp2psmoke.model.FeedEntry
 import com.example.libp2psmoke.model.LanEndpoint
 import com.example.libp2psmoke.model.NodeUiState
 import com.example.libp2psmoke.model.PeerState
+import com.example.libp2psmoke.model.QuicRuntimePreferenceOption
 import com.example.libp2psmoke.ui.UiIntent
 import com.example.libp2psmoke.dex.BtcAddressType
 import com.example.libp2psmoke.dex.BtcWalletManager
@@ -97,6 +99,8 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
             is UiIntent.InitiateMpcSwap -> handleInitiateMpcSwap()
             is UiIntent.UpdateBootstrapPeers -> handleUpdateBootstrapPeers(event.raw)
             is UiIntent.UpdateRelayPeers -> handleUpdateRelayPeers(event.raw)
+            is UiIntent.UpdateQuicRuntimePreference -> handleUpdateQuicRuntimePreference(event.preference)
+            is UiIntent.UpdateQuicRuntimeLibraryPath -> handleUpdateQuicRuntimeLibraryPath(event.path)
             is UiIntent.ApplyNetworkConfig -> handleApplyNetworkConfig()
             is UiIntent.SetMarketEnabled -> handleSetMarketEnabled(event.enabled)
             is UiIntent.ResetNodeData -> handleResetNodeData()
@@ -172,11 +176,37 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
         _state.update { it.copy(relayPeersRaw = raw) }
     }
 
+    private fun handleUpdateQuicRuntimePreference(preference: QuicRuntimePreferenceOption) {
+        _state.update {
+            it.copy(
+                quicRuntimePreference = preference,
+                quicRuntimeStatus = it.quicRuntimeStatus.copy(
+                    requestedPreference = preference
+                )
+            )
+        }
+    }
+
+    private fun handleUpdateQuicRuntimeLibraryPath(path: String) {
+        _state.update {
+            it.copy(
+                quicRuntimeLibraryPath = path,
+                quicRuntimeStatus = it.quicRuntimeStatus.copy(
+                    requestedLibraryPath = path.trim()
+                )
+            )
+        }
+    }
+
     private fun handleApplyNetworkConfig() {
         val bootstrapRaw = _state.value.bootstrapPeersRaw.trim()
         val relayRaw = _state.value.relayPeersRaw.trim()
+        val runtimePreference = _state.value.quicRuntimePreference
+        val runtimeLibraryPath = _state.value.quicRuntimeLibraryPath.trim()
         appPreferences.setBootstrapPeersRaw(bootstrapRaw)
         appPreferences.setRelayPeersRaw(relayRaw)
+        appPreferences.setQuicRuntimePreference(runtimePreference)
+        appPreferences.setQuicRuntimeLibraryPath(runtimeLibraryPath)
         restartP2PNode()
         updateSuccess("Network config applied")
     }
@@ -456,12 +486,21 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
         val marketEnabled = appPreferences.isMarketEnabled()
         val intervalRaw = appPreferences.getMarketInterval(_state.value.binanceInterval)
         val interval = if (BINANCE_INTERVALS.contains(intervalRaw)) intervalRaw else BINANCE_INTERVALS.first()
+        val quicRuntimePreference = appPreferences.getQuicRuntimePreference()
+        val quicRuntimeLibraryPath = appPreferences.getQuicRuntimeLibraryPath()
         _state.update {
             it.copy(
                 bootstrapPeersRaw = bootstrapRaw,
                 relayPeersRaw = relayRaw,
                 marketEnabled = marketEnabled,
-                binanceInterval = interval
+                binanceInterval = interval,
+                quicRuntimePreference = quicRuntimePreference,
+                quicRuntimeLibraryPath = quicRuntimeLibraryPath,
+                quicRuntimeStatus = QuicRuntimeJson.parseStatus(
+                    diagnostics = null,
+                    requestedPreference = quicRuntimePreference,
+                    requestedLibraryPath = quicRuntimeLibraryPath
+                )
             )
         }
     }
@@ -713,11 +752,12 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
     private fun collectP2PState() {
         viewModelScope.launch {
             p2pUseCase.p2pState.collect { p2p ->
-                _state.update { 
-                    it.copy(
+                _state.update { state ->
+                    state.copy(
                         running = p2p.isRunning,
                         localPeerId = p2p.localPeerId,
-                        peerCount = p2p.connectedPeers
+                        peerCount = p2p.connectedPeers,
+                        lastError = p2p.error ?: if (p2p.isRunning) null else state.lastError
                     )
                 }
             }
@@ -780,10 +820,12 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
         }
         val bootstrapRaw = _state.value.bootstrapPeersRaw
         val relayRaw = _state.value.relayPeersRaw
+        val quicRuntimePreference = _state.value.quicRuntimePreference
+        val quicRuntimeLibraryPath = _state.value.quicRuntimeLibraryPath.trim()
         if (BuildConfig.DEBUG) {
             Log.i(
                 TAG,
-                "startP2PNode: bootstrapRaw=$bootstrapRaw relayRaw=$relayRaw"
+                "startP2PNode: bootstrapRaw=$bootstrapRaw relayRaw=$relayRaw quicRuntime=${quicRuntimePreference.wireValue} runtimePath=$quicRuntimeLibraryPath"
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -794,11 +836,28 @@ class NimNodeViewModel(application: Application) : AndroidViewModel(application)
                 if (BuildConfig.DEBUG) {
                     Log.i(TAG, "startP2PNode: parsed bootstrap=${bootstrap.size} relays=${relays.size}")
                 }
-                p2pUseCase.startNode(bootstrap, relays)
+                p2pUseCase.startNode(
+                    bootstrapPeers = bootstrap,
+                    relayPeers = relays,
+                    quicRuntimePreference = quicRuntimePreference,
+                    quicRuntimeLibraryPath = quicRuntimeLibraryPath
+                )
+                refreshQuicRuntimeStatus()
             } catch (e: Exception) {
                 Log.e(TAG, "startP2PNode failed", e)
             }
         }
+    }
+
+    private fun refreshQuicRuntimeStatus() {
+        val requestedPreference = _state.value.quicRuntimePreference
+        val requestedLibraryPath = _state.value.quicRuntimeLibraryPath
+        val status = QuicRuntimeJson.parseStatus(
+            diagnostics = p2pUseCase.fetchDiagnostics(),
+            requestedPreference = requestedPreference,
+            requestedLibraryPath = requestedLibraryPath
+        )
+        _state.update { it.copy(quicRuntimeStatus = status) }
     }
 
     private fun ensureMulticastLock() {

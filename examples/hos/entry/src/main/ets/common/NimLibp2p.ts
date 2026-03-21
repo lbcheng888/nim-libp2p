@@ -50,6 +50,7 @@ interface NimBridgeModule {
   lanEndpoints(handle: number): string | undefined;
   lanEndpointsAsync?(handle: number): Promise<string | undefined>;
   localPeerId(handle: number): string | undefined;
+  getDiagnostics?(handle: number): string | undefined;
   setMdnsInterface(handle: number, ipv4: string): boolean;
   listenAddresses(handle: number): string | undefined;
   getDialableAddresses(handle: number): string | undefined;
@@ -59,6 +60,8 @@ interface NimBridgeModule {
   connectPeerAsync?(handle: number, peerId: string): Promise<number>;
   connectMultiaddr(handle: number, multiaddr: string): boolean;
   connectMultiaddrAsync?(handle: number, multiaddr: string): Promise<boolean>;
+  portProbeJson?(targetsJson: string, timeoutMs: number): string | undefined;
+  portProbeJsonAsync?(targetsJson: string, timeoutMs: number): Promise<string | undefined>;
   publishFeed(handle: number, payload: string): boolean;
   fetchFeedSnapshot(handle: number): string | undefined;
   upsertLivestream(handle: number, streamKey: string, configJson: string): boolean;
@@ -429,6 +432,17 @@ export class NimLibp2p {
     return this.node ? lib.listenAddresses(this.node.handle) ?? '[]' : '[]';
   }
 
+  diagnostics(): string {
+    if (!this.node) {
+      return '{}';
+    }
+    const lib = loadNative();
+    if (typeof lib.getDiagnostics !== 'function') {
+      return '{}';
+    }
+    return lib.getDiagnostics(this.node.handle) ?? '{}';
+  }
+
   dialableAddresses(): string {
     const lib = loadNative();
     return this.node ? lib.getDialableAddresses(this.node.handle) ?? '[]' : '[]';
@@ -507,6 +521,27 @@ export class NimLibp2p {
       }
     }
     return lib.connectMultiaddr(this.node.handle, multiaddr);
+  }
+
+  async portProbeJsonAsync(targetsJson: string, timeoutMs: number = 15000): Promise<string> {
+    if (!targetsJson || targetsJson.length === 0) {
+      return '{"ok":false,"error":"missing_targets","results":[]}';
+    }
+    const lib = loadNative();
+    if (typeof lib.portProbeJsonAsync === 'function') {
+      try {
+        const result = await lib.portProbeJsonAsync(targetsJson, timeoutMs);
+        return result ?? '{"ok":false,"error":"empty_result","results":[]}';
+      } catch (err) {
+        const message = err ? `${err}` : 'unknown error';
+        hilog.warn(0xD0B0, 'nimlib', 'portProbeJsonAsync bridge failed: %{public}s', message);
+        return `{"ok":false,"error":${JSON.stringify(message)},"results":[]}`;
+      }
+    }
+    if (typeof lib.portProbeJson === 'function') {
+      return lib.portProbeJson(targetsJson, timeoutMs) ?? '{"ok":false,"error":"empty_result","results":[]}';
+    }
+    return '{"ok":false,"error":"probe_unavailable","results":[]}';
   }
 
   registerPeerHints(peerId: string, addresses: string[], source: string = ''): boolean {

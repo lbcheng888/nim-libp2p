@@ -91,6 +91,9 @@ object NimBridge {
     fun uiFrameSnapshot(handle: Long, maxEvents: Int = 32, discoveryLimit: Int = 64): String? =
         nativeUiFrameSnapshot(handle, maxEvents, discoveryLimit)
 
+    fun diagnosticsJson(handle: Long): String? =
+        nativeGetDiagnosticsJson(handle)
+
     fun registerPeerHints(handle: Long, peerId: String, addressesJson: String, source: String? = null): Boolean =
         nativeRegisterPeerHints(handle, peerId, addressesJson, source)
 
@@ -131,6 +134,11 @@ object NimBridge {
     fun lastDirectError(handle: Long): String? = nativeGetLastDirectError(handle)
 
     fun lastInitError(): String? = nativeGetLastInitError()
+
+    fun portProbeJson(targetsJson: String, timeoutMs: Int): String? {
+        ensureLoaded()
+        return nativePortProbeJson(targetsJson, timeoutMs)
+    }
 
     fun identityFromSeed(seed: ByteArray): String? {
         ensureLoaded()
@@ -201,10 +209,12 @@ object NimBridge {
     private external fun nativePublishFeed(handle: Long, jsonPayload: String?): Boolean
     private external fun nativeFetchFeedSnapshot(handle: Long): String?
     private external fun nativeUiFrameSnapshot(handle: Long, maxEvents: Int, discoveryLimit: Int): String?
+    private external fun nativeGetDiagnosticsJson(handle: Long): String?
     private external fun nativeUpsertLivestream(handle: Long, streamKey: String?, configJson: String?): Boolean
     private external fun nativePublishLivestreamFrame(handle: Long, streamKey: String?, payload: ByteArray?): Boolean
     private external fun nativeGetLastDirectError(handle: Long): String?
     private external fun nativeGetLastInitError(): String?
+    private external fun nativePortProbeJson(targetsJson: String?, timeoutMs: Int): String?
     private external fun nativeIdentityFromSeed(seed: ByteArray?): String?
     private external fun nativeRegisterPeerHints(handle: Long, peerId: String?, addressesJson: String?, source: String?): Boolean
     private external fun nativeAddExternalAddress(handle: Long, multiaddr: String?): Boolean
