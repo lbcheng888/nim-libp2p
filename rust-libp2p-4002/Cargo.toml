@@ -1,0 +1,9 @@
+[package]
+name = "rust-libp2p-4002"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3"
+libp2p = { version = "0.56", features = ["identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"] }
+tokio = { version = "1", features = ["full"] }
