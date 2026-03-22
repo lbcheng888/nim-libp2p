@@ -69,6 +69,11 @@ type
     publicNode
     mobileEdge
 
+  ExactSeedDialPolicy* {.pure.} = enum
+    single
+    serial
+    parallel
+
   WanBootstrapTrust* {.pure.} = enum
     rejected
     quarantine
@@ -88,6 +93,7 @@ type
     role*: WanBootstrapRole
     journalPath*: string
     authoritativePeerIds*: seq[string]
+    exactSeedDialPolicy*: ExactSeedDialPolicy
     peerStoreTtl*: Duration
     maxBootstrapCandidates*: int
     maxConcurrentBootstrapDials*: int
@@ -176,6 +182,7 @@ type
   WanBootstrapStateSnapshot* = object
     networkId*: string
     role*: WanBootstrapRole
+    exactSeedDialPolicy*: ExactSeedDialPolicy
     running*: bool
     journalLoaded*: bool
     journalDirty*: bool
@@ -349,6 +356,30 @@ proc exactBootstrapDialAddrs(addrs: openArray[MultiAddress]): seq[MultiAddress] 
   if result.len > 1:
     sortBootstrapDialAddrs(result)
 
+proc exactSeedDialPolicyLabel(policy: ExactSeedDialPolicy): string =
+  case policy
+  of ExactSeedDialPolicy.single:
+    "same_family_serial"
+  of ExactSeedDialPolicy.serial:
+    "serial"
+  of ExactSeedDialPolicy.parallel:
+    "parallel"
+
+proc selectExactBootstrapDialAddrs(
+    addrs: openArray[MultiAddress], policy: ExactSeedDialPolicy
+): seq[MultiAddress] =
+  result = exactBootstrapDialAddrs(addrs)
+  if policy == ExactSeedDialPolicy.single and result.len > 1:
+    let primaryRank = bootstrapDialRank(result[0])
+    let allowRanks =
+      if primaryRank <= 1:
+        @[0, 1]
+      elif primaryRank <= 3:
+        @[2, 3]
+      else:
+        @[primaryRank]
+    result.keepItIf(bootstrapDialRank(it) in allowRanks)
+
 proc isBootstrapInfraHint(source: string): bool =
   let normalized = source.strip().toLowerAscii()
   normalized in ["bootstrap", "relay", "mdns", "dht", "peerstore", "dnsaddr", "rendezvous", "journal"]
@@ -383,6 +414,7 @@ proc init*(
     role = WanBootstrapRole.publicNode,
     journalPath = "",
     authoritativePeerIds: seq[string] = @[],
+    exactSeedDialPolicy = ExactSeedDialPolicy.serial,
     peerStoreTtl = 30.minutes,
     maxBootstrapCandidates = DefaultWanBootstrapCandidates,
     maxConcurrentBootstrapDials = 0,
@@ -410,11 +442,18 @@ proc init*(
       2
     else:
       DefaultWanBootstrapDialConcurrency
+  let resolvedExactSeedDialPolicy =
+    if exactSeedDialPolicy == ExactSeedDialPolicy.serial and
+        role == WanBootstrapRole.mobileEdge and authoritativePeerIds.len > 0:
+      ExactSeedDialPolicy.single
+    else:
+      exactSeedDialPolicy
   WanBootstrapConfig(
     networkId: if networkId.len == 0: "default" else: networkId,
     role: role,
     journalPath: journalPath,
     authoritativePeerIds: authoritativePeerIds,
+    exactSeedDialPolicy: resolvedExactSeedDialPolicy,
     peerStoreTtl: clampDuration(peerStoreTtl, 30.minutes),
     maxBootstrapCandidates: max(1, maxBootstrapCandidates),
     maxConcurrentBootstrapDials: max(1, dialConcurrency),
@@ -1213,6 +1252,7 @@ proc bootstrapStateSnapshot*(
   WanBootstrapStateSnapshot(
     networkId: svc.config.networkId,
     role: svc.config.role,
+    exactSeedDialPolicy: svc.config.exactSeedDialPolicy,
     running: svc.running,
     journalLoaded: svc.journalLoaded,
     journalDirty: svc.journalDirty,
@@ -1242,6 +1282,9 @@ proc bootstrapStateJson*(
   result = newJObject()
   result["networkId"] = %snapshot.networkId
   result["role"] = %roleLabel(snapshot.role)
+  result["exactSeedDialPolicy"] = %exactSeedDialPolicyLabel(snapshot.exactSeedDialPolicy)
+  result["exactSeedAddrFallbackAllowed"] = %(snapshot.exactSeedDialPolicy != ExactSeedDialPolicy.single)
+  result["exactSeedParallelDial"] = %(snapshot.exactSeedDialPolicy == ExactSeedDialPolicy.parallel)
   result["running"] = %snapshot.running
   result["journalLoaded"] = %snapshot.journalLoaded
   result["journalDirty"] = %snapshot.journalDirty
@@ -1818,78 +1861,139 @@ proc connectBootstrapCandidate(
     error: lastError,
   )
 
+proc dialBootstrapCandidateExactAddr(
+    svc: WanBootstrapService,
+    candidate: WanBootstrapCandidate,
+    stage: string,
+    dialAddr: MultiAddress,
+): Future[WanBootstrapDialOutcome] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil:
+    return WanBootstrapDialOutcome(connected: false, error: "service_unavailable")
+  let attemptedAddr = $dialAddr
+  let timeout = svc.bootstrapExactConnectBudget(dialAddr)
+  let quicDial = isQuicBootstrapDial(dialAddr)
+  if quicDial and svc.peerCurrentlyConnected(candidate.peerId):
+    try:
+      await svc.switch.disconnect(candidate.peerId)
+    except CatchableError:
+      discard
+  if isExactPeerMultiaddr(dialAddr):
+    let fut = svc.switch.connect(dialAddr, allowUnknownPeerId = true)
+    let completed = await withTimeout(fut, timeout)
+    if not completed:
+      fut.cancelSoon()
+      return WanBootstrapDialOutcome(
+        connected: false,
+        attemptedAddr: attemptedAddr,
+        error: "timeout",
+      )
+    try:
+      let resolvedPeerId = await fut
+      if resolvedPeerId != candidate.peerId:
+        try:
+          await svc.switch.disconnect(resolvedPeerId)
+        except CatchableError:
+          discard
+        return WanBootstrapDialOutcome(
+          connected: false,
+          attemptedAddr: attemptedAddr,
+          error: "peer_id_mismatch",
+        )
+      return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
+    except CatchableError as exc:
+      return WanBootstrapDialOutcome(
+        connected: false,
+        attemptedAddr: attemptedAddr,
+        error: if exc.msg.len > 0: exc.msg else: $exc.name,
+      )
+  var hadOriginalAddrs = false
+  var originalAddrs: seq[MultiAddress] = @[]
+  let peerStore = svc.switch.peerStore
+  if not peerStore.isNil:
+    try:
+      originalAddrs = peerStore[AddressBook][candidate.peerId]
+      hadOriginalAddrs = peerStore[AddressBook].contains(candidate.peerId)
+      peerStore.setAddresses(candidate.peerId, @[dialAddr])
+    except CatchableError:
+      hadOriginalAddrs = false
+      originalAddrs = @[]
+  let fut = svc.switch.connect(candidate.peerId, @[dialAddr], forceDial = true)
+  let completed = await withTimeout(fut, timeout)
+  if not peerStore.isNil:
+    try:
+      if hadOriginalAddrs:
+        peerStore.setAddresses(candidate.peerId, originalAddrs)
+      else:
+        discard peerStore[AddressBook].del(candidate.peerId)
+    except CatchableError:
+      discard
+  if not completed:
+    fut.cancelSoon()
+    return WanBootstrapDialOutcome(
+      connected: false,
+      attemptedAddr: attemptedAddr,
+      error: "timeout",
+    )
+  try:
+    await fut
+    return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
+  except CatchableError as exc:
+    WanBootstrapDialOutcome(
+      connected: false,
+      attemptedAddr: attemptedAddr,
+      error: if exc.msg.len > 0: exc.msg else: $exc.name,
+    )
+
 proc connectBootstrapCandidateExact(
     svc: WanBootstrapService, candidate: WanBootstrapCandidate, stage: string
 ): Future[WanBootstrapDialOutcome] {.async: (raises: [CancelledError]).} =
   if svc.isNil or svc.switch.isNil or candidate.addrs.len == 0:
     return WanBootstrapDialOutcome(connected: false, error: "no_candidate_addrs")
-  var ordered = exactBootstrapDialAddrs(candidate.addrs)
-  var lastError = ""
-  var attemptedAddr = ""
-  for addr in ordered:
-    attemptedAddr = $addr
-    let timeout = svc.bootstrapExactConnectBudget(addr)
-    let quicDial = isQuicBootstrapDial(addr)
-    if quicDial and svc.peerCurrentlyConnected(candidate.peerId):
-      try:
-        await svc.switch.disconnect(candidate.peerId)
-      except CatchableError:
-        discard
-    if isExactPeerMultiaddr(addr):
-      let fut = svc.switch.connect(addr, allowUnknownPeerId = true)
-      let completed = await withTimeout(fut, timeout)
-      if not completed:
-        fut.cancelSoon()
-        lastError = "timeout"
-        continue
-      try:
-        let resolvedPeerId = await fut
-        if resolvedPeerId != candidate.peerId:
-          lastError = "peer_id_mismatch"
-          try:
-            await svc.switch.disconnect(resolvedPeerId)
-          except CatchableError:
-            discard
-          continue
-        return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
-      except CatchableError as exc:
-        lastError = if exc.msg.len > 0: exc.msg else: $exc.name
-        continue
-    var hadOriginalAddrs = false
-    var originalAddrs: seq[MultiAddress] = @[]
-    let peerStore = svc.switch.peerStore
-    if not peerStore.isNil:
-      try:
-        originalAddrs = peerStore[AddressBook][candidate.peerId]
-        hadOriginalAddrs = peerStore[AddressBook].contains(candidate.peerId)
-        peerStore.setAddresses(candidate.peerId, @[addr])
-      except CatchableError:
-        hadOriginalAddrs = false
-        originalAddrs = @[]
-    let fut = svc.switch.connect(candidate.peerId, @[addr], forceDial = true)
-    let completed = await withTimeout(fut, timeout)
-    if not peerStore.isNil:
-      try:
-        if hadOriginalAddrs:
-          peerStore.setAddresses(candidate.peerId, originalAddrs)
-        else:
-          discard peerStore[AddressBook].del(candidate.peerId)
-      except CatchableError:
-        discard
-    if not completed:
-      fut.cancelSoon()
-      lastError = "timeout"
-      continue
+  let policy = svc.config.exactSeedDialPolicy
+  let ordered = selectExactBootstrapDialAddrs(candidate.addrs, policy)
+  if ordered.len == 0:
+    return WanBootstrapDialOutcome(connected: false, error: "no_candidate_addrs")
+  if policy == ExactSeedDialPolicy.parallel and ordered.len > 1 and ordered.allIt(isExactPeerMultiaddr(it)):
+    var futs: seq[Future[WanBootstrapDialOutcome]] = @[]
+    var lastOutcome = WanBootstrapDialOutcome(
+      connected: false,
+      attemptedAddr: $ordered[0],
+      error: "all_attempts_failed",
+    )
     try:
-      await fut
-      return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
-    except CatchableError as exc:
-      lastError = if exc.msg.len > 0: exc.msg else: $exc.name
-  WanBootstrapDialOutcome(
-    connected: false,
-    attemptedAddr: attemptedAddr,
-    error: lastError,
-  )
+      for addr in ordered:
+        futs.add(svc.dialBootstrapCandidateExactAddr(candidate, stage, addr))
+      while true:
+        var finishedCount = 0
+        for fut in futs:
+          if fut.isNil or not fut.finished():
+            continue
+          inc finishedCount
+          let outcome =
+            try:
+              fut.read()
+            except CatchableError as exc:
+              WanBootstrapDialOutcome(
+                connected: false,
+                error: if exc.msg.len > 0: exc.msg else: $exc.name,
+              )
+          if outcome.attemptedAddr.len > 0 or outcome.error.len > 0:
+            lastOutcome = outcome
+          if outcome.connected:
+            return outcome
+        if finishedCount >= futs.len:
+          return lastOutcome
+        await sleepAsync(chronos.milliseconds(50))
+    finally:
+      for fut in futs:
+        if not fut.isNil and not fut.finished():
+          fut.cancelSoon()
+  var lastOutcome = WanBootstrapDialOutcome(connected: false, error: "all_attempts_failed")
+  for addr in ordered:
+    lastOutcome = await svc.dialBootstrapCandidateExactAddr(candidate, stage, addr)
+    if lastOutcome.connected:
+      return lastOutcome
+  lastOutcome
 
 proc connectBootstrapCandidates(
     svc: WanBootstrapService,
@@ -2299,13 +2403,21 @@ proc bootstrapRoleConfig*(
     )
 
 proc syncLoop(svc: WanBootstrapService) {.async: (raises: [CancelledError]).} =
+  when defined(ohos):
+    const allowMobileEdgeAutoJoin = false
+  else:
+    const allowMobileEdgeAutoJoin = true
   while svc.running:
     try:
       if svc.joinInProgress:
         await sleepAsync(250.milliseconds)
         continue
       discard await svc.refreshBootstrapState()
-      if svc.config.role == mobileEdge and svc.connectedPeerIds().len == 0 and not svc.joinInProgress:
+      if
+        allowMobileEdgeAutoJoin and
+        svc.config.role == mobileEdge and
+        svc.connectedPeerIds().len == 0 and
+        not svc.joinInProgress:
         let visibleCandidates = svc.selectBootstrapCandidates(1)
         if visibleCandidates.len > 0:
           let selected = visibleCandidates[0]

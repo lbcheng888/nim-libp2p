@@ -191,18 +191,55 @@ proc performDialerHandshake(
 ): Future[MultistreamVersion] {.
     async: (raises: [CancelledError, LPStreamError, MultiStreamError])
 .} =
+  let handshakeWriteTimeout =
+    when defined(ohos):
+      chronos.milliseconds(1500)
+    else:
+      chronos.seconds(15)
+  let handshakeReadTimeout =
+    when defined(ohos):
+      chronos.milliseconds(3500)
+    else:
+      chronos.seconds(15)
+  proc writeHandshakeWithTimeout(payload: string, stage: string) {.
+      async: (raises: [CancelledError, LPStreamError, MultiStreamError])
+  .} =
+    let writeFuture = conn.writeLp(payload)
+    let writeReady = await withTimeout(writeFuture, handshakeWriteTimeout)
+    if not writeReady:
+      writeFuture.cancelSoon()
+      when defined(ohos):
+        warn "multistream dialer handshake write timeout", conn, stage,
+          timeoutMs = handshakeWriteTimeout.milliseconds
+      raise (ref MultiStreamError)(
+        msg: "MultistreamSelect " & stage & " write timeout"
+      )
+    await writeFuture
+
   warn "multistream dialer handshake begin", conn, attemptV2
-  await conn.writeLp(CodecV1 & "\n")
+  await writeHandshakeWithTimeout(CodecV1 & "\n", "response1")
+  when defined(ohos):
+    warn "multistream dialer sent handshake v1", conn
   when defined(libp2p_msquic_debug):
     debug "multistream dialer sent v1", conn
 
   if attemptV2:
     trace "requesting multistream v2", conn
-    await conn.writeLp(CodecV2 & "\n")
+    await writeHandshakeWithTimeout(CodecV2 & "\n", "response2")
+    when defined(ohos):
+      warn "multistream dialer sent handshake v2", conn
     when defined(libp2p_msquic_debug):
       debug "multistream dialer sent v2", conn
 
-  let response1 = await conn.readLp(MsgSize)
+  let response1Future = conn.readLp(MsgSize)
+  let response1Ready = await withTimeout(response1Future, handshakeReadTimeout)
+  if not response1Ready:
+    response1Future.cancelSoon()
+    when defined(ohos):
+      warn "multistream dialer handshake response1 timeout", conn,
+        timeoutMs = handshakeReadTimeout.milliseconds
+    raise (ref MultiStreamError)(msg: "MultistreamSelect handshake response1 timeout")
+  let response1 = await response1Future
   warn "multistream dialer got handshake response1", conn, bytes = response1.len
   var handshake = string.fromBytes(response1)
   when defined(libp2p_msquic_debug):
@@ -216,7 +253,15 @@ proc performDialerHandshake(
   var version = msv1
 
   if attemptV2:
-    let response2 = await conn.readLp(MsgSize)
+    let response2Future = conn.readLp(MsgSize)
+    let response2Ready = await withTimeout(response2Future, handshakeReadTimeout)
+    if not response2Ready:
+      response2Future.cancelSoon()
+      when defined(ohos):
+        warn "multistream dialer handshake response2 timeout", conn,
+          timeoutMs = handshakeReadTimeout.milliseconds
+      raise (ref MultiStreamError)(msg: "MultistreamSelect handshake response2 timeout")
+    let response2 = await response2Future
     warn "multistream dialer got handshake response2", conn, bytes = response2.len
     var v2Response = string.fromBytes(response2)
     when defined(libp2p_msquic_debug):

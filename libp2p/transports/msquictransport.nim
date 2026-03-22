@@ -419,7 +419,18 @@ method newStream*(
     m: MsQuicMuxer, name: string = "", lazy: bool = false
 ): Future[Connection] {.async: (raises: [CancelledError, LPStreamError, MuxerError]).} =
   try:
+    when defined(ohos):
+      warn "MsQuic muxer newStream begin",
+        peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
+        protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
+        name = name,
+        lazy = lazy
     let stream = m.session.openMsQuicStream(false, Direction.Out)
+    when defined(ohos):
+      warn "MsQuic muxer newStream opened",
+        peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
+        protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
+        name = name
     return newMsQuicChannel(m.session, stream)
   except LPStreamError as exc:
     raise exc

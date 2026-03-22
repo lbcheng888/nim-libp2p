@@ -77,12 +77,32 @@ method readOnce*(
   if stream.cached.len == 0:
     var chunk: seq[byte]
     try:
+      when defined(ohos):
+        warn "MsQuic readOnce begin",
+          stream = cast[uint64](stream.state.stream),
+          requested = nbytes,
+          cached = stream.cached.len
       chunk = await msquicdrv.readStream(stream.state)
+      when defined(ohos):
+        warn "MsQuic readOnce chunk",
+          stream = cast[uint64](stream.state.stream),
+          bytes = chunk.len
     except msquicdrv.QuicRuntimeEventQueueClosed as exc:
+      when defined(ohos):
+        warn "MsQuic readOnce queue closed",
+          stream = cast[uint64](stream.state.stream),
+          err = exc.msg
       raise newLPStreamConnDownError(exc)
     except CatchableError as exc:
+      when defined(ohos):
+        warn "MsQuic readOnce failed",
+          stream = cast[uint64](stream.state.stream),
+          err = exc.msg
       raise msquicStreamError("MsQuic read failed: " & exc.msg, exc)
     if chunk.len == 0:
+      when defined(ohos):
+        warn "MsQuic readOnce eof",
+          stream = cast[uint64](stream.state.stream)
       raise newLPStreamEOFError()
     swap(stream.cached, chunk)
   let toRead = min(nbytes, stream.cached.len)

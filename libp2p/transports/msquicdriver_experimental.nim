@@ -667,6 +667,10 @@ proc msquicConnectionEventRelay(event: msevents.ConnectionEvent) {.gcsafe.} =
   var dispatchEvent = event
   var shouldDispatch = true
   if event.kind == msevents.cePeerStreamStarted and not event.stream.isNil:
+    when defined(ohos):
+      warn "MsQuic peer stream started",
+        stream = cast[uint64](event.stream),
+        flags = event.streamFlags
     when defined(libp2p_msquic_debug):
       warn "MsQuic peer stream started", stream = cast[uint64](event.stream),
         flags = event.streamFlags
@@ -713,6 +717,10 @@ proc msquicConnectionEventRelay(event: msevents.ConnectionEvent) {.gcsafe.} =
           shouldDispatch = false
         else:
           storePendingStream(state, event.stream, streamState)
+          when defined(ohos):
+            warn "MsQuic pending peer stream stored",
+              stream = cast[uint64](event.stream),
+              connection = cast[uint64](state.connection)
     else:
       shouldDispatch = false
   if event.kind in {msevents.ceShutdownInitiated, msevents.ceShutdownComplete}:
@@ -929,6 +937,8 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
     completedSend = cast[MsQuicPendingSend](forwarded.clientContext)
     forwarded.clientContext = completedSend.clientContext
   if forwarded.kind == msevents.seStartComplete:
+    when defined(ohos):
+      warn "MsQuic stream start complete", stream = cast[uint64](state.stream)
     when defined(libp2p_msquic_debug):
       warn "MsQuic stream start complete", stream = cast[uint64](state.stream)
     var startWaiters: seq[Future[void]]
@@ -942,6 +952,12 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
         if fut.isNil or fut.finished():
           continue
         fut.complete()
+  if forwarded.kind == msevents.seReceive:
+    when defined(ohos):
+      warn "MsQuic stream receive event",
+        stream = cast[uint64](state.stream),
+        buffers = forwarded.bufferCount,
+        totalLen = forwarded.totalBufferLength
   if not state.externalHandler.isNil:
     try:
       state.externalHandler(forwarded)
@@ -1534,6 +1550,13 @@ proc readStream*(state: MsQuicStreamState): Future[seq[byte]] {.gcsafe.} =
       waiterLen = state.readWaiters.len
   if hasImmediate:
     let chunk = move(immediateChunk)
+    when defined(ohos):
+      warn "MsQuic stream read immediate",
+        stream = cast[uint64](state.stream),
+        bytes = chunk.payload.len,
+        receiveLen = chunk.receiveLen,
+        queued = queuedLen,
+        waiters = waiterLen
     when defined(libp2p_msquic_debug):
       warn "MsQuic stream read immediate",
         stream = cast[uint64](state.stream),
@@ -1544,6 +1567,11 @@ proc readStream*(state: MsQuicStreamState): Future[seq[byte]] {.gcsafe.} =
     {.cast(gcsafe).}:
       completeStreamReceive(state, chunk.receiveLen)
     fut.complete(chunk.payload)
+  elif defined(ohos):
+    warn "MsQuic stream read waiting",
+      stream = cast[uint64](state.stream),
+      queued = queuedLen,
+      waiters = waiterLen
   elif defined(libp2p_msquic_debug):
     warn "MsQuic stream read waiting",
       stream = cast[uint64](state.stream),
@@ -1584,6 +1612,11 @@ proc writeStream*(state: MsQuicStreamState; data: seq[byte];
     msapi.QUIC_SEND_FLAGS(flags),
     sendContext
   )
+  when defined(ohos):
+    warn "MsQuic StreamSend status", stream = cast[uint64](state.stream),
+      status = status,
+      bytes = data.len,
+      flags = flags
   when defined(libp2p_msquic_debug):
     warn "MsQuic StreamSend status", stream = cast[uint64](state.stream),
       status = status

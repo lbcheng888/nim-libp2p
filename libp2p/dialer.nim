@@ -335,25 +335,144 @@ proc internalConnect(
     )
 
   try:
-    debug "internalConnect storeMuxer begin",
-      peerId = muxed.connection.peerId,
-      protocol = muxed.connection.protocol,
-      negotiated = muxed.connection.negotiatedMuxer
-    self.connManager.storeMuxer(muxed)
-    debug "internalConnect storeMuxer done",
-      peerId = muxed.connection.peerId,
-      protocol = muxed.connection.protocol,
-      negotiated = muxed.connection.negotiatedMuxer
     when defined(libp2p_msquic_experimental):
       if muxed.connection of msquicconnection.MsQuicConnection:
-        proc finishNativeQuicIdentify() {.async: (raises: []).} =
+        when defined(ohos):
+          debug "internalConnect storeMuxer begin",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          self.connManager.storeMuxer(muxed)
+          debug "internalConnect storeMuxer done",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          proc finishOhosNativeQuicIdentify() {.async: (raises: []).} =
+            try:
+              warn "internalConnect native QUIC ohos async identify begin",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer
+              await self.peerStore.identify(muxed)
+              warn "internalConnect native QUIC ohos async identify done",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer
+              await self.connManager.triggerPeerEvents(
+                muxed.connection.peerId,
+                PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+              )
+            except CancelledError:
+              discard
+            except CatchableError as exc:
+              warn "internalConnect native QUIC ohos async identify failed",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer,
+                description = exc.msg
+          asyncSpawn finishOhosNativeQuicIdentify()
+        else:
+          debug "internalConnect storeMuxer begin",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          self.connManager.storeMuxer(muxed)
+          debug "internalConnect storeMuxer done",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          proc finishNativeQuicIdentify() {.async: (raises: []).} =
+            try:
+              warn "internalConnect native QUIC identify begin",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer
+              await self.peerStore.identify(muxed)
+              warn "internalConnect native QUIC identify done",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer
+              await self.connManager.triggerPeerEvents(
+                muxed.connection.peerId,
+                PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+              )
+            except CancelledError:
+              discard
+            except CatchableError as exc:
+              warn "internalConnect native QUIC identify failed",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer,
+                description = exc.msg
+          asyncSpawn finishNativeQuicIdentify()
+      else:
+        debug "internalConnect storeMuxer begin",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+        self.connManager.storeMuxer(muxed)
+        debug "internalConnect storeMuxer done",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+        when defined(ohos):
+          proc finishOhosOutgoingIdentify() {.async: (raises: []).} =
+            try:
+              warn "internalConnect ohos async identify begin",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer
+              await self.peerStore.identify(muxed)
+              warn "internalConnect ohos async identify done",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer
+              await self.connManager.triggerPeerEvents(
+                muxed.connection.peerId,
+                PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+              )
+            except CancelledError:
+              discard
+            except CatchableError as exc:
+              warn "internalConnect ohos async identify failed",
+                peerId = muxed.connection.peerId,
+                protocol = muxed.connection.protocol,
+                negotiated = muxed.connection.negotiatedMuxer,
+                description = exc.msg
+          asyncSpawn finishOhosOutgoingIdentify()
+        else:
+          warn "internalConnect identify begin",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          await self.peerStore.identify(muxed)
+          warn "internalConnect identify done",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          await self.connManager.triggerPeerEvents(
+            muxed.connection.peerId,
+            PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+          )
+    else:
+      debug "internalConnect storeMuxer begin",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
+      self.connManager.storeMuxer(muxed)
+      debug "internalConnect storeMuxer done",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
+      when defined(ohos):
+        proc finishOhosOutgoingIdentify() {.async: (raises: []).} =
           try:
-            warn "internalConnect native QUIC identify begin",
+            warn "internalConnect ohos async identify begin",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer
             await self.peerStore.identify(muxed)
-            warn "internalConnect native QUIC identify done",
+            warn "internalConnect ohos async identify done",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer
@@ -364,12 +483,12 @@ proc internalConnect(
           except CancelledError:
             discard
           except CatchableError as exc:
-            warn "internalConnect native QUIC identify failed",
+            warn "internalConnect ohos async identify failed",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer,
               description = exc.msg
-        asyncSpawn finishNativeQuicIdentify()
+        asyncSpawn finishOhosOutgoingIdentify()
       else:
         warn "internalConnect identify begin",
           peerId = muxed.connection.peerId,
@@ -384,20 +503,6 @@ proc internalConnect(
           muxed.connection.peerId,
           PeerEvent(kind: PeerEventKind.Identified, initiator: true),
         )
-    else:
-      warn "internalConnect identify begin",
-        peerId = muxed.connection.peerId,
-        protocol = muxed.connection.protocol,
-        negotiated = muxed.connection.negotiatedMuxer
-      await self.peerStore.identify(muxed)
-      warn "internalConnect identify done",
-        peerId = muxed.connection.peerId,
-        protocol = muxed.connection.protocol,
-        negotiated = muxed.connection.negotiatedMuxer
-      await self.connManager.triggerPeerEvents(
-        muxed.connection.peerId,
-        PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-      )
     return muxed
   except CancelledError as exc:
     await muxed.close()

@@ -321,7 +321,7 @@ proc identify*(
     peerId = muxer.connection.peerId,
     protocol = muxer.connection.protocol,
     negotiated = muxer.connection.negotiatedMuxer
-  var stream = await muxer.newStream()
+  var stream = await muxer.newStream("identify")
   if stream == nil:
     warn "peerStore.identify newStream nil",
       peerId = muxer.connection.peerId,

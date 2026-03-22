@@ -383,6 +383,8 @@ type
     streamId: uint64
     pendingChunks: seq[PendingStreamChunk]
     receiveBuffersProvided: uint64
+    flushRetryScheduled: bool
+    flushRetryAttempts: int
 
   ListenerState = ref object of QuicHandleState
     registration: RegistrationState
@@ -1929,6 +1931,7 @@ proc appendUniqueLostStream(streams: var seq[StreamState];
   streams.add(stream)
 
 proc flushStream(state: StreamState) {.gcsafe.}
+proc scheduleFlushStreamRetry(state: StreamState; reason: string) {.gcsafe.}
 
 proc detectAckDrivenLosses(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoch;
     nowUs: uint64; lostBytes: var uint32; largestLost: var uint64;
@@ -2454,6 +2457,88 @@ proc connectionReceiveMaterial(conn: ConnectionState): tuple[key, iv, hp: seq[by
   else:
     (conn.oneRttKeys.serverKey, conn.oneRttKeys.serverIv, conn.oneRttKeys.serverHp)
 
+proc safeEmitConnDiag(handle: pointer; note: string) {.gcsafe, raises: [].} =
+  try:
+    {.cast(gcsafe).}:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: handle,
+        note: note
+      ))
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
+proc sendPacketImmediate(transp: DatagramTransport; remote: TransportAddress;
+    packet: seq[byte]): tuple[ok: bool, err: string] {.gcsafe, raises: [].} =
+  if transp.isNil:
+    return (false, "transport nil")
+  if packet.len == 0:
+    return (true, "")
+  when defined(windows):
+    (false, "unsupported on windows")
+  else:
+    var saddr: Sockaddr_storage
+    var slen: SockLen
+    toSAddr(remote, saddr, slen)
+    let flags =
+      when declared(posix.MSG_NOSIGNAL):
+        cint(posix.MSG_NOSIGNAL)
+      else:
+        0.cint
+    let rc = posix.sendto(
+      SocketHandle(transp.fd),
+      cast[pointer](unsafeAddr packet[0]),
+      packet.len.cint,
+      flags,
+      cast[ptr SockAddr](addr saddr),
+      slen
+    )
+    if rc < 0:
+      (false, osErrorMsg(osLastError()))
+    else:
+      (true, "")
+
+proc sendOneRttPacketAsync(conn: ConnectionState; remote: TransportAddress;
+    packet: seq[byte]; frameKind: SentFrameKind) {.async.} =
+  if conn.isNil or conn.transport.isNil:
+    return
+  when defined(ohos):
+    safeEmitConnDiag(
+      cast[pointer](conn),
+      "UDP send begin kind=" & $frameKind &
+        " bytes=" & $packet.len &
+        " remote=" & $remote
+    )
+  try:
+    await conn.transport.sendTo(remote, packet)
+    when defined(ohos):
+      safeEmitConnDiag(
+        cast[pointer](conn),
+        "UDP send ok kind=" & $frameKind &
+          " bytes=" & $packet.len &
+          " remote=" & $remote
+      )
+  except CatchableError as exc:
+    when defined(ohos):
+      safeEmitConnDiag(
+        cast[pointer](conn),
+        "UDP send failed kind=" & $frameKind &
+          " bytes=" & $packet.len &
+          " remote=" & $remote &
+          " err=" & exc.msg
+      )
+  except Exception as exc:
+    when defined(ohos):
+      safeEmitConnDiag(
+        cast[pointer](conn),
+        "UDP send exception kind=" & $frameKind &
+          " bytes=" & $packet.len &
+          " remote=" & $remote &
+          " err=" & exc.msg
+      )
+
 proc emitNativeConnected(state: ConnectionState) =
   if state.isNil or state.callback.isNil:
     return
@@ -2617,7 +2702,7 @@ proc sendOneRttPacket(conn: ConnectionState; payload: seq[byte];
   let sendRemote =
     if targetRemote.isNil: conn.remoteAddress
     else: targetRemote[]
-  asyncCheck conn.transport.sendTo(sendRemote, packet)
+  asyncCheck sendOneRttPacketAsync(conn, sendRemote, packet, frameKind)
   let packetLength = uint16(min(packet.len, high(uint16).int))
   conn.recordSentPacket(SentPacketMeta(
     packetNumber: pn,
@@ -2721,7 +2806,7 @@ proc sendZeroRttPacket(conn: ConnectionState; payload: seq[byte];
   let sendRemote =
     if targetRemote.isNil: conn.remoteAddress
     else: targetRemote[]
-  asyncCheck conn.transport.sendTo(sendRemote, packet)
+  asyncCheck sendOneRttPacketAsync(conn, sendRemote, packet, frameKind)
   let packetLength = uint16(min(packet.len, high(uint16).int))
   conn.recordSentPacket(SentPacketMeta(
     packetNumber: pn,
@@ -2821,7 +2906,7 @@ proc sendInitialPacket(conn: ConnectionState; payload: seq[byte];
   let sendRemote =
     if targetRemote.isNil: conn.remoteAddress
     else: targetRemote[]
-  asyncCheck conn.transport.sendTo(sendRemote, packet)
+  asyncCheck sendOneRttPacketAsync(conn, sendRemote, packet, frameKind)
   let packetLength = uint16(min(packet.len, high(uint16).int))
   conn.recordSentPacket(SentPacketMeta(
     packetNumber: pn,
@@ -2914,7 +2999,7 @@ proc sendHandshakePacket(conn: ConnectionState; payload: seq[byte];
   let sendRemote =
     if targetRemote.isNil: conn.remoteAddress
     else: targetRemote[]
-  asyncCheck conn.transport.sendTo(sendRemote, packet)
+  asyncCheck sendOneRttPacketAsync(conn, sendRemote, packet, frameKind)
   let packetLength = uint16(min(packet.len, high(uint16).int))
   conn.recordSentPacket(SentPacketMeta(
     packetNumber: pn,
@@ -4460,8 +4545,24 @@ proc handleShortHeaderPacket(conn: ConnectionState; remote: TransportAddress; da
     else:
       tls.decryptPacket(receiveMat.key, receiveMat.iv, uint64(pnVal), aad, ciphertext, recTag)
   if plaintext.len == 0 and ciphertext.len > 0:
+    when defined(ohos):
+      safeEmitConnDiag(
+        cast[pointer](conn),
+        "RX short decrypt failed pn=" & $pnVal &
+          " bytes=" & $data.len &
+          " cipher=" & $ciphertext.len &
+          " remote=" & $remote
+      )
     discard conn.handleStatelessReset(remote)
     return
+  when defined(ohos):
+    safeEmitConnDiag(
+      cast[pointer](conn),
+      "RX short ok pn=" & $pnVal &
+        " bytes=" & $data.len &
+        " payload=" & $plaintext.len &
+        " remote=" & $remote
+    )
   handleOneRttPayload(conn, remote, uint64(pnVal), plaintext)
 
 proc handleHandshakePacket(conn: ConnectionState; remote: TransportAddress; data: seq[byte]) =
@@ -4855,7 +4956,7 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
       for i in 0 .. 3:
         packet[responsePnOffset + i] = responsePn[i]
 
-    asyncCheck conn.transport.sendTo(conn.remoteAddress, packet)
+    asyncCheck sendOneRttPacketAsync(conn, conn.remoteAddress, packet, sfkCrypto)
     discard conn.sendHandshakePacket(buildCryptoFrame(serverFinished), sfkCrypto, true)
     if conn.quicConn.model.handshake.zeroRttAccepted:
       state.replayPendingZeroRtt(conn, remote)
@@ -5313,10 +5414,20 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
                 {.cast(gcsafe).}:
                   handleHandshakePacket(state, remote, data)
             else:
+              when defined(ohos):
+                safeEmitConnDiag(
+                  cast[pointer](state),
+                  "RX short candidate bytes=" & $data.len &
+                    " remote=" & $remote
+                )
               {.cast(gcsafe).}:
                 handleShortHeaderPacket(state, remote, data)
-          except Exception:
-            discard
+          except Exception as exc:
+            when defined(ohos):
+              safeEmitConnDiag(
+                cast[pointer](state),
+                "client transport recv exception err=" & exc.msg
+              )
         ),
         local = state.selectClientLocalBind()
       )
@@ -5469,7 +5580,7 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
       for i in 0..3: packet[pnOffset+i] = pnSlice[i]
       
     if transportEnabled and not state.transport.isNil:
-      asyncCheck state.transport.sendTo(state.remoteAddress, packet)
+      asyncCheck sendOneRttPacketAsync(state, state.remoteAddress, packet, sfkCrypto)
       emitDiagnostics(DiagnosticsEvent(kind: diagConnectionEvent, handle: connection, note: "TX Initial Encrypted"))
     else:
       emitDiagnostics(DiagnosticsEvent(
@@ -5531,6 +5642,7 @@ proc msquicStreamClose(stream: HQUIC) {.cdecl.} =
       system.copyMem(buf, unsafeAddr payload, sizeof(payload))
     )
     state.closed = true
+    state.flushRetryScheduled = false
   releaseHandle(stream)
 
 proc msquicStreamStart(stream: HQUIC;
@@ -5619,10 +5731,27 @@ proc flushStream(state: StreamState) {.gcsafe.} =
       state.pendingChunks[0].zeroRttDispatched:
     state.pendingChunks.delete(0)
   if state.pendingChunks.len == 0:
+    state.flushRetryAttempts = 0
     return
 
   let chunk = state.pendingChunks[0]
   if not conn.handshakeComplete:
+    when defined(ohos):
+      warn "MsQuic flushStream deferred handshake_incomplete",
+        stream = cast[uint64](state),
+        streamId = state.streamId,
+        pending = state.pendingChunks.len,
+        attempts = state.flushRetryAttempts
+    scheduleFlushStreamRetry(state, "handshake_incomplete")
+    return
+  if conn.transport.isNil:
+    when defined(ohos):
+      warn "MsQuic flushStream deferred transport_nil",
+        stream = cast[uint64](state),
+        streamId = state.streamId,
+        pending = state.pendingChunks.len,
+        attempts = state.flushRetryAttempts
+    scheduleFlushStreamRetry(state, "transport_nil")
     return
   let streamFrame = proto.encodeStreamFrame(
     state.streamId,
@@ -5644,10 +5773,60 @@ proc flushStream(state: StreamState) {.gcsafe.} =
       else: unsafeAddr chunk.targetRemote)
   )
   if pn == 0'u64:
+    when defined(ohos):
+      let sendMat = connectionSendMaterial(conn)
+      warn "MsQuic flushStream deferred send_failed",
+        stream = cast[uint64](state),
+        streamId = state.streamId,
+        pending = state.pendingChunks.len,
+        attempts = state.flushRetryAttempts,
+        handshakeComplete = conn.handshakeComplete,
+        transportReady = (not conn.transport.isNil),
+        keyLen = sendMat.key.len,
+        ivLen = sendMat.iv.len,
+        hpLen = sendMat.hp.len
+    scheduleFlushStreamRetry(state, "send_failed")
     return
   state.pendingChunks.delete(0)
+  state.flushRetryAttempts = 0
   if chunk.fin:
     state.finSent = true
+
+proc flushStreamRetryTask(state: StreamState): Future[void] {.async.} =
+  if state.isNil or state.closed:
+    return
+  let attempt = max(state.flushRetryAttempts, 1)
+  let delayMs = min(200, 5 * attempt)
+  await sleepAsync(chronos.milliseconds(delayMs))
+  if state.isNil or state.closed:
+    return
+  state.flushRetryScheduled = false
+  try:
+    flushStream(state)
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
+proc scheduleFlushStreamRetry(state: StreamState; reason: string) {.gcsafe.} =
+  if state.isNil or state.closed:
+    return
+  if state.pendingChunks.len == 0:
+    state.flushRetryAttempts = 0
+    state.flushRetryScheduled = false
+    return
+  if state.flushRetryScheduled:
+    return
+  state.flushRetryScheduled = true
+  inc state.flushRetryAttempts
+  when defined(ohos):
+    warn "MsQuic flushStream retry scheduled",
+      stream = cast[uint64](state),
+      streamId = state.streamId,
+      reason = reason,
+      pending = state.pendingChunks.len,
+      attempt = state.flushRetryAttempts
+  asyncCheck flushStreamRetryTask(state)
 
 proc msquicStreamSend(stream: HQUIC; buffers: ptr QuicBuffer;
     bufferCount: uint32; flags: QUIC_SEND_FLAGS;

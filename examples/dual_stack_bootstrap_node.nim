@@ -4,7 +4,6 @@ import std/[os, strutils]
 import chronos
 import libp2p
 import libp2p/protocols/ping
-import libp2p/protocols/rendezvous
 import libp2p/crypto/crypto
 import bearssl/[rand, hash]
 import nimcrypto/sha2 as nimsha2
@@ -60,9 +59,10 @@ proc deterministicPrivateKeyFromSeed(seedText: string): PrivateKey =
 proc main() {.async: (raises: [CatchableError, Exception]).} =
   let
     rng = newRng()
-    rdv = RendezVous.new()
     ping = Ping.new(rng = rng)
     identitySeed = getEnv("BOOTSTRAP_IDENTITY_SEED").strip()
+    networkId = getEnv("BOOTSTRAP_NETWORK_ID", "unimaker-mobile").strip()
+    journalPath = getEnv("BOOTSTRAP_JOURNAL_PATH").strip()
   var listenAddrs = parseListenAddrs(
     getEnv("BOOTSTRAP_TCP_LISTEN", DefaultTcpListen)
   )
@@ -74,11 +74,17 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
     .new()
     .withRng(rng)
     .withAddresses(listenAddrs)
+    .withWanBootstrapProfile(
+      bootstrapRoleConfig(
+        role = WanBootstrapRole.anchor,
+        networkId = if networkId.len > 0: networkId else: "unimaker-mobile",
+        journalPath = journalPath,
+      )
+    )
     .withTcpTransport()
     .withYamux()
     .withMplex()
     .withNoise()
-    .withRendezVous(rdv)
 
   if identitySeed.len > 0:
     builder = builder.withPrivateKey(deterministicPrivateKeyFromSeed(identitySeed))
