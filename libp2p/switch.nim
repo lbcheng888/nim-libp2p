@@ -22,6 +22,7 @@ import
   stream/connection,
   transports/transport,
   transports/tcptransport,
+  transports/tsnettransport,
   upgrademngrs/upgrade,
   multistream,
   multiaddress,
@@ -180,6 +181,13 @@ proc bandwidthTotals*(
     (0'u64, 0'u64)
   else:
     (s.bandwidthManager.totalInbound, s.bandwidthManager.totalOutbound)
+
+proc tsnetTransport*(s: Switch): TsnetTransport {.public, gcsafe.} =
+  if s.isNil:
+    return nil
+  for transp in s.transports:
+    if not transp.isNil and transp of TsnetTransport:
+      return TsnetTransport(transp)
 
 proc bitswapLedger*(s: Switch): BitswapLedger {.public.} =
   if s.bitswap.isNil:
@@ -1018,20 +1026,39 @@ proc upgrader(
         raise newException(
           UpgradeError, "Connection denied by connection gater after upgrade"
         )
-    warn "incoming upgrader identify begin",
-      peerId = muxed.connection.peerId,
-      protocol = muxed.connection.protocol,
-      negotiated = muxed.connection.negotiatedMuxer
-    await switch.peerStore.identify(muxed)
-    warn "incoming upgrader identify done",
+    debug "incoming upgrader storeMuxer begin",
       peerId = muxed.connection.peerId,
       protocol = muxed.connection.protocol,
       negotiated = muxed.connection.negotiatedMuxer
     switch.connManager.storeMuxer(muxed)
-    await switch.connManager.triggerPeerEvents(
-      muxed.connection.peerId,
-      PeerEvent(kind: PeerEventKind.Identified, initiator: false),
-    )
+    debug "incoming upgrader storeMuxer done",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
+    proc finishIncomingIdentify() {.async: (raises: []).} =
+      try:
+        warn "incoming upgrader identify begin",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+        await switch.peerStore.identify(muxed)
+        warn "incoming upgrader identify done",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+        await switch.connManager.triggerPeerEvents(
+          muxed.connection.peerId,
+          PeerEvent(kind: PeerEventKind.Identified, initiator: false),
+        )
+      except CancelledError:
+        discard
+      except CatchableError as exc:
+        warn "incoming upgrader identify failed",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer,
+          description = exc.msg
+    asyncSpawn finishIncomingIdentify()
   except CancelledError as e:
     raise e
   except CatchableError as e:

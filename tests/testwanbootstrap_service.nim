@@ -1,0 +1,927 @@
+{.used.}
+
+import std/[json, os, sequtils]
+from std/times import epochTime
+
+import chronos
+import unittest2
+
+import ./helpers
+import ../libp2p/[builders, crypto/crypto, switch]
+import ../libp2p/nameresolving/nameresolver
+import ../libp2p/protocols/connectivity/autonatv2/[service, types]
+import ../libp2p/protocols/kademlia/[kademlia, keys]
+import ../libp2p/protocols/connectivity/relay/utils
+import ../libp2p/protocols/rendezvous/rendezvous
+import ../libp2p/services/hpservice
+import ../libp2p/services/wanbootstrapservice
+import ./kademlia/utils
+
+proc makeMemorySwitch(): Switch =
+  newStandardSwitch(transport = TransportType.Memory)
+
+proc makeMemorySwitch(resolver: NameResolver): Switch =
+  newStandardSwitchBuilder(
+    transport = TransportType.Memory, nameResolver = Opt.some(resolver)
+  ).build()
+
+proc tcpListenAddress(): MultiAddress =
+  MultiAddress.init("/ip4/127.0.0.1/tcp/0").tryGet()
+
+proc makeTcpSwitch(): Switch =
+  newStandardSwitch(addrs = @[tcpListenAddress()])
+
+proc makeTcpSwitch(resolver: NameResolver): Switch =
+  newStandardSwitchBuilder(
+    addrs = @[tcpListenAddress()], nameResolver = Opt.some(resolver)
+  ).build()
+
+proc nowMillis(): int64 =
+  int64(epochTime() * 1000)
+
+proc withPeerId(ma: MultiAddress, peerId: PeerId): MultiAddress =
+  MultiAddress.init($ma & "/p2p/" & $peerId).tryGet()
+
+proc hasKadKey(kad: KadDHT, key: Key): bool =
+  for bucket in kad.rtable.buckets:
+    for entry in bucket.peers:
+      if entry.nodeId == key:
+        return true
+  false
+
+suite "WAN bootstrap service":
+  teardown:
+    checkTrackers()
+
+  asyncTest "progressive selection prefers direct hints and enforces caps":
+    let sw = makeMemorySwitch()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = await startWanBootstrapService(
+      sw,
+      WanBootstrapConfig.init(
+        maxBootstrapCandidates = 4,
+        recentStableSlots = 1,
+        randomPoolCap = 8,
+      ),
+    )
+
+    let peerA = makeMemorySwitch().peerInfo.peerId
+    let peerB = makeMemorySwitch().peerInfo.peerId
+    let peerC = makeMemorySwitch().peerInfo.peerId
+    let peerD = makeMemorySwitch().peerInfo.peerId
+    let baseTs = nowMillis() + 5_000
+
+    check svc.registerBootstrapHint(
+      peerA,
+      @[MultiAddress.init("/ip4/10.0.0.1/tcp/4001").tryGet()],
+      source = "invite",
+    )
+    check svc.registerBootstrapHint(
+      peerB,
+      @[MultiAddress.init("/ip4/10.0.0.2/tcp/4001").tryGet()],
+      source = "rendezvous",
+    )
+    check svc.registerBootstrapHint(
+      peerC,
+      @[MultiAddress.init("/ip4/10.0.0.3/tcp/4001").tryGet()],
+      source = "mdns",
+    )
+    check svc.registerBootstrapHint(
+      peerD,
+      @[MultiAddress.init("/ip4/10.0.0.4/tcp/4001").tryGet()],
+      source = "dnsaddr",
+    )
+
+    check svc.markBootstrapSeen(peerA, baseTs + 4)
+    check svc.markBootstrapSeen(peerB, baseTs + 3)
+    check svc.markBootstrapSeen(peerC, baseTs + 2)
+    check svc.markBootstrapSeen(peerD, baseTs + 1)
+
+    let selected = svc.selectBootstrapCandidates()
+    check selected.len == 4
+    check selected[0].peerId == peerA
+    check selected[0].selectionReason == "direct_hint"
+    check selected[1].peerId == peerB
+    check selected[1].selectionReason == "hint"
+    check selected[2].peerId == peerC
+    check selected[2].selectionReason == "recent_stable"
+    check selected[3].peerId == peerD
+    check selected[3].selectionReason == "random_pool"
+
+  asyncTest "authoritative bootstrap peers suppress stale non-bootstrap candidates before first connection":
+    let sw = makeMemorySwitch()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let peerBootstrapA = makeMemorySwitch().peerInfo.peerId
+    let peerBootstrapB = makeMemorySwitch().peerInfo.peerId
+    let stalePeer = makeMemorySwitch().peerInfo.peerId
+
+    let svc = await startWanBootstrapService(
+      sw,
+      WanBootstrapConfig.init(
+        authoritativePeerIds = @[$peerBootstrapA, $peerBootstrapB],
+        maxBootstrapCandidates = 6,
+      ),
+    )
+
+    check svc.registerBootstrapHint(
+      peerBootstrapA,
+      @[MultiAddress.init("/ip6/2001:db8::1/tcp/4001").tryGet()],
+      source = "bootstrap",
+    )
+    check svc.registerBootstrapHint(
+      peerBootstrapB,
+      @[MultiAddress.init("/ip6/2001:db8::2/udp/4001/quic-v1").tryGet()],
+      source = "bootstrap",
+    )
+    check svc.registerBootstrapHint(
+      stalePeer,
+      @[MultiAddress.init("/ip4/10.0.0.9/tcp/4001").tryGet()],
+      source = "journal",
+    )
+
+    let selected = svc.selectBootstrapCandidates()
+    check selected.len == 2
+    check selected.allIt($it.peerId in [ $peerBootstrapA, $peerBootstrapB ])
+    check not selected.anyIt(it.peerId == stalePeer)
+
+  asyncTest "joinViaBootstrap connects to hinted memory peer":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let svc = await startWanBootstrapService(client)
+    check svc.registerBootstrapHint(
+      server.peerInfo.peerId, server.peerInfo.addrs, source = "invite"
+    )
+
+    let result = await client.joinViaBootstrap()
+    check result.ok
+    check result.attemptedCount == 1
+    check result.connectedCount == 1
+    check result.attempts.len == 1
+    check result.attempts[0].candidate.peerId == server.peerInfo.peerId
+    check client.isConnected(server.peerInfo.peerId)
+
+  asyncTest "joinViaBootstrap stops after first stable connection when stopAfterConnected is one":
+    let primary = makeMemorySwitch()
+    let secondary = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await primary.start()
+    await secondary.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await secondary.stop()
+      await primary.stop()
+
+    let svc = await startWanBootstrapService(
+      client,
+      WanBootstrapConfig.init(
+        maxBootstrapCandidates = 3,
+        maxConcurrentBootstrapDials = 1,
+        stopAfterConnected = 1,
+      ),
+    )
+    check svc.registerBootstrapHint(
+      primary.peerInfo.peerId, primary.peerInfo.addrs, source = "invite"
+    )
+    check svc.registerBootstrapHint(
+      secondary.peerInfo.peerId, secondary.peerInfo.addrs, source = "dnsaddr"
+    )
+
+    let result = await client.joinViaBootstrap()
+    check result.ok
+    check result.connectedCount == 1
+    check result.attemptedCount == 1
+    check result.attempts.len == 1
+    check result.attempts[0].candidate.peerId == primary.peerInfo.peerId
+    check client.isConnected(primary.peerInfo.peerId)
+    check not client.isConnected(secondary.peerInfo.peerId)
+
+  asyncTest "joinViaBootstrap retries later candidate addrs when the first addr fails":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let svc = await startWanBootstrapService(client)
+    let badAddr = MultiAddress.init("/memory/999999").tryGet()
+    check svc.registerBootstrapHint(
+      server.peerInfo.peerId, @[badAddr, server.peerInfo.addrs[0]], source = "invite"
+    )
+
+    let result = await client.joinViaBootstrap()
+    check result.ok
+    check result.attemptedCount == 1
+    check result.connectedCount == 1
+    check result.attempts.len == 1
+    check result.attempts[0].candidate.peerId == server.peerInfo.peerId
+    check result.attempts[0].connected
+    check result.attempts[0].attemptedAddr == $server.peerInfo.addrs[0]
+    check client.isConnected(server.peerInfo.peerId)
+
+  asyncTest "attestPeer can reject a connected bootstrap peer":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let rejectAttester: WanBootstrapAttester =
+      proc(
+          switch: Switch,
+          peerId: PeerId,
+          addrs: seq[MultiAddress],
+          sources: seq[string],
+          currentTrust: WanBootstrapTrust,
+          stage: string,
+      ): Future[WanBootstrapTrust] {.async: (raises: []).} =
+        check peerId == server.peerInfo.peerId
+        check addrs.len >= 1
+        check "Hints" in sources
+        check stage.len >= 5 and stage[0 .. 4] == "local"
+        return rejected
+    let svc = await startWanBootstrapService(
+      client, WanBootstrapConfig.init(attestPeer = rejectAttester)
+    )
+    check svc.registerBootstrapHint(
+      server.peerInfo.peerId, server.peerInfo.addrs, source = "invite"
+    )
+
+    let result = await client.joinViaBootstrap()
+    check not result.ok
+    check result.attemptedCount == 1
+    check result.connectedCount == 0
+    check result.attempts.len == 1
+    check not result.attempts[0].connected
+    check not client.isConnected(server.peerInfo.peerId)
+    let snapshot = svc.bootstrapStateSnapshot()
+    check snapshot.metrics.attestRejected == 1
+    check not snapshot.selectedCandidates.anyIt(it.peerId == server.peerInfo.peerId)
+    check snapshot.hasLastJoinResult
+    check snapshot.lastJoinResult.attempts.len == 1
+    check snapshot.lastJoinResult.attempts[0].candidate.peerId == server.peerInfo.peerId
+    check not snapshot.lastJoinResult.attempts[0].connected
+
+  asyncTest "attestPeer can promote a connected peer to trusted":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let trustAttester: WanBootstrapAttester =
+      proc(
+          switch: Switch,
+          peerId: PeerId,
+          addrs: seq[MultiAddress],
+          sources: seq[string],
+          currentTrust: WanBootstrapTrust,
+          stage: string,
+      ): Future[WanBootstrapTrust] {.async: (raises: []).} =
+        check peerId == server.peerInfo.peerId
+        check currentTrust == quarantine
+        check stage.len >= 5 and stage[0 .. 4] == "local"
+        return trusted
+    let svc = await startWanBootstrapService(
+      client, WanBootstrapConfig.init(attestPeer = trustAttester)
+    )
+    check svc.registerBootstrapHint(
+      server.peerInfo.peerId, server.peerInfo.addrs, source = "invite"
+    )
+
+    let result = await client.joinViaBootstrap()
+    check result.ok
+    check client.isConnected(server.peerInfo.peerId)
+    let snapshot = svc.bootstrapStateSnapshot()
+    check snapshot.metrics.attestTrusted == 1
+    check snapshot.selectedCandidates.anyIt(
+      it.peerId == server.peerInfo.peerId and it.trust == trusted
+    )
+
+  asyncTest "journal persists and reloads bootstrap candidates":
+    let peer = makeMemorySwitch().peerInfo.peerId
+    let journalPath =
+      getTempDir() / ("nim-libp2p-wan-bootstrap-" & $nowMillis() & ".json")
+    if fileExists(journalPath):
+      removeFile(journalPath)
+
+    block:
+      let sw = makeMemorySwitch()
+      await sw.start()
+      defer:
+        await sw.stop()
+
+      let svc = await startWanBootstrapService(
+        sw, WanBootstrapConfig.init(journalPath = journalPath)
+      )
+      check svc.registerBootstrapHint(
+        peer,
+        @[MultiAddress.init("/ip4/10.0.0.50/tcp/4010").tryGet()],
+        source = "invite",
+      )
+      check svc.saveBootstrapJournal()
+
+    let restored = makeMemorySwitch()
+    await restored.start()
+    defer:
+      await restored.stop()
+      if fileExists(journalPath):
+        removeFile(journalPath)
+
+    let restoredSvc = await startWanBootstrapService(
+      restored, WanBootstrapConfig.init(journalPath = journalPath)
+    )
+    let selected = restoredSvc.selectBootstrapCandidates()
+    check selected.len >= 1
+    check selected.anyIt(it.peerId == peer)
+
+  asyncTest "snapshot protocol returns remote bootstrap snapshot":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let serverSvc = await startWanBootstrapService(server)
+    let clientSvc = await startWanBootstrapService(client)
+    let peer = makeMemorySwitch().peerInfo.peerId
+
+    check serverSvc.registerBootstrapHint(
+      peer,
+      @[MultiAddress.init("/ip4/10.0.0.60/tcp/4011").tryGet()],
+      source = "manual",
+    )
+    await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+
+    let snapshot = await clientSvc.requestBootstrapSnapshot(server.peerInfo.peerId)
+    check snapshot.len >= 1
+    check snapshot.anyIt(it.peerId == peer)
+
+  asyncTest "dnsaddr fallback and rendezvous refresh hydrate candidates":
+    let resolver = MockResolver.new()
+    let networkId = "wan-bootstrap-test-" & $nowMillis()
+    let anchorNode = makeMemorySwitch()
+    let publicNodeSwitch = makeMemorySwitch()
+    let client = makeMemorySwitch(NameResolver(resolver))
+
+    await anchorNode.start()
+    await publicNodeSwitch.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await publicNodeSwitch.stop()
+      await anchorNode.stop()
+
+    let anchorSeed = withPeerId(anchorNode.peerInfo.addrs[0], anchorNode.peerInfo.peerId)
+    let dnsSeed =
+      MultiAddress.init("/dnsaddr/bootstrap.example/p2p/" & $anchorNode.peerInfo.peerId).tryGet()
+    resolver.txtResponses["_dnsaddr.bootstrap.example"] = @["dnsaddr=" & $anchorSeed]
+
+    let anchorSvc = await startWanBootstrapService(
+      anchorNode, bootstrapRoleConfig(WanBootstrapRole.anchor, networkId = networkId)
+    )
+    let publicSvc = await startWanBootstrapService(
+      publicNodeSwitch,
+      bootstrapRoleConfig(WanBootstrapRole.publicNode, networkId = networkId),
+    )
+    let clientSvc = await startWanBootstrapService(
+      client,
+      bootstrapRoleConfig(
+        WanBootstrapRole.mobileEdge, networkId = networkId, fallbackDnsAddrs = @[dnsSeed]
+      ),
+    )
+
+    var publicJoin = WanBootstrapJoinResult(timestampMs: nowMillis())
+    proc publicConnectedToAnchor(): Future[bool] {.async: (raises: [CancelledError]).} =
+      publicJoin = await publicSvc.joinViaBootstrap()
+      publicJoin.ok and publicNodeSwitch.isConnected(anchorNode.peerInfo.peerId)
+
+    check publicSvc.registerBootstrapHint(
+      anchorNode.peerInfo.peerId, anchorNode.peerInfo.addrs, source = "invite"
+    )
+    checkUntilTimeout:
+      await publicConnectedToAnchor()
+    check publicJoin.ok
+    let publicRefresh = await publicSvc.refreshBootstrapState()
+    check publicRefresh >= 1 or publicSvc.bootstrapStateSnapshot().connectedPeerCount >= 1
+    discard anchorSvc
+
+    let clientJoin = await clientSvc.joinViaBootstrap()
+    check clientJoin.ok
+    check client.isConnected(anchorNode.peerInfo.peerId)
+    checkUntilTimeout:
+      clientSvc.selectBootstrapCandidates().anyIt(it.peerId == publicNodeSwitch.peerInfo.peerId)
+
+  asyncTest "state snapshot captures join and refresh activity":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    let importedPeer = makeMemorySwitch().peerInfo.peerId
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let serverSvc = await startWanBootstrapService(server)
+    let clientSvc = await startWanBootstrapService(client)
+    check serverSvc.registerBootstrapHint(
+      importedPeer,
+      @[MultiAddress.init("/ip4/10.0.0.88/tcp/4088").tryGet()],
+      source = "manual",
+    )
+    check clientSvc.registerBootstrapHint(
+      server.peerInfo.peerId, server.peerInfo.addrs, source = "invite"
+    )
+
+    let joinResult = await clientSvc.joinViaBootstrap()
+    check joinResult.ok
+    let refreshImported = await clientSvc.refreshBootstrapState()
+    check refreshImported >= 1
+
+    let snapshot = clientSvc.bootstrapStateSnapshot()
+    check snapshot.networkId == clientSvc.config.networkId
+    check snapshot.connectedPeerCount >= 1
+    check snapshot.hasLastJoinResult
+    check snapshot.lastJoinResult.ok
+    check snapshot.lastJoinResult.attemptedCount == joinResult.attemptedCount
+    check snapshot.metrics.joinRuns == 1
+    check snapshot.metrics.joinAttempts == joinResult.attemptedCount.int64
+    check snapshot.metrics.joinConnected == joinResult.connectedCount.int64
+    check snapshot.lastRefresh.timestampMs > 0
+    check snapshot.lastRefresh.snapshotImported >= 1
+    check snapshot.selectedCandidates.anyIt(it.peerId == importedPeer)
+    let stateJson = clientSvc.bootstrapStateJson()
+    check stateJson{"hasLastJoinResult"}.getBool()
+    check stateJson{"metrics", "joinRuns"}.getBiggestInt() == 1
+
+  asyncTest "joinViaBootstrap bootstraps mounted kademlia after connect":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    let serverKad = KadDHT.new(server, PermissiveValidator(), CandSelector())
+    let clientKad = KadDHT.new(client, PermissiveValidator(), CandSelector())
+    server.mount(serverKad)
+    client.mount(clientKad)
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let clientSvc = await startWanBootstrapService(
+      client, WanBootstrapConfig.init(enableKadAfterJoin = true)
+    )
+    check clientSvc.registerBootstrapHint(
+      server.peerInfo.peerId, server.peerInfo.addrs, source = "invite"
+    )
+
+    let result = await clientSvc.joinViaBootstrap()
+    check result.ok
+    checkUntilTimeout:
+      clientKad.hasKadKey(serverKad.rtable.selfId)
+    let snapshot = clientSvc.bootstrapStateSnapshot()
+    check snapshot.metrics.kadBootstrapRuns == 1
+    check snapshot.metrics.kadBootstrapProtocols >= 1
+
+  asyncTest "tcp multi client bootstrap discovers public peers through anchor":
+    let resolver = MockResolver.new()
+    let networkId = "wan-bootstrap-tcp-" & $nowMillis()
+    let anchorNode = makeTcpSwitch()
+    let publicNodeSwitch = makeTcpSwitch()
+    let clientA = makeTcpSwitch(NameResolver(resolver))
+    let clientB = makeTcpSwitch(NameResolver(resolver))
+
+    await anchorNode.start()
+    await publicNodeSwitch.start()
+    await clientA.start()
+    await clientB.start()
+    defer:
+      await clientB.stop()
+      await clientA.stop()
+      await publicNodeSwitch.stop()
+      await anchorNode.stop()
+
+    let anchorSeed = withPeerId(anchorNode.peerInfo.addrs[0], anchorNode.peerInfo.peerId)
+    let dnsSeed =
+      MultiAddress.init("/dnsaddr/bootstrap.example/p2p/" & $anchorNode.peerInfo.peerId).tryGet()
+    resolver.txtResponses["_dnsaddr.bootstrap.example"] = @["dnsaddr=" & $anchorSeed]
+
+    let anchorSvc = await startWanBootstrapService(
+      anchorNode, bootstrapRoleConfig(WanBootstrapRole.anchor, networkId = networkId)
+    )
+    let publicSvc = await startWanBootstrapService(
+      publicNodeSwitch,
+      bootstrapRoleConfig(WanBootstrapRole.publicNode, networkId = networkId),
+    )
+    let clientASvc = await startWanBootstrapService(
+      clientA,
+      bootstrapRoleConfig(
+        WanBootstrapRole.mobileEdge, networkId = networkId, fallbackDnsAddrs = @[dnsSeed]
+      ),
+    )
+    let clientBSvc = await startWanBootstrapService(
+      clientB,
+      bootstrapRoleConfig(
+        WanBootstrapRole.mobileEdge, networkId = networkId, fallbackDnsAddrs = @[dnsSeed]
+      ),
+    )
+
+    check publicSvc.registerBootstrapHint(
+      anchorNode.peerInfo.peerId, anchorNode.peerInfo.addrs, source = "invite"
+    )
+    let publicJoin = await publicSvc.joinViaBootstrap()
+    check publicJoin.ok
+    check publicNodeSwitch.isConnected(anchorNode.peerInfo.peerId)
+    check (await publicSvc.refreshBootstrapState()) >= 1
+    discard anchorSvc
+
+    let joinAFut = clientASvc.joinViaBootstrap()
+    let joinBFut = clientBSvc.joinViaBootstrap()
+    await allFutures(@[joinAFut, joinBFut])
+    let joinA = joinAFut.read()
+    let joinB = joinBFut.read()
+    check joinA.ok
+    check joinB.ok
+    check clientA.isConnected(anchorNode.peerInfo.peerId)
+    check clientB.isConnected(anchorNode.peerInfo.peerId)
+    checkUntilTimeout:
+      clientASvc.selectBootstrapCandidates().anyIt(it.peerId == publicNodeSwitch.peerInfo.peerId)
+      clientBSvc.selectBootstrapCandidates().anyIt(it.peerId == publicNodeSwitch.peerInfo.peerId)
+
+    let stateA = clientASvc.bootstrapStateSnapshot()
+    let stateB = clientBSvc.bootstrapStateSnapshot()
+    check stateA.metrics.joinRuns >= 1
+    check stateB.metrics.joinRuns >= 1
+    check stateA.connectedPeerCount >= 1
+    check stateB.connectedPeerCount >= 1
+    check stateA.candidateCount >= 2
+    check stateB.candidateCount >= 2
+
+  test "mobile/public role config stays seedless without explicit fallback":
+    let mobileCfg = bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = "seedless-mobile")
+    let publicCfg = bootstrapRoleConfig(WanBootstrapRole.publicNode, networkId = "seedless-public")
+    check mobileCfg.fallbackDnsAddrs.len == 0
+    check publicCfg.fallbackDnsAddrs.len == 0
+    check not mobileCfg.enableDnsaddrFallback
+    check not publicCfg.enableDnsaddrFallback
+
+  asyncTest "legacy public bootstrap dnsaddrs are ignored when fallback is disabled":
+    let sw = makeMemorySwitch()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = await startWanBootstrapService(
+      sw,
+      bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = "seedless-filter"),
+    )
+    let legacyPeer = makeMemorySwitch().peerInfo.peerId
+    let legacyAddr = MultiAddress.init(
+      "/dnsaddr/bootstrap.libp2p.io/p2p/" & $legacyPeer
+    ).tryGet()
+    check not svc.registerBootstrapHint(legacyPeer, @[legacyAddr], source = "journal")
+    check svc.selectBootstrapCandidates().len == 0
+
+  asyncTest "third node learns first peer from second snapshot without static fallback":
+    let networkId = "wan-bootstrap-snapshot-chain-" & $nowMillis()
+    let node1 = makeMemorySwitch()
+    let node2 = makeMemorySwitch()
+    let node3 = makeMemorySwitch()
+
+    await node1.start()
+    await node2.start()
+    await node3.start()
+    defer:
+      await node3.stop()
+      await node2.stop()
+      await node1.stop()
+
+    discard await startWanBootstrapService(
+      node1,
+      bootstrapRoleConfig(WanBootstrapRole.publicNode, networkId = networkId),
+    )
+    let node2Svc = await startWanBootstrapService(
+      node2,
+      bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = networkId),
+    )
+    let node3Svc = await startWanBootstrapService(
+      node3,
+      bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = networkId),
+    )
+
+    check node2Svc.registerBootstrapHint(
+      node1.peerInfo.peerId, node1.peerInfo.addrs, source = "manual"
+    )
+    let node2Join = await node2Svc.joinViaBootstrap()
+    check node2Join.ok
+    check node2Join.attemptedCount == 1
+    check node2Join.attempts[0].candidate.peerId == node1.peerInfo.peerId
+    check node2.isConnected(node1.peerInfo.peerId)
+
+    check node3Svc.registerBootstrapHint(
+      node2.peerInfo.peerId, node2.peerInfo.addrs, source = "manual"
+    )
+    let node3Join = await node3Svc.joinViaBootstrap()
+    check node3Join.ok
+    check node3Join.attemptedCount == 1
+    check node3Join.attempts[0].candidate.peerId == node2.peerInfo.peerId
+    check node3.isConnected(node2.peerInfo.peerId)
+    checkUntilTimeout:
+      node3Svc.selectBootstrapCandidates().anyIt(it.peerId == node1.peerInfo.peerId)
+
+    let node3State = node3Svc.bootstrapStateSnapshot()
+    check node3State.metrics.snapshotImported >= 1
+    check node3State.selectedCandidates.anyIt(it.peerId == node1.peerInfo.peerId)
+    check not node3State.selectedCandidates.anyIt(
+      $it.peerId == "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+    )
+
+  asyncTest "seeded join uses explicit seed addrs without peerstore fallback":
+    let server = makeMemorySwitch()
+    let client = makeMemorySwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let svc = await startWanBootstrapService(client)
+    let badAddr = MultiAddress.init("/memory/999999").tryGet()
+    check svc.registerBootstrapHint(
+      server.peerInfo.peerId, @[badAddr], source = "stale"
+    )
+
+    let result = await client.joinViaSeedBootstrap(
+      server.peerInfo.peerId,
+      server.peerInfo.addrs,
+      source = "manual",
+    )
+    check result.ok
+    check result.attemptedCount == 1
+    check result.connectedCount == 1
+    check result.attempts.len == 1
+    check result.attempts[0].stage == "seeded_direct_hint"
+    check result.attempts[0].candidate.peerId == server.peerInfo.peerId
+    check result.attempts[0].attemptedAddr == $server.peerInfo.addrs[0]
+    check client.isConnected(server.peerInfo.peerId)
+
+  asyncTest "seeded join preserves explicit exact addr order":
+    let server = makeTcpSwitch()
+    let client = makeTcpSwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let svc = await startWanBootstrapService(client)
+    let badExact = MultiAddress.init(
+      "/ip4/127.0.0.1/tcp/1/p2p/" & $server.peerInfo.peerId
+    ).tryGet()
+    let goodExact = withPeerId(server.peerInfo.addrs[0], server.peerInfo.peerId)
+
+    let result = await client.joinViaSeedBootstrap(
+      server.peerInfo.peerId,
+      @[goodExact, badExact],
+      source = "manual",
+    )
+    check result.ok
+    check result.attemptedCount == 1
+    check result.connectedCount == 1
+    check result.attempts.len == 1
+    check result.attempts[0].stage == "seeded_direct_hint"
+    check result.attempts[0].candidate.peerId == server.peerInfo.peerId
+    check result.attempts[0].attemptedAddr == $goodExact
+    check client.isConnected(server.peerInfo.peerId)
+
+  asyncTest "seeded join same-family policy forbids cross-family fallback":
+    let server = makeTcpSwitch()
+    let client = makeTcpSwitch()
+    await server.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let svc = await startWanBootstrapService(
+      client,
+      WanBootstrapConfig.init(
+        exactSeedDialPolicy = ExactSeedDialPolicy.single,
+      ),
+    )
+    let badIpv6Exact = MultiAddress.init(
+      "/ip6/2001:db8::1/tcp/4001/p2p/" & $server.peerInfo.peerId
+    ).tryGet()
+    let goodExact = withPeerId(server.peerInfo.addrs[0], server.peerInfo.peerId)
+
+    let result = await svc.joinViaSeedBootstrap(
+      server.peerInfo.peerId,
+      @[badIpv6Exact, goodExact],
+      source = "manual",
+    )
+    check not result.ok
+    check result.attemptedCount == 1
+    check result.connectedCount == 0
+    check result.attempts.len == 1
+    check result.attempts[0].attemptedAddr == $badIpv6Exact
+    check not client.isConnected(server.peerInfo.peerId)
+
+  asyncTest "first three nodes prefer direct chain before fallback":
+    let networkId = "wan-bootstrap-chain-" & $nowMillis()
+    let node1 = makeMemorySwitch()
+    let node2 = makeMemorySwitch()
+    let node3 = makeMemorySwitch()
+    let node3Fallback = makeMemorySwitch()
+    var node2Stopped = false
+
+    await node1.start()
+    await node2.start()
+    await node3.start()
+    await node3Fallback.start()
+    defer:
+      await node3Fallback.stop()
+      await node3.stop()
+      if not node2Stopped:
+        await node2.stop()
+      await node1.stop()
+
+    discard await startWanBootstrapService(
+      node1,
+      bootstrapRoleConfig(WanBootstrapRole.publicNode, networkId = networkId),
+    )
+    let node2Svc = await startWanBootstrapService(
+      node2,
+      bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = networkId),
+    )
+    check node2Svc.registerBootstrapHint(
+      node1.peerInfo.peerId, node1.peerInfo.addrs, source = "manual"
+    )
+
+    let node2Join = await node2Svc.joinViaBootstrap()
+    check node2Join.ok
+    check node2Join.attemptedCount == 1
+    check node2Join.attempts.len == 1
+    check node2Join.attempts[0].candidate.peerId == node1.peerInfo.peerId
+    check node2Join.attempts[0].connected
+    check node2.isConnected(node1.peerInfo.peerId)
+
+    let node3Svc = await startWanBootstrapService(
+      node3,
+      bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = networkId),
+    )
+    check node3Svc.registerBootstrapHint(
+      node2.peerInfo.peerId, node2.peerInfo.addrs, source = "manual"
+    )
+    check node3Svc.registerBootstrapHint(
+      node1.peerInfo.peerId, node1.peerInfo.addrs, source = "bootstrap"
+    )
+
+    let node3Join = await node3Svc.joinViaBootstrap()
+    check node3Join.ok
+    check node3Join.attemptedCount == 1
+    check node3Join.attempts.len == 1
+    check node3Join.attempts[0].candidate.peerId == node2.peerInfo.peerId
+    check node3Join.attempts[0].connected
+    check node3.isConnected(node2.peerInfo.peerId)
+
+    await node2.stop()
+    node2Stopped = true
+
+    let node3FallbackSvc = await startWanBootstrapService(
+      node3Fallback,
+      bootstrapRoleConfig(WanBootstrapRole.mobileEdge, networkId = networkId),
+    )
+    check node3FallbackSvc.registerBootstrapHint(
+      node2.peerInfo.peerId, node2.peerInfo.addrs, source = "manual"
+    )
+    check node3FallbackSvc.registerBootstrapHint(
+      node1.peerInfo.peerId, node1.peerInfo.addrs, source = "bootstrap"
+    )
+
+    let fallbackJoin = await node3FallbackSvc.joinViaBootstrap()
+    check fallbackJoin.ok
+    check fallbackJoin.attemptedCount == 2
+    check fallbackJoin.attempts.len == 2
+    check fallbackJoin.attempts[0].candidate.peerId == node2.peerInfo.peerId
+    check not fallbackJoin.attempts[0].connected
+    check fallbackJoin.attempts[1].candidate.peerId == node1.peerInfo.peerId
+    check fallbackJoin.attempts[1].connected
+
+  test "builder wires wan bootstrap service":
+    let cfg = WanBootstrapConfig.init(
+      maxBootstrapCandidates = 5, maxConcurrentBootstrapDials = 2
+    )
+    let sw =
+      SwitchBuilder
+        .new()
+        .withRng(newRng())
+        .withWanBootstrapService(cfg)
+        .build()
+    let svc = sw.getWanBootstrapService()
+    check svc != nil
+    check svc.config.maxBootstrapCandidates == 5
+    check svc.config.maxConcurrentBootstrapDials == 2
+
+  asyncTest "builder anchor profile mounts relay hop, snapshot, rendezvous and autonat server":
+    let cfg = bootstrapRoleConfig(
+      WanBootstrapRole.anchor, networkId = "builder-anchor-profile-" & $nowMillis()
+    )
+    let sw =
+      newStandardSwitchBuilder(transport = TransportType.Memory)
+        .withWanBootstrapProfile(cfg)
+        .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = sw.getWanBootstrapService()
+    check svc != nil
+    check svc.config.mountRendezvousProtocol
+    check sw.services.anyIt(it of WanBootstrapService)
+    checkUntilTimeout:
+      cfg.snapshotCodec in sw.peerInfo.protocols
+      RelayV2HopCodec in sw.peerInfo.protocols
+      $AutonatV2Codec.DialRequest in sw.peerInfo.protocols
+      RendezVousCodecs().allIt(it in sw.peerInfo.protocols)
+
+  asyncTest "builder public profile mounts autonat client without relay defaults":
+    let cfg = bootstrapRoleConfig(
+      WanBootstrapRole.publicNode, networkId = "builder-public-profile-" & $nowMillis()
+    )
+    let sw =
+      newStandardSwitchBuilder(transport = TransportType.Memory)
+        .withWanBootstrapProfile(cfg)
+        .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = sw.getWanBootstrapService()
+    check svc != nil
+    check sw.services.anyIt(it of WanBootstrapService)
+    check sw.services.anyIt(it of AutonatV2Service)
+    checkUntilTimeout:
+      cfg.snapshotCodec in sw.peerInfo.protocols
+      $AutonatV2Codec.DialBack in sw.peerInfo.protocols
+    check RelayV2HopCodec notin sw.peerInfo.protocols
+    check RelayV2StopCodec notin sw.peerInfo.protocols
+
+  asyncTest "builder mobile profile enables relay client and autonat client":
+    let cfg = bootstrapRoleConfig(
+      WanBootstrapRole.mobileEdge, networkId = "builder-mobile-profile-" & $nowMillis()
+    )
+    let hpCfg = HPServiceConfig.init(
+      directProbeTimeout = 4.seconds,
+      maxProbeCandidates = 3,
+      keepaliveInterval = 8.seconds,
+      relayCloseDelay = 1.seconds,
+      upgradeDelay = 300.milliseconds,
+      dcutrConnectTimeout = 13.seconds,
+      maxDcutrDialableAddrs = 6,
+    )
+    let sw =
+      newStandardSwitchBuilder(transport = TransportType.Memory)
+        .withWanBootstrapProfile(cfg, hpConfig = hpCfg)
+        .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = sw.getWanBootstrapService()
+    check svc != nil
+    check svc.config.maxConcurrentBootstrapDials == 2
+    check sw.services.anyIt(it of WanBootstrapService)
+    check sw.services.anyIt(it of AutonatV2Service)
+    check sw.services.anyIt(it of HPService)
+    let hpSvc = HPService(sw.services.filterIt(it of HPService)[0])
+    check hpSvc.config.directProbeTimeout == 4.seconds
+    check hpSvc.config.maxProbeCandidates == 3
+    check hpSvc.config.keepaliveInterval == 8.seconds
+    check hpSvc.config.relayCloseDelay == 1.seconds
+    check hpSvc.config.upgradeDelay == 300.milliseconds
+    check hpSvc.config.dcutrConnectTimeout == 13.seconds
+    check hpSvc.config.maxDcutrDialableAddrs == 6
+    checkUntilTimeout:
+      cfg.snapshotCodec in sw.peerInfo.protocols
+      $AutonatV2Codec.DialBack in sw.peerInfo.protocols
+      RelayV2StopCodec in sw.peerInfo.protocols
+    check RelayV2HopCodec notin sw.peerInfo.protocols

@@ -1,6 +1,6 @@
 module go-peer
 
-go 1.25.1
+go 1.26.1
 
 require github.com/libp2p/go-libp2p v0.43.0
 

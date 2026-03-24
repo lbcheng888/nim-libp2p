@@ -48,6 +48,8 @@ const
     "/ip6/::/udp/4001/quic-v1/webtransport/certhash/uEiAENlMVTJM43KZl38nn7rRIb5uiry9dKDpPZpnE0-WxEg/certhash/uEiD-CkhhQs6FPYz9tpPXkonFWeh6QozlIbzOUSBaLZy7hQ",
     "/ip4/192.0.2.1/udp/4001/quic/webtransport/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC",
     "/ip6/::/udp/4001/quic-v1/webtransport/certhash/uEiAENlMVTJM43KZl38nn7rRIb5uiry9dKDpPZpnE0-WxEg/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC",
+    "/ip4/100.64.0.1/tcp/4001/tsnet",
+    "/ip6/fd7a:115c:a1e0::1/udp/4001/quic-v1/tsnet",
     "/ip4/127.0.0.1/ipfs/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC",
     "/ip4/127.0.0.1/ipfs/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC/tcp/1234",
     "/ip4/127.0.0.1/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC",

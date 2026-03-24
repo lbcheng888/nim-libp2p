@@ -393,6 +393,7 @@ const MultiCodecList = [
   ("tls", 0x01C0),
   ("quic", 0x01CC),
   ("quic-v1", 0x01CD),
+  ("tsnet", 7367778),
   ("webtransport", 0x01D1),
   ("certhash", 0x01D2),
   ("awdl", 0x300000),

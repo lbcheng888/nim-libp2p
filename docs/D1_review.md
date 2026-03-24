@@ -111,7 +111,7 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | Crypto 单测 | Pedersen / Musig2 / HKDF / Onion peel | Crypto Core | `tests/coinjoin/testprotocol.nim` |
 | 协议仿真 | Commit→Shuffle→Sign happy path + timeout + blame | Privacy WG | `tests/coinjoin/test_fsm.nim` |
-| 网络集成 | gossip + hpservice + `/dex/mixer` HTTP | DEX Core | `examples/dex/mixer_service.nim` + `tests/integration/testcoinjoinflow.nim` |
+| 网络集成 | gossip + hpservice + `/dex/mixer` HTTP | DEX Core | 已移除的 `examples/dex/mixer_service.nim` + `tests/integration/testcoinjoinflow.nim` |
 | 故障注入 | Drop/Delay/Replay/Coordinator crash | Reliability | `tests/integration/testcoinjoinflow.nim --scenario=delay` |
 | 观察性 | Metrics/log 匿名化 | Ops | `nimble test -d:libp2p_metrics_anonymized` |
 

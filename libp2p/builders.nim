@@ -24,7 +24,7 @@ import
   stream/connection,
   multiaddress,
   crypto/crypto,
-  transports/[transport, tcptransport, memorytransport],
+  transports/[transport, tcptransport, memorytransport, tsnettransport],
   muxers/[muxer, mplex/mplex, yamux/yamux],
   protocols/[identify, secure/secure, secure/noise]
 when not defined(libp2p_no_tls):
@@ -92,6 +92,8 @@ let defaultHttpNotFoundHandler*: lpHttp.HttpHandler =
 
 export
   switch, peerid, peerinfo, connection, multiaddress, crypto, errors, ServerFlags, PrivateNetworkKey, loadPrivateNetworkKey
+export tsnettransport.TsnetTransportBuilderConfig
+export tsnettransport.init
 when not defined(libp2p_no_tls):
   export TLSPrivateKey, TLSCertificate, TLSFlags
 else:
@@ -415,6 +417,15 @@ proc withTcpTransport*(
   b.withTransport(
     proc(config: TransportConfig): Transport =
       TcpTransport.new(flags, config.upgr)
+  )
+
+proc withTsnetTransport*(
+    b: SwitchBuilder, cfg: TsnetTransportBuilderConfig
+): SwitchBuilder {.public.} =
+  let builderCfg = cfg
+  b.withTransport(
+    proc(config: TransportConfig): Transport =
+      TsnetTransport.new(config.upgr, config.privateKey, builderCfg)
   )
 
 when not defined(libp2p_no_tls):

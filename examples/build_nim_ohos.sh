@@ -139,9 +139,8 @@ NIM_FLAGS=(
   $(for d in "${REPO_ROOT}/nimbledeps/pkgs2"/*; do if [ -d "$d" ]; then echo "--path:$d"; fi; done)
   "--passC:-Iexamples/mobile_ffi/compat"
   "--passC:-I${NIM_LIBP2P_DIR}"
-  "--passC:-I$REPO_ROOT/compat"
   "--passC:-include"
-  "--passC:${REPO_ROOT}/compat/explicit_bzero.h"
+  "--passC:${REPO_ROOT}/examples/mobile_ffi/compat/explicit_bzero.h"
   "--passC:-fPIC"
   "--passC:${TARGET_FLAG}"
   "--passC:${SYSROOT_FLAG}"

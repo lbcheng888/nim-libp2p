@@ -422,6 +422,7 @@ const
     MAProtocol(mcodec: multiCodec("https"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("quic"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("quic-v1"), kind: Marker, size: 0),
+    MAProtocol(mcodec: multiCodec("tsnet"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("webtransport"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("awdl"), kind: Marker, size: 0),
     MAProtocol(mcodec: multiCodec("nan"), kind: Marker, size: 0),
@@ -488,6 +489,7 @@ const
   QUIC_V1_IP* = mapAnd(UDP_IP, mapEq("quic-v1"))
   QUIC_V1_DNS* = mapAnd(UDP_DNS, mapEq("quic-v1"))
   QUIC_V1* = mapOr(QUIC_V1_DNS, QUIC_V1_IP)
+  Tsnet* = mapEq("tsnet")
   NAN* = mapAnd(mapEq("nan"), mapEq("id"))
   NearLink* = mapAnd(mapEq("nearlink"), mapEq("mac"))
   MobileNearfield* = mapOr(NAN, NearLink)

@@ -424,7 +424,7 @@
 | --- | --- | --- | --- | --- |
 | D1 需求建模 | Privacy WG（dex/bridge 联合） | 2025-03-20 | ⚙️ 进行中 | D1.1、D1.2 已写入 `docs/dex_bridge_design.md`，剩余状态图 / 威胁建模待补 |
 | D2 密码学原型 | Crypto Core | 2025-04-05 | ⏸ 未启动 | 依赖 D1 签字；产出 `libp2p/crypto/coinjoin.nim` + `tests/coinjoin/testprotocol.nim` |
-| D3 网络与可靠性 | DEX Core | 2025-04-15 | ⏸ 未启动 | 集成 gossip/onion/http，完成 `examples/dex/mixer_service.nim` |
+| D3 网络与可靠性 | DEX Core | 2025-04-15 | ⏸ 未启动 | 集成 gossip/onion/http，完成已移除的 `examples/dex/mixer_service.nim` |
 | D4 审计与优化 | Security & Perf | 2025-05-05 | ⏸ 未启动 | 第三方审计 + benchmark + 故障注入 |
 | D5 生产护栏 | Ops & Bridge | 2025-05-15 | ⏸ 未启动 | 指标/告警/runbook + 演练 |
 
@@ -440,7 +440,7 @@
 ### 20.3 评审准备与下一步
 - **交付门槛**：D1.3/D1.4 完成后生成 `D1_review.md`（含状态图、匿名性指标、威胁模型、测试矩阵），并链接至 `docs/dex_bridge_design.md`、`docs/dev_plan.md`。
 - **评审流程**：Program Owner 组织 Dex/Bridge/Security 评审，输出结论 + 必要整改项；若无阻塞项，则将 D1 状态切换为 ✅，并解锁 D2 任务。
-- **后续行动**：提前草拟 `libp2p/crypto/coinjoin.nim` 模块骨架与 `tests/coinjoin/testprotocol.nim` 测试清单，以便 D2 开始即可编码；并同步 `examples/dex/dex_node` 的 mixer CLI 需求，保证 D3 网络整合具备示例入口。
+- **后续行动**：提前草拟 `libp2p/crypto/coinjoin.nim` 模块骨架与 `tests/coinjoin/testprotocol.nim` 测试清单，以便 D2 开始即可编码；并同步已移除的 `examples/dex/dex_node` 的 mixer CLI 需求，保证 D3 网络整合具备示例入口。
 
 ### 20.4 D2 密码学原型计划（待启动）
 > 详见 `docs/dex_bridge_design.md` “D2 密码学原型计划（预备）”。

@@ -46,18 +46,21 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NIM_LIBP2P_DIR="$REPO_ROOT"
 NIM_UNIMAKER_DIR="$REPO_ROOT/examples/mobile_ffi"
+UNIMAKER_ANDROID_ROOT="${UNIMAKER_ANDROID_ROOT:-/Users/lbcheng/UniMaker/android}"
 
 MSQUIC_BOOTSTRAP="$NIM_LIBP2P_DIR/scripts/nim/bootstrap_msquic.sh"
 if [[ -x "$MSQUIC_BOOTSTRAP" ]]; then
   eval "$("$MSQUIC_BOOTSTRAP" env || true)"
 fi
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/examples/android/app/src/main/jniLibs/$ABI_DIR}"
+OUT_DIR="${OUT_DIR:-$UNIMAKER_ANDROID_ROOT/core-bridge/src/main/jniLibs/$ABI_DIR}"
 mkdir -p "$OUT_DIR"
 
 LIB_NAME="libnimlibp2p.so"
 OUT_PATH="$OUT_DIR/$LIB_NAME"
+TSNET_BRIDGE_OUT="$OUT_DIR/libtsnetbridge.so"
 NIM_ANDROID_QUIC_BACKEND="${NIM_ANDROID_QUIC_BACKEND:-builtin}"
 NIM_ANDROID_PURE_CRYPTO="${NIM_ANDROID_PURE_CRYPTO:-1}"
+NIM_ANDROID_ENABLE_TSNET="${NIM_ANDROID_ENABLE_TSNET:-1}"
 
 if [[ "${NIM_ANDROID_PURE_CRYPTO}" != "1" ]]; then
   echo "[nim-android] OpenSSL/libssl packaging has been removed; set NIM_ANDROID_PURE_CRYPTO=1" >&2
@@ -80,15 +83,12 @@ NIM_FLAGS=(
   "--path:examples/mobile_ffi/compat/chronicles_stub"
   "--path:."
   "--path:examples/mobile_ffi"
-  "--path:examples/dex"
-  "--path:examples/dex/compat"
   "--path:${REPO_ROOT}/nimbledeps/pkgs2"
   "--path:${SECP_PATH}"
   "--passC:-Iexamples/mobile_ffi/compat"
   "--passC:-I${NIM_LIBP2P_DIR}"
-  "--passC:-I$REPO_ROOT/compat"
   "--passC:-include"
-  "--passC:${REPO_ROOT}/compat/explicit_bzero.h"
+  "--passC:${REPO_ROOT}/examples/mobile_ffi/compat/explicit_bzero.h"
   "--passC:-fPIC"
   "--passC:-D_POSIX_C_SOURCE=200809L"
   "--passC:--target=${TARGET_TRIPLE}${API_LEVEL}"
@@ -171,6 +171,27 @@ echo "[nim-android] Building Nim libp2p -> $OUT_PATH"
   AR="$AR_BIN" \
   nim "${NIM_FLAGS[@]}" "$NIM_UNIMAKER_DIR/libnimlibp2p.nim"
 )
+
+if [[ "${NIM_ANDROID_ENABLE_TSNET}" == "1" ]]; then
+  if ! command -v go >/dev/null 2>&1; then
+    echo "[nim-android] go is required to build libtsnetbridge.so" >&2
+    exit 1
+  fi
+  echo "[nim-android] Building tsnet bridge -> $TSNET_BRIDGE_OUT"
+  (
+    cd "$REPO_ROOT/go/tsnetbridge"
+    CGO_ENABLED=1 \
+    GOOS=android \
+    GOARCH=arm64 \
+    CC="$CLANG_BIN" \
+    CXX="$CLANG_BIN" \
+    AR="$AR_BIN" \
+    go build -buildmode=c-shared -o "$TSNET_BRIDGE_OUT" .
+  )
+  rm -f "$OUT_DIR/libtsnetbridge.h"
+else
+  rm -f "$TSNET_BRIDGE_OUT" "$OUT_DIR/libtsnetbridge.h"
+fi
 
 rm -f "$OUT_DIR/libssl.so" "$OUT_DIR/libcrypto.so" "$OUT_DIR/libcrypto_compat.so" "$OUT_DIR/libmsquic.so"
 rm -rf "$OUT_DIR/ossl-modules" "$OUT_DIR/engines-4"

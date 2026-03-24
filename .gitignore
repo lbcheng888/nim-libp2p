@@ -107,3 +107,6 @@ tests/debug_connected_peers_info
 tests/debug_snapshot_after_host_status
 tests/debug_snapshot_yamux
 tests/debug_wanbootstrap_tmp
+examples/mobile_ffi/libnimlibp2p
+libp2p/switch
+tsnetbridge/tsnetbridge

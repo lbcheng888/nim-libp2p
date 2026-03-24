@@ -33,6 +33,7 @@ when libp2pDataTransferEnabled:
   import libp2p/protocols/datatransfer/[datatransfer, protobuf]
 import libp2p/protocols/rendezvous/rendezvous
 import libp2p/stream/lpstream
+import libp2p/transports/tsnettransport
 import bearssl/[rand, hash]
 
 when defined(libp2p_msquic_experimental):
@@ -41,12 +42,6 @@ when defined(libp2p_msquic_experimental):
   import libp2p/transports/quicruntime
   import "libp2p/transports/nim-msquic/api/diagnostics_model"
 
-import examples/dex/dex_node as dex_node
-import examples/dex/mixer_service as mixer_service
-import examples/dex/types as dex_types
-import examples/dex/marketdata/kline_store as dex_kline_store
-import examples/dex/storage/order_store as dex_store
-import examples/dex/security/signing as dex_signing
 import examples/mobile_ffi/game_mesh_core
 import examples/mpc_crypto
 import libp2p/crypto/coinjoin/[types, secp_utils]
@@ -421,6 +416,9 @@ type
     cmdConnectedPeers,
     cmdPeerMultiaddrs,
     cmdDiagnostics,
+    cmdTailnetStatus,
+    cmdTailnetPing,
+    cmdTailnetDerpMap,
     cmdConnectedPeersInfo,
     cmdRegisterPeerHints,
     cmdAddExternalAddress,
@@ -470,12 +468,7 @@ type
     cmdMeasurePeerLatency,
     cmdRequestFileChunk,
     cmdWaitSecureChannel,
-    cmdPollEvents,
-    cmdDexInit,
-    cmdDexSubmitOrder,
-    cmdDexSubmitMixerIntent,
-    cmdDexGetMarketData,
-    cmdDexGetWallets
+    cmdPollEvents
 
   Command = ref object
     kind: CommandKind
@@ -549,7 +542,6 @@ type
     ## it inline during dequeue.
     retiredCommandTails: seq[Command]
     thread: Thread[pointer]
-    dexNode: DexNode
     subscriptions: Table[pointer, Subscription]
     peerHints: Table[string, seq[string]]
     peerHintSources: Table[string, seq[string]]
@@ -600,6 +592,8 @@ type
     localSystemProfileUpdatedAt: int64
     hostNetworkStatus: JsonNode
     hostNetworkStatusUpdatedAt: int64
+    lastTailnetPing: JsonNode
+    lastTailnetPingUpdatedAt: int64
     publicIpProbeState: PublicIpProbeState
     publicIpProbeLock: Lock
     udpEchoSock4: DatagramTransport
@@ -1245,44 +1239,53 @@ proc seedAddrRank(address: string): int {.gcsafe.} =
   let isPhysical =
     lower.contains("/awdl/") or lower.contains("/nan/") or lower.contains("/nearlink/")
   let isRelayed = lower.contains("/p2p-circuit")
+  let isTsnet = lower.contains("/tsnet")
   let hasTcp = "/tcp/" in lower
   let hasUdp = "/udp/" in lower
   let hasQuic = "/quic-v1" in lower or "/quic/" in lower
   let hasIpv4 = "/ip4/" in lower
   let hasIpv6 = "/ip6/" in lower and "/ip6/fe80:" notin lower
-  if hasQuic and hasIpv6 and not isPhysical and not isRelayed:
+  if isTsnet and hasTcp and hasIpv4 and not isPhysical and not isRelayed:
     return 0
-  if hasTcp and hasIpv6 and not isPhysical and not isRelayed:
+  if isTsnet and hasQuic and hasIpv4 and not isPhysical and not isRelayed:
     return 1
-  if hasQuic and hasIpv4 and not isPhysical and not isRelayed:
+  if isTsnet and hasTcp and hasIpv6 and not isPhysical and not isRelayed:
     return 2
-  if hasTcp and hasIpv4 and not isPhysical and not isRelayed:
+  if isTsnet and hasQuic and hasIpv6 and not isPhysical and not isRelayed:
     return 3
-  if hasQuic and isPhysical and not isRelayed:
+  if hasQuic and hasIpv6 and not isPhysical and not isRelayed:
     return 4
-  if hasTcp and isPhysical and not isRelayed:
+  if hasTcp and hasIpv6 and not isPhysical and not isRelayed:
     return 5
-  if hasUdp and not hasQuic and hasIpv6 and not isRelayed:
+  if hasQuic and hasIpv4 and not isPhysical and not isRelayed:
     return 6
-  if hasUdp and not hasQuic and hasIpv4 and not isRelayed:
+  if hasTcp and hasIpv4 and not isPhysical and not isRelayed:
     return 7
-  if hasIpv6 and not isRelayed:
+  if hasQuic and isPhysical and not isRelayed:
     return 8
-  if hasIpv4 and not isRelayed:
+  if hasTcp and isPhysical and not isRelayed:
     return 9
-  if hasQuic and hasIpv6:
+  if hasUdp and not hasQuic and hasIpv6 and not isRelayed:
     return 10
-  if hasTcp and hasIpv6:
+  if hasUdp and not hasQuic and hasIpv4 and not isRelayed:
     return 11
-  if hasQuic and hasIpv4:
+  if hasIpv6 and not isRelayed:
     return 12
-  if hasTcp and hasIpv4:
+  if hasIpv4 and not isRelayed:
     return 13
-  if hasIpv6:
+  if hasQuic and hasIpv6:
     return 14
-  if hasIpv4:
+  if hasTcp and hasIpv6:
     return 15
-  16
+  if hasQuic and hasIpv4:
+    return 16
+  if hasTcp and hasIpv4:
+    return 17
+  if hasIpv6:
+    return 18
+  if hasIpv4:
+    return 19
+  20
 
 proc prioritizeGameSeedAddrs(seedAddrs: seq[string]): seq[string] =
   var byEndpoint = initTable[string, string]()
@@ -3500,6 +3503,67 @@ when defined(libp2p_msquic_experimental):
       )
     ).strip()
 
+proc configuredUnderlay(extra: JsonNode): string {.gcsafe, raises: [].} =
+  if extra.kind != JObject:
+    return ""
+  jsonGetStr(
+    extra,
+    "underlay",
+    jsonGetStr(extra, "transportUnderlay", jsonGetStr(extra, "transport_underlay", ""))
+  ).strip().toLowerAscii()
+
+proc wantsTsnetTransport(cfg: NodeConfig): bool {.gcsafe, raises: [].} =
+  if configuredUnderlay(cfg.extra) == "tsnet":
+    return true
+  for addr in cfg.listenAddresses:
+    if addr.toLowerAscii().contains("/tsnet"):
+      return true
+  false
+
+proc defaultTsnetListenAddresses(): seq[string] {.gcsafe, raises: [].} =
+  result = @["/ip4/0.0.0.0/tcp/0/tsnet"]
+  when defined(libp2p_msquic_experimental):
+    result.add("/ip4/0.0.0.0/udp/0/quic-v1/tsnet")
+
+proc configuredTsnetTransportBuilderConfig(
+    cfg: NodeConfig
+): TsnetTransportBuilderConfig {.gcsafe, raises: [].} =
+  result = TsnetTransportBuilderConfig.init()
+  if cfg.extra.kind != JObject:
+    return
+
+  let tsnetNode =
+    if cfg.extra.hasKey("tsnet"):
+      cfg.extra.getOrDefault("tsnet")
+    else:
+      newJNull()
+  if tsnetNode.kind != JObject:
+    return
+  result.bridgeExtraJson = $tsnetNode
+
+  result.controlUrl =
+    jsonGetStr(tsnetNode, "controlUrl", jsonGetStr(tsnetNode, "control_url", "")).strip()
+  result.authKey =
+    jsonGetStr(tsnetNode, "authKey", jsonGetStr(tsnetNode, "auth_key", "")).strip()
+  result.hostname =
+    jsonGetStr(tsnetNode, "hostname", "").strip()
+  result.stateDir =
+    jsonGetStr(tsnetNode, "stateDir", jsonGetStr(tsnetNode, "state_dir", "")).strip()
+  result.wireguardPort = max(
+    0,
+    int(jsonGetInt64(tsnetNode, "wireguardPort", jsonGetInt64(tsnetNode, "wireguard_port", 0)))
+  )
+  result.bridgeLibraryPath =
+    jsonGetStr(
+      tsnetNode,
+      "bridgeLibraryPath",
+      jsonGetStr(tsnetNode, "bridge_library_path", "")
+    ).strip()
+  result.logLevel =
+    jsonGetStr(tsnetNode, "logLevel", jsonGetStr(tsnetNode, "log_level", "")).strip()
+  result.enableDebug =
+    jsonGetBool(tsnetNode, "enableDebug", jsonGetBool(tsnetNode, "enable_debug", false))
+
 proc buildTransportHealthPayload(
     n: NimNode, listenAddrs, dialableAddrs: openArray[string]
 ): JsonNode {.gcsafe.} =
@@ -3719,6 +3783,110 @@ proc sanitizeSystemProfile(node: JsonNode): JsonNode =
     profile["network"] = sanitizeHostNetworkStatus(node["network"])
   profile["updatedAtMs"] = %jsonGetInt64(node, "updatedAtMs", nowMillis())
   profile
+
+template ffiTsnetSafe(body: untyped): untyped =
+  {.cast(gcsafe).}:
+    body
+
+proc activeTsnetTransport(n: NimNode): TsnetTransport {.gcsafe, raises: [].} =
+  if n.isNil or n.switchInstance.isNil:
+    return nil
+  n.switchInstance.tsnetTransport()
+
+proc gossipAvailable(n: NimNode): bool {.gcsafe, raises: [].} =
+  not n.isNil and not n.gossip.isNil and not n.gossip.PubSub.isNil
+
+proc libp2pPathLabel(n: NimNode): string {.gcsafe, raises: [].} =
+  if n.isNil or n.switchInstance.isNil or n.switchInstance.connManager.isNil:
+    return "NONE"
+  var hasRelay = false
+  for _, muxers in n.switchInstance.connManager.getConnections().pairs:
+    for mux in muxers:
+      if mux.isNil or mux.connection.isNil or mux.connection.closed:
+        continue
+      if isRelayed(mux.connection):
+        hasRelay = true
+      else:
+        return "DIRECT"
+  if hasRelay:
+    "RELAY"
+  else:
+    "NONE"
+
+proc emptyTailnetStatusPayload(
+    n: NimNode,
+    enabled = false,
+    error = ""
+): JsonNode {.gcsafe, raises: [].} =
+  result = %*{
+    "ok": error.len == 0 and enabled,
+    "enabled": enabled,
+    "running": (not n.isNil and n.started),
+    "libp2pPath": libp2pPathLabel(n),
+    "tailnetIPs": newJArray(),
+    "tailnetPath": "",
+    "tailnetRelay": "",
+    "tailnetDerpMapSummary": "",
+    "tailnetPeers": newJArray(),
+    "tailnetPing": newJNull(),
+  }
+  if error.len > 0:
+    result["error"] = %error
+  if not n.isNil and not n.lastTailnetPing.isNil and n.lastTailnetPing.kind != JNull:
+    result["tailnetPing"] = cloneJson(n.lastTailnetPing)
+  if not n.isNil and n.lastTailnetPingUpdatedAt > 0:
+    result["tailnetPingUpdatedAtMs"] = %n.lastTailnetPingUpdatedAt
+
+proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    return emptyTailnetStatusPayload(n, enabled = false)
+  let payloadRes = ffiTsnetSafe:
+    transport.tailnetStatusPayload()
+  if payloadRes.isErr:
+    return emptyTailnetStatusPayload(n, enabled = true, error = payloadRes.error)
+  result =
+    if payloadRes.get().kind == JObject:
+      cloneJson(payloadRes.get())
+    else:
+      newJObject()
+  result["ok"] = %true
+  result["enabled"] = %true
+  result["running"] = %(not n.isNil and n.started)
+  result["libp2pPath"] = %libp2pPathLabel(n)
+  if not result.hasKey("tailnetIPs"):
+    result["tailnetIPs"] = newJArray()
+  if not result.hasKey("tailnetPeers"):
+    result["tailnetPeers"] = newJArray()
+  if not result.hasKey("tailnetPath"):
+    result["tailnetPath"] = %""
+  if not result.hasKey("tailnetRelay"):
+    result["tailnetRelay"] = %""
+  if not result.hasKey("tailnetDerpMapSummary"):
+    result["tailnetDerpMapSummary"] = %""
+  let existingTailnetPing = result.getOrDefault("tailnetPing")
+  if (existingTailnetPing.isNil or existingTailnetPing.kind == JNull) and
+      not n.isNil and not n.lastTailnetPing.isNil and n.lastTailnetPing.kind != JNull:
+    result["tailnetPing"] = cloneJson(n.lastTailnetPing)
+  if not n.isNil and n.lastTailnetPingUpdatedAt > 0:
+    result["tailnetPingUpdatedAtMs"] = %n.lastTailnetPingUpdatedAt
+
+proc overlayTailnetFields(target: var JsonNode, tailnet: JsonNode) {.gcsafe, raises: [].} =
+  if target.isNil or target.kind != JObject or tailnet.isNil or tailnet.kind != JObject:
+    return
+  target["tailnet"] = cloneJson(tailnet)
+  for key in [
+    "libp2pPath",
+    "tailnetIPs",
+    "tailnetPath",
+    "tailnetRelay",
+    "tailnetDerpMapSummary",
+    "tailnetPeers",
+    "tailnetPing",
+    "tailnetPingUpdatedAtMs",
+  ]:
+    if tailnet.hasKey(key):
+      target[key] = cloneJson(tailnet.getOrDefault(key))
 
 proc prunePeerProfiles(n: NimNode) =
   let nowTs = nowMillis()
@@ -4350,6 +4518,8 @@ proc makeTopicHandler(
       fut
 
 proc ensureInternalSubscription(n: NimNode, topic: string, handler: TopicHandler) =
+  if not gossipAvailable(n) or topic.len == 0:
+    return
   if n.internalSubscriptions.hasKey(topic):
     return
   n.gossip.PubSub.subscribe(topic, handler)
@@ -4955,7 +5125,7 @@ proc removeLanGroupSubscription(n: NimNode, groupId: string): bool =
   if groupId.len == 0:
     return false
   let topic = lanGroupTopic(groupId)
-  if n.internalSubscriptions.hasKey(topic):
+  if n.internalSubscriptions.hasKey(topic) and gossipAvailable(n):
     let handler = n.internalSubscriptions.getOrDefault(topic)
     try:
       n.gossip.PubSub.unsubscribe(topic, handler)
@@ -5308,43 +5478,44 @@ proc setupDefaultTopics(n: NimNode): Future[void] {.async.} =
       warn "setupDefaultTopics: dm service initialization failed", peer = local
   else:
     warn "setupDefaultTopics: invalid local peer id for dm service", peer = local
-  let ackTopic = "/unimaker/dm_ack/" & local
-  ensureInternalSubscription(n, ackTopic, makeTopicHandler(n, handleDirectTopic))
-  let contentTopic = "unimaker/content/v1"
-  if not n.internalSubscriptions.hasKey(contentTopic):
-    let handler =
-      proc(node: NimNode, t: string, payload: seq[byte]) {.gcsafe.} =
-        {.cast(gcsafe).}:
-          handleContentFeedNode(node, bytesToString(payload), "")
-    ensureInternalSubscription(n, contentTopic, makeTopicHandler(n, handler))
-  if not n.internalSubscriptions.hasKey(NodeTelemetryTopic):
-    let telemetryHandler =
-      proc(node: NimNode, t: string, payload: seq[byte]) {.gcsafe.} =
-        handleNodeTelemetry(node, payload)
-    ensureInternalSubscription(n, NodeTelemetryTopic, makeTopicHandler(n, telemetryHandler))
-  if n.feedService.isNil:
-    var localPid: PeerId
-    if localPid.init(local):
-      let feedHandler =
-        proc(item: FeedItem) {.async: (raises: []), gcsafe, closure.} =
-          let raw = bytesToString(item.entry.raw)
-          let publisherStr = $item.publisher
-          try:
-            {.cast(gcsafe).}:
-              handleContentFeedNode(n, raw, publisherStr)
-          except Exception as exc:
-            warn "setupDefaultTopics: feed handler failed", peer = local, err = exc.msg
-      n.feedService = newFeedService(n.gossip, localPid, feedHandler)
-      try:
-        # Join the local per-peer feed topic so subsequent publishes build a
-        # usable mesh/fanout instead of only updating local task state.
-        await n.feedService.subscribeToPeer(localPid)
-      except CatchableError as exc:
-        warn "setupDefaultTopics: self feed subscription failed", peer = local, err = exc.msg
-    else:
-      warn "setupDefaultTopics: invalid local peer id for feed service", peer = local
+  if not n.gossip.isNil:
+    let ackTopic = "/unimaker/dm_ack/" & local
+    ensureInternalSubscription(n, ackTopic, makeTopicHandler(n, handleDirectTopic))
+    let contentTopic = "unimaker/content/v1"
+    if not n.internalSubscriptions.hasKey(contentTopic):
+      let handler =
+        proc(node: NimNode, t: string, payload: seq[byte]) {.gcsafe.} =
+          {.cast(gcsafe).}:
+            handleContentFeedNode(node, bytesToString(payload), "")
+      ensureInternalSubscription(n, contentTopic, makeTopicHandler(n, handler))
+    if not n.internalSubscriptions.hasKey(NodeTelemetryTopic):
+      let telemetryHandler =
+        proc(node: NimNode, t: string, payload: seq[byte]) {.gcsafe.} =
+          handleNodeTelemetry(node, payload)
+      ensureInternalSubscription(n, NodeTelemetryTopic, makeTopicHandler(n, telemetryHandler))
+    if n.feedService.isNil:
+      var localPid: PeerId
+      if localPid.init(local):
+        let feedHandler =
+          proc(item: FeedItem) {.async: (raises: []), gcsafe, closure.} =
+            let raw = bytesToString(item.entry.raw)
+            let publisherStr = $item.publisher
+            try:
+              {.cast(gcsafe).}:
+                handleContentFeedNode(n, raw, publisherStr)
+            except Exception as exc:
+              warn "setupDefaultTopics: feed handler failed", peer = local, err = exc.msg
+        n.feedService = newFeedService(n.gossip, localPid, feedHandler)
+        try:
+          # Join the local per-peer feed topic so subsequent publishes build a
+          # usable mesh/fanout instead of only updating local task state.
+          await n.feedService.subscribeToPeer(localPid)
+        except CatchableError as exc:
+          warn "setupDefaultTopics: self feed subscription failed", peer = local, err = exc.msg
+      else:
+        warn "setupDefaultTopics: invalid local peer id for feed service", peer = local
   n.defaultTopicsReady = true
-  if nodeTelemetryPublishEnabled(n.cfg):
+  if not n.gossip.isNil and nodeTelemetryPublishEnabled(n.cfg):
     asyncSpawn(publishLocalTelemetry(n))
 
 proc isLanIpv4(ip: string): bool {.gcsafe.} =
@@ -5805,7 +5976,12 @@ proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] {.gcsafe.} =
   if n.switchInstance.isNil or n.switchInstance.peerInfo.isNil:
     return @[]
   var base: seq[MultiAddress] = @[]
-  if n.cfg.listenAddresses.len > 0:
+  let preferRuntimeBase = n.cfg.listenAddresses.anyIt(it.toLowerAscii().endsWith("/tsnet"))
+  if preferRuntimeBase and n.switchInstance.peerInfo.listenAddrs.len > 0:
+    base = n.switchInstance.peerInfo.listenAddrs
+  elif preferRuntimeBase and n.switchInstance.peerInfo.addrs.len > 0:
+    base = n.switchInstance.peerInfo.addrs
+  elif n.cfg.listenAddresses.len > 0:
     for cfgAddr in n.cfg.listenAddresses:
       let parsed = MultiAddress.init(cfgAddr)
       if parsed.isOk():
@@ -8741,8 +8917,17 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
   builder = builder.withRng(newRng())
   debugLog("[nimlibp2p] buildSwitch applied RNG")
 
+  let tsnetRequested = wantsTsnetTransport(cfg)
+  var listenAddressStrings = cfg.listenAddresses
+  if tsnetRequested and listenAddressStrings.len == 0:
+    listenAddressStrings = defaultTsnetListenAddresses()
+    debugLog(
+      "[nimlibp2p] buildSwitch synthesized tsnet listen addresses count=" &
+      $listenAddressStrings.len
+    )
+
   var addresses: seq[MultiAddress] = @[]
-  for addr in cfg.listenAddresses:
+  for addr in listenAddressStrings:
     let parsed = MultiAddress.init(addr).valueOr:
       return err("invalid multiaddr: " & addr)
     addresses.add(parsed)
@@ -8776,13 +8961,53 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     )
 
   let wantsTcp =
-    if cfg.listenAddresses.len == 0:
+    if tsnetRequested:
+      false
+    elif listenAddressStrings.len == 0:
       true
     else:
-      cfg.listenAddresses.anyIt(it.contains("/tcp/"))
-  let wantsQuic = cfg.listenAddresses.anyIt(it.contains("/quic"))
+      listenAddressStrings.anyIt(it.contains("/tcp/"))
+  let wantsQuic =
+    if tsnetRequested:
+      false
+    else:
+      listenAddressStrings.anyIt(it.contains("/quic"))
 
-  if wantsTcp:
+  if tsnetRequested:
+    var tsnetBuilderCfg = configuredTsnetTransportBuilderConfig(cfg)
+    when defined(libp2p_msquic_experimental):
+      if cfg.dataDir.isSome():
+        tsnetBuilderCfg.quicTlsTempDir = cfg.dataDir.get() / "tls_tmp"
+      let prefRes = configuredQuicRuntimePreference(cfg.extra)
+      if prefRes.isErr:
+        return err(prefRes.error)
+      if prefRes.get().isSome:
+        tsnetBuilderCfg.quicConfig.setRuntimePreference(prefRes.get().get())
+        debugLog(
+          "[nimlibp2p] buildSwitch applied tsnet QUIC runtime preference=" &
+          quicRuntimePreferenceLabel(prefRes.get().get())
+        )
+      let explicitRuntimePath = configuredQuicRuntimeLibraryPath(cfg.extra)
+      if explicitRuntimePath.len > 0:
+        tsnetBuilderCfg.quicConfig.loadOptions.explicitPath = explicitRuntimePath
+        tsnetBuilderCfg.quicConfig.loadOptions.allowFallback = false
+        debugLog(
+          "[nimlibp2p] buildSwitch applied tsnet QUIC runtime library path=" &
+          explicitRuntimePath
+        )
+      let tsnetNeedsQuic =
+        listenAddressStrings.anyIt(it.toLowerAscii().contains("/quic-v1/tsnet"))
+      if tsnetNeedsQuic:
+        let bridgeRes = msquicruntime.acquireMsQuicBridge(tsnetBuilderCfg.quicConfig.loadOptions)
+        if bridgeRes.success and not bridgeRes.bridge.isNil:
+          msquicruntime.releaseMsQuicBridge(bridgeRes.bridge)
+        else:
+          let errMsg =
+            if bridgeRes.error.len > 0: bridgeRes.error else: "unknown error"
+          return err("MsQuic runtime unavailable for tsnet QUIC: " & errMsg)
+    builder = builder.withTsnetTransport(tsnetBuilderCfg)
+    debugLog("[nimlibp2p] buildSwitch applied tsnet transport")
+  elif wantsTcp:
     builder = builder.withTcpTransport({ServerFlags.TcpNoDelay})
     debugLog("[nimlibp2p] buildSwitch applied TCP transport")
   else:
@@ -8861,7 +9086,7 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     if wantsQuic:
       return err("QUIC listen addresses require -d:libp2p_msquic_experimental")
 
-  if not wantsTcp and not wantsQuic:
+  if not tsnetRequested and not wantsTcp and not wantsQuic:
     return err("no supported transports configured in listenAddresses")
   let pureQuicOnly = wantsQuic and not wantsTcp
   if pureQuicOnly:
@@ -8975,6 +9200,8 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     err("switch build failed: " & exc.msg)
 
 proc initGossip(sw: Switch, cfg: NodeConfig): Result[GossipSub, string] =
+  if not cfg.automations.gossipsub:
+    return ok(GossipSub(nil))
   try:
     let params = GossipSubParams.init(
       floodPublish = true, # 直接下行传播，避免 DM 依赖 mesh 收敛
@@ -9458,6 +9685,7 @@ proc buildUiFrameSnapshotPayload(
   payload["discovery"] = discoveryPayload
   payload["lanEndpoints"] = gatherLanEndpoints(node)
   payload["feed"] = buildFeedSnapshotPayload(node)
+  payload["tailnet"] = buildTailnetStatusPayload(node)
   payload
 
 proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []), gcsafe.} =
@@ -9598,17 +9826,23 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         info "cmdStop: switch stopped"
         command.resultCode = NimResultOk
     of cmdPublish:
-      if n.started:
+      if not n.started:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "node not started"
+      elif not gossipAvailable(n):
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "gossipsub unavailable"
+      else:
         let delivered = await n.gossip.PubSub.publish(command.topic, command.payload)
         command.delivered = delivered
         command.resultCode = NimResultOk
-      else:
-        command.resultCode = NimResultInvalidState
-        command.errorMsg = "node not started"
     of cmdSubscribe:
       if command.callback.isNil:
         command.resultCode = NimResultInvalidArgument
         command.errorMsg = "callback is nil"
+      elif not gossipAvailable(n):
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "gossipsub unavailable"
       else:
         var subscription = Subscription(
           topic: command.topic,
@@ -9654,7 +9888,8 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         else:
           if subscription.active:
             subscription.active = false
-            n.gossip.PubSub.unsubscribe(subscription.topic, subscription.handler)
+            if gossipAvailable(n):
+              n.gossip.PubSub.unsubscribe(subscription.topic, subscription.handler)
           n.subscriptions.del(key)
           command.resultCode = NimResultOk
     of cmdConnectPeer:
@@ -10022,14 +10257,16 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.resultCode = NimResultOk
         return
       var topics: seq[string] = @[]
-      for topic in n.gossip.PubSub.topics.keys:
-        topics.add(topic)
+      if gossipAvailable(n):
+        for topic in n.gossip.PubSub.topics.keys:
+          topics.add(topic)
       let listenAddrs =
         peerInfo.listenAddrs.mapIt($it)
       let dialableAddrs =
         peerInfo.addrs.mapIt($it)
       let hostNetwork = currentHostNetworkStatus(n)
       let transportHealth = buildTransportHealthPayload(n, listenAddrs, dialableAddrs)
+      let tailnet = buildTailnetStatusPayload(n)
       var publicAddr = ""
       for addr in dialableAddrs:
         if (not addr.contains("/ip4/0.0.0.0/")) and
@@ -10074,6 +10311,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         "transportHealth": transportHealth,
         "hostNetworkStatus": hostNetwork,
       }
+      overlayTailnetFields(diagnostics, tailnet)
       if n.cfg.identity.isSome():
         let ident = n.cfg.identity.get()
         if ident.peerId.len > 0:
@@ -10085,6 +10323,70 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       command.stringResult = $diagnostics
       command.resultCode = NimResultOk
       debugLog("[nimlibp2p] cmdDiagnostics completed")
+    of cmdTailnetStatus:
+      command.stringResult = $buildTailnetStatusPayload(n)
+      command.resultCode = NimResultOk
+    of cmdTailnetPing:
+      let transport = activeTsnetTransport(n)
+      if transport.isNil:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "tsnet transport unavailable"
+      elif command.jsonString.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing tailnet ping payload"
+      else:
+        try:
+          let request = parseJson(command.jsonString)
+          let peerIp =
+            jsonGetStr(
+              request,
+              "peerIP",
+              jsonGetStr(
+                request,
+                "peerIp",
+                jsonGetStr(request, "host", jsonGetStr(request, "ip", ""))
+              )
+            ).strip()
+          let pingType = jsonGetStr(request, "pingType", jsonGetStr(request, "type", "")).strip()
+          let sampleCount = max(
+            0,
+            int(jsonGetInt64(request, "sampleCount", jsonGetInt64(request, "samples", 0)))
+          )
+          let timeoutMs = max(
+            0,
+            int(jsonGetInt64(request, "timeoutMs", jsonGetInt64(request, "timeout_ms", 0)))
+          )
+          if peerIp.len == 0:
+            command.resultCode = NimResultInvalidArgument
+            command.errorMsg = "missing tailnet peer IP"
+          else:
+            let payloadRes = ffiTsnetSafe:
+              transport.tailnetPingPayload(peerIp, pingType, sampleCount, timeoutMs)
+            if payloadRes.isErr:
+              command.resultCode = NimResultError
+              command.errorMsg = payloadRes.error
+            else:
+              n.lastTailnetPing = cloneJson(payloadRes.get())
+              n.lastTailnetPingUpdatedAt = nowMillis()
+              command.stringResult = $payloadRes.get()
+              command.resultCode = NimResultOk
+        except CatchableError as exc:
+          command.resultCode = NimResultInvalidArgument
+          command.errorMsg = "invalid tailnet ping payload: " & exc.msg
+    of cmdTailnetDerpMap:
+      let transport = activeTsnetTransport(n)
+      if transport.isNil:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "tsnet transport unavailable"
+      else:
+        let payloadRes = ffiTsnetSafe:
+          transport.tailnetDerpMapPayload()
+        if payloadRes.isErr:
+          command.resultCode = NimResultError
+          command.errorMsg = payloadRes.error
+        else:
+          command.stringResult = $payloadRes.get()
+          command.resultCode = NimResultOk
     of cmdConnectedPeersInfo:
       command.stringResult = $(await buildConnectedPeersInfoArrayForNode(n))
       command.resultCode = NimResultOk
@@ -10920,6 +11222,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       if command.streamKey.len == 0 or command.payload.len == 0:
         command.resultCode = NimResultInvalidArgument
         command.errorMsg = "missing stream key or payload"
+      elif not gossipAvailable(n):
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "gossipsub unavailable"
       else:
         var session = n.livestreams.getOrDefault(command.streamKey)
         session.streamKey = command.streamKey
@@ -10968,6 +11273,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       if command.topic.len == 0 or command.textPayload.len == 0:
         command.resultCode = NimResultInvalidArgument
         command.errorMsg = "missing group id or message"
+      elif not gossipAvailable(n):
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "gossipsub unavailable"
       else:
         if not ensureLanGroupSubscription(n, command.topic):
           command.resultCode = NimResultError
@@ -11497,260 +11805,6 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
     of cmdPollEvents:
       command.stringResult = pollEventLog(n, command.requestLimit)
       command.resultCode = NimResultOk
-    of cmdDexInit:
-      try:
-        var cfg: dex_node.CliConfig
-        cfg.mode = dex_types.DexMode.dmTrader
-        
-        # Use the environment variable set by libp2p_node_init if available
-        let baseDir = getEnv("UNIMAKER_LIBP2P_DATA_DIR")
-        if baseDir.len > 0:
-          cfg.dataDir = baseDir / "dex_state"
-          debugLog("[nimlibp2p] cmdDexInit using dataDir=" & cfg.dataDir)
-        else:
-          cfg.dataDir = "dex_state"
-          debugLog("[nimlibp2p] cmdDexInit using relative dataDir=" & cfg.dataDir)
-
-        cfg.enableMixer = true
-        cfg.metricsInterval = 10
-        cfg.enableAutoMatch = false
-        cfg.enableAutoTrade = false
-        # Production defaults: require signatures.
-        var allowUnsigned = false
-        var enableSigning = true
-        
-        if command.jsonString.len > 0:
-          try:
-             let j = parseJson(command.jsonString)
-             if j.hasKey("mode") and j["mode"].kind == JString:
-               case j["mode"].getStr().toLowerAscii()
-               of "matcher":
-                 cfg.mode = dex_types.DexMode.dmMatcher
-               of "observer":
-                 cfg.mode = dex_types.DexMode.dmObserver
-               of "kline":
-                 cfg.mode = dex_types.DexMode.dmKline
-               else:
-                 cfg.mode = dex_types.DexMode.dmTrader
-             if j.hasKey("enableMixer"):
-               cfg.enableMixer = j["enableMixer"].getBool()
-             if j.hasKey("enableAutoMatch"):
-               cfg.enableAutoMatch = j["enableAutoMatch"].getBool()
-             if j.hasKey("enableAutoTrade"):
-               cfg.enableAutoTrade = j["enableAutoTrade"].getBool()
-             if j.hasKey("allowUnsigned"):
-               allowUnsigned = j["allowUnsigned"].getBool()
-             if j.hasKey("enableSigning"):
-               enableSigning = j["enableSigning"].getBool()
-          except CatchableError:
-             debugLog("[nimlibp2p] cmdDexInit failed to parse json config")
-
-        let store = dex_store.initOrderStore(cfg.dataDir)
-        let keyPath = cfg.dataDir / dex_signing.DefaultKeyFile
-        let signingCfg = dex_signing.SigningConfig(
-            mode: if enableSigning: dex_signing.smEnabled else: dex_signing.smDisabled,
-            keyPath: keyPath,
-            requireRemoteSignature: false,
-            allowUnsigned: allowUnsigned
-        )
-        let signingCtx = dex_signing.initSigning(signingCfg)
-        
-        n.dexNode = await dex_node.initDexNode(n.switchInstance, n.gossip, cfg, store, signingCtx)
-        n.dexNode.onEvent = proc(topic: string, payload: string) {.gcsafe, raises: [].} =
-          recordEvent(n, topic, payload)
-        
-        if n.dexNode.mixerCtx != nil:
-          n.dexNode.mixerCtx.onEvent = proc(payload: string) {.gcsafe.} =
-            recordEvent(n, "dex.mixer", payload)
-        
-        dex_node.handleOrders(n.dexNode)
-        dex_node.handleMatches(n.dexNode)
-        dex_node.subscribeTrades(n.dexNode)
-        dex_node.handleMixers(n.dexNode)
-        
-        if cfg.enableMixer:
-             asyncSpawn(dex_node.runMixer(n.dexNode))
-        
-        command.resultCode = NimResultOk
-      except CatchableError as exc:
-        command.errorMsg = "DexInit failed: " & exc.msg
-        command.resultCode = NimResultError
-
-    of cmdDexSubmitMixerIntent:
-      if n.dexNode.isNil or n.dexNode.mixerCtx.isNil:
-           command.errorMsg = "DEX/Mixer not initialized"
-           command.resultCode = NimResultInvalidState
-      else:
-           try:
-             if command.jsonString.len > 0:
-               let json = parseJson(command.jsonString)
-               # Basic mapping for the demo UI which sends simple strings
-               let assetStr = json["asset"].getStr()
-               var asset = AssetDef(chainId: ChainBTC, symbol: assetStr, decimals: 8)
-               
-               # Simple heuristic for the demo
-               if assetStr == "ETH":
-                 asset = AssetDef(chainId: ChainETH, symbol: "ETH", decimals: 18)
-               elif assetStr == "USDC":
-                 asset = AssetDef(chainId: ChainETH, symbol: "USDC", decimals: 6)
-               elif assetStr == "SOL":
-                 asset = AssetDef(chainId: ChainSOL, symbol: "SOL", decimals: 9)
-               
-               let amount = json["amount"].getFloat()
-               # hops is now internal to mixer config or fixed
-               await n.dexNode.mixerCtx.submitIntent(asset, amount)
-             else:
-               # Default BTC test
-               let asset = AssetDef(chainId: ChainBTC, symbol: "BTC", decimals: 8)
-               await n.dexNode.mixerCtx.submitIntent(asset, 1.0)
-             command.resultCode = NimResultOk
-           except CatchableError as exc:
-             command.errorMsg = exc.msg
-             command.resultCode = NimResultError
-
-    of cmdDexSubmitOrder:
-      if n.dexNode.isNil:
-        command.errorMsg = "DEX not initialized"
-        command.resultCode = NimResultInvalidState
-      else:
-        proc jsonFloat(node: JsonNode, key: string, fallback: float): float =
-          if node.kind != JObject or not node.hasKey(key):
-            return fallback
-          let value = node[key]
-          case value.kind
-          of JFloat, JInt:
-            value.getFloat()
-          of JString:
-            try:
-              parseFloat(value.getStr())
-            except ValueError:
-              fallback
-          else:
-            fallback
-
-        proc jsonInt(node: JsonNode, key: string, fallback: int): int =
-          if node.kind != JObject or not node.hasKey(key):
-            return fallback
-          let value = node[key]
-          case value.kind
-          of JInt, JFloat:
-            value.getInt()
-          of JString:
-            try:
-              parseInt(value.getStr())
-            except ValueError:
-              fallback
-          else:
-            fallback
-
-        proc jsonStr(node: JsonNode, key: string, fallback = ""): string =
-          if node.kind == JObject and node.hasKey(key) and node[key].kind == JString:
-            node[key].getStr()
-          else:
-            fallback
-
-        try:
-          var order: dex_types.OrderMessage
-          if command.jsonString.len > 0:
-            let json = parseJson(command.jsonString)
-            order = dex_types.OrderMessage(
-              id: jsonStr(json, "id"),
-              traderPeer: jsonStr(json, "traderPeer"),
-              baseAsset:
-                if json.kind == JObject and json.hasKey("baseAsset"):
-                  dex_types.decodeAssetDef(json["baseAsset"])
-                else:
-                  dex_types.AssetDef(chainId: dex_types.ChainBTC, symbol: "BTC", decimals: 8, assetType: dex_types.AssetNative),
-              quoteAsset:
-                if json.kind == JObject and json.hasKey("quoteAsset"):
-                  dex_types.decodeAssetDef(json["quoteAsset"])
-                else:
-                  dex_types.AssetDef(chainId: dex_types.ChainBSC, symbol: "USDC", decimals: 6, assetType: dex_types.AssetERC20),
-              side: jsonStr(json, "side", "buy"),
-              price: jsonFloat(json, "price", 0.0),
-              amount: jsonFloat(json, "amount", 0.0),
-              ttlMs: jsonInt(json, "ttlMs", 60_000),
-              timestamp: jsonInt(json, "timestamp", 0).int64,
-              signature: jsonStr(json, "signature"),
-              signerPubKey: jsonStr(json, "signerPubKey"),
-              signatureVersion: jsonInt(json, "signatureVersion", 0),
-              onionPath: @[]
-            )
-          else:
-            order = dex_types.OrderMessage(
-              id: "",
-              traderPeer: "",
-              baseAsset: dex_types.AssetDef(chainId: dex_types.ChainBTC, symbol: "BTC", decimals: 8, assetType: dex_types.AssetNative),
-              quoteAsset: dex_types.AssetDef(chainId: dex_types.ChainBSC, symbol: "USDC", decimals: 6, assetType: dex_types.AssetERC20),
-              side: "buy",
-              price: 65_000.0,
-              amount: 0.01,
-              ttlMs: 60_000,
-              timestamp: nowMillis(),
-              signature: "",
-              signerPubKey: "",
-              signatureVersion: 0,
-              onionPath: @[]
-            )
-
-          let localPeer = $n.switchInstance.peerInfo.peerId
-          let signingPeer = dex_signing.peerIdStr(n.dexNode.signing)
-          order.traderPeer = if signingPeer.len > 0: signingPeer else: localPeer
-          if order.id.len == 0:
-            order.id = $n.dexNode.rng[].generate(uint64)
-          if order.timestamp <= 0:
-            order.timestamp = nowMillis()
-          if order.ttlMs <= 0:
-            order.ttlMs = 60_000
-          if order.price <= 0:
-            order.price = 65_000.0
-          if order.amount <= 0:
-            order.amount = 0.01
-          if order.side.len == 0:
-            order.side = "buy"
-
-          dex_signing.signOrder(n.dexNode.signing, order)
-          discard await n.dexNode.publishOrder(order)
-          recordEvent(n, "dex.order_submitted", $(%*{
-            "id": order.id,
-            "side": order.side,
-            "price": order.price,
-            "amount": order.amount,
-            "base": order.baseAsset.toString(),
-            "quote": order.quoteAsset.toString(),
-          }))
-          command.resultCode = NimResultOk
-        except CatchableError as exc:
-          command.errorMsg = exc.msg
-          command.resultCode = NimResultError
-
-    of cmdDexGetMarketData:
-      if n.dexNode.isNil or n.dexNode.klineStore.isNil:
-        command.stringResult = "[]"
-        command.resultCode = NimResultOk
-      else:
-        let filter = command.textPayload.strip()
-        let buckets = await dex_kline_store.snapshot(n.dexNode.klineStore)
-        var resultArr = newJArray()
-        for bucket in buckets:
-          if filter.len > 0 and bucket.asset != filter and filter != "*":
-            continue
-          resultArr.add(dex_types.klineBucketToJson(bucket))
-        command.stringResult = $resultArr
-        command.resultCode = NimResultOk
-
-    of cmdDexGetWallets:
-      if n.dexNode.isNil or n.dexNode.wallet.isNil:
-        command.stringResult = "[]"
-        command.resultCode = NimResultOk
-      else:
-        try:
-          let json = dex_node.getWalletAssets(n.dexNode)
-          command.stringResult = $json
-          command.resultCode = NimResultOk
-        except CatchableError as exc:
-          command.errorMsg = exc.msg
-          command.resultCode = NimResultError
   except Defect as exc:
     if command.resultCode == NimResultOk:
       command.resultCode = NimResultError
@@ -12174,7 +12228,10 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       recordInitError("initGossip failed: " & error)
       debugLog("[nimlibp2p] initGossip failed: " & error)
       return nil
-    debugLog("[nimlibp2p] initGossip succeeded")
+    if gossip.isNil:
+      debugLog("[nimlibp2p] initGossip skipped by config")
+    else:
+      debugLog("[nimlibp2p] initGossip succeeded")
     debugLog("[nimlibp2p] creating thread signal")
     let signalRes = ThreadSignalPtr.new()
     if signalRes.isErr():
@@ -12252,6 +12309,8 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       localSystemProfileUpdatedAt: 0,
       hostNetworkStatus: defaultHostNetworkStatus(),
       hostNetworkStatusUpdatedAt: 0,
+      lastTailnetPing: newJNull(),
+      lastTailnetPingUpdatedAt: 0,
       publicIpProbeState: PublicIpProbeState(),
       lastConnectedPeersInfo: newJArray(),
       lastConnectedPeersInfoUpdatedAt: 0,
@@ -12857,6 +12916,72 @@ proc libp2p_get_host_network_status_json*(handle: pointer): cstring {.exportc, c
       cloneOwnedString(result.stringResult)
     else:
       $defaultHostNetworkStatus()
+  destroyCommand(cmd)
+  allocCString(text)
+
+proc libp2p_tailnet_status_json*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString($emptyTailnetStatusPayload(nil))
+  let cmd = makeCommand(cmdTailnetStatus)
+  let result = submitCommand(node, cmd)
+  let text =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      $emptyTailnetStatusPayload(node)
+  destroyCommand(cmd)
+  allocCString(text)
+
+proc libp2p_tailnet_ping*(
+    handle: pointer,
+    requestJson: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_unavailable\"}")
+  let cmd = makeCommand(cmdTailnetPing)
+  cmd.jsonString = if requestJson == nil: "" else: $requestJson
+  let result = submitCommand(node, cmd)
+  let text =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      $(
+        %*{
+          "ok": false,
+          "error": (
+            if result.errorMsg.len > 0:
+              result.errorMsg
+            else:
+              "tailnet ping failed"
+          )
+        }
+      )
+  destroyCommand(cmd)
+  allocCString(text)
+
+proc libp2p_tailnet_derp_map*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_unavailable\"}")
+  let cmd = makeCommand(cmdTailnetDerpMap)
+  let result = submitCommand(node, cmd)
+  let text =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      $(
+        %*{
+          "ok": false,
+          "error": (
+            if result.errorMsg.len > 0:
+              result.errorMsg
+            else:
+              "tailnet derp map unavailable"
+          )
+        }
+      )
   destroyCommand(cmd)
   allocCString(text)
 
@@ -14170,6 +14295,17 @@ proc buildConnectedPeersInfoArrayForNode(
       bandwidthNode["relayBottleneckBps"] = jsonSafeFloat(min(uplinkEma, downlinkEma))
     entry["bandwidth"] = bandwidthNode
     entry["isRelayed"] = %relayed
+    let connSnapshot = actualPeerConnectionSnapshot(node, peerIdText, peerId)
+    for key in [
+      "relayConnected",
+      "directConnected",
+      "selectedPath",
+      "selectedRelayed",
+      "selectedDirection",
+      "selectedMuxer",
+    ]:
+      if connSnapshot.hasKey(key):
+        entry[key] = cloneJson(connSnapshot[key])
     var peerProfile = defaultSystemProfile()
     if node.peerSystemProfiles.hasKey(peerIdText):
       try:
@@ -19294,10 +19430,17 @@ proc bootstrapSeedObserveDirectUpgradePayload(
 
 proc exactSeedConnectAttemptBudgetMs(maText: string): int {.gcsafe.} =
   let lowerAddr = maText.toLowerAscii()
+  let isTsnet = lowerAddr.contains("/tsnet")
   if lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/"):
-    20_000
+    if isTsnet:
+      35_000
+    else:
+      20_000
   else:
-    6_000
+    if isTsnet:
+      20_000
+    else:
+      6_000
 
 proc exactSeedConnectTotalBudgetMs(addrs: openArray[string]): int {.gcsafe.} =
   var total = 1_500
@@ -20420,64 +20563,6 @@ proc libp2p_reserve_on_all_relays*(handle: pointer, timeoutMs: cint): cint {.exp
   let count = if result.resultCode == NimResultOk: result.intResult else: 0
   destroyCommand(cmd)
   cint(count)
-
-proc libp2p_dex_init*(handle: pointer, configJson: cstring): bool {.exportc, cdecl, dynlib.} =
-  let node = nodeFromHandle(handle)
-  if node.isNil: return false
-  let cmd = makeCommand(cmdDexInit)
-  cmd.jsonString = if configJson != nil: $configJson else: ""
-  let result = submitCommand(node, cmd)
-  let ok = result.resultCode == NimResultOk
-  destroyCommand(cmd)
-  ok
-
-proc libp2p_dex_submit_order*(handle: pointer, orderJson: cstring): bool {.exportc, cdecl, dynlib.} =
-  let node = nodeFromHandle(handle)
-  if node.isNil: return false
-  let cmd = makeCommand(cmdDexSubmitOrder)
-  cmd.jsonString = if orderJson != nil: $orderJson else: ""
-  let result = submitCommand(node, cmd)
-  let ok = result.resultCode == NimResultOk
-  destroyCommand(cmd)
-  ok
-
-proc libp2p_dex_submit_mixer_intent*(handle: pointer, intentJson: cstring): bool {.exportc, cdecl, dynlib.} =
-  let node = nodeFromHandle(handle)
-  if node.isNil: return false
-  let cmd = makeCommand(cmdDexSubmitMixerIntent)
-  cmd.jsonString = if intentJson != nil: $intentJson else: ""
-  let result = submitCommand(node, cmd)
-  let ok = result.resultCode == NimResultOk
-  destroyCommand(cmd)
-  ok
-
-proc libp2p_dex_get_market_data*(handle: pointer, asset: cstring): cstring {.exportc, cdecl, dynlib.} =
-  setupForeignThreadGc()
-  defer: tearDownForeignThreadGc()
-  let node = nodeFromHandle(handle)
-  if node.isNil: return nil
-  let cmd = makeCommand(cmdDexGetMarketData)
-  cmd.textPayload = if asset != nil: $asset else: ""
-  let result = submitCommand(node, cmd)
-  let payload = if result.resultCode == NimResultOk: cloneOwnedString(result.stringResult) else: ""
-  destroyCommand(cmd)
-  allocCString(payload)
-
-proc libp2p_dex_get_wallets*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
-  setupForeignThreadGc()
-  defer: tearDownForeignThreadGc()
-  let node = nodeFromHandle(handle)
-  if node.isNil: return allocCString("[]")
-  let cmd = makeCommand(cmdDexGetWallets)
-  let result = submitCommand(node, cmd)
-  let payload =
-    if result.resultCode == NimResultOk:
-      let copied = cloneOwnedString(result.stringResult)
-      if copied.len > 0: copied else: "[]"
-    else:
-      "[]"
-  destroyCommand(cmd)
-  allocCString(payload)
 
 
 # ---------------------------------------------------------------------------
