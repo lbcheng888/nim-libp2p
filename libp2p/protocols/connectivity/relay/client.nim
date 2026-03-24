@@ -9,6 +9,7 @@
 
 {.push raises: [].}
 
+import std/[algorithm, strutils]
 import times
 import chronos, chronicles
 import
@@ -45,6 +46,70 @@ type
     voucher*: Opt[Voucher] # optional, reservation voucher
     limitDuration*: uint32 # seconds
     limitData*: uint64 # bytes
+
+proc relayControlAddrPriority(ma: MultiAddress): int =
+  let lower = ($ma).toLowerAscii()
+  if lower.contains("/tcp/"):
+    return 0
+  if lower.contains("/quic-v1"):
+    return 1
+  if lower.contains("/quic"):
+    return 2
+  if lower.contains("/udp/"):
+    return 3
+  4
+
+proc orderedRelayControlAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
+  if addrs.len <= 1:
+    return addrs
+  result = addrs
+  result.sort(proc(a, b: MultiAddress): int =
+    result = cmp(relayControlAddrPriority(a), relayControlAddrPriority(b))
+    if result == 0:
+      result = cmp($a, $b)
+  )
+
+proc dialRelayControlConnection(
+    cl: RelayClient,
+    peerId: PeerId,
+    addrs: seq[MultiAddress],
+    forceDial: bool,
+    reuseConnection: bool,
+): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
+  var lastErr: ref CatchableError = nil
+  if reuseConnection:
+    try:
+      warn "relay reserve reuse begin", peerId = peerId
+      let reused = await cl.switch.dial(peerId, RelayV2HopCodec)
+      warn "relay reserve reuse done", peerId = peerId, conn = reused
+      return reused
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      lastErr = exc
+      warn "relay reserve reuse failed", peerId = peerId, err = exc.msg
+
+  for addr in orderedRelayControlAddrs(addrs):
+    try:
+      warn "relay reserve single dial begin", peerId = peerId, addr = addr
+      let conn = await cl.switch.dial(
+        peerId,
+        @[addr],
+        RelayV2HopCodec,
+        forceDial = forceDial,
+        reuseConnection = false,
+      )
+      warn "relay reserve single dial done", peerId = peerId, addr = addr, conn = conn
+      return conn
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      lastErr = exc
+      warn "relay reserve single dial failed", peerId = peerId, addr = addr, err = exc.msg
+
+  if not lastErr.isNil:
+    raise newException(DialFailedError, lastErr.msg, lastErr)
+  raise newException(DialFailedError, "relay reserve dial failed")
 
 proc sendStopError(
     conn: Connection, code: StatusV2
@@ -87,17 +152,39 @@ proc handleRelayedConnect(
     await conn.close()
 
 proc reserve*(
-    cl: RelayClient, peerId: PeerId, addrs: seq[MultiAddress] = @[]
+    cl: RelayClient,
+    peerId: PeerId,
+    addrs: seq[MultiAddress] = @[],
+    forceDial = false,
+    reuseConnection = true,
 ): Future[Rsvp] {.async: (raises: [ReservationError, DialFailedError, CancelledError]).} =
-  let conn = await cl.switch.dial(peerId, addrs, RelayV2HopCodec)
+  warn "relay reserve dial begin",
+    peerId = peerId,
+    addrs = addrs,
+    forceDial = forceDial,
+    reuseConnection = reuseConnection
+  let conn = await dialRelayControlConnection(
+    cl,
+    peerId,
+    addrs,
+    forceDial,
+    reuseConnection,
+  )
+  warn "relay reserve dial done", peerId = peerId, conn = conn
   defer:
     await conn.close()
   let
     pb = encode(HopMessage(msgType: HopMessageType.Reserve))
     msg =
       try:
+        warn "relay reserve write begin", peerId = peerId, bytes = pb.buffer.len
         await conn.writeLp(pb.buffer)
-        HopMessage.decode(await conn.readLp(RelayClientMsgSize)).tryGet()
+        warn "relay reserve write done", peerId = peerId
+        warn "relay reserve read begin", peerId = peerId
+        let decoded =
+          HopMessage.decode(await conn.readLp(RelayClientMsgSize)).tryGet()
+        warn "relay reserve read done", peerId = peerId, msgType = decoded.msgType
+        decoded
       except CancelledError as exc:
         raise exc
       except CatchableError as exc:

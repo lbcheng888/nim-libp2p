@@ -305,6 +305,7 @@ method dial*(
   if self.stopping:
     raise newTransportClosedError()
 
+  warn "TcpTransport dial begin", address = $address, hostname = hostname
   let ta = initTAddress(address).valueOr:
     raise (ref TcpTransportError)(msg: "Unsupported address: " & $address)
 

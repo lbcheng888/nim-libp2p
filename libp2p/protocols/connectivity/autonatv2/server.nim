@@ -175,16 +175,21 @@ proc canDial(self: AutonatV2, addrs: MultiAddress): bool =
 proc forceNewConnection(
     self: AutonatV2, pid: PeerId, addrs: seq[MultiAddress]
 ): Future[Opt[(Muxer, Connection)]] {.async: (raises: [CancelledError]).} =
-  ## Bypasses connManager to force a new connection to ``pid``
-  ## instead of reusing a preexistent one
+  ## Force a new protocol stream to ``pid`` instead of reusing a preexisting
+  ## connection.
+  let dialer = self.switch.dialer
+  if dialer.isNil or not (dialer of Dialer):
+    error "AutoNAT v2 server requires a concrete Dialer", peer = pid
+    return Opt.none((Muxer, Connection))
   try:
-    let mux = await self.switch.dialer.dialAndUpgrade(Opt.some(pid), addrs)
+    let concreteDialer = Dialer(dialer)
+    let mux = await concreteDialer.dialAndUpgrade(Opt.some(pid), addrs)
     if mux.isNil():
       return Opt.none((Muxer, Connection))
     return Opt.some(
       (
         mux,
-        await self.switch.dialer.negotiateStream(
+        await concreteDialer.negotiateStream(
           await mux.newStream(), @[$AutonatV2Codec.DialBack]
         ),
       )

@@ -954,23 +954,29 @@ method dial*(
     addrs: seq[MultiAddress],
     protos: seq[string],
     forceDial = false,
+    reuseConnection = true,
 ): Future[Connection] {.
     public, async: (raises: [DialFailedError, CancelledError], raw: true)
 .} =
   ## Connected to a peer and open a stream
   ## with the specified `protos`
 
-  s.dialer.dial(peerId, addrs, protos, forceDial)
+  s.dialer.dial(peerId, addrs, protos, forceDial, reuseConnection)
 
 proc dial*(
-    s: Switch, peerId: PeerId, addrs: seq[MultiAddress], proto: string
+    s: Switch,
+    peerId: PeerId,
+    addrs: seq[MultiAddress],
+    proto: string,
+    forceDial = false,
+    reuseConnection = true,
 ): Future[Connection] {.
     public, async: (raises: [DialFailedError, CancelledError], raw: true)
 .} =
   ## Connected to a peer and open a stream
   ## with the specified `proto`
 
-  dial(s, peerId, addrs, @[proto])
+  dial(s, peerId, addrs, @[proto], forceDial, reuseConnection)
 
 proc mount*[T: LPProtocol](
     s: Switch, proto: T, matcher: Matcher = nil

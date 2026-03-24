@@ -232,13 +232,12 @@ suite "BufferStream":
     expect LPStreamEOFError:
       await stream.pushData("123".toBytes())
 
-  asyncTest "no concurrent pushes":
+  asyncTest "concurrent pushes are serialized":
     var stream = BufferStream.new()
     await stream.pushData("123".toBytes())
-    let push = stream.pushData("123".toBytes())
-
-    expect AssertionDefect:
-      await stream.pushData("123".toBytes())
+    let push1 = stream.pushData("123".toBytes())
+    let push2 = stream.pushData("456".toBytes())
 
     await stream.closeWithEOF()
-    await push
+    check await push1.withTimeout(100.milliseconds)
+    check await push2.withTimeout(100.milliseconds)

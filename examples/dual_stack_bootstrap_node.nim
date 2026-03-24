@@ -84,6 +84,7 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
     .withTcpTransport()
     .withYamux()
     .withMplex()
+    .withTls()
     .withNoise()
 
   if identitySeed.len > 0:

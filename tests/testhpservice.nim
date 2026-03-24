@@ -19,6 +19,7 @@ import unittest2
 import ./helpers
 import ./stubs/switchstub
 import ../libp2p/[builders, switch, wire, connmanager, services/hpservice, services/autorelayservice]
+import ../libp2p/protocols/ping
 import ../libp2p/protocols/connectivity/relay/[relay, client]
 import ../libp2p/protocols/connectivity/autonat/[service]
 import ../libp2p/nameresolving/[nameresolver, mockresolver]
@@ -56,6 +57,30 @@ proc buildRelayMA(switchRelay: Switch, switchClient: Switch): MultiAddress =
   .get()
 
 suite "HPService guards":
+  test "new stores explicit config":
+    let cfg = HPServiceConfig.init(
+      directProbeTimeout = 3.seconds,
+      maxProbeCandidates = 4,
+      keepaliveInterval = 9.seconds,
+      relayCloseDelay = 1.seconds,
+      upgradeDelay = 250.milliseconds,
+      dcutrConnectTimeout = 11.seconds,
+      maxDcutrDialableAddrs = 5,
+    )
+    let autonatClientStub = AutonatClientStub.new()
+    let autonatService =
+      AutonatService.new(autonatClientStub, newRng(), maxQueueSize = 1)
+    proc noop(addresses: seq[MultiAddress]) = discard
+    let autoRelayService = AutoRelayService.new(0, RelayClient.new(), noop, newRng())
+    let hpservice = HPService.new(autonatService, autoRelayService, config = cfg)
+    check hpservice.config.directProbeTimeout == 3.seconds
+    check hpservice.config.maxProbeCandidates == 4
+    check hpservice.config.keepaliveInterval == 9.seconds
+    check hpservice.config.relayCloseDelay == 1.seconds
+    check hpservice.config.upgradeDelay == 250.milliseconds
+    check hpservice.config.dcutrConnectTimeout == 11.seconds
+    check hpservice.config.maxDcutrDialableAddrs == 5
+
   asyncTest "newConnectedPeerHandler tolerates missing peer entry":
     let autonatClientStub = AutonatClientStub.new()
     let autonatService =
@@ -67,6 +92,32 @@ suite "HPService guards":
     let event = PeerEvent(kind: PeerEventKind.Joined, initiator: false)
     check await hpservice.setup(sw)
     await sw.connManager.triggerPeerEvents(sw.peerInfo.peerId, event)
+    discard await hpservice.stop(sw)
+
+  asyncTest "connectionEventHandler tolerates missing peer entry":
+    let autonatClientStub = AutonatClientStub.new()
+    let autonatService =
+      AutonatService.new(autonatClientStub, newRng(), maxQueueSize = 1)
+    proc noop(addresses: seq[MultiAddress]) = discard
+    let autoRelayService = AutoRelayService.new(0, RelayClient.new(), noop, newRng())
+    let hpservice = HPService.new(autonatService, autoRelayService)
+    let sw = createSwitch()
+    check await hpservice.setup(sw)
+    await sw.connManager.triggerConnEvent(
+      sw.peerInfo.peerId, ConnEvent(kind: ConnEventKind.Disconnected)
+    )
+    discard await hpservice.stop(sw)
+
+  asyncTest "setup mounts ping protocol for direct path keepalive":
+    let autonatClientStub = AutonatClientStub.new()
+    let autonatService =
+      AutonatService.new(autonatClientStub, newRng(), maxQueueSize = 1)
+    proc noop(addresses: seq[MultiAddress]) = discard
+    let autoRelayService = AutoRelayService.new(0, RelayClient.new(), noop, newRng())
+    let hpservice = HPService.new(autonatService, autoRelayService)
+    let sw = createSwitch()
+    check await hpservice.setup(sw)
+    check PingCodec in sw.peerInfo.protocols
     discard await hpservice.stop(sw)
 
 when defined(libp2p_run_hp_tests):

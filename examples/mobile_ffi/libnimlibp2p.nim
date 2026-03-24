@@ -13,6 +13,7 @@ when defined(posix):
 import libp2p/[bandwidthmanager, builders, connmanager, features, memorymanager, multiaddress,
                muxers/mplex/mplex, muxers/muxer, muxers/yamux/yamux, peerid, peerstore, protocols/connectivity/relay/client,
                resourcemanager, switch, wire]
+import libp2p/protocols/connectivity/relay/relay
 import libp2p/discovery/discoverymngr
 import libp2p/discovery/mdns
 import libp2p/crypto/[crypto, ed25519/ed25519]
@@ -185,11 +186,51 @@ var msquicDiagnosticsHookInstalled = false
 var messageIdCounter: int64 = 0
 var messageIdLock: Lock
 var lastNodeIdentityLock: Lock
+var bootstrapSeedConnectKickoffState {.global.}: Table[string, string] = initTable[string, string]()
+var bootstrapSeedConnectKickoffStateLock {.global.}: Lock
 var lastNodeHandle: pointer = nil
 var lastNodePeerIdCache = ""
 
 initLock(messageIdLock)
 initLock(lastNodeIdentityLock)
+initLock(bootstrapSeedConnectKickoffStateLock)
+
+proc bootstrapSeedConnectKickoffStateJson(
+    peerId: string,
+    status: string,
+    payload: JsonNode = newJNull(),
+    error: string = ""
+): string =
+  var obj = %*{
+    "status": status,
+    "peerId": peerId,
+    "error": error
+  }
+  if payload.kind != JNull:
+    obj["payload"] = payload
+  $obj
+
+proc setBootstrapSeedConnectKickoffState(
+    peerId: string,
+    status: string,
+    payload: JsonNode = newJNull(),
+    error: string = ""
+) =
+  let safePeerId = peerId.strip()
+  if safePeerId.len == 0:
+    return
+  withLock(bootstrapSeedConnectKickoffStateLock):
+    bootstrapSeedConnectKickoffState[safePeerId] =
+      bootstrapSeedConnectKickoffStateJson(safePeerId, status, payload, error)
+
+proc getBootstrapSeedConnectKickoffState(peerId: string): string =
+  let safePeerId = peerId.strip()
+  if safePeerId.len == 0:
+    return bootstrapSeedConnectKickoffStateJson("", "missing", newJNull(), "missing_peerId")
+  withLock(bootstrapSeedConnectKickoffStateLock):
+    if bootstrapSeedConnectKickoffState.hasKey(safePeerId):
+      return bootstrapSeedConnectKickoffState[safePeerId]
+  bootstrapSeedConnectKickoffStateJson(safePeerId, "missing")
 
 logScope:
   topics = "nimlibp2p ffi"
@@ -386,6 +427,7 @@ type
     cmdCheckPeerConnected,
     cmdSyncPeerstore,
     cmdLoadStoredPeers,
+    cmdBootstrapTick,
     cmdReconnectBootstrap,
     cmdGetRandomBootstrapPeers,
     cmdJoinViaRandomBootstrap,
@@ -470,6 +512,11 @@ type
     boolParam: bool
     next: Atomic[Command]
 
+  RelayReservationTarget = object
+    key: string
+    peerId: PeerId
+    addrs: seq[MultiAddress]
+
   NimNode* = ref object
     cfg: NodeConfig
     switchInstance: Switch
@@ -534,6 +581,8 @@ type
     connectionHandlers: seq[(ConnEventKind, ConnEventHandler)]
     keepAlivePeers: HashSet[string]
     keepAliveLoop: Future[void]
+    relayReservationLoop: Future[void]
+    relayReservationCycle: Future[int]
     telemetryLoop: Future[void]
     metricsLoop: Future[void]
     metricsTextfileLoop: Future[void]
@@ -566,6 +615,17 @@ type
     lanGroups: Table[string, LanGroupState]
     rendezvous: RendezVous
     relayReservations: Table[string, int64]
+    relayReservationMappedAddrs: Table[string, seq[MultiAddress]]
+    relayReservationTargetCount: int
+    relayReservationLastAttemptCount: int
+    relayReservationLastReservedCount: int
+    relayReservationLastError: string
+    relayReservationRefreshPending: bool
+    networkControlForegroundCount: int
+    deferredHostNetworkSideEffectsPending: bool
+    deferredHostNetworkStatus: JsonNode
+    deferredHostNetworkMdnsTransportChanged: bool
+    deferredHostNetworkMdnsAllowed: bool
     discovery: DiscoveryManager
     configuredMdnsService: string
     mdnsInterface: MdnsInterface
@@ -587,6 +647,10 @@ var hookInstalled = false
 
 const
   DefaultMetricsTextfileInterval = 15_000
+  RelayReservationAttemptTimeoutMs = 10_000
+  RelayReservationRefreshSkewSec = 30'i64
+  RelayReservationLoopMinSleepMs = 1_000
+  RelayReservationLoopMaxSleepMs = 30_000
 
 proc resetCommandFields(cmd: Command) =
   cmd.topic = ""
@@ -753,7 +817,19 @@ proc dequeueCommand(n: NimNode): Command =
 
 proc logMemoryLoop(n: NimNode) {.async.}
 proc localPeerId(n: NimNode): string {.gcsafe, raises: [].}
-proc gatherKnownAddrs(n: NimNode, peer: PeerId): seq[MultiAddress]
+proc gatherKnownAddrs(n: NimNode, peer: PeerId): seq[MultiAddress] {.gcsafe, raises: [].}
+proc normalizeBootstrapMultiaddr(peerId: string, rawAddr: string): string
+proc jsonEncodeStringSeq(items: seq[string]): string
+proc jsonGetBool(node: JsonNode, key: string, defaultValue: bool = false): bool
+proc jsonGetInt64(node: JsonNode, key: string, defaultValue: int64 = 0): int64
+proc libp2p_bootstrap_seed_connect_exact*(
+    handle: pointer,
+    peerId: cstring,
+    addressesJson: cstring,
+    source: cstring,
+    limit: cint,
+    secureTimeoutMs: cint
+): cstring {.exportc, cdecl, dynlib.}
 proc jsonGetStr(node: JsonNode, key: string, defaultValue: string = ""): string
 proc ensureMessageId(mid: string): string {.gcsafe, raises: [].}
 proc connectedPeersArray(handle: pointer): JsonNode
@@ -1133,56 +1209,112 @@ proc fullP2PListenAddresses*(port: int = FullP2PDefaultPort): seq[string] =
     "/ip6/::/tcp/" & $safePort
   ]
 
-proc prioritizeGameSeedAddrs(seedAddrs: seq[string]): seq[string] =
-  proc seedRank(address: string): int =
-    let lower = address.toLowerAscii()
-    let isPhysical =
-      lower.contains("/awdl/") or lower.contains("/nan/") or lower.contains("/nearlink/")
-    let hasTcp = "/tcp/" in lower
-    let hasUdp = "/udp/" in lower
-    let hasQuic = "/quic-v1" in lower or "/quic/" in lower
-    let hasIpv4 = "/ip4/" in lower
-    let hasIpv6 = "/ip6/" in lower and "/ip6/fe80:" notin lower
-    if hasQuic and hasIpv6 and not isPhysical:
-      return 0
-    if hasQuic and hasIpv4 and not isPhysical:
-      return 1
-    if hasQuic and isPhysical:
-      return 2
-    if hasTcp and hasIpv6 and not isPhysical:
-      return 3
-    if hasTcp and hasIpv4 and not isPhysical:
-      return 4
-    if hasTcp and isPhysical:
-      return 5
-    if hasUdp and not hasQuic and hasIpv6:
-      return 6
-    if hasUdp and not hasQuic and hasIpv4:
-      return 7
-    if hasIpv6:
-      return 8
-    if hasIpv4:
-      return 9
-    10
+proc seedAddrPrefixRank(address: string): int {.gcsafe.} =
+  let lower = address.strip().toLowerAscii()
+  if lower.startsWith("/awdl/"):
+    return 1
+  if lower.startsWith("/nan/"):
+    return 2
+  if lower.startsWith("/nearlink/"):
+    return 3
+  0
 
-  var ranked: seq[string] = @[]
-  var seen = initHashSet[string]()
+proc canonicalSeedEndpointKey(address: string): string {.gcsafe.} =
+  let parts = address.strip().split('/').filterIt(it.len > 0)
+  if parts.len == 0:
+    return ""
+  var normalized: seq[string] = @[]
+  var skipNext = false
+  for part in parts:
+    if skipNext:
+      skipNext = false
+      continue
+    let lower = part.toLowerAscii()
+    case lower
+    of "awdl", "nan", "nearlink":
+      continue
+    of "p2p", "ipfs":
+      skipNext = true
+      continue
+    else:
+      normalized.add(lower)
+  normalized.join("/")
+
+proc seedAddrRank(address: string): int {.gcsafe.} =
+  let lower = address.toLowerAscii()
+  let isPhysical =
+    lower.contains("/awdl/") or lower.contains("/nan/") or lower.contains("/nearlink/")
+  let isRelayed = lower.contains("/p2p-circuit")
+  let hasTcp = "/tcp/" in lower
+  let hasUdp = "/udp/" in lower
+  let hasQuic = "/quic-v1" in lower or "/quic/" in lower
+  let hasIpv4 = "/ip4/" in lower
+  let hasIpv6 = "/ip6/" in lower and "/ip6/fe80:" notin lower
+  if hasQuic and hasIpv6 and not isPhysical and not isRelayed:
+    return 0
+  if hasTcp and hasIpv6 and not isPhysical and not isRelayed:
+    return 1
+  if hasQuic and hasIpv4 and not isPhysical and not isRelayed:
+    return 2
+  if hasTcp and hasIpv4 and not isPhysical and not isRelayed:
+    return 3
+  if hasQuic and isPhysical and not isRelayed:
+    return 4
+  if hasTcp and isPhysical and not isRelayed:
+    return 5
+  if hasUdp and not hasQuic and hasIpv6 and not isRelayed:
+    return 6
+  if hasUdp and not hasQuic and hasIpv4 and not isRelayed:
+    return 7
+  if hasIpv6 and not isRelayed:
+    return 8
+  if hasIpv4 and not isRelayed:
+    return 9
+  if hasQuic and hasIpv6:
+    return 10
+  if hasTcp and hasIpv6:
+    return 11
+  if hasQuic and hasIpv4:
+    return 12
+  if hasTcp and hasIpv4:
+    return 13
+  if hasIpv6:
+    return 14
+  if hasIpv4:
+    return 15
+  16
+
+proc prioritizeGameSeedAddrs(seedAddrs: seq[string]): seq[string] =
+  var byEndpoint = initTable[string, string]()
+  var seenRaw = initHashSet[string]()
+
   for addr in seedAddrs:
     let normalized = addr.strip()
-    if normalized.len == 0 or normalized in seen:
+    if normalized.len == 0:
       continue
-    seen.incl(normalized)
-    ranked.add(normalized)
-  ranked.sort(proc(a, b: string): int =
-    let rankA = seedRank(a)
-    let rankB = seedRank(b)
+    let endpointKey = canonicalSeedEndpointKey(normalized)
+    if endpointKey.len == 0:
+      if normalized in seenRaw:
+        continue
+      seenRaw.incl(normalized)
+      byEndpoint[normalized] = normalized
+      continue
+    let previous = byEndpoint.getOrDefault(endpointKey, "")
+    if previous.len == 0 or seedAddrPrefixRank(normalized) < seedAddrPrefixRank(previous):
+      byEndpoint[endpointKey] = normalized
+
+  result = @[]
+  for _, value in byEndpoint.pairs:
+    result.add(value)
+  result.sort(proc(a, b: string): int =
+    let rankA = seedAddrRank(a)
+    let rankB = seedAddrRank(b)
     if rankA < rankB:
       return -1
     if rankA > rankB:
       return 1
     system.cmp(a, b)
   )
-  ranked
 
 proc currentGameSeedAddrs(node: NimNode, peerId: string): seq[string] =
   if node.isNil:
@@ -1407,6 +1539,8 @@ proc collectLocalGameSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
       if not info.isNil:
         let refreshed = refreshLanAwareAddrs(node)
         var runtimeAddrs = (if refreshed.len > 0: refreshed else: info.listenAddrs).mapIt($it)
+        if info.addrs.len > 0:
+          runtimeAddrs.add(info.addrs.mapIt($it))
         if runtimeAddrs.len == 0:
           runtimeAddrs = info.addrs.mapIt($it)
         let filtered = runtimeAddrs.filterIt(
@@ -1503,6 +1637,7 @@ proc isRelayBackedWanSeedAddr(addrText: string): bool {.gcsafe.} =
 proc replaceIpv4(addrStr: string, ip: string): Option[string] {.gcsafe.}
 proc replaceIpv6(addrStr: string, ip: string): Option[string] {.gcsafe.}
 proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.}
+proc dedupeLocalMultiaddrs(addrs: openArray[MultiAddress]): seq[MultiAddress] {.gcsafe.}
 
 proc extraMultiaddrTexts(extra: JsonNode, keys: openArray[string]): seq[string] {.gcsafe.} =
   if extra.isNil or extra.kind != JObject:
@@ -1604,7 +1739,25 @@ proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
 proc configuredRelayReservationAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
-  extraMultiaddrTexts(node.cfg.extra, ["relayMultiaddrs"])
+  var addrs = extraMultiaddrTexts(node.cfg.extra, ["relayMultiaddrs"])
+  addrs.sort(proc(a, b: string): int =
+    proc relayRank(addressText: string): int =
+      let lower = addressText.toLowerAscii()
+      if "/tcp/" in lower:
+        return 0
+      if "/quic-v1" in lower or "/quic/" in lower:
+        return 1
+      2
+
+    let rankA = relayRank(a)
+    let rankB = relayRank(b)
+    if rankA < rankB:
+      return -1
+    if rankA > rankB:
+      return 1
+    system.cmp(a, b)
+  )
+  addrs
 
 proc configuredAnchorSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
@@ -1624,10 +1777,70 @@ proc configuredAnchorSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   )
   prioritizeGameSeedAddrs(addrs)
 
+proc configuredRelayReservationTargets(
+    node: NimNode
+): seq[RelayReservationTarget] {.gcsafe.}
+
+proc activeRelayReservationAddrs(node: NimNode): seq[MultiAddress] {.gcsafe, raises: [].} =
+  if node.isNil:
+    return @[]
+  try:
+    let nowUnix = times.now().utc.toTime.toUnix
+    var staleRelayAddrs: seq[string] = @[]
+    for relayAddr, expire in node.relayReservations.pairs:
+      if expire <= nowUnix:
+        staleRelayAddrs.add(relayAddr)
+        continue
+      let mappedAddrs = node.relayReservationMappedAddrs.getOrDefault(relayAddr)
+      if mappedAddrs.len == 0:
+        continue
+      for addr in mappedAddrs:
+        result.add(addr)
+    for relayAddr in staleRelayAddrs:
+      node.relayReservations.del(relayAddr)
+      node.relayReservationMappedAddrs.del(relayAddr)
+    result = dedupeLocalMultiaddrs(result)
+  except CatchableError:
+    result = @[]
+  except Exception:
+    result = @[]
+
+proc activeRelayReservationSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
+  if node.isNil:
+    return @[]
+  var seen = initHashSet[string]()
+
+  for mapped in activeRelayReservationAddrs(node):
+    let canonical = canonicalizeMultiaddrText($mapped)
+    if canonical.len == 0 or canonical in seen:
+      continue
+    seen.incl(canonical)
+    result.add(canonical)
+
+  try:
+    let nowUnix = times.now().utc.toTime.toUnix
+    for target in configuredRelayReservationTargets(node):
+      let expire = node.relayReservations.getOrDefault(target.key, 0'i64)
+      if expire <= nowUnix:
+        continue
+      for baseAddr in target.addrs:
+        let relayedText = canonicalizeMultiaddrText($baseAddr & "/p2p-circuit")
+        if relayedText.len == 0 or relayedText in seen:
+          continue
+        seen.incl(relayedText)
+        result.add(relayedText)
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
+  result = prioritizeGameSeedAddrs(result)
+
 proc collectRelayBackedProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
-  let localSeedAddrs = prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node))
+  var localSeedAddrs = activeRelayReservationSeedAddrs(node)
+  localSeedAddrs.add(prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node)))
   var seen = initHashSet[string]()
   for addr in localSeedAddrs:
     let canonical = canonicalizeMultiaddrText(addr)
@@ -1660,12 +1873,14 @@ proc appendParsedUniqueAddrs(
     let canonical = canonicalizeMultiaddrText(addrText.strip())
     if canonical.len == 0:
       continue
+    let preserveRelayRoute = isRelayBackedWanSeedAddr(canonical)
     var normalized = canonical
-    for marker in ["/p2p/", "/ipfs/"]:
-      let idx = normalized.rfind(marker)
-      if idx >= 0:
-        normalized = normalized[0 ..< idx]
-        break
+    if not preserveRelayRoute:
+      for marker in ["/p2p/", "/ipfs/"]:
+        let idx = normalized.rfind(marker)
+        if idx >= 0:
+          normalized = normalized[0 ..< idx]
+          break
     if normalized.len == 0:
       continue
     let parsed = parseDialableMultiaddr(normalized)
@@ -1891,6 +2106,15 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       @[]
     else:
       collectRelayBackedProviderSeedAddrs(node)
+  let relayReservationTargetCount =
+    if node.isNil:
+      0
+    else:
+      node.relayReservationTargetCount
+  let relayReservationActiveAddrCount = relayProviderSeedAddrs.len
+  let relayReservationLoopRunning =
+    not node.isNil and not node.relayReservationLoop.isNil and
+      not node.relayReservationLoop.finished()
   let anchorSeedAddrs =
     if node.isNil:
       @[]
@@ -2040,6 +2264,15 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
   payload["providerSeedAddrs"] = %providerSeedAddrs
   payload["providerDirectSeedAddrs"] = %directProviderSeedAddrs
   payload["providerRelaySeedAddrs"] = %relayProviderSeedAddrs
+  payload["relayReservationConfiguredTargetCount"] = %relayReservationTargetCount
+  payload["relayReservationActiveAddrCount"] = %relayReservationActiveAddrCount
+  payload["relayReservationLoopRunning"] = %relayReservationLoopRunning
+  payload["relayReservationLastAttemptCount"] =
+    %(if node.isNil: 0 else: node.relayReservationLastAttemptCount)
+  payload["relayReservationLastReservedCount"] =
+    %(if node.isNil: 0 else: node.relayReservationLastReservedCount)
+  payload["relayReservationLastError"] =
+    %(if node.isNil: "" else: node.relayReservationLastError)
   payload["anchorSeedAddrs"] = %anchorSeedAddrs
   payload["authoritativeBootstrapPeerIds"] = %authoritativePeerIds
   payload["authoritativeBootstrapPeerIdCount"] = %authoritativePeerIds.len
@@ -2092,6 +2325,12 @@ proc attachBootstrapProvider(
     "providerSeedAddrs",
     "providerDirectSeedAddrs",
     "providerRelaySeedAddrs",
+    "relayReservationConfiguredTargetCount",
+    "relayReservationActiveAddrCount",
+    "relayReservationLoopRunning",
+    "relayReservationLastAttemptCount",
+    "relayReservationLastReservedCount",
+    "relayReservationLastError",
     "anchorSeedAddrs",
     "preferredSeedAddr",
     "preferredDirectSeedAddr",
@@ -2882,6 +3121,115 @@ proc refreshPublicIpProbeAsync(
 
 proc restartMdnsSafe(n: NimNode, reason: string): Future[void] {.async.}
 proc stopMdns(n: NimNode): Future[void] {.async.}
+proc sanitizeHostNetworkStatus(node: JsonNode): JsonNode
+proc runHostNetworkStatusSideEffects(
+    n: NimNode,
+    hostStatus: JsonNode,
+    mdnsTransportChanged: bool,
+    currentMdnsAllowed: bool,
+): Future[void] {.async.}
+
+proc networkControlForegroundActive(n: NimNode): bool {.gcsafe, raises: [].} =
+  not n.isNil and n.networkControlForegroundCount > 0
+
+proc deferHostNetworkStatusSideEffects(
+    n: NimNode,
+    hostStatus: JsonNode,
+    mdnsTransportChanged: bool,
+    currentMdnsAllowed: bool,
+    reason: string,
+): bool {.gcsafe, raises: [].} =
+  if n.isNil or not networkControlForegroundActive(n):
+    return false
+  n.deferredHostNetworkSideEffectsPending = true
+  n.deferredHostNetworkStatus =
+    if hostStatus.isNil: defaultHostNetworkStatus() else: hostStatus
+  n.deferredHostNetworkMdnsTransportChanged =
+    n.deferredHostNetworkMdnsTransportChanged or mdnsTransportChanged
+  n.deferredHostNetworkMdnsAllowed = currentMdnsAllowed
+  debugLog(
+    "[nimlibp2p] cmdUpdateHostNetworkStatus side_effects:deferred_foreground" &
+    " reason=" & reason &
+    " active=" & $n.networkControlForegroundCount
+  )
+  true
+
+proc scheduleHostNetworkStatusSideEffects(
+    n: NimNode,
+    hostStatus: JsonNode,
+    mdnsTransportChanged: bool,
+    currentMdnsAllowed: bool,
+    reason: string,
+) {.gcsafe, raises: [].} =
+  if n.isNil:
+    return
+  if deferHostNetworkStatusSideEffects(
+    n,
+    hostStatus,
+    mdnsTransportChanged,
+    currentMdnsAllowed,
+    reason,
+  ):
+    return
+  asyncCheck(
+    runHostNetworkStatusSideEffects(
+      n,
+      hostStatus,
+      mdnsTransportChanged,
+      currentMdnsAllowed,
+    )
+  )
+  debugLog(
+    "[nimlibp2p] cmdUpdateHostNetworkStatus side_effects:spawned" &
+    " reason=" & reason
+  )
+
+proc replayDeferredHostNetworkStatusSideEffects(n: NimNode, reason: string) {.gcsafe, raises: [].} =
+  if n.isNil or not n.deferredHostNetworkSideEffectsPending:
+    return
+  let hostStatus =
+    if n.deferredHostNetworkStatus.isNil:
+      defaultHostNetworkStatus()
+    else:
+      n.deferredHostNetworkStatus
+  let mdnsTransportChanged = n.deferredHostNetworkMdnsTransportChanged
+  let currentMdnsAllowed = n.deferredHostNetworkMdnsAllowed
+  n.deferredHostNetworkSideEffectsPending = false
+  n.deferredHostNetworkMdnsTransportChanged = false
+  n.deferredHostNetworkMdnsAllowed = false
+  n.deferredHostNetworkStatus = defaultHostNetworkStatus()
+  debugLog(
+    "[nimlibp2p] cmdUpdateHostNetworkStatus side_effects:replay_deferred" &
+    " reason=" & reason
+  )
+  scheduleHostNetworkStatusSideEffects(
+    n,
+    hostStatus,
+    mdnsTransportChanged,
+    currentMdnsAllowed,
+    "replay:" & reason,
+  )
+
+proc enterForegroundNetworkControl(n: NimNode, reason: string) {.gcsafe, raises: [].} =
+  if n.isNil:
+    return
+  inc n.networkControlForegroundCount
+  debugLog(
+    "[nimlibp2p] networkControl foreground:enter reason=" & reason &
+    " active=" & $n.networkControlForegroundCount
+  )
+
+proc leaveForegroundNetworkControl(n: NimNode, reason: string) {.gcsafe, raises: [].} =
+  if n.isNil:
+    return
+  if n.networkControlForegroundCount > 0:
+    dec n.networkControlForegroundCount
+  debugLog(
+    "[nimlibp2p] networkControl foreground:leave reason=" & reason &
+    " active=" & $n.networkControlForegroundCount
+  )
+  if n.networkControlForegroundCount == 0:
+    replayDeferredHostNetworkStatusSideEffects(n, reason)
 
 proc runHostNetworkStatusSideEffects(
     n: NimNode,
@@ -2891,8 +3239,24 @@ proc runHostNetworkStatusSideEffects(
 ): Future[void] {.async.} =
   if n.isNil:
     return
+  if deferHostNetworkStatusSideEffects(
+    n,
+    hostStatus,
+    mdnsTransportChanged,
+    currentMdnsAllowed,
+    "pre_yield",
+  ):
+    return
   # Yield once so fireSync callers on the command queue can continue first.
   await sleepAsync(chronos.milliseconds(1))
+  if deferHostNetworkStatusSideEffects(
+    n,
+    hostStatus,
+    mdnsTransportChanged,
+    currentMdnsAllowed,
+    "post_yield",
+  ):
+    return
   try:
     when defined(ohos):
       if jsonGetBool(hostStatus, "isConnected", false):
@@ -3715,6 +4079,66 @@ proc peerLikelyRelayed(n: NimNode, peerIdText: string, peerId: PeerId): bool =
         return true
     break
   false
+
+proc actualPeerMuxers(n: NimNode, peerId: PeerId): seq[Muxer] {.gcsafe, raises: [].} =
+  if n.isNil or n.switchInstance.isNil or n.switchInstance.connManager.isNil:
+    return @[]
+  for muxer in n.switchInstance.connManager.getConnections().getOrDefault(peerId):
+    if muxer.isNil or muxer.connection.isNil or muxer.connection.closed:
+      continue
+    result.add(muxer)
+
+proc actualHasRelayConn(n: NimNode, peerId: PeerId): bool {.gcsafe, raises: [].} =
+  actualPeerMuxers(n, peerId).anyIt(isRelayed(it.connection))
+
+proc actualHasDirectConn(n: NimNode, peerId: PeerId): bool {.gcsafe, raises: [].} =
+  actualPeerMuxers(n, peerId).anyIt(not isRelayed(it.connection))
+
+proc selectPreferredActualMuxer(n: NimNode, peerId: PeerId): Muxer {.gcsafe, raises: [].} =
+  let muxers = actualPeerMuxers(n, peerId)
+  for muxer in muxers:
+    if not isRelayed(muxer.connection) and muxer.connection.dir == Direction.Out:
+      return muxer
+  for muxer in muxers:
+    if not isRelayed(muxer.connection):
+      return muxer
+  for muxer in muxers:
+    if isRelayed(muxer.connection) and muxer.connection.dir == Direction.Out:
+      return muxer
+  for muxer in muxers:
+    if isRelayed(muxer.connection):
+      return muxer
+
+proc actualPeerConnectionSnapshot(
+    n: NimNode, peerIdText: string, peerId: PeerId
+): JsonNode {.gcsafe, raises: [].} =
+  var snapshot = newJObject()
+  snapshot["peerId"] = %peerIdText
+  let muxers = actualPeerMuxers(n, peerId)
+  snapshot["connected"] = %(muxers.len > 0)
+  snapshot["connCount"] = %muxers.len
+  let relayConnected = muxers.anyIt(isRelayed(it.connection))
+  let directConnected = muxers.anyIt(not isRelayed(it.connection))
+  snapshot["relayConnected"] = %relayConnected
+  snapshot["directConnected"] = %directConnected
+  snapshot["selectedPath"] =
+    %(
+      if directConnected:
+        "direct"
+      elif relayConnected:
+        "relay"
+      else:
+        "none"
+    )
+  let selected = selectPreferredActualMuxer(n, peerId)
+  if not selected.isNil and not selected.connection.isNil:
+    snapshot["selectedRelayed"] = %isRelayed(selected.connection)
+    snapshot["selectedDirection"] =
+      %(if selected.connection.dir == Direction.In: "inbound" else: "outbound")
+    let codec = detectMuxerCodec(selected.connection)
+    if codec.len > 0:
+      snapshot["selectedMuxer"] = %codec
+  snapshot
 
 proc peerBandwidthTotals(n: NimNode, peerId: PeerId): tuple[outbound: int64, inbound: int64] =
   if n.isNil or n.switchInstance.isNil:
@@ -5287,6 +5711,69 @@ proc preferStableAddrStrings(addrs: seq[string]): seq[string] {.gcsafe.} =
   )
   result = indexed.mapIt(it[2])
 
+proc configuredRelayReservationTargets(
+    node: NimNode
+): seq[RelayReservationTarget] {.gcsafe.} =
+  if node.isNil:
+    return @[]
+  let relayAddrs = configuredRelayReservationAddrs(node)
+  if relayAddrs.len == 0:
+    return @[]
+  var targetIndex = initTable[string, int]()
+  for relayAddr in relayAddrs:
+    let maRes = MultiAddress.init(relayAddr)
+    if maRes.isErr():
+      continue
+    let fullAddressRes = parseFullAddress(maRes.get())
+    if fullAddressRes.isErr():
+      continue
+    let (peerId, baseAddr) = fullAddressRes.get()
+    let key = $peerId
+    if key.len == 0:
+      continue
+    let targetPos = targetIndex.getOrDefault(key, -1)
+    if targetPos < 0:
+      targetIndex[key] = result.len
+      result.add(
+        RelayReservationTarget(key: key, peerId: peerId, addrs: @[baseAddr])
+      )
+    else:
+      var exists = false
+      for existing in result[targetPos].addrs:
+        if existing == baseAddr:
+          exists = true
+          break
+      if not exists:
+        result[targetPos].addrs.add(baseAddr)
+  for idx in 0 ..< result.len:
+    let knownAddrs = gatherKnownAddrs(node, result[idx].peerId)
+    for known in knownAddrs:
+      let knownText = $known
+      if knownText.len == 0 or knownText.contains("/p2p-circuit"):
+        continue
+      var resolvedBase: MultiAddress
+      var resolved = false
+      let fullAddressRes = parseFullAddress(known)
+      if fullAddressRes.isOk():
+        let (knownPeerId, baseAddr) = fullAddressRes.get()
+        if knownPeerId != result[idx].peerId:
+          continue
+        resolvedBase = baseAddr
+        resolved = true
+      else:
+        resolvedBase = known
+        resolved = true
+      if not resolved:
+        continue
+      var exists = false
+      for existing in result[idx].addrs:
+        if existing == resolvedBase:
+          exists = true
+          break
+      if not exists:
+        result[idx].addrs.add(resolvedBase)
+    result[idx].addrs = preferStableMultiaddrs(result[idx].addrs)
+
 proc addrTransportPortKey(text: string): string {.gcsafe.} =
   let lower = text.toLowerAscii()
   var transport = ""
@@ -5757,12 +6244,18 @@ proc configuredWanBootstrapAuthoritativePeerIds(cfg: NodeConfig): seq[string] =
     seen.incl(peerId)
     result.add(peerId)
 
+proc configuredRelayBootstrapGate(cfg: NodeConfig): bool =
+  cfg.automations.circuitRelay and
+    configuredWanBootstrapAuthoritativePeerIds(cfg).len > 0 and
+    extraMultiaddrTexts(cfg.extra, ["relayMultiaddrs"]).len > 0
+
 proc configuredWanBootstrapConfig(cfg: NodeConfig): WanBootstrapConfig =
   bootstrapRoleConfig(
     role = configuredWanBootstrapRole(cfg),
     networkId = configuredWanNetworkId(cfg),
     journalPath = configuredWanJournalPath(cfg),
     authoritativePeerIds = configuredWanBootstrapAuthoritativePeerIds(cfg),
+    deferAutoJoinUntilRelayReady = configuredRelayBootstrapGate(cfg),
     fallbackDnsAddrs = configuredWanBootstrapAddrs(cfg),
   )
 
@@ -5915,6 +6408,7 @@ proc reconnectAuthoritativeBootstrapExact(
         peerRes.get(),
         parsed,
         source,
+        syncConnectedState = false,
       )
       debugLog(
         "[nimlibp2p] reconnectAuthoritativeBootstrapExact peer=" & peerId &
@@ -6240,7 +6734,7 @@ proc shouldRetryDial(errMsg: string): bool =
     ("temporary" in lowered) or
     ("newstream" in lowered)
 
-proc gatherKnownAddrs(n: NimNode, peer: PeerId): seq[MultiAddress] =
+proc gatherKnownAddrs(n: NimNode, peer: PeerId): seq[MultiAddress] {.gcsafe, raises: [].} =
   var seen = initHashSet[string]()
   let peerStr = $peer
   let hints = n.peerHints.getOrDefault(peerStr)
@@ -6375,6 +6869,26 @@ proc drainFutureDetached[T](
       " err=" & exc.msg
     )
 
+proc drainFutureDetachedVoid(
+    fut: Future[void],
+    context: string
+) {.async: (raises: []).} =
+  if fut.isNil:
+    return
+  try:
+    await fut
+    debugLog("[nimlibp2p] future detached complete context=" & context)
+  except CancelledError as exc:
+    debugLog(
+      "[nimlibp2p] future detached cancelled context=" & context &
+      " err=" & exc.msg
+    )
+  except CatchableError as exc:
+    debugLog(
+      "[nimlibp2p] future detached failed context=" & context &
+      " err=" & exc.msg
+    )
+
 proc awaitFutureWithinDeadline[T](
     fut: Future[T],
     timeoutMs: int,
@@ -6430,9 +6944,38 @@ proc connectMultiaddrDeferred(
   await sleepAsync(chronos.milliseconds(0))
   return await n.switchInstance.connect(ma, allowUnknownPeerId = true)
 
+proc reserveOnRelayDeferred(
+    client: RelayClient,
+    peerId: PeerId,
+    addrs: seq[MultiAddress],
+    forceDial: bool,
+    reuseConnection: bool,
+): Future[Rsvp] {.async.} =
+  await sleepAsync(chronos.milliseconds(0))
+  return await client.reserve(
+    peerId,
+    addrs,
+    forceDial = forceDial,
+    reuseConnection = reuseConnection,
+  )
+
 proc ensurePeerConnectivity(n: NimNode, peer: PeerId, preferWanBootstrap = false): Future[bool] {.async.} =
   if peerCurrentlyConnected(n, peer):
     return true
+  proc tryWanBootstrapReconnect(): Future[bool] {.async.} =
+    if n.switchInstance.isNil:
+      return false
+    let peerText = $peer
+    try:
+      await reconnectAuthoritativeBootstrapExact(n, "relay_reservation_exact")
+      debugLog("[nimlibp2p] ensurePeerConnectivity bootstrapReconnect peer=" & peerText)
+    except CatchableError as exc:
+      debugLog("[nimlibp2p] ensurePeerConnectivity bootstrapReconnect failed peer=" & peerText & " err=" & exc.msg)
+    except Exception as exc:
+      debugLog("[nimlibp2p] ensurePeerConnectivity bootstrapReconnect fatal peer=" & peerText & " err=" & exc.msg)
+    if peerCurrentlyConnected(n, peer):
+      return true
+    false
   proc tryKnownAddresses(): Future[bool] {.async.} =
     let known = gatherKnownAddrs(n, peer)
     if known.len == 0:
@@ -6442,14 +6985,41 @@ proc ensurePeerConnectivity(n: NimNode, peer: PeerId, preferWanBootstrap = false
     if dialable.len == 0:
       debugLog("[nimlibp2p] ensurePeerConnectivity no dialable addresses peer=" & $peer)
       return false
+    debugLog(
+      "[nimlibp2p] ensurePeerConnectivity tryKnownAddresses peer=" & $peer &
+      " addrCount=" & $dialable.len
+    )
     try:
       let connectFuture = n.switchInstance.connect(peer, dialable, forceDial = true)
-      let connected = await withTimeout(connectFuture, chronos.milliseconds(8_000))
-      if not connected:
-        connectFuture.cancelSoon()
+      let waitRes = await awaitFutureWithinDeadlineOrPeerConnected(
+        n,
+        connectFuture,
+        peer,
+        8_000,
+      )
+      debugLog(
+        "[nimlibp2p] ensurePeerConnectivity known wait peer=" & $peer &
+        " completed=" & $waitRes.completed &
+        " observedConnected=" & $waitRes.observedConnected
+      )
+      if not waitRes.completed and not waitRes.observedConnected:
+        await cancelFutureAndDrain(
+          connectFuture,
+          "ensure_peer_connectivity:" & $peer,
+        )
         debugLog("[nimlibp2p] ensurePeerConnectivity timeout peer=" & $peer)
         return false
-      await connectFuture
+      if waitRes.completed:
+        await connectFuture
+        debugLog("[nimlibp2p] ensurePeerConnectivity connect future completed peer=" & $peer)
+      else:
+        asyncSpawn(
+          drainFutureDetachedVoid(
+            connectFuture,
+            "ensure_peer_connectivity:" & $peer,
+          )
+        )
+        debugLog("[nimlibp2p] ensurePeerConnectivity observed connected peer=" & $peer)
       return true
     except CatchableError as exc:
       let errMsg = if exc.msg.len > 0: exc.msg else: $exc.name
@@ -6465,22 +7035,12 @@ proc ensurePeerConnectivity(n: NimNode, peer: PeerId, preferWanBootstrap = false
       warn "ensurePeerConnectivity connect fatal", peer = $peer, err = exc.msg
     false
 
+  if preferWanBootstrap and await tryWanBootstrapReconnect():
+    return true
   if await tryKnownAddresses():
     return true
   if preferWanBootstrap and not n.switchInstance.isNil:
-    try:
-      let joinResult = await bootstrapReconnect(n.switchInstance, BootstrapCandidateCap)
-      debugLog(
-        "[nimlibp2p] ensurePeerConnectivity bootstrapReconnect peer=" & $peer &
-        " ok=" & $joinResult.ok &
-        " connectedCount=" & $joinResult.connectedCount &
-        " attemptedCount=" & $joinResult.attemptedCount
-      )
-    except CatchableError as exc:
-      debugLog("[nimlibp2p] ensurePeerConnectivity bootstrapReconnect failed peer=" & $peer & " err=" & exc.msg)
-    except Exception as exc:
-      debugLog("[nimlibp2p] ensurePeerConnectivity bootstrapReconnect fatal peer=" & $peer & " err=" & exc.msg)
-    if peerCurrentlyConnected(n, peer):
+    if await tryWanBootstrapReconnect():
       return true
     if await tryKnownAddresses():
       return true
@@ -6607,6 +7167,18 @@ proc hasConnectedAuthoritativeBootstrap(node: NimNode): bool {.gcsafe.} =
       return true
   false
 
+proc relayBootstrapGateEnabled(node: NimNode): bool {.gcsafe, raises: [].} =
+  if node.isNil or node.authoritativeBootstrapPeerIds.len == 0:
+    return false
+  node.cfg.automations.circuitRelay and configuredRelayReservationAddrs(node).len > 0
+
+proc relayBootstrapGateReady(node: NimNode): bool {.gcsafe, raises: [].} =
+  if node.isNil or node.switchInstance.isNil:
+    return true
+  if not relayBootstrapGateEnabled(node):
+    return true
+  bootstrapAutoJoinReady(node.switchInstance)
+
 proc maybeKickAuthoritativeBootstrap(
     node: NimNode,
     source = "auto_authoritative_seed_status",
@@ -6617,6 +7189,8 @@ proc maybeKickAuthoritativeBootstrap(
   if node.isNil or not node.started or node.switchInstance.isNil:
     return
   if node.authoritativeBootstrapPeerIds.len == 0:
+    return
+  if not relayBootstrapGateReady(node):
     return
   if hasConnectedAuthoritativeBootstrap(node):
     return
@@ -7408,6 +7982,14 @@ proc boostConnectivity(n: NimNode): Future[void] {.async.} =
   var bootstrapReconnectTriggered = false
   for peerId, addresses in n.peerHints.pairs:
     if peerId in n.authoritativeBootstrapPeerIds:
+      if not relayBootstrapGateReady(n):
+        if not bootstrapReconnectTriggered:
+          bootstrapReconnectTriggered = true
+          debugLog(
+            "[nimlibp2p] boostConnectivity defer authoritative bootstrapReconnect until relay ready peer=" &
+            peerId
+          )
+        continue
       when defined(ohos):
         if not bootstrapReconnectTriggered:
           bootstrapReconnectTriggered = true
@@ -7460,49 +8042,310 @@ proc boostConnectivity(n: NimNode): Future[void] {.async.} =
           " err=" & exc.msg
         )
 
-proc reserveOnRelayAsync(n: NimNode, relayAddr: string): Future[int] {.async.} =
+proc reserveOnRelayAsync(
+    n: NimNode,
+    relayKey: string,
+    relayPeerId: PeerId,
+    relayAddrs: seq[MultiAddress],
+): Future[int] {.async.} =
   if n.switchInstance.isNil or n.switchInstance.peerInfo.isNil:
     debugLog("[nimlibp2p] reserveOnRelayAsync: switchInstance or peerInfo missing")
     return 0
-  let maRes = MultiAddress.init(relayAddr)
-  if maRes.isErr():
+  if relayKey.len == 0 or relayAddrs.len == 0:
     return 0
-  let ma = maRes.get()
-  let marker = "/p2p/"
-  let idx = relayAddr.rfind(marker)
-  if idx < 0:
-    return 0
-  var peerPart = relayAddr[idx + marker.len ..< relayAddr.len]
-  let slashIdx = peerPart.find('/')
-  if slashIdx >= 0:
-    peerPart = peerPart[0 ..< slashIdx]
-  let peerRes = PeerId.init(peerPart)
-  if peerRes.isErr():
-    return 0
-  var baseAddr = relayAddr[0 ..< idx]
-  if baseAddr.len == 0:
-    baseAddr = relayAddr
-  var addrs: seq[MultiAddress] = @[]
-  let baseRes = MultiAddress.init(baseAddr)
-  if baseRes.isOk():
-    addrs.add(baseRes.get())
-  if addrs.len == 0:
-    addrs.add(ma)
+  debugLog(
+    "[nimlibp2p] reserveOnRelayAsync start relay=" & relayKey &
+    " addrs=" & relayAddrs.mapIt($it).join(",")
+  )
+  n.relayReservationLastError = ""
   var client = RelayClient.new(canHop = true)
   client.switch = n.switchInstance
   try:
-    let rsvp = await client.reserve(peerRes.get(), addrs)
-    let peerInfo = n.switchInstance.peerInfo
-    if not peerInfo.isNil:
-      for addr in rsvp.addrs:
-        if addr notin peerInfo.addrs:
-          peerInfo.addrs.add(addr)
-      await peerInfo.update()
-    n.relayReservations[relayAddr] = int64(rsvp.expire)
-    return rsvp.addrs.len
+    let relayAlreadyConnected = peerCurrentlyConnected(n, relayPeerId)
+    let reuseConnection = true
+    let forceDial = not relayAlreadyConnected
+    debugLog(
+      "[nimlibp2p] reserveOnRelayAsync mode relay=" & relayKey &
+      " connected=" & $relayAlreadyConnected &
+      " forceDial=" & $forceDial &
+      " reuseConnection=" & $reuseConnection
+    )
+    let reserveFuture = reserveOnRelayDeferred(
+      client,
+      relayPeerId,
+      relayAddrs,
+      forceDial = forceDial,
+      reuseConnection = reuseConnection,
+    )
+    debugLog("[nimlibp2p] reserveOnRelayAsync future created relay=" & relayKey)
+    let completed = await withTimeout(
+      reserveFuture,
+      chronos.milliseconds(RelayReservationAttemptTimeoutMs)
+    )
+    if not completed:
+      debugLog("[nimlibp2p] reserveOnRelayAsync timeout relay=" & relayKey)
+      await cancelFutureAndDrain(
+        reserveFuture,
+        "relay_reservation:" & relayKey
+      )
+      raise newException(IOError, "relay reservation timeout")
+    let rsvp = await reserveFuture
+    var mappedAddrs: seq[MultiAddress] = @[]
+    for addr in rsvp.addrs:
+      let relayedRes = MultiAddress.init($addr & "/p2p-circuit")
+      if relayedRes.isOk():
+        mappedAddrs.add(relayedRes.get())
+    n.relayReservations[relayKey] = int64(rsvp.expire)
+    if mappedAddrs.len > 0:
+      n.relayReservationMappedAddrs[relayKey] = dedupeLocalMultiaddrs(mappedAddrs)
+    else:
+      n.relayReservationMappedAddrs.del(relayKey)
+    discard await syncAdvertisedPeerInfo(n, "relay_reservation", reannounce = true)
+    debugLog(
+      "[nimlibp2p] reserveOnRelayAsync success relay=" & relayKey &
+      " raw=" & $rsvp.addrs.len &
+      " mapped=" & $mappedAddrs.len &
+      " addrs=" & (if mappedAddrs.len > 0: mappedAddrs.mapIt($it).join(",") else: "<empty>")
+    )
+    n.relayReservationLastError = ""
+    return mappedAddrs.len
   except CatchableError as exc:
-    warn "reserveOnRelayAsync failed", relay = relayAddr, err = exc.msg
+    n.relayReservations.del(relayKey)
+    n.relayReservationMappedAddrs.del(relayKey)
+    n.relayReservationLastError = exc.msg
+    warn "reserveOnRelayAsync failed", relay = relayKey, err = exc.msg
+    debugLog("[nimlibp2p] reserveOnRelayAsync failed relay=" & relayKey & " err=" & exc.msg)
     return 0
+
+proc reserveOnRelayAsync(n: NimNode, relayAddr: string): Future[int] {.async.} =
+  let normalized = canonicalizeMultiaddrText(relayAddr)
+  if normalized.len == 0:
+    return 0
+  for target in configuredRelayReservationTargets(n):
+    for addr in target.addrs:
+      if $addr == normalized:
+        return await reserveOnRelayAsync(n, target.key, target.peerId, target.addrs)
+  return 0
+
+proc relayReservationNeedsRefresh(
+    n: NimNode,
+    relayAddr: string,
+    nowUnix: int64
+): bool {.gcsafe, raises: [].}
+
+proc completeRelayReservationGate(n: NimNode) =
+  if relayBootstrapGateEnabled(n) and activeRelayReservationAddrs(n).len > 0:
+    if not n.switchInstance.isNil:
+      markBootstrapAutoJoinReady(n.switchInstance)
+    maybeKickAuthoritativeBootstrap(
+      n,
+      source = "explicit_relay_reservation",
+      minIntervalMs = 0'i64,
+    )
+
+proc runRelayReservationCycle(
+    n: NimNode,
+    forceRefresh: bool,
+): Future[int] {.async.} =
+  enterForegroundNetworkControl(n, "relay_reservation_cycle")
+  defer:
+    leaveForegroundNetworkControl(n, "relay_reservation_cycle")
+  let relayTargets = configuredRelayReservationTargets(n)
+  if relayTargets.len == 0:
+    n.relayReservationLastAttemptCount = 0
+    n.relayReservationLastReservedCount = 0
+    return 0
+  let nowUnix = times.now().utc.toTime.toUnix
+  var attempts = 0
+  var total = 0
+  for target in relayTargets:
+    if n.stopRequested.load(moAcquire):
+      break
+    if not forceRefresh and not relayReservationNeedsRefresh(n, target.key, nowUnix):
+      continue
+    inc attempts
+    let reserveFuture = reserveOnRelayAsync(n, target.key, target.peerId, target.addrs)
+    var reserved = 0
+    let reserveCompleted = await withTimeout(
+      reserveFuture,
+      chronos.milliseconds(RelayReservationAttemptTimeoutMs),
+    )
+    if reserveCompleted:
+      try:
+        reserved = await reserveFuture
+      except CatchableError as exc:
+        n.relayReservationLastError = exc.msg
+        debugLog(
+          "[nimlibp2p] relayReservationCycle future failed relay=" & target.key &
+          " err=" & exc.msg
+        )
+    else:
+      n.relayReservationLastError = "relay_reservation_cycle_timeout"
+      if not reserveFuture.finished():
+        reserveFuture.cancelSoon()
+      debugLog(
+        "[nimlibp2p] relayReservationCycle timeout relay=" & target.key &
+        " forceRefresh=" & $forceRefresh
+      )
+    total += reserved
+    debugLog(
+      "[nimlibp2p] relayReservationCycle relay=" & target.key &
+      " reserved=" & $reserved &
+      " forceRefresh=" & $forceRefresh
+    )
+  n.relayReservationLastAttemptCount = attempts
+  n.relayReservationLastReservedCount = total
+  completeRelayReservationGate(n)
+  total
+
+proc clearRelayReservationCycleWhenDone(
+    n: NimNode,
+    cycle: Future[int],
+): Future[void] {.async.} =
+  if cycle.isNil:
+    return
+  try:
+    discard await cycle
+  except CatchableError:
+    discard
+  if n.relayReservationCycle == cycle:
+    n.relayReservationCycle = nil
+
+proc startRelayReservationCycle(
+    n: NimNode,
+    forceRefresh: bool,
+): Future[int] =
+  if n.isNil:
+    return nil
+  if not n.relayReservationCycle.isNil and not n.relayReservationCycle.finished():
+    if forceRefresh:
+      debugLog(
+        "[nimlibp2p] relayReservationCycle mark refresh-pending forceRefresh=true"
+      )
+      n.relayReservationRefreshPending = true
+    debugLog(
+      "[nimlibp2p] relayReservationCycle reuse in-flight forceRefresh=" &
+      $forceRefresh
+    )
+    return n.relayReservationCycle
+  let effectiveForceRefresh = forceRefresh or n.relayReservationRefreshPending
+  n.relayReservationRefreshPending = false
+  let cycle = runRelayReservationCycle(n, effectiveForceRefresh)
+  n.relayReservationCycle = cycle
+  asyncSpawn(clearRelayReservationCycleWhenDone(n, cycle))
+  debugLog(
+    "[nimlibp2p] relayReservationCycle started forceRefresh=" & $effectiveForceRefresh
+  )
+  cycle
+
+proc relayReservationNeedsRefresh(n: NimNode, relayAddr: string, nowUnix: int64): bool {.gcsafe, raises: [].} =
+  if n.isNil or relayAddr.len == 0:
+    return false
+  let expire = n.relayReservations.getOrDefault(relayAddr, 0'i64)
+  expire <= 0 or (expire - nowUnix) <= RelayReservationRefreshSkewSec
+
+proc nextRelayReservationSleepMs(n: NimNode, relayAddrs: openArray[string]): int {.gcsafe, raises: [].} =
+  if n.isNil or relayAddrs.len == 0:
+    return RelayReservationLoopMaxSleepMs
+  let nowUnix = times.now().utc.toTime.toUnix
+  var nextWakeMs = RelayReservationLoopMaxSleepMs
+  for relayAddr in relayAddrs:
+    let expire = n.relayReservations.getOrDefault(relayAddr, 0'i64)
+    if expire <= 0:
+      return RelayReservationLoopMinSleepMs
+    let remainingSec = expire - nowUnix - RelayReservationRefreshSkewSec
+    if remainingSec <= 0:
+      return RelayReservationLoopMinSleepMs
+    let remainingMs = int(min(remainingSec * 1_000'i64, RelayReservationLoopMaxSleepMs.int64))
+    if remainingMs < nextWakeMs:
+      nextWakeMs = remainingMs
+  max(RelayReservationLoopMinSleepMs, nextWakeMs)
+
+proc relayReservationLoop(n: NimNode) {.async.} =
+  debugLog("[nimlibp2p] relayReservationLoop start node=" & $cast[int](n))
+  var startupGateReleased = false
+  while n.running.load(moAcquire) and not n.stopRequested.load(moAcquire):
+    let relayTargets = configuredRelayReservationTargets(n)
+    if relayTargets.len == 0:
+      debugLog("[nimlibp2p] relayReservationLoop no configured relays node=" & $cast[int](n))
+      break
+    var relayKeys: seq[string] = @[]
+    for target in relayTargets:
+      relayKeys.add(target.key)
+    let cycle = startRelayReservationCycle(n, forceRefresh = false)
+    let reservedTotal =
+      if cycle.isNil:
+        0
+      else:
+        try:
+          await cycle
+        except CatchableError as exc:
+          n.relayReservationLastError = exc.msg
+          0
+    let attempts = n.relayReservationLastAttemptCount
+    n.relayReservationLastAttemptCount = attempts
+    n.relayReservationLastReservedCount = reservedTotal
+    let activeRelayAddrCount = activeRelayReservationAddrs(n).len
+    let refreshPending = n.relayReservationRefreshPending
+    let sleepMs =
+      if refreshPending:
+        0
+      else:
+        nextRelayReservationSleepMs(n, relayKeys)
+    debugLog(
+      "[nimlibp2p] relayReservationLoop cycle attempts=" & $attempts &
+      " reserved=" & $reservedTotal &
+      " activeAddrCount=" & $activeRelayAddrCount &
+      " sleepMs=" & $sleepMs
+    )
+    if refreshPending:
+      debugLog("[nimlibp2p] relayReservationLoop immediate refresh pending=true")
+    if
+      not startupGateReleased and relayBootstrapGateEnabled(n) and
+      activeRelayAddrCount > 0
+    :
+      startupGateReleased = true
+      if not n.switchInstance.isNil:
+        markBootstrapAutoJoinReady(n.switchInstance)
+      debugLog(
+        "[nimlibp2p] relayReservationLoop startup gate released attempts=" &
+        $attempts & " reserved=" & $reservedTotal &
+        " activeAddrCount=" & $activeRelayAddrCount
+      )
+      maybeKickAuthoritativeBootstrap(
+        n,
+        source = "auto_authoritative_seed_after_relay",
+        minIntervalMs = 0'i64,
+      )
+    if sleepMs > 0:
+      await sleepAsync(chronos.milliseconds(sleepMs))
+  debugLog("[nimlibp2p] relayReservationLoop exit node=" & $cast[int](n))
+
+proc startRelayReservationLoop(n: NimNode) =
+  let relayReservationTargets = configuredRelayReservationTargets(n)
+  n.relayReservationTargetCount = relayReservationTargets.len
+  debugLog(
+    "[nimlibp2p] startRelayReservationLoop configured=" & $relayReservationTargets.len &
+    " circuitRelay=" & $n.cfg.automations.circuitRelay &
+    " addrs=" &
+    (
+      if relayReservationTargets.len > 0:
+        relayReservationTargets.mapIt(it.addrs.mapIt($it).join("|")).join(",")
+      else:
+        "<empty>"
+    )
+  )
+  if relayReservationTargets.len == 0:
+    return
+  if not n.cfg.automations.circuitRelay:
+    debugLog("[nimlibp2p] startRelayReservationLoop skipped: circuit relay disabled")
+    return
+  if not n.relayReservationLoop.isNil and not n.relayReservationLoop.finished():
+    debugLog("[nimlibp2p] startRelayReservationLoop already running")
+    return
+  n.relayReservationLoop = relayReservationLoop(n)
+  asyncSpawn(n.relayReservationLoop)
+  debugLog("[nimlibp2p] startRelayReservationLoop spawned")
 
 proc waitForSecureChannel(n: NimNode, peerId: string, timeoutMs: int): Future[bool] {.async.} =
   let peerRes = PeerId.init(peerId)
@@ -8035,12 +8878,6 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     debugLog("[nimlibp2p] buildSwitch skipped Yamux for QUIC-only profile")
   var enableNoise = true
   var enableTls = true
-  when defined(android):
-    when defined(libp2p_pure_crypto):
-      enableNoise = false
-      enableTls = true
-    else:
-      enableTls = false
   if cfg.extra.kind == JObject:
     if cfg.extra.hasKey("enableNoise"):
       let node = cfg.extra["enableNoise"]
@@ -8085,8 +8922,11 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     builder = builder.withAutonat()
     debugLog("[nimlibp2p] buildSwitch enabled autonat")
   if cfg.automations.circuitRelay:
-    builder = builder.withCircuitRelay()
-    debugLog("[nimlibp2p] buildSwitch enabled circuit relay")
+    if builder.hasCircuitRelay():
+      debugLog("[nimlibp2p] buildSwitch keeping existing circuit relay from WAN bootstrap profile")
+    else:
+      builder = builder.withCircuitRelay()
+      debugLog("[nimlibp2p] buildSwitch enabled circuit relay")
   if cfg.automations.rendezvous:
     try:
       builder = builder.withRendezVous(RendezVous.new())
@@ -8409,6 +9249,9 @@ proc runLibp2pNcProbe(
     result["durationMs"] = %ncProbeElapsedMs(startedAt)
     result["error"] = %exc.msg
 
+proc readyNcProbeResult(payload: JsonNode): Future[JsonNode] {.async.} =
+  return payload
+
 proc runNativeNcProbe(targets: seq[MultiAddress]; timeoutMs: int): Future[JsonNode] {.async.} =
   result = newJObject()
   result["ok"] = %false
@@ -8428,21 +9271,23 @@ proc runNativeNcProbe(targets: seq[MultiAddress]; timeoutMs: int): Future[JsonNo
       switchError = exc.msg
 
   try:
-    var anySuccess = false
+    var pending: seq[Future[JsonNode]] = @[]
     for target in targets:
       let modes = classifyNcProbeTarget(target)
       if ncpmRawTcp in modes:
-        let rawProbe = await runRawTcpProbe(target, timeoutMs)
-        anySuccess = anySuccess or jsonBool(rawProbe, "ok", false)
-        items.add(rawProbe)
+        pending.add(runRawTcpProbe(target, timeoutMs))
       if ncpmLibp2p in modes:
-        let libp2pProbe =
+        pending.add(
           if sw.isNil:
-            buildLibp2pProbeFailure(target, switchError)
+            readyNcProbeResult(buildLibp2pProbeFailure(target, switchError))
           else:
-            await runLibp2pNcProbe(sw, target, timeoutMs)
-        anySuccess = anySuccess or jsonBool(libp2pProbe, "ok", false)
-        items.add(libp2pProbe)
+            runLibp2pNcProbe(sw, target, timeoutMs)
+        )
+    var anySuccess = false
+    for probeFut in pending:
+      let probe = await probeFut
+      anySuccess = anySuccess or jsonBool(probe, "ok", false)
+      items.add(probe)
     result["ok"] = %anySuccess
     result["results"] = items
   finally:
@@ -8648,16 +9493,21 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           debugLog("[nimlibp2p] cmdStart: udp echo responder ready")
           when not defined(ohos):
             if n.authoritativeBootstrapPeerIds.len > 0 and not n.switchInstance.isNil:
-              proc delayedAuthoritativeBootstrapReconnect() {.async.} =
-                await sleepAsync(chronos.seconds(1))
-                try:
-                  await reconnectAuthoritativeBootstrapExact(n, "auto_authoritative_seed_startup")
-                except CatchableError as exc:
-                  debugLog(
-                    "[nimlibp2p] delayed authoritative bootstrapReconnect failed err=" &
-                    exc.msg
-                  )
-              asyncSpawn(delayedAuthoritativeBootstrapReconnect())
+              if relayBootstrapGateReady(n):
+                proc delayedAuthoritativeBootstrapReconnect() {.async.} =
+                  await sleepAsync(chronos.seconds(1))
+                  try:
+                    await reconnectAuthoritativeBootstrapExact(n, "auto_authoritative_seed_startup")
+                  except CatchableError as exc:
+                    debugLog(
+                      "[nimlibp2p] delayed authoritative bootstrapReconnect failed err=" &
+                      exc.msg
+                    )
+                asyncSpawn(delayedAuthoritativeBootstrapReconnect())
+              else:
+                debugLog(
+                  "[nimlibp2p] cmdStart: defer authoritative bootstrap auto reconnect until relay ready"
+                )
           when defined(ohos):
             if n.authoritativeBootstrapPeerIds.len > 0:
               debugLog("[nimlibp2p] cmdStart: skip authoritative bootstrap auto reconnect on ohos")
@@ -8666,19 +9516,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
               await sleepAsync(chronos.seconds(1))
               await boostConnectivity(n)
             asyncSpawn(delayedBoost())
-          let relayReservationAddrs = configuredRelayReservationAddrs(n)
-          if relayReservationAddrs.len > 0:
-            proc delayedRelayReservation() {.async.} =
-              await sleepAsync(chronos.seconds(1))
-              var reservedTotal = 0
-              for relayAddr in relayReservationAddrs:
-                reservedTotal += await reserveOnRelayAsync(n, relayAddr)
-              debugLog(
-                "[nimlibp2p] cmdStart: relay reservation attempted count=" &
-                $relayReservationAddrs.len &
-                " reserved=" & $reservedTotal
-              )
-            asyncSpawn(delayedRelayReservation())
+          startRelayReservationLoop(n)
           scheduleStartMdns(n)
           debugLog("[nimlibp2p] cmdStart: mdns start scheduled")
           if n.mdnsRestartPending:
@@ -8747,6 +9585,12 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         if not n.keepAliveLoop.isNil:
           n.keepAliveLoop.cancel()
           n.keepAliveLoop = nil
+        if not n.relayReservationLoop.isNil:
+          n.relayReservationLoop.cancel()
+          n.relayReservationLoop = nil
+        if not n.relayReservationCycle.isNil:
+          n.relayReservationCycle.cancelSoon()
+          n.relayReservationCycle = nil
         n.started = false
         n.stopRequested.store(true, moRelease)
         if not n.signal.isNil:
@@ -9379,6 +10223,20 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       obj["totalCount"] = %total
       command.stringResult = $obj
       command.resultCode = NimResultOk
+    of cmdBootstrapTick:
+      if n.switchInstance.isNil:
+        command.resultCode = NimResultInvalidState
+        command.errorMsg = "switch not initialized"
+      else:
+        maybeKickAuthoritativeBootstrap(n, "auto_authoritative_seed_tick")
+        discard await refreshBootstrapState(n.switchInstance)
+        let providerNode = buildWanProviderPayload(n)
+        var bootstrapNode = bootstrapStateJson(n.switchInstance, BootstrapCandidateCap)
+        if n.authoritativeBootstrapPeerIds.len > 0:
+          mergeLocalBootstrapStatus(n, bootstrapNode, BootstrapCandidateCap)
+        attachBootstrapProvider(bootstrapNode, providerNode)
+        command.stringResult = $bootstrapNode
+        command.resultCode = NimResultOk
     of cmdReconnectBootstrap:
       if n.switchInstance.isNil:
         command.resultCode = NimResultInvalidState
@@ -9924,13 +10782,13 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             jsonGetStr(previousHost, "transport", "") != jsonGetStr(normalized, "transport", "") or
             jsonGetStr(previousHost, "preferredIpv4", "") != jsonGetStr(normalized, "preferredIpv4", "") or
             jsonGetStr(previousHost, "localIpv4", "") != jsonGetStr(normalized, "localIpv4", "")
-          asyncCheck(runHostNetworkStatusSideEffects(
+          scheduleHostNetworkStatusSideEffects(
             n,
             normalized,
             mdnsTransportChanged,
             currentMdnsAllowed,
-          ))
-          debugLog("[nimlibp2p] cmdUpdateHostNetworkStatus side_effects:spawned")
+            "cmd_update_host_network_status",
+          )
           let event = buildHostNetworkEvent(normalized)
           recordEvent(n, "network_event", $event)
           command.stringResult = $normalized
@@ -10266,12 +11124,27 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.intResult = reserved
         command.resultCode = NimResultOk
     of cmdReserveOnAllRelays:
-      var total = 0
-      for peerId, addresses in n.peerHints.pairs:
-        for addr in addresses:
-          total += await reserveOnRelayAsync(n, addr)
-      command.intResult = total
-      command.resultCode = NimResultOk
+      let cycle = startRelayReservationCycle(n, forceRefresh = true)
+      if cycle.isNil:
+        command.intResult = activeRelayReservationAddrs(n).len
+        command.resultCode = NimResultOk
+      else:
+        let timeoutMs = max(command.timeoutMs, 0)
+        if timeoutMs > 0:
+          let completed = await withTimeout(cycle, chronos.milliseconds(timeoutMs))
+          if not completed:
+            command.intResult = activeRelayReservationAddrs(n).len
+            command.resultCode = NimResultError
+            command.errorMsg = "relay_reservation_timeout"
+            return
+        try:
+          let total = await cycle
+          command.intResult = max(total, activeRelayReservationAddrs(n).len)
+          command.resultCode = NimResultOk
+        except CatchableError as exc:
+          command.intResult = activeRelayReservationAddrs(n).len
+          command.resultCode = NimResultError
+          command.errorMsg = exc.msg
     of cmdMeasurePeerBandwidth:
       if not n.started:
         command.resultCode = NimResultInvalidState
@@ -11365,6 +12238,8 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       connectionHandlers: @[],
       keepAlivePeers: initHashSet[string](),
       keepAliveLoop: nil,
+      relayReservationLoop: nil,
+      relayReservationCycle: nil,
       telemetryLoop: nil,
       pingProtocol: nil,
       eventLog: @[],
@@ -11389,6 +12264,17 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       lanGroups: initTable[string, LanGroupState](),
       rendezvous: findRendezvousService(sw),
       relayReservations: initTable[string, int64](),
+      relayReservationMappedAddrs: initTable[string, seq[MultiAddress]](),
+      relayReservationTargetCount: 0,
+      relayReservationLastAttemptCount: 0,
+      relayReservationLastReservedCount: 0,
+      relayReservationLastError: "",
+      relayReservationRefreshPending: false,
+      networkControlForegroundCount: 0,
+      deferredHostNetworkSideEffectsPending: false,
+      deferredHostNetworkStatus: defaultHostNetworkStatus(),
+      deferredHostNetworkMdnsTransportChanged: false,
+      deferredHostNetworkMdnsAllowed: false,
       discovery: nil,
       configuredMdnsService: configuredMdnsServiceName(cfg),
       mdnsInterface: nil,
@@ -11418,6 +12304,16 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       )
     node.mdnsEnabled = not disableMdns
     node.mdnsIntervalSeconds = 2
+    if not node.switchInstance.isNil and not node.switchInstance.peerInfo.isNil:
+      node.switchInstance.peerInfo.addressMappers.add(
+        proc(listenAddrs: seq[MultiAddress]): Future[seq[MultiAddress]] {.gcsafe, async: (raises: [CancelledError]).} =
+          var mapped = dedupeLocalMultiaddrs(listenAddrs)
+          let relayAddrs = activeRelayReservationAddrs(node)
+          for relayAddr in relayAddrs:
+            if relayAddr notin mapped:
+              mapped.add(relayAddr)
+          mapped
+      )
     initCommandQueue(node)
     node.running.store(true, moRelease)
     node.stopRequested.store(false, moRelease)
@@ -13124,7 +14020,7 @@ proc recordSocialEvent(
   evt["payload"] = payload
   recordEvent(node, "social_event", $evt)
 
-proc takeCStringAndFree(value: cstring): string =
+proc takeCStringAndFree(value: cstring): string {.gcsafe, raises: [].} =
   if value.isNil:
     return ""
   result = $value
@@ -13409,6 +14305,24 @@ proc collectDiscoveredPeersForNode(node: NimNode, connectedInfo: JsonNode): Json
     let hints = preferStableAddrStrings(node.peerHints.getOrDefault(peerId))
     upsertPeer(peerId, "mDNS", hints, seenAt)
     annotateTransportSources(peerId, hints, seenAt)
+
+  if not node.isNil and not node.switchInstance.isNil:
+    try:
+      for entry in bootstrapSnapshot(node.switchInstance, BootstrapCandidateCap):
+        let peerId = $entry.peerId
+        var addrs: seq[string] = @[]
+        for addr in entry.addrs:
+          addrs.add($addr)
+        if entry.sources.len > 0:
+          for source in entry.sources:
+            upsertPeer(peerId, source, addrs, entry.lastSeenAtMs)
+        else:
+          upsertPeer(peerId, "bootstrap", addrs, entry.lastSeenAtMs)
+        if entry.relayCapable:
+          upsertPeer(peerId, "relay", @[], entry.lastSeenAtMs)
+        annotateTransportSources(peerId, addrs, entry.lastSeenAtMs)
+    except CatchableError:
+      discard
 
   var arr = newJArray()
   for _, row in peers:
@@ -18159,6 +19073,24 @@ proc libp2p_get_bootstrap_status*(handle: pointer): cstring {.exportc, cdecl, dy
   attachBootstrapProvider(obj, providerNode)
   allocCString($obj)
 
+proc libp2p_bootstrap_tick*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("{\"ok\":false,\"error\":\"node_not_initialized\"}")
+  let cmd = makeCommand(cmdBootstrapTick)
+  let result = submitCommand(node, cmd)
+  let payload =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      var response = newJObject()
+      response["ok"] = %false
+      response["error"] =
+        %(if result.errorMsg.len > 0: result.errorMsg else: "bootstrap_tick_failed")
+      $response
+  destroyCommand(cmd)
+  allocCString(payload)
+
 proc buildBootstrapStatusNode(node: NimNode): JsonNode {.gcsafe.} =
   if node.isNil:
     return newJObject()
@@ -18273,34 +19205,105 @@ proc bootstrapSeedConnectExactPayload(
     payload["error"] = %error
   $payload
 
-proc exactSeedConnectReservedBudgetMs(maText: string): int {.gcsafe.} =
-  let lowerAddr = maText.toLowerAscii()
-  if lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/"):
-    2_000
-  else:
-    when defined(ohos):
-      4_000
-    else:
-      3_000
+proc waitForObservedPeerPathSnapshot(
+    node: NimNode,
+    peerIdText: string,
+    peerId: PeerId,
+    timeoutMs: int,
+    wantRelay = false,
+    wantDirect = false,
+    pollMs = 100
+): JsonNode {.gcsafe, raises: [].} =
+  let safeTimeoutMs = max(timeoutMs, 0)
+  let safePollMs = max(pollMs, 25)
+  let deadlineMs = nowMillis() + int64(safeTimeoutMs)
+  result = actualPeerConnectionSnapshot(node, peerIdText, peerId)
+  while true:
+    let relayConnected = jsonGetBool(result, "relayConnected", false)
+    let directConnected = jsonGetBool(result, "directConnected", false)
+    if (not wantRelay or relayConnected) and (not wantDirect or directConnected):
+      return result
+    let remainingMs = int(deadlineMs - nowMillis())
+    if remainingMs <= 0:
+      return result
+    sleep(min(safePollMs, remainingMs))
+    result = actualPeerConnectionSnapshot(node, peerIdText, peerId)
 
-proc exactSeedConnectAttemptCapMs(maText: string, hasFutureAttempts: bool): int {.gcsafe.} =
+proc bootstrapSeedObserveDirectUpgradePayload(
+    node: NimNode,
+    seedPeerId: string,
+    source: string,
+    selectedAddrs: seq[string],
+    relayAddrs: seq[string],
+    directAddrs: seq[string],
+    attempts: seq[JsonNode],
+    stage: string,
+    error: string,
+    relayObserved: bool,
+    directObserved: bool
+): string {.gcsafe.} =
+  let bootstrap = buildBootstrapStatusNode(node)
+  let bootstrapConnected = bootstrapStatusShowsConnectedPeer(bootstrap, seedPeerId)
+  let peerRes = PeerId.init(seedPeerId)
+  let connection =
+    if peerRes.isOk():
+      actualPeerConnectionSnapshot(node, seedPeerId, peerRes.get())
+    else:
+      %*{
+        "peerId": seedPeerId,
+        "connected": false,
+        "connCount": 0,
+        "relayConnected": false,
+        "directConnected": false,
+        "selectedPath": "none",
+      }
+  var payload = newJObject()
+  payload["ok"] = %jsonGetBool(connection, "directConnected", false)
+  payload["peerId"] = %seedPeerId
+  payload["source"] = %source
+  payload["mode"] = %"relay_first_upgrade_observe"
+  payload["stage"] = %stage
+  payload["selectedAddrCount"] = %selectedAddrs.len
+  payload["relayCandidateCount"] = %relayAddrs.len
+  payload["directCandidateCount"] = %directAddrs.len
+  payload["selectedAddrs"] = %selectedAddrs
+  payload["relayAddrs"] = %relayAddrs
+  payload["directAddrs"] = %directAddrs
+  payload["relayObserved"] = %relayObserved
+  payload["directObserved"] = %(
+    directObserved or jsonGetBool(connection, "directConnected", false)
+  )
+  payload["bootstrapConnected"] = %bootstrapConnected
+  payload["bootstrap"] = bootstrap
+  payload["connection"] = connection
+  payload["attemptCount"] = %attempts.len
+  if attempts.len > 0:
+    if attempts[^1].kind == JObject:
+      payload["attemptedAddr"] = %(jsonGetStr(attempts[^1], "addr"))
+    else:
+      payload["attemptedAddr"] = %""
+  else:
+    payload["attemptedAddr"] = %""
+  var attemptsNode = newJArray()
+  for item in attempts:
+    attemptsNode.add(item)
+  payload["attempts"] = attemptsNode
+  if error.len > 0:
+    payload["error"] = %error
+  $payload
+
+proc exactSeedConnectAttemptBudgetMs(maText: string): int {.gcsafe.} =
   let lowerAddr = maText.toLowerAscii()
   if lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/"):
-    when defined(ohos):
-      if hasFutureAttempts:
-        3_500
-      else:
-        5_000
-    else:
-      if hasFutureAttempts:
-        6_000
-      else:
-        8_000
+    20_000
   else:
-    when defined(ohos):
-      5_000
-    else:
-      3_500
+    6_000
+
+proc exactSeedConnectTotalBudgetMs(addrs: openArray[string]): int {.gcsafe.} =
+  var total = 1_500
+  for addr in addrs:
+    total += exactSeedConnectAttemptBudgetMs(addr)
+  max(total, 5_000)
 
 type BootstrapSeedConnectExactKickoffArg = object
   handle: pointer
@@ -18467,17 +19470,14 @@ proc libp2p_bootstrap_seed_connect_exact*(
   destroyCommand(hintsCmd)
 
   let peerRes = PeerId.init(safePeerId)
-  let totalBudgetMs =
-    if secureTimeoutMs > 0:
-      max(min(int(secureTimeoutMs), 10_000), 2_500)
-    else:
-      5_000
+  let selectedAddrs = orderedAddrs[0 ..< safeLimit]
+  let totalBudgetMs = exactSeedConnectTotalBudgetMs(selectedAddrs)
   let exactStartedAtMs = nowMillis()
   var attempts: seq[JsonNode] = @[]
   var lastError = ""
   var attemptedAddr = ""
 
-  for idx, addr in orderedAddrs[0 ..< safeLimit]:
+  for idx, addr in selectedAddrs:
     let elapsedBeforeAttempt = int(nowMillis() - exactStartedAtMs)
     var remainingBudgetMs = totalBudgetMs - elapsedBeforeAttempt
     if remainingBudgetMs <= 0:
@@ -18490,12 +19490,14 @@ proc libp2p_bootstrap_seed_connect_exact*(
       break
     attemptedAddr = addr
     let lowerAddr = addr.toLowerAscii()
+    let addrPathKind =
+      if "/p2p-circuit" in lowerAddr: "relay" else: "direct"
     let remainingAttempts = max(1, safeLimit - idx)
     var reservedForFutureMs = 0
     if remainingAttempts > 1:
-      for futureAddr in orderedAddrs[(idx + 1) ..< safeLimit]:
-        reservedForFutureMs += exactSeedConnectReservedBudgetMs(futureAddr)
-    let maxConnectTimeoutMs = exactSeedConnectAttemptCapMs(addr, remainingAttempts > 1)
+      for futureAddr in selectedAddrs[(idx + 1) ..< safeLimit]:
+        reservedForFutureMs += exactSeedConnectAttemptBudgetMs(futureAddr)
+    let maxConnectTimeoutMs = exactSeedConnectAttemptBudgetMs(addr)
     let timeoutMs =
       max(
         750,
@@ -18507,6 +19509,7 @@ proc libp2p_bootstrap_seed_connect_exact*(
     debugLog(
       "[nimlibp2p] bootstrapSeedConnectExact attempt:start peer=" & safePeerId &
       " addr=" & addr &
+      " path=" & addrPathKind &
       " timeoutMs=" & $timeoutMs &
       " remainingBudgetMs=" & $remainingBudgetMs &
       " totalBudgetMs=" & $totalBudgetMs
@@ -18530,6 +19533,7 @@ proc libp2p_bootstrap_seed_connect_exact*(
 
     var attemptNode = newJObject()
     attemptNode["addr"] = %addr
+    attemptNode["path"] = %addrPathKind
     attemptNode["timeoutMs"] = %timeoutMs
     attemptNode["ok"] = %(rc == NimResultOk)
     if err.len > 0:
@@ -18577,7 +19581,7 @@ proc libp2p_bootstrap_seed_connect_exact*(
             asyncSpawn(promoteConnectedBootstrapPeerDetached(
               node,
               safePeerId,
-              orderedAddrs[0 ..< safeLimit],
+              selectedAddrs,
               effectiveSource,
             ))
             return allocCString(
@@ -18650,7 +19654,7 @@ proc libp2p_bootstrap_seed_connect_exact*(
       asyncSpawn(promoteConnectedBootstrapPeerDetached(
         node,
         safePeerId,
-        orderedAddrs[0 ..< safeLimit],
+        selectedAddrs,
         effectiveSource,
       ))
       bootstrapNode = buildBootstrapStatusNode(node)
@@ -18685,6 +19689,301 @@ proc libp2p_bootstrap_seed_connect_exact*(
       attempts,
       false,
       lastError,
+    )
+  )
+
+proc libp2p_bootstrap_seed_observe_direct_upgrade*(
+    handle: pointer,
+    peerId: cstring,
+    addressesJson: cstring,
+    source: cstring,
+    limit: cint,
+    relayTimeoutMs: cint,
+    upgradeTimeoutMs: cint
+): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  let safePeerId = (if peerId.isNil: "" else: $peerId).strip()
+  let safeSource = (if source.isNil: "" else: $source).strip()
+  let effectiveSource = if safeSource.len > 0: safeSource else: "seeded_relay_upgrade_observe"
+  if node.isNil:
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        nil,
+        safePeerId,
+        effectiveSource,
+        @[],
+        @[],
+        @[],
+        @[],
+        "node_not_initialized",
+        "node_not_initialized",
+        false,
+        false,
+      )
+    )
+  let safeAddressesJson = (if addressesJson.isNil: "" else: $addressesJson).strip()
+  debugLog(
+    "[nimlibp2p] bootstrapSeedObserveDirectUpgrade start peer=" & safePeerId &
+    " source=" & effectiveSource &
+    " relayTimeoutMs=" & $int(relayTimeoutMs) &
+    " upgradeTimeoutMs=" & $int(upgradeTimeoutMs) &
+    " addressesJson=" & safeAddressesJson
+  )
+  if safePeerId.len == 0 or safeAddressesJson.len == 0:
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        @[],
+        @[],
+        @[],
+        @[],
+        "missing_peerId_or_addresses",
+        "missing_peerId_or_addresses",
+        false,
+        false,
+      )
+    )
+  var addresses = parseJsonStringSeq(safeAddressesJson)
+  if addresses.len == 0:
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        @[],
+        @[],
+        @[],
+        @[],
+        "no_valid_addresses",
+        "no_valid_addresses",
+        false,
+        false,
+      )
+    )
+  let orderedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(addresses))
+  let safeLimit =
+    if limit > 0:
+      min(max(int(limit), 1), orderedAddrs.len)
+    else:
+      orderedAddrs.len
+  if safeLimit <= 0:
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        @[],
+        @[],
+        @[],
+        @[],
+        "no_valid_addresses",
+        "no_valid_addresses",
+        false,
+        false,
+      )
+    )
+  let selectedAddrs = orderedAddrs[0 ..< safeLimit]
+  var relayAddrs: seq[string] = @[]
+  var directAddrs: seq[string] = @[]
+  for addr in selectedAddrs:
+    if isCircuitAddressText(addr):
+      relayAddrs.add(addr)
+    else:
+      directAddrs.add(addr)
+  let peerRes = PeerId.init(safePeerId)
+  if peerRes.isErr():
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        selectedAddrs,
+        relayAddrs,
+        directAddrs,
+        @[],
+        "invalid_peer_id",
+        "invalid_peer_id",
+        false,
+        false,
+      )
+    )
+  if relayAddrs.len == 0:
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        selectedAddrs,
+        relayAddrs,
+        directAddrs,
+        @[],
+        "missing_relay_addresses",
+        "missing_relay_addresses",
+        false,
+        actualHasDirectConn(node, peerRes.get()),
+      )
+    )
+
+  let hintsCmd = makeCommand(cmdRegisterPeerHints)
+  hintsCmd.peerId = safePeerId
+  hintsCmd.addresses = selectedAddrs
+  hintsCmd.source = effectiveSource
+  discard submitCommand(node, hintsCmd)
+  destroyCommand(hintsCmd)
+
+  var attempts: seq[JsonNode] = @[]
+  var relayObserved = actualHasRelayConn(node, peerRes.get())
+  var directObserved = actualHasDirectConn(node, peerRes.get())
+  if directObserved:
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        selectedAddrs,
+        relayAddrs,
+        directAddrs,
+        attempts,
+        "already_direct",
+        "",
+        relayObserved,
+        directObserved,
+      )
+    )
+
+  let safeRelayTimeoutMs =
+    if relayTimeoutMs > 0:
+      max(min(int(relayTimeoutMs), 60_000), 1_000)
+    else:
+      max(6_000, relayAddrs.len * 8_000)
+  let safeUpgradeTimeoutMs =
+    if upgradeTimeoutMs > 0:
+      max(min(int(upgradeTimeoutMs), 90_000), 1_000)
+    else:
+      30_000
+  let relayStartedAtMs = nowMillis()
+  var lastError = ""
+  for idx, addr in relayAddrs:
+    let elapsedBeforeAttempt = int(nowMillis() - relayStartedAtMs)
+    let remainingBudgetMs = safeRelayTimeoutMs - elapsedBeforeAttempt
+    if remainingBudgetMs <= 0:
+      lastError = "relay_connect_timeout"
+      break
+    let remainingAttempts = max(1, relayAddrs.len - idx)
+    var reservedForFutureMs = 0
+    if remainingAttempts > 1:
+      for futureAddr in relayAddrs[(idx + 1) ..< relayAddrs.len]:
+        reservedForFutureMs += exactSeedConnectAttemptBudgetMs(futureAddr)
+    let timeoutMs =
+      max(
+        750,
+        min(
+          exactSeedConnectAttemptBudgetMs(addr),
+          remainingBudgetMs - reservedForFutureMs
+        )
+      )
+    debugLog(
+      "[nimlibp2p] bootstrapSeedObserveDirectUpgrade relay_attempt:start peer=" & safePeerId &
+      " addr=" & addr &
+      " timeoutMs=" & $timeoutMs &
+      " remainingBudgetMs=" & $remainingBudgetMs
+    )
+    let cmd = makeCommand(cmdConnectMultiaddr)
+    cmd.multiaddr = addr
+    cmd.timeoutMs = timeoutMs
+    cmd.requestLimit = 1
+    let result = submitCommand(node, cmd)
+    let rc = result.resultCode
+    let err = result.errorMsg.strip()
+    destroyCommand(cmd)
+    let lateWindowMs = max(0, min(1_500, safeRelayTimeoutMs - int(nowMillis() - relayStartedAtMs)))
+    let connectionSnapshot = waitForObservedPeerPathSnapshot(
+      node,
+      safePeerId,
+      peerRes.get(),
+      lateWindowMs,
+      wantRelay = false,
+      wantDirect = false,
+    )
+    let relayConnected = jsonGetBool(connectionSnapshot, "relayConnected", false)
+    let directConnected = jsonGetBool(connectionSnapshot, "directConnected", false)
+    relayObserved = relayObserved or relayConnected
+    directObserved = directObserved or directConnected
+    var attemptNode = newJObject()
+    attemptNode["addr"] = %addr
+    attemptNode["path"] = %"relay"
+    attemptNode["timeoutMs"] = %timeoutMs
+    attemptNode["ok"] = %(rc == NimResultOk or relayConnected or directConnected)
+    if err.len > 0:
+      attemptNode["error"] = %err
+    attemptNode["relayConnected"] = %relayConnected
+    attemptNode["directConnected"] = %directConnected
+    attemptNode["connection"] = connectionSnapshot
+    attempts.add(attemptNode)
+    if directConnected or relayConnected:
+      break
+    if err.len > 0:
+      lastError = err
+  if not relayObserved and not directObserved:
+    if lastError.len == 0:
+      lastError = "relay_connect_timeout"
+    return allocCString(
+      bootstrapSeedObserveDirectUpgradePayload(
+        node,
+        safePeerId,
+        effectiveSource,
+        selectedAddrs,
+        relayAddrs,
+        directAddrs,
+        attempts,
+        "relay_connect_failed",
+        lastError,
+        relayObserved,
+        directObserved,
+      )
+    )
+
+  asyncSpawn(promoteConnectedBootstrapPeerDetached(
+    node,
+    safePeerId,
+    selectedAddrs,
+    effectiveSource,
+  ))
+  let finalSnapshot =
+    if directObserved:
+      actualPeerConnectionSnapshot(node, safePeerId, peerRes.get())
+    else:
+      waitForObservedPeerPathSnapshot(
+        node,
+        safePeerId,
+        peerRes.get(),
+        safeUpgradeTimeoutMs,
+        wantDirect = true,
+      )
+  relayObserved = relayObserved or jsonGetBool(finalSnapshot, "relayConnected", false)
+  directObserved = directObserved or jsonGetBool(finalSnapshot, "directConnected", false)
+  let finalStage =
+    if directObserved:
+      if relayObserved: "direct_upgraded" else: "direct_connected"
+    elif relayObserved:
+      "relay_connected_no_upgrade"
+    else:
+      "disconnected"
+  allocCString(
+    bootstrapSeedObserveDirectUpgradePayload(
+      node,
+      safePeerId,
+      effectiveSource,
+      selectedAddrs,
+      relayAddrs,
+      directAddrs,
+      attempts,
+      finalStage,
+      if directObserved: "" elif lastError.len > 0: lastError else: "direct_upgrade_timeout",
+      relayObserved,
+      directObserved,
     )
   )
 
@@ -18726,16 +20025,47 @@ proc bootstrapSeedConnectExactKickoffThread(
         kickoffArg.secureTimeoutMs,
       )
     )
+    var payloadNode = newJNull()
+    try:
+      payloadNode = parseJson(payload)
+    except CatchableError:
+      payloadNode = %*{
+        "ok": false,
+        "peerId": safePeerId,
+        "error": "bootstrap_seed_connect_exact_invalid_payload",
+        "rawPayload": payload
+      }
+    setBootstrapSeedConnectKickoffState(safePeerId, "done", payloadNode)
     debugLog(
       "[nimlibp2p] bootstrapSeedConnectExactKickoffThread done peer=" & safePeerId &
       " payloadBytes=" & $payload.len
     )
   except CatchableError as exc:
+    setBootstrapSeedConnectKickoffState(
+      safePeerId,
+      "done",
+      %*{
+        "ok": false,
+        "peerId": safePeerId,
+        "error": exc.msg
+      },
+      exc.msg
+    )
     debugLog(
       "[nimlibp2p] bootstrapSeedConnectExactKickoffThread failed peer=" & safePeerId &
       " err=" & exc.msg
     )
   except Exception as exc:
+    setBootstrapSeedConnectKickoffState(
+      safePeerId,
+      "done",
+      %*{
+        "ok": false,
+        "peerId": safePeerId,
+        "error": exc.msg
+      },
+      exc.msg
+    )
     debugLog(
       "[nimlibp2p] bootstrapSeedConnectExactKickoffThread fatal peer=" & safePeerId &
       " err=" & exc.msg
@@ -18795,6 +20125,16 @@ proc libp2p_bootstrap_seed_connect_exact_kickoff*(
     recordRuntimeError("kickoff_arg_copy_failed")
     return false
 
+  setBootstrapSeedConnectKickoffState(
+    safePeerId,
+    "pending",
+    %*{
+      "ok": false,
+      "peerId": safePeerId,
+      "status": "pending"
+    }
+  )
+
   try:
     when defined(posix):
       var worker: Pthread
@@ -18816,8 +20156,30 @@ proc libp2p_bootstrap_seed_connect_exact_kickoff*(
     true
   except CatchableError as exc:
     destroyBootstrapSeedConnectExactKickoffArg(arg)
+    setBootstrapSeedConnectKickoffState(
+      safePeerId,
+      "done",
+      %*{
+        "ok": false,
+        "peerId": safePeerId,
+        "error": exc.msg
+      },
+      exc.msg
+    )
     recordRuntimeError("bootstrap_seed_connect_exact_kickoff_failed: " & exc.msg)
     false
+
+proc libp2p_bootstrap_seed_connect_exact_kickoff_status*(
+    peerId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  allocCString(
+    getBootstrapSeedConnectKickoffState(
+      if peerId.isNil:
+        ""
+      else:
+        $peerId
+    )
+  )
 
 proc libp2p_udp_echo_probe*(handle: pointer, multiaddr: cstring, timeoutMs: cint): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
@@ -19048,11 +20410,12 @@ proc libp2p_reserve_on_relay*(handle: pointer, relayAddr: cstring): bool {.expor
   destroyCommand(cmd)
   ok
 
-proc libp2p_reserve_on_all_relays*(handle: pointer): cint {.exportc, cdecl, dynlib.} =
+proc libp2p_reserve_on_all_relays*(handle: pointer, timeoutMs: cint): cint {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
     return cint(0)
   let cmd = makeCommand(cmdReserveOnAllRelays)
+  cmd.timeoutMs = max(int(timeoutMs), 0)
   let result = submitCommand(node, cmd)
   let count = if result.resultCode == NimResultOk: result.intResult else: 0
   destroyCommand(cmd)

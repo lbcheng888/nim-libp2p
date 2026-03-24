@@ -77,6 +77,69 @@ proc allowsDial(self: Dialer, peer: Opt[PeerId], address: MultiAddress): bool {.
     return true
   self.gater.allowDial(peer, address)
 
+proc expandDnsAddr(
+    self: Dialer, peerId: Opt[PeerId], address: MultiAddress
+): Future[seq[(MultiAddress, Opt[PeerId])]] {.
+    async: (raises: [CancelledError, MaError, TransportAddressError, LPError])
+.}
+
+type ParallelDialAttempt = object
+  peerId: Opt[PeerId]
+  hostname: string
+  address: MultiAddress
+
+proc collectParallelDialAttempts(
+    self: Dialer,
+    peerId: Opt[PeerId],
+    addrs: seq[MultiAddress],
+): Future[seq[ParallelDialAttempt]] {.
+    async: (raises: [CancelledError, DialFailedError, MaError, TransportAddressError, LPError])
+.} =
+  let orderedAddrs = preferStableAddrs(addrs)
+  var seen = initTable[string, bool]()
+  for rawAddress in orderedAddrs:
+    let addresses = await self.expandDnsAddr(peerId, rawAddress)
+    for (expandedAddress, addrPeerId) in addresses:
+      let
+        hostname = expandedAddress.getHostname()
+        resolvedAddresses =
+          if isNil(self.nameResolver):
+            @[expandedAddress]
+          else:
+            await self.nameResolver.resolveMAddress(expandedAddress)
+
+      debug "Expanded address and hostname",
+        expandedAddress = expandedAddress,
+        hostname = hostname,
+        resolvedAddresses = resolvedAddresses
+
+      for resolvedAddress in resolvedAddresses:
+        if not self.allowsDial(addrPeerId, resolvedAddress):
+          trace "Dial blocked by connection gater",
+            resolvedAddress, peerId = addrPeerId.get(default(PeerId))
+          continue
+        let key = $addrPeerId.get(default(PeerId)) & "|" & $resolvedAddress
+        if seen.hasKey(key):
+          continue
+        seen[key] = true
+        result.add(
+          ParallelDialAttempt(
+            peerId: addrPeerId,
+            hostname: hostname,
+            address: resolvedAddress,
+          )
+        )
+
+proc cancelParallelDialAttempt[T](fut: Future[T]) {.async: (raises: []).} =
+  if fut.isNil or fut.finished():
+    return
+  try:
+    await fut.cancelAndWait()
+  except CancelledError:
+    discard
+  except CatchableError:
+    discard
+
 method dialAndUpgrade*(
     self: Dialer,
     peerId: Opt[PeerId],
@@ -222,40 +285,52 @@ method dialAndUpgrade*(
   debug "Dialing peer", peerId = peerId.get(default(PeerId)), addrs
   var lastErr: ref CatchableError = nil
   var lastMsg = ""
-  let orderedAddrs = preferStableAddrs(addrs)
-  for rawAddress in orderedAddrs:
-    # resolve potential dnsaddr
-    let addresses = await self.expandDnsAddr(peerId, rawAddress)
-    for (expandedAddress, addrPeerId) in addresses:
-      # DNS resolution
-      let
-        hostname = expandedAddress.getHostname()
-        resolvedAddresses =
-          if isNil(self.nameResolver):
-            @[expandedAddress]
-          else:
-            await self.nameResolver.resolveMAddress(expandedAddress)
+  let attempts = await self.collectParallelDialAttempts(peerId, addrs)
+  if attempts.len == 0:
+    return nil
 
-      debug "Expanded address and hostname",
-        expandedAddress = expandedAddress,
-        hostname = hostname,
-        resolvedAddresses = resolvedAddresses
+  var futs: seq[Future[Muxer]] = @[]
+  futs.setLen(attempts.len)
+  for idx, attempt in attempts:
+    futs[idx] = self.dialAndUpgrade(
+      attempt.peerId,
+      attempt.hostname,
+      attempt.address,
+      dir,
+    )
 
-      for resolvedAddress in resolvedAddresses:
-        if not self.allowsDial(addrPeerId, resolvedAddress):
-          trace "Dial blocked by connection gater",
-            resolvedAddress, peerId = addrPeerId.get(default(PeerId))
+  var settled = newSeq[bool](futs.len)
+  var pending = futs.len
+  while pending > 0:
+    var winner = -1
+    for idx, fut in futs:
+      if settled[idx] or fut.isNil or not fut.finished():
+        continue
+      settled[idx] = true
+      dec pending
+      try:
+        let mux = fut.read()
+        if not isNil(mux):
+          result = mux
+          winner = idx
+          break
+      except CancelledError as exc:
+        lastErr = exc
+        lastMsg = exc.msg
+      except CatchableError as exc:
+        lastErr = exc
+        lastMsg = exc.msg
+    if winner >= 0:
+      var cancelFuts: seq[Future[void]] = @[]
+      for idx, fut in futs:
+        if idx == winner:
           continue
-        try:
-          result = await self.dialAndUpgrade(addrPeerId, hostname, resolvedAddress, dir)
-          if not isNil(result):
-            return result
-        except CancelledError as exc:
-          raise exc
-        except CatchableError as exc:
-          lastErr = exc
-          lastMsg = exc.msg
-          continue
+        cancelFuts.add(cancelParallelDialAttempt(fut))
+      if cancelFuts.len > 0:
+        await allFutures(cancelFuts)
+      return result
+    if pending > 0:
+      await sleepAsync(chronos.milliseconds(25))
 
   if lastMsg.len > 0:
     raise newException(DialFailedError, "all dial attempts failed: " & lastMsg, lastErr)
@@ -415,64 +490,14 @@ proc internalConnect(
           peerId = muxed.connection.peerId,
           protocol = muxed.connection.protocol,
           negotiated = muxed.connection.negotiatedMuxer
-        when defined(ohos):
-          proc finishOhosOutgoingIdentify() {.async: (raises: []).} =
-            try:
-              warn "internalConnect ohos async identify begin",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer
-              await self.peerStore.identify(muxed)
-              warn "internalConnect ohos async identify done",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer
-              await self.connManager.triggerPeerEvents(
-                muxed.connection.peerId,
-                PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-              )
-            except CancelledError:
-              discard
-            except CatchableError as exc:
-              warn "internalConnect ohos async identify failed",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer,
-                description = exc.msg
-          asyncSpawn finishOhosOutgoingIdentify()
-        else:
-          warn "internalConnect identify begin",
-            peerId = muxed.connection.peerId,
-            protocol = muxed.connection.protocol,
-            negotiated = muxed.connection.negotiatedMuxer
-          await self.peerStore.identify(muxed)
-          warn "internalConnect identify done",
-            peerId = muxed.connection.peerId,
-            protocol = muxed.connection.protocol,
-            negotiated = muxed.connection.negotiatedMuxer
-          await self.connManager.triggerPeerEvents(
-            muxed.connection.peerId,
-            PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-          )
-    else:
-      debug "internalConnect storeMuxer begin",
-        peerId = muxed.connection.peerId,
-        protocol = muxed.connection.protocol,
-        negotiated = muxed.connection.negotiatedMuxer
-      self.connManager.storeMuxer(muxed)
-      debug "internalConnect storeMuxer done",
-        peerId = muxed.connection.peerId,
-        protocol = muxed.connection.protocol,
-        negotiated = muxed.connection.negotiatedMuxer
-      when defined(ohos):
-        proc finishOhosOutgoingIdentify() {.async: (raises: []).} =
+        proc finishOutgoingIdentify() {.async: (raises: []).} =
           try:
-            warn "internalConnect ohos async identify begin",
+            warn "internalConnect async identify begin",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer
             await self.peerStore.identify(muxed)
-            warn "internalConnect ohos async identify done",
+            warn "internalConnect async identify done",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer
@@ -483,26 +508,46 @@ proc internalConnect(
           except CancelledError:
             discard
           except CatchableError as exc:
-            warn "internalConnect ohos async identify failed",
+            warn "internalConnect async identify failed",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer,
               description = exc.msg
-        asyncSpawn finishOhosOutgoingIdentify()
-      else:
-        warn "internalConnect identify begin",
-          peerId = muxed.connection.peerId,
-          protocol = muxed.connection.protocol,
-          negotiated = muxed.connection.negotiatedMuxer
-        await self.peerStore.identify(muxed)
-        warn "internalConnect identify done",
-          peerId = muxed.connection.peerId,
-          protocol = muxed.connection.protocol,
-          negotiated = muxed.connection.negotiatedMuxer
-        await self.connManager.triggerPeerEvents(
-          muxed.connection.peerId,
-          PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-        )
+        asyncSpawn finishOutgoingIdentify()
+    else:
+      debug "internalConnect storeMuxer begin",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
+      self.connManager.storeMuxer(muxed)
+      debug "internalConnect storeMuxer done",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
+      proc finishOutgoingIdentify() {.async: (raises: []).} =
+        try:
+          warn "internalConnect async identify begin",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          await self.peerStore.identify(muxed)
+          warn "internalConnect async identify done",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+          await self.connManager.triggerPeerEvents(
+            muxed.connection.peerId,
+            PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+          )
+        except CancelledError:
+          discard
+        except CatchableError as exc:
+          warn "internalConnect async identify failed",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer,
+            description = exc.msg
+      asyncSpawn finishOutgoingIdentify()
     return muxed
   except CancelledError as exc:
     await muxed.close()
@@ -612,6 +657,7 @@ method dial*(
     addrs: seq[MultiAddress],
     protos: seq[string],
     forceDial = false,
+    reuseConnection = true,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
   ## create a protocol stream and establish
   ## a connection if one doesn't exist already
@@ -630,7 +676,12 @@ method dial*(
 
   try:
     trace "Dialing (new)", peerId, protos
-    conn = await self.internalConnect(Opt.some(peerId), addrs, forceDial)
+    conn = await self.internalConnect(
+      Opt.some(peerId),
+      addrs,
+      forceDial,
+      reuseConnection,
+    )
     trace "Opening stream", conn
     stream = await self.connManager.getStream(conn)
 

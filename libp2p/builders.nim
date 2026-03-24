@@ -26,11 +26,7 @@ import
   crypto/crypto,
   transports/[transport, tcptransport, memorytransport],
   muxers/[muxer, mplex/mplex, yamux/yamux],
-  protocols/[
-    identify,
-    secure/secure,
-    secure/noise,
-  ]
+  protocols/[identify, secure/secure, secure/noise]
 when not defined(libp2p_no_tls):
   import protocols/secure/tls
   import transports/wstransport
@@ -737,6 +733,9 @@ proc withCircuitRelay*(b: SwitchBuilder, r: Relay = Relay.new()): SwitchBuilder 
   b.circuitRelay = Opt.some(r)
   b
 
+proc hasCircuitRelay*(b: SwitchBuilder): bool {.public.} =
+  not b.isNil and b.circuitRelay.isSome
+
 proc withRendezVous*(
     b: SwitchBuilder, rdv: RendezVous = RendezVous.new()
 ): SwitchBuilder =
@@ -786,6 +785,7 @@ proc withWanBootstrapService*(
 proc withWanBootstrapProfile*(
     b: SwitchBuilder,
     config: WanBootstrapConfig = WanBootstrapConfig.init(),
+    hpConfig: HPServiceConfig = HPServiceConfig.init(),
 ): SwitchBuilder {.public.} =
   if b.rng.isNil:
     b.rng = newRng()
@@ -812,7 +812,7 @@ proc withWanBootstrapProfile*(
     let autoRelaySvc = AutoRelayService.new(1, relayClient, nil, nextBuilder.rng)
     let autonatSvc =
       AutonatService.new(AutonatClient(), nextBuilder.rng, enableAddressMapper = false)
-    let hpSvc = HPService.new(autonatSvc, autoRelaySvc)
+    let hpSvc = HPService.new(autonatSvc, autoRelaySvc, config = hpConfig)
     nextBuilder.services.keepItIf(not (it of HPService))
     nextBuilder.services.add(hpSvc)
     nextBuilder
@@ -841,6 +841,7 @@ proc withMobileFullP2PProfile*(
     resourceSource: NodeResourceCollectorSource = NodeResourceCollectorSource(),
     mobileMeshConfig: MobileMeshServiceConfig = MobileMeshServiceConfig.init(),
     maxNumRelays = 2,
+    hpConfig: HPServiceConfig = HPServiceConfig.init(),
 ): SwitchBuilder {.public, raises: [LPError].} =
   if b.rng.isNil:
     b.rng = newRng()
@@ -878,11 +879,10 @@ proc withMobileFullP2PProfile*(
   let relayClient = RelayClient.new()
   discard b.withCircuitRelay(relayClient)
 
-  let autoRelaySvc =
-    AutoRelayService.new(max(1, maxNumRelays), relayClient, nil, b.rng)
+  let autoRelaySvc = AutoRelayService.new(max(1, maxNumRelays), relayClient, nil, b.rng)
   let autonatSvc =
     AutonatService.new(AutonatClient(), b.rng, enableAddressMapper = false)
-  let hpSvc = HPService.new(autonatSvc, autoRelaySvc)
+  let hpSvc = HPService.new(autonatSvc, autoRelaySvc, config = hpConfig)
   b.services.keepItIf(not (it of HPService))
   b.services.add(hpSvc)
   b

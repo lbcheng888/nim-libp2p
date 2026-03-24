@@ -24,6 +24,7 @@ const BufferStreamTrackerName* = "BufferStream"
 type BufferStream* = ref object of Connection
   readQueue*: AsyncQueue[seq[byte]] # read queue for managing backpressure
   readBuf: ZeroQueue # zero queue buffer for readOnce
+  pushLock: AsyncLock
   pushing*: bool # number of ongoing push operations
   reading*: bool # is there an ongoing read? (only allow one)
   pushedEof*: bool # eof marker has been put on readQueue
@@ -52,6 +53,7 @@ method initStream*(s: BufferStream) =
   procCall Connection(s).initStream()
 
   s.readQueue = newAsyncQueue[seq[byte]](1)
+  s.pushLock = newAsyncLock()
 
   trace "BufferStream created", s
 
@@ -69,41 +71,66 @@ method pushData*(
   ## `pushTo` will block if the queue is full, thus maintaining backpressure.
   ##
 
-  doAssert(not s.pushing, "Only one concurrent push allowed for stream " & s.shortLog())
-
-  if s.isClosed or s.pushedEof:
-    raise newLPStreamClosedError()
-
-  if data.len == 0:
-    return # Don't push 0-length buffers, these signal EOF
-
-  # We will block here if there is already data queued, until it has been
-  # processed
   try:
-    s.pushing = true
-    trace "Pushing data", s, data = data.len
-    await s.readQueue.addLast(data)
+    await s.pushLock.acquire()
+  except AsyncLockError as exc:
+    raiseAssert("failed to acquire BufferStream push lock: " & exc.msg)
+
+  try:
+    if s.isClosed or s.pushedEof:
+      raise newLPStreamClosedError()
+
+    doAssert(not s.pushing, "Only one concurrent push allowed for stream " & s.shortLog())
+
+    if data.len == 0:
+      return # Don't push 0-length buffers, these signal EOF
+
+    # We will block here if there is already data queued, until it has been
+    # processed
+    try:
+      s.pushing = true
+      trace "Pushing data", s, data = data.len
+      await s.readQueue.addLast(data)
+    finally:
+      s.pushing = false
   finally:
-    s.pushing = false
+    try:
+      s.pushLock.release()
+    except AsyncLockError:
+      discard
 
 method pushEof*(
     s: BufferStream
 ) {.base, async: (raises: [CancelledError, LPStreamError]).} =
-  if s.pushedEof:
-    return
-
-  doAssert(not s.pushing, "Only one concurrent push allowed for stream " & s.shortLog())
-
-  s.pushedEof = true
-
-  # We will block here if there is already data queued, until it has been
-  # processed
   try:
-    s.pushing = true
-    trace "Pushing EOF", s
-    await s.readQueue.addLast(Eof)
+    await s.pushLock.acquire()
+  except AsyncLockError as exc:
+    raiseAssert("failed to acquire BufferStream push lock: " & exc.msg)
+
+  try:
+    if s.pushedEof:
+      return
+
+    s.pushedEof = true
+
+    if s.isClosed:
+      raise newLPStreamClosedError()
+
+    doAssert(not s.pushing, "Only one concurrent push allowed for stream " & s.shortLog())
+
+    # We will block here if there is already data queued, until it has been
+    # processed
+    try:
+      s.pushing = true
+      trace "Pushing EOF", s
+      await s.readQueue.addLast(Eof)
+    finally:
+      s.pushing = false
   finally:
-    s.pushing = false
+    try:
+      s.pushLock.release()
+    except AsyncLockError:
+      discard
 
 method atEof*(s: BufferStream): bool =
   s.isEof and s.readBuf.isEmpty

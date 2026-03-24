@@ -35,8 +35,11 @@ proc new*(
   ) {.async: (raises: [CancelledError]).} =
     var peerDialableAddrs: seq[MultiAddress]
     try:
-      let connectMsg = DcutrMsg.decode(await stream.readLp(1024))
-      debug "Dcutr receiver received a Connect message.", connectMsg
+      let connectMsg = DcutrMsg.decode(await stream.readLp(DcutrMsgMaxSize))
+      connectMsg.expectMsgType(MsgType.Connect)
+      info "Dcutr receiver received Connect", peerId = stream.peerId,
+        remoteAddrCount = connectMsg.addrs.len,
+        remoteAddrs = addrsForLog(connectMsg.addrs)
 
       var ourAddrs = switch.peerStore.getMostObservedProtosAndPorts()
         # likely empty when the peer is reachable
@@ -44,25 +47,25 @@ proc new*(
         # this list should be the same as the peer's public addrs when it is reachable
         ourAddrs =
           switch.peerInfo.listenAddrs.mapIt(switch.peerStore.guessDialableAddr(it))
-      var ourDialableAddrs = getHolePunchableAddrs(ourAddrs)
+      let ourDialableAddrs = getHolePunchableAddrs(ourAddrs, maxDialableAddrs)
       if ourDialableAddrs.len == 0:
-        debug "Dcutr receiver has no supported dialable addresses. Aborting Dcutr.",
-          ourAddrs
+        info "Dcutr receiver has no supported dialable addresses. Aborting Dcutr.",
+          ourAddrs = addrsForLog(ourAddrs)
         return
 
-      await stream.send(MsgType.Connect, ourAddrs)
-      debug "Dcutr receiver has sent a Connect message back."
-      let syncMsg = DcutrMsg.decode(await stream.readLp(1024))
-      debug "Dcutr receiver has received a Sync message.", syncMsg
+      await stream.send(MsgType.Connect, ourDialableAddrs)
+      info "Dcutr receiver sent Connect", peerId = stream.peerId,
+        localAddrCount = ourDialableAddrs.len,
+        localAddrs = addrsForLog(ourDialableAddrs)
+      let syncMsg = DcutrMsg.decode(await stream.readLp(DcutrMsgMaxSize))
+      syncMsg.expectMsgType(MsgType.Sync)
+      info "Dcutr receiver received Sync", peerId = stream.peerId
 
-      peerDialableAddrs = getHolePunchableAddrs(connectMsg.addrs)
+      peerDialableAddrs = getHolePunchableAddrs(connectMsg.addrs, maxDialableAddrs)
       if peerDialableAddrs.len == 0:
-        debug "Dcutr initiator has no supported dialable addresses to connect to. Aborting Dcutr.",
-          addrs = connectMsg.addrs
+        info "Dcutr initiator has no supported dialable addresses to connect to. Aborting Dcutr.",
+          addrs = addrsForLog(connectMsg.addrs)
         return
-
-      if peerDialableAddrs.len > maxDialableAddrs:
-        peerDialableAddrs = peerDialableAddrs[0 ..< maxDialableAddrs]
       var futs = peerDialableAddrs.mapIt(
         switch.connect(
           stream.peerId,
@@ -74,7 +77,9 @@ proc new*(
       )
       try:
         discard await anyCompleted(futs).wait(connectTimeout)
-        debug "Dcutr receiver has directly connected to the remote peer."
+        info "Dcutr receiver simultaneous dial succeeded", peerId = stream.peerId,
+          remoteAddrCount = peerDialableAddrs.len,
+          remoteAddrs = addrsForLog(peerDialableAddrs)
       finally:
         for fut in futs:
           fut.cancel()
@@ -82,11 +87,15 @@ proc new*(
       trace "cancelled Dcutr receiver"
       raise err
     except AllFuturesFailedError as err:
-      debug "Dcutr receiver could not connect to the remote peer, " &
-        "all connect attempts failed", peerDialableAddrs, description = err.msg
+      warn "Dcutr receiver could not connect to the remote peer, " &
+        "all connect attempts failed",
+        peerDialableAddrs = addrsForLog(peerDialableAddrs),
+        description = err.msg
     except AsyncTimeoutError as err:
-      debug "Dcutr receiver could not connect to the remote peer, " &
-        "all connect attempts timed out", peerDialableAddrs, description = err.msg
+      warn "Dcutr receiver could not connect to the remote peer, " &
+        "all connect attempts timed out",
+        peerDialableAddrs = addrsForLog(peerDialableAddrs),
+        description = err.msg
     except CatchableError as err:
       warn "Unexpected error when Dcutr receiver tried to connect " &
         "to the remote peer", description = err.msg

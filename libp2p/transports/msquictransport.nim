@@ -2965,6 +2965,7 @@ method dial*(
     peerId: Opt[PeerId] = Opt.none(PeerId)
   ): Future[Connection] {.gcsafe, async: (raises: [basetransport.TransportError, CancelledError]).} =
   self.ensureRunning()
+  warn "MsQuicTransport dial begin", address = $address, hostname = hostname
 
   let split = splitTransportAddress(address)
   if split.isErr:

@@ -43,18 +43,18 @@ const
 
 {.emit: """
 static void libp2p_set_alpn(br_ssl_engine_context *ctx, const char *const *names, size_t num) {
-  br_ssl_engine_set_protocol_names(ctx, names, num);
+  br_ssl_engine_set_protocol_names(ctx, (const char *const *)names, num);
 }
 """.}
 
 proc libp2pSetAlpn(
-    ctx: ptr SslEngineContext, names: cstringArray, num: csize_t
+    ctx: ptr SslEngineContext, names: pointer, num: csize_t
 ) {.importc: "libp2p_set_alpn", header: "bearssl_ssl.h".}
 
 template applyAlpn(
     engine: var SslEngineContext, alpnPtr: cstringArray, count: Natural
 ) =
-  libp2pSetAlpn(addr engine, alpnPtr, csize_t(count))
+  libp2pSetAlpn(addr engine, cast[pointer](alpnPtr), csize_t(count))
 
 type
   TLSError* = object of LPStreamError

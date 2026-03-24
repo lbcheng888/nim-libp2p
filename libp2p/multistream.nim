@@ -27,6 +27,28 @@ const
   Na = "na\n"
   Ls = "ls\n"
 
+template protocolSelectWriteTimeout(): untyped =
+  chronos.seconds(15)
+
+template protocolSelectReadTimeout(): untyped =
+  chronos.seconds(15)
+
+template writeLpWithin(
+    conn: Connection,
+    payload: untyped,
+    timeout: Duration,
+    stage: string
+): untyped =
+  block:
+    let writeFuture = conn.writeLp(payload)
+    let writeReady = await withTimeout(writeFuture, timeout)
+    if not writeReady:
+      writeFuture.cancelSoon()
+      raise (ref MultiStreamError)(
+        msg: "MultistreamSelect " & stage & " write timeout"
+      )
+    await writeFuture
+
 type
   Matcher* = proc(proto: string): bool {.gcsafe, raises: [].}
 
@@ -51,6 +73,84 @@ type
   ProtocolSelectMessage = object
     version: uint32
     protocols: seq[string]
+
+proc readSmallLpWithin(
+    conn: Connection,
+    maxSize: int,
+    timeout: Duration,
+    stage: string,
+): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
+  let deadline = Moment.now() + timeout
+  let maxLen = uint64(if maxSize < 0: int.high else: maxSize)
+  let readChunkSize =
+    if maxSize < 0:
+      MsgSize + 10
+    else:
+      max(maxSize + 10, 64)
+  var buffer: seq[byte] = @[]
+
+  while true:
+    if buffer.len > 0:
+      var consumed = 0
+      var length = 0'u64
+      let decodeRes = PB.getUVarint(buffer.toOpenArray(0, buffer.high), consumed, length)
+      if decodeRes.isOk():
+        if length > maxLen:
+          raise (ref MultiStreamError)(
+            msg: "MultistreamSelect " & stage & " exceeds maximum length"
+          )
+        if length == 0'u64:
+          return @[]
+        if length > uint64(high(int)):
+          raise (ref MultiStreamError)(
+            msg: "MultistreamSelect " & stage & " exceeds host allocation capacity"
+          )
+        let total = consumed + int(length)
+        if buffer.len >= total:
+          return buffer[consumed ..< total]
+      elif decodeRes.error() != VarintError.Incomplete:
+        raise (ref MultiStreamError)(
+          msg: "MultistreamSelect " & stage & " invalid length prefix"
+        )
+
+    let remaining = deadline - Moment.now()
+    if remaining <= chronos.milliseconds(0):
+      raise (ref MultiStreamError)(
+        msg: "MultistreamSelect " & stage & " read timeout"
+      )
+
+    var chunk = newSeqUninit[byte](readChunkSize)
+    let readFuture = conn.readOnce(addr chunk[0], chunk.len)
+    let readReady = await withTimeout(readFuture, remaining)
+    if not readReady:
+      readFuture.cancelSoon()
+      raise (ref MultiStreamError)(
+        msg: "MultistreamSelect " & stage & " read timeout"
+      )
+    let readCount = await readFuture
+    if readCount <= 0:
+      raise (ref MultiStreamError)(
+        msg: "MultistreamSelect " & stage & " empty read"
+      )
+    chunk.setLen(readCount)
+    buffer.add(chunk)
+
+proc readLpMessageWithin(
+    conn: Connection,
+    maxSize: int,
+    timeout: Duration,
+    stage: string,
+): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
+  await readSmallLpWithin(conn, maxSize, timeout, stage)
+
+template readLpWithin(
+    conn: Connection,
+    size: int,
+    timeout: Duration,
+    stage: string
+): untyped =
+  block:
+    await readLpMessageWithin(conn, size, timeout, stage)
 
 proc encodeProtocolSelect(protocols: openArray[string]): ProtoBuffer =
   var pb = initProtoBuffer()
@@ -223,23 +323,14 @@ proc performDialerHandshake(
   when defined(libp2p_msquic_debug):
     debug "multistream dialer sent v1", conn
 
-  if attemptV2:
-    trace "requesting multistream v2", conn
-    await writeHandshakeWithTimeout(CodecV2 & "\n", "response2")
-    when defined(ohos):
-      warn "multistream dialer sent handshake v2", conn
-    when defined(libp2p_msquic_debug):
-      debug "multistream dialer sent v2", conn
-
-  let response1Future = conn.readLp(MsgSize)
-  let response1Ready = await withTimeout(response1Future, handshakeReadTimeout)
-  if not response1Ready:
-    response1Future.cancelSoon()
-    when defined(ohos):
-      warn "multistream dialer handshake response1 timeout", conn,
-        timeoutMs = handshakeReadTimeout.milliseconds
-    raise (ref MultiStreamError)(msg: "MultistreamSelect handshake response1 timeout")
-  let response1 = await response1Future
+  let response1 =
+    try:
+      await readLpMessageWithin(conn, MsgSize, handshakeReadTimeout, "handshake response1")
+    except MultiStreamError as exc:
+      when defined(ohos):
+        warn "multistream dialer handshake response1 timeout", conn,
+          timeoutMs = handshakeReadTimeout.milliseconds
+      raise exc
   warn "multistream dialer got handshake response1", conn, bytes = response1.len
   var handshake = string.fromBytes(response1)
   when defined(libp2p_msquic_debug):
@@ -253,15 +344,20 @@ proc performDialerHandshake(
   var version = msv1
 
   if attemptV2:
-    let response2Future = conn.readLp(MsgSize)
-    let response2Ready = await withTimeout(response2Future, handshakeReadTimeout)
-    if not response2Ready:
-      response2Future.cancelSoon()
-      when defined(ohos):
-        warn "multistream dialer handshake response2 timeout", conn,
-          timeoutMs = handshakeReadTimeout.milliseconds
-      raise (ref MultiStreamError)(msg: "MultistreamSelect handshake response2 timeout")
-    let response2 = await response2Future
+    trace "requesting multistream v2", conn
+    await writeHandshakeWithTimeout(CodecV2 & "\n", "response2")
+    when defined(ohos):
+      warn "multistream dialer sent handshake v2", conn
+    when defined(libp2p_msquic_debug):
+      debug "multistream dialer sent v2", conn
+    let response2 =
+      try:
+        await readLpMessageWithin(conn, MsgSize, handshakeReadTimeout, "handshake response2")
+      except MultiStreamError as exc:
+        when defined(ohos):
+          warn "multistream dialer handshake response2 timeout", conn,
+            timeoutMs = handshakeReadTimeout.milliseconds
+        raise exc
     warn "multistream dialer got handshake response2", conn, bytes = response2.len
     var v2Response = string.fromBytes(response2)
     when defined(libp2p_msquic_debug):
@@ -301,9 +397,19 @@ proc attemptProtocolSelectDialer(
     return (psNoMatch, "", currentPermit)
 
   let psMessage = encodeProtocolSelect(proto)
-  await conn.writeLp(psMessage.buffer)
+  writeLpWithin(
+    conn,
+    psMessage.buffer,
+    protocolSelectWriteTimeout(),
+    "protocol_select",
+  )
 
-  let response = await conn.readLp(MsgSize)
+  let response = readLpWithin(
+    conn,
+    MsgSize,
+    protocolSelectReadTimeout(),
+    "protocol_select",
+  )
   if response.len == 0 or response[0] == byte('/'):
     trace "protocol select remote fallback detected", conn
     return (psUnsupported, "", currentPermit)
@@ -418,7 +524,12 @@ proc select*(
     let firstProto = proto[0]
     trace "selecting proto", conn, proto = firstProto
     try:
-      await conn.writeLp(firstProto & "\n")
+      writeLpWithin(
+        conn,
+        firstProto & "\n",
+        protocolSelectWriteTimeout(),
+        "select_first_proto",
+      )
     except CancelledError as exc:
       releasePermit(firstPermit)
       raise exc
@@ -426,7 +537,14 @@ proc select*(
       releasePermit(firstPermit)
       raise exc
 
-    var response = string.fromBytes(await conn.readLp(MsgSize))
+    var response = string.fromBytes(
+      readLpWithin(
+        conn,
+        MsgSize,
+        protocolSelectReadTimeout(),
+        "select_first_proto",
+      )
+    )
     validateSuffix(response)
 
     if response == firstProto:
@@ -459,7 +577,12 @@ proc select*(
       var permit = permitAttempt.permit
       trace "selecting proto", conn, proto = p
       try:
-        await conn.writeLp(p & "\n")
+        writeLpWithin(
+          conn,
+          p & "\n",
+          protocolSelectWriteTimeout(),
+          "select_proto",
+        )
       except CancelledError as exc:
         releasePermit(permit)
         raise exc
@@ -467,7 +590,14 @@ proc select*(
         releasePermit(permit)
         raise exc
 
-      var response = string.fromBytes(await conn.readLp(MsgSize))
+      var response = string.fromBytes(
+        readLpWithin(
+          conn,
+          MsgSize,
+          protocolSelectReadTimeout(),
+          "select_proto",
+        )
+      )
       validateSuffix(response)
       if response == p:
         trace "selected protocol", conn, protocol = response

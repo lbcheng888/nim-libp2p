@@ -208,13 +208,31 @@ suite "Mobile mesh service":
 
   test "mobile full p2p builder wires required services":
     let builder = SwitchBuilder.new().withRng(newRng())
+    let hpCfg = HPServiceConfig.init(
+      directProbeTimeout = 3.seconds,
+      maxProbeCandidates = 4,
+      keepaliveInterval = 7.seconds,
+      relayCloseDelay = 1.seconds,
+      upgradeDelay = 200.milliseconds,
+      dcutrConnectTimeout = 12.seconds,
+      maxDcutrDialableAddrs = 5,
+    )
 
     when defined(libp2p_msquic_experimental) or defined(libp2p_quic_support):
-      let sw = builder.withMobileFullP2PProfile(dataDir = "/tmp/mobile-full").build()
+      let sw =
+        builder.withMobileFullP2PProfile(dataDir = "/tmp/mobile-full", hpConfig = hpCfg).build()
       check sw.getNodeResourceService() != nil
       check sw.getMobileMeshService() != nil
       check sw.services.anyIt(it of HPService)
-      check sw.transports.len == 1
+      let hpSvc = HPService(sw.services.filterIt(it of HPService)[0])
+      check hpSvc.config.directProbeTimeout == 3.seconds
+      check hpSvc.config.maxProbeCandidates == 4
+      check hpSvc.config.keepaliveInterval == 7.seconds
+      check hpSvc.config.relayCloseDelay == 1.seconds
+      check hpSvc.config.upgradeDelay == 200.milliseconds
+      check hpSvc.config.dcutrConnectTimeout == 12.seconds
+      check hpSvc.config.maxDcutrDialableAddrs == 5
+      check sw.transports.len == 2
       check sw.peerInfo.listenAddrs.len == 1
       check ($sw.peerInfo.listenAddrs[0]).contains("/quic")
     else:

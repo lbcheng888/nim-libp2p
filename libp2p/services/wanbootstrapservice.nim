@@ -93,6 +93,7 @@ type
     role*: WanBootstrapRole
     journalPath*: string
     authoritativePeerIds*: seq[string]
+    deferAutoJoinUntilRelayReady*: bool
     exactSeedDialPolicy*: ExactSeedDialPolicy
     peerStoreTtl*: Duration
     maxBootstrapCandidates*: int
@@ -199,6 +200,7 @@ type
   WanBootstrapService* = ref object of Service
     switch*: Switch
     config*: WanBootstrapConfig
+    startupRelayReady: bool
     hints: Table[PeerId, seq[MultiAddress]]
     hintSources: Table[PeerId, seq[string]]
     lastSeen: Table[PeerId, int64]
@@ -414,6 +416,7 @@ proc init*(
     role = WanBootstrapRole.publicNode,
     journalPath = "",
     authoritativePeerIds: seq[string] = @[],
+    deferAutoJoinUntilRelayReady = false,
     exactSeedDialPolicy = ExactSeedDialPolicy.serial,
     peerStoreTtl = 30.minutes,
     maxBootstrapCandidates = DefaultWanBootstrapCandidates,
@@ -453,6 +456,7 @@ proc init*(
     role: role,
     journalPath: journalPath,
     authoritativePeerIds: authoritativePeerIds,
+    deferAutoJoinUntilRelayReady: deferAutoJoinUntilRelayReady,
     exactSeedDialPolicy: resolvedExactSeedDialPolicy,
     peerStoreTtl: clampDuration(peerStoreTtl, 30.minutes),
     maxBootstrapCandidates: max(1, maxBootstrapCandidates),
@@ -485,6 +489,7 @@ proc new*(
 ): T =
   T(
     config: config,
+    startupRelayReady: not config.deferAutoJoinUntilRelayReady,
     hints: initTable[PeerId, seq[MultiAddress]](),
     hintSources: initTable[PeerId, seq[string]](),
     lastSeen: initTable[PeerId, int64](),
@@ -961,6 +966,28 @@ proc peerCurrentlyConnected(
     return false
   peerId in svc.connectedPeerIds()
 
+proc awaitConnectFutureOrPeerConnected[T](
+    svc: WanBootstrapService,
+    fut: Future[T],
+    peerId: PeerId,
+    timeout: Duration,
+): Future[tuple[completed: bool, observedConnected: bool]] {.async: (raises: [CancelledError]).} =
+  if fut.isNil:
+    return (false, false)
+  if fut.finished():
+    return (true, false)
+  if svc.peerCurrentlyConnected(peerId):
+    return (false, true)
+  let deadline = Moment.now() + timeout
+  while not fut.finished():
+    if svc.peerCurrentlyConnected(peerId):
+      return (false, true)
+    let remaining = deadline - Moment.now()
+    if remaining <= chronos.milliseconds(0):
+      return (false, false)
+    await sleepAsync(min(chronos.milliseconds(50), remaining))
+  (true, false)
+
 proc sortBootstrapCandidates(candidates: var seq[WanBootstrapCandidate]) =
   candidates.sort(compareBootstrapCandidates)
 
@@ -1285,6 +1312,8 @@ proc bootstrapStateJson*(
   result["exactSeedDialPolicy"] = %exactSeedDialPolicyLabel(snapshot.exactSeedDialPolicy)
   result["exactSeedAddrFallbackAllowed"] = %(snapshot.exactSeedDialPolicy != ExactSeedDialPolicy.single)
   result["exactSeedParallelDial"] = %(snapshot.exactSeedDialPolicy == ExactSeedDialPolicy.parallel)
+  result["deferAutoJoinUntilRelayReady"] = %svc.config.deferAutoJoinUntilRelayReady
+  result["startupRelayReady"] = %svc.startupRelayReady
   result["running"] = %snapshot.running
   result["journalLoaded"] = %snapshot.journalLoaded
   result["journalDirty"] = %snapshot.journalDirty
@@ -1468,9 +1497,23 @@ proc refreshFromDnsaddrFallback*(
 proc rendezvousPeers(svc: WanBootstrapService): seq[PeerId] =
   if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
     return @[]
+  var seen = initHashSet[string]()
+  for authoritativePeerId in svc.config.authoritativePeerIds:
+    let normalized = authoritativePeerId.strip()
+    if normalized.len == 0 or seen.contains(normalized):
+      continue
+    let parsed = PeerId.init(normalized).valueOr:
+      continue
+    seen.incl(normalized)
+    result.add(parsed)
   let protoBook = svc.switch.peerStore[ProtoBook]
   for peerId in svc.connectedPeerIds():
-    if supportsRendezvousCodecs(protoBook[peerId]) or svc.isAuthoritativePeer(peerId):
+    let text = peerIdText(peerId)
+    if seen.contains(text):
+      continue
+    let protos = protoBook[peerId]
+    if protos.len == 0 or supportsRendezvousCodecs(protos) or svc.isAuthoritativePeer(peerId):
+      seen.incl(text)
       result.add(peerId)
 
 proc supportsSnapshot(svc: WanBootstrapService, peerId: PeerId): bool =
@@ -1478,7 +1521,8 @@ proc supportsSnapshot(svc: WanBootstrapService, peerId: PeerId): bool =
     return false
   if svc.isAuthoritativePeer(peerId):
     return true
-  svc.config.snapshotCodec in svc.switch.peerStore[ProtoBook][peerId]
+  let protos = svc.switch.peerStore[ProtoBook][peerId]
+  protos.len == 0 or svc.config.snapshotCodec in protos
 
 proc defaultJoinResult(): WanBootstrapJoinResult {.inline.} =
   WanBootstrapJoinResult(timestampMs: nowMillis())
@@ -1700,11 +1744,12 @@ proc refreshBootstrapState*(
   if not svc.switch.isNil and svc.connectedPeerIds().len == 0 and svc.config.enableDnsaddrFallback:
     report.dnsaddrImported = await svc.refreshFromDnsaddrFallback()
     result += report.dnsaddrImported
-  if svc.connectedPeerIds().len > 0:
+  if svc.rendezvousPeers().len > 0:
     report.rendezvousAdvertised = await svc.advertiseRendezvousNamespaces()
     result += report.rendezvousAdvertised
     report.rendezvousImported = await svc.refreshFromRendezvousNamespaces()
     result += report.rendezvousImported
+  if svc.connectedPeerIds().len > 0:
     report.snapshotImported = await svc.refreshFromBootstrapSnapshots()
     result += report.snapshotImported
   report.totalImported =
@@ -1751,6 +1796,7 @@ proc attestConnectedPeer(
   if svc.config.attestPeer.isNil:
     return (true, trusted)
   try:
+    warn "wan bootstrap attestation begin", peerId = candidate.peerId, stage = stage
     let trust = await svc.config.attestPeer(
       svc.switch,
       candidate.peerId,
@@ -1759,6 +1805,7 @@ proc attestConnectedPeer(
       candidate.trust,
       stage,
     )
+    warn "wan bootstrap attestation completed", peerId = candidate.peerId, stage = stage, trust = trust
     svc.recordAttestationResult(trust)
     if trust == rejected:
       await svc.switch.disconnect(candidate.peerId)
@@ -1800,6 +1847,10 @@ proc finalizeBootstrapConnectedCandidate(
     stage: string,
     attemptedAddr: string,
 ): Future[WanBootstrapDialOutcome] {.async: (raises: [CancelledError]).} =
+  warn "wan bootstrap finalize connected candidate begin",
+    peerId = candidate.peerId,
+    stage = stage,
+    attemptedAddr = attemptedAddr
   let provisionalTrust =
     if svc.config.attestPeer.isNil:
       trusted
@@ -1822,6 +1873,10 @@ proc finalizeBootstrapConnectedCandidate(
   if not accepted:
     svc.trustBuckets[candidate.peerId] = rejected
     discard svc.markBootstrapSeen(candidate.peerId, trust = rejected)
+    warn "wan bootstrap finalize connected candidate rejected",
+      peerId = candidate.peerId,
+      stage = stage,
+      attemptedAddr = attemptedAddr
     return WanBootstrapDialOutcome(
       connected: false,
       attemptedAddr: attemptedAddr,
@@ -1831,6 +1886,11 @@ proc finalizeBootstrapConnectedCandidate(
     svc.trustBuckets.getOrDefault(candidate.peerId, quarantine), attestedTrust
   )
   discard svc.markBootstrapSeen(candidate.peerId, trust = attestedTrust)
+  warn "wan bootstrap finalize connected candidate completed",
+    peerId = candidate.peerId,
+    stage = stage,
+    attemptedAddr = attemptedAddr,
+    trust = attestedTrust
   WanBootstrapDialOutcome(connected: true, attemptedAddr: attemptedAddr)
 
 proc connectBootstrapCandidate(
@@ -1877,35 +1937,23 @@ proc dialBootstrapCandidateExactAddr(
       await svc.switch.disconnect(candidate.peerId)
     except CatchableError:
       discard
+  var connectAddr = dialAddr
   if isExactPeerMultiaddr(dialAddr):
-    let fut = svc.switch.connect(dialAddr, allowUnknownPeerId = true)
-    let completed = await withTimeout(fut, timeout)
-    if not completed:
-      fut.cancelSoon()
+    let extracted = extractSeedPeer(dialAddr)
+    if extracted.isNone:
       return WanBootstrapDialOutcome(
         connected: false,
         attemptedAddr: attemptedAddr,
-        error: "timeout",
+        error: "invalid_exact_multiaddr",
       )
-    try:
-      let resolvedPeerId = await fut
-      if resolvedPeerId != candidate.peerId:
-        try:
-          await svc.switch.disconnect(resolvedPeerId)
-        except CatchableError:
-          discard
-        return WanBootstrapDialOutcome(
-          connected: false,
-          attemptedAddr: attemptedAddr,
-          error: "peer_id_mismatch",
-        )
-      return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
-    except CatchableError as exc:
+    let (resolvedPeerId, baseAddr) = extracted.get()
+    if resolvedPeerId != candidate.peerId:
       return WanBootstrapDialOutcome(
         connected: false,
         attemptedAddr: attemptedAddr,
-        error: if exc.msg.len > 0: exc.msg else: $exc.name,
+        error: "peer_id_mismatch",
       )
+    connectAddr = baseAddr
   var hadOriginalAddrs = false
   var originalAddrs: seq[MultiAddress] = @[]
   let peerStore = svc.switch.peerStore
@@ -1913,12 +1961,23 @@ proc dialBootstrapCandidateExactAddr(
     try:
       originalAddrs = peerStore[AddressBook][candidate.peerId]
       hadOriginalAddrs = peerStore[AddressBook].contains(candidate.peerId)
-      peerStore.setAddresses(candidate.peerId, @[dialAddr])
+      peerStore.setAddresses(candidate.peerId, @[connectAddr])
     except CatchableError:
       hadOriginalAddrs = false
       originalAddrs = @[]
-  let fut = svc.switch.connect(candidate.peerId, @[dialAddr], forceDial = true)
-  let completed = await withTimeout(fut, timeout)
+  let fut = svc.switch.connect(candidate.peerId, @[connectAddr], forceDial = true)
+  let waitRes = await svc.awaitConnectFutureOrPeerConnected(
+    fut,
+    candidate.peerId,
+    timeout,
+  )
+  warn "wan bootstrap exact dial wait completed",
+    peerId = candidate.peerId,
+    stage = stage,
+    attemptedAddr = attemptedAddr,
+    completed = waitRes.completed,
+    observedConnected = waitRes.observedConnected,
+    timeoutMs = timeout.milliseconds.int
   if not peerStore.isNil:
     try:
       if hadOriginalAddrs:
@@ -1927,13 +1986,15 @@ proc dialBootstrapCandidateExactAddr(
         discard peerStore[AddressBook].del(candidate.peerId)
     except CatchableError:
       discard
-  if not completed:
+  if not waitRes.completed and not waitRes.observedConnected:
     fut.cancelSoon()
     return WanBootstrapDialOutcome(
       connected: false,
       attemptedAddr: attemptedAddr,
       error: "timeout",
     )
+  if waitRes.observedConnected:
+    return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
   try:
     await fut
     return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
@@ -1990,7 +2051,17 @@ proc connectBootstrapCandidateExact(
           fut.cancelSoon()
   var lastOutcome = WanBootstrapDialOutcome(connected: false, error: "all_attempts_failed")
   for addr in ordered:
+    warn "wan bootstrap exact dial begin",
+      peerId = candidate.peerId,
+      stage = stage,
+      attemptedAddr = $addr
     lastOutcome = await svc.dialBootstrapCandidateExactAddr(candidate, stage, addr)
+    warn "wan bootstrap exact dial completed",
+      peerId = candidate.peerId,
+      stage = stage,
+      attemptedAddr = $addr,
+      connected = lastOutcome.connected,
+      error = lastOutcome.error
     if lastOutcome.connected:
       return lastOutcome
   lastOutcome
@@ -2034,6 +2105,7 @@ proc joinViaSeedBootstrapImpl(
     peerId: PeerId,
     addrs: seq[MultiAddress],
     source = "seeded_join",
+    syncConnectedState = true,
 ): Future[WanBootstrapJoinResult] {.async: (raises: [CancelledError]).} =
   result = WanBootstrapJoinResult(
     attempts: @[],
@@ -2071,7 +2143,18 @@ proc joinViaSeedBootstrapImpl(
     signedPeerRecordSeen: signedPeerRecordSeen,
   )
 
+  warn "wan bootstrap seeded exact connect begin",
+    peerId = peerId,
+    source = effectiveSource,
+    addrCount = normalized.len,
+    syncConnectedState = syncConnectedState
   let outcome = await svc.connectBootstrapCandidateExact(candidate, "seeded_direct_hint")
+  warn "wan bootstrap seeded exact connect completed",
+    peerId = peerId,
+    source = effectiveSource,
+    connected = outcome.connected,
+    attemptedAddr = outcome.attemptedAddr,
+    error = outcome.error
   result.attempts.add(
     WanBootstrapJoinAttempt(
       stage: "seeded_direct_hint",
@@ -2086,12 +2169,12 @@ proc joinViaSeedBootstrapImpl(
     result.connectedCount = 1
     result.ok = true
 
-  if svc.connectedPeerIds().len > 0:
+  if syncConnectedState and svc.connectedPeerIds().len > 0:
     discard await svc.advertiseRendezvousNamespaces()
     discard await svc.refreshFromRendezvousNamespaces()
     discard await svc.refreshFromBootstrapSnapshots()
 
-  if result.ok:
+  if result.ok and syncConnectedState:
     discard await svc.bootstrapMountedKadDHTs()
 
   svc.recordJoinResult(result)
@@ -2177,6 +2260,7 @@ proc joinViaSeedBootstrap*(
     peerId: PeerId,
     addrs: seq[MultiAddress],
     source = "seeded_join",
+    syncConnectedState = true,
 ): Future[WanBootstrapJoinResult] {.async: (raises: [CancelledError]).} =
   if svc.isNil:
     return WanBootstrapJoinResult(timestampMs: nowMillis())
@@ -2186,7 +2270,12 @@ proc joinViaSeedBootstrap*(
     return await svc.waitOngoingJoin()
   svc.joinInProgress = true
   try:
-    return await svc.joinViaSeedBootstrapImpl(peerId, addrs, source)
+    return await svc.joinViaSeedBootstrapImpl(
+      peerId,
+      addrs,
+      source,
+      syncConnectedState = syncConnectedState,
+    )
   finally:
     svc.joinInProgress = false
 
@@ -2195,11 +2284,17 @@ proc joinViaSeedBootstrap*(
     peerId: PeerId,
     addrs: seq[MultiAddress],
     source = "seeded_join",
+    syncConnectedState = true,
 ): Future[WanBootstrapJoinResult] {.async: (raises: [CancelledError]).} =
   let svc = getWanBootstrapService(switch)
   if svc.isNil:
     return WanBootstrapJoinResult(timestampMs: nowMillis())
-  await svc.joinViaSeedBootstrap(peerId, addrs, source)
+  await svc.joinViaSeedBootstrap(
+    peerId,
+    addrs,
+    source,
+    syncConnectedState = syncConnectedState,
+  )
 
 proc runBootstrapStage(
     svc: WanBootstrapService,
@@ -2308,12 +2403,12 @@ proc joinViaBootstrapImpl(
     discard await svc.refreshFromDnsaddrFallback()
     appendAttempts(await svc.runBootstrapStage("dnsaddr", attemptedAddrCounts, limit))
 
-  if svc.connectedPeerIds().len > 0:
+  if svc.rendezvousPeers().len > 0:
     discard await svc.advertiseRendezvousNamespaces()
     discard await svc.refreshFromRendezvousNamespaces()
     if result.connectedCount < svc.config.stopAfterConnected:
       appendAttempts(await svc.runBootstrapStage("rendezvous", attemptedAddrCounts, limit))
-
+  if svc.connectedPeerIds().len > 0:
     discard await svc.refreshFromBootstrapSnapshots()
     if result.connectedCount < svc.config.stopAfterConnected:
       appendAttempts(await svc.runBootstrapStage("snapshot", attemptedAddrCounts, limit))
@@ -2362,11 +2457,34 @@ proc bootstrapReconnect*(
     return WanBootstrapJoinResult(timestampMs: nowMillis())
   await svc.bootstrapReconnect(limit)
 
+proc bootstrapAutoJoinReady*(svc: WanBootstrapService): bool {.gcsafe, raises: [].} =
+  if svc.isNil:
+    return true
+  (not svc.config.deferAutoJoinUntilRelayReady) or svc.startupRelayReady
+
+proc bootstrapAutoJoinReady*(switch: Switch): bool {.gcsafe, raises: [].} =
+  let svc = getWanBootstrapService(switch)
+  if svc.isNil:
+    return true
+  svc.bootstrapAutoJoinReady()
+
+proc markBootstrapAutoJoinReady*(svc: WanBootstrapService) {.gcsafe, raises: [].} =
+  if svc.isNil:
+    return
+  svc.startupRelayReady = true
+
+proc markBootstrapAutoJoinReady*(switch: Switch) {.gcsafe, raises: [].} =
+  let svc = getWanBootstrapService(switch)
+  if svc.isNil:
+    return
+  svc.markBootstrapAutoJoinReady()
+
 proc bootstrapRoleConfig*(
     role: WanBootstrapRole,
     networkId = "default",
     journalPath = "",
     authoritativePeerIds: seq[string] = @[],
+    deferAutoJoinUntilRelayReady = false,
     fallbackDnsAddrs: seq[MultiAddress] = @[],
 ): WanBootstrapConfig =
   case role
@@ -2376,6 +2494,7 @@ proc bootstrapRoleConfig*(
       role = role,
       journalPath = journalPath,
       authoritativePeerIds = authoritativePeerIds,
+      deferAutoJoinUntilRelayReady = deferAutoJoinUntilRelayReady,
       fallbackDnsAddrs = fallbackDnsAddrs,
       mountRendezvousProtocol = true,
       maxConcurrentBootstrapDials = 3,
@@ -2387,6 +2506,7 @@ proc bootstrapRoleConfig*(
       role = role,
       journalPath = journalPath,
       authoritativePeerIds = authoritativePeerIds,
+      deferAutoJoinUntilRelayReady = deferAutoJoinUntilRelayReady,
       fallbackDnsAddrs = fallbackDnsAddrs,
       maxConcurrentBootstrapDials = 3,
     )
@@ -2396,6 +2516,7 @@ proc bootstrapRoleConfig*(
       role = role,
       journalPath = journalPath,
       authoritativePeerIds = authoritativePeerIds,
+      deferAutoJoinUntilRelayReady = deferAutoJoinUntilRelayReady,
       fallbackDnsAddrs = fallbackDnsAddrs,
       maxConcurrentBootstrapDials = 2,
       stopAfterConnected = 1,
@@ -2416,6 +2537,13 @@ proc syncLoop(svc: WanBootstrapService) {.async: (raises: [CancelledError]).} =
       if
         allowMobileEdgeAutoJoin and
         svc.config.role == mobileEdge and
+        svc.config.deferAutoJoinUntilRelayReady and
+        not svc.startupRelayReady:
+        debug "wan bootstrap auto join deferred until relay ready"
+      if
+        allowMobileEdgeAutoJoin and
+        svc.config.role == mobileEdge and
+        svc.bootstrapAutoJoinReady() and
         svc.connectedPeerIds().len == 0 and
         not svc.joinInProgress:
         let visibleCandidates = svc.selectBootstrapCandidates(1)

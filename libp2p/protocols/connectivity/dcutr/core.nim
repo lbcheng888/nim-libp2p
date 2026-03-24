@@ -19,7 +19,9 @@ import ../../../protobuf/minprotobuf
 
 export multiaddress
 
-const DcutrCodec* = "/libp2p/dcutr"
+const
+  DcutrCodec* = "/libp2p/dcutr"
+  DcutrMsgMaxSize* = 4 * 1024
 
 type
   MsgType* = enum
@@ -31,6 +33,11 @@ type
     addrs*: seq[MultiAddress]
 
   DcutrError* = object of LPError
+
+  DcutrAttemptOutcome* = enum
+    DcutrConnected
+    DcutrLocalUnsupportedAddrs
+    DcutrRemoteUnsupportedAddrs
 
 proc encode*(msg: DcutrMsg): ProtoBuffer =
   result = initProtoBuffer()
@@ -56,12 +63,38 @@ proc send*(
   let pb = DcutrMsg(msgType: msgType, addrs: addrs).encode()
   await conn.writeLp(pb.buffer)
 
+proc expectMsgType*(msg: DcutrMsg, expected: MsgType) {.raises: [DcutrError].} =
+  if msg.msgType != expected:
+    raise newException(
+      DcutrError,
+      "Unexpected message type, expected " & $expected & " but got " & $msg.msgType,
+    )
+
+proc addrsForLog*(addrs: openArray[MultiAddress], limit = 4): seq[string] =
+  if limit <= 0:
+    return @[]
+  for addr in addrs:
+    if result.len >= limit:
+      break
+    result.add($addr)
+
 proc getHolePunchableAddrs*(
-    addrs: seq[MultiAddress]
+    addrs: seq[MultiAddress], maxAddrs = 0
 ): seq[MultiAddress] {.raises: [LPError].} =
   var result = newSeq[MultiAddress]()
   for a in addrs:
-    # This is necessary to also accept addrs like /ip4/198.51.100/tcp/1234/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N
-    if [TCP, mapAnd(TCP_DNS, P2PPattern), mapAnd(TCP_IP, P2PPattern)].anyIt(it.match(a)):
+    # Accept both bare transport addresses and the same addresses advertised with a trailing /p2p/<peer-id>.
+    if [TCP, mapAnd(TCP, P2PPattern)].anyIt(it.match(a)):
       result.add(a[0 .. 1].tryGet())
+    elif [
+      QUIC,
+      QUIC_V1,
+      mapAnd(QUIC, P2PPattern),
+      mapAnd(QUIC_V1, P2PPattern),
+    ].anyIt(it.match(a)):
+      result.add(a[0 .. 2].tryGet())
+    else:
+      continue
+    if maxAddrs > 0 and result.len >= maxAddrs:
+      break
   return result
