@@ -3,9 +3,12 @@
 This directory contains the operational pieces needed for the `tsnet` transport:
 
 - `build_tsnetbridge_host.sh`
-  Builds `libtsnetbridge` for the local host and writes it to `build/`.
+  Builds the deprecated legacy Go `libtsnetbridge` for the local host and writes
+  it to `build/`. This is now an oracle/compatibility path, not the default
+  runtime packaging path.
 - `build_tsnetbridge_android.sh`
-  Cross-compiles `libtsnetbridge.so` for Android `arm64-v8a` and writes it to
+  Cross-compiles the deprecated legacy Go `libtsnetbridge.so` for Android
+  `arm64-v8a` and writes it to
   `/Users/lbcheng/UniMaker/android/core-bridge/src/main/jniLibs/arm64-v8a/`.
 - `setup_headscale_derp.sh`
   Provisions a Headscale control plane with embedded DERP on a remote host.
@@ -17,7 +20,14 @@ This directory contains the operational pieces needed for the `tsnet` transport:
 Useful runtime knobs:
 
 - `NIM_TSNET_BRIDGE_LIB`
-  Explicit path to `libtsnetbridge.{dylib,so}` for macOS/Linux testing.
+  Explicit path to `libtsnetbridge.{dylib,so}` for macOS/Linux legacy testing.
+- `NIM_ANDROID_ENABLE_LEGACY_TSNET_BRIDGE=1`
+  Opt-in packaging flag for the deprecated Android bridge. The default build no
+  longer ships `libtsnetbridge.so`.
+
+If `controlUrl`/`authKey` are configured without an explicit legacy bridge path,
+`tsnet` now fails fast instead of auto-discovering `libtsnetbridge`. That keeps
+the default runtime on the pure-Nim path until a real in-app provider exists.
 - Gradle properties for Android:
   - `-Pp2p_underlay=tsnet`
   - `-Ptsnet_control_url=https://...`

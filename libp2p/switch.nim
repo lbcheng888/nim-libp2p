@@ -1037,11 +1037,17 @@ proc upgrader(
       negotiated = muxed.connection.negotiatedMuxer
     proc finishIncomingIdentify() {.async: (raises: []).} =
       try:
+        let previousPeerId = muxed.connection.peerId
         warn "incoming upgrader identify begin",
           peerId = muxed.connection.peerId,
           protocol = muxed.connection.protocol,
           negotiated = muxed.connection.negotiatedMuxer
         await switch.peerStore.identify(muxed)
+        switch.connManager.reindexMuxerPeerId(
+          muxed,
+          previousPeerId,
+          muxed.connection.peerId,
+        )
         warn "incoming upgrader identify done",
           peerId = muxed.connection.peerId,
           protocol = muxed.connection.protocol,

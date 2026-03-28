@@ -1,6 +1,6 @@
 {.used.}
 
-import std/[sequtils, strutils]
+import std/[json, os, sequtils, strutils]
 import unittest2
 
 import
@@ -9,11 +9,23 @@ import
     crypto/crypto,
     multiaddress,
     transports/transport,
+    transports/tsnetprovider,
     transports/tsnettransport,
     upgrademngrs/upgrade,
   ]
 
 import ./helpers, ./commontransport
+
+proc fixturePath(name: string): string =
+  currentSourcePath.parentDir() / "fixtures" / "tsnet" / name
+
+var tempDirCounter = 0
+
+proc tempStateDir(tag: string): string =
+  inc tempDirCounter
+  let path = getTempDir() / ("nim-libp2p-tsnet-transport-" & tag & "-" & $tempDirCounter)
+  createDir(path)
+  path
 
 suite "Tsnet transport":
   teardown:
@@ -42,6 +54,75 @@ suite "Tsnet transport":
     let status = transport.tailnetStatus()
     check status.tailnetIPs.len == 2
     check status.tailnetIPs.anyIt(it.startsWith("100.64."))
+    let statusPayload = transport.tailnetStatusPayload().tryGet()
+    check statusPayload["providerKind"].getStr() == "builtin-synthetic"
+    check statusPayload["providerRequestedBackend"].getStr() == "builtin-synthetic"
+    check not statusPayload["providerReady"].getBool()
+    check statusPayload["providerInApp"].getBool()
+    check statusPayload["providerCapabilities"]["inApp"].getBool()
+    check not statusPayload["providerCapabilities"]["proxyBacked"].getBool()
+    await transport.stop()
+
+  asyncTest "self-hosted config does not block cold-start before first tailnet call":
+    let privKey = PrivateKey.random(rng[]).expect("private key")
+    var cfg = TsnetTransportBuilderConfig.init()
+    cfg.controlUrl = "https://headscale.invalid"
+    cfg.authKey = "tskey-auth-placeholder"
+    let transport = TsnetTransport.new(Upgrade(), privKey, cfg)
+    let listenAddr = MultiAddress.init("/ip4/0.0.0.0/tcp/0/tsnet").tryGet()
+    await transport.start(@[listenAddr])
+    check transport.addrs.len == 0
+    let statusPayload = transport.tailnetStatusPayload().tryGet()
+    check statusPayload["providerRequestedBackend"].getStr() == "nim-inapp"
+    check not statusPayload["providerReady"].getBool()
+    check statusPayload["deferred"].getBool()
+    check statusPayload["reason"].getStr() == "provider_start_deferred"
+    check not statusPayload["ok"].getBool()
+    await transport.stop()
+
+  asyncTest "self-hosted config publishes /tsnet addresses only after warm":
+    let dir = tempStateDir("oracle-warm")
+    copyFile(fixturePath("self_hosted_901_sin.json"), dir / "nim-tsnet-oracle.json")
+
+    let privKey = PrivateKey.random(rng[]).expect("private key")
+    var cfg = TsnetTransportBuilderConfig.init()
+    cfg.controlUrl = "https://64-176-84-12.sslip.io"
+    cfg.stateDir = dir
+    cfg.hostname = "nim-transport-deferred-warm"
+    cfg.enableDebug = true
+    let transport = TsnetTransport.new(Upgrade(), privKey, cfg)
+
+    await transport.start(@[MultiAddress.init("/ip4/0.0.0.0/tcp/0/tsnet").tryGet()])
+    check transport.addrs.len == 0
+    let deferredPayload = transport.tailnetStatusPayload().tryGet()
+    check deferredPayload["deferred"].getBool()
+    check transport.warmProvider().isOk()
+    check transport.addrs.len == 1
+    check ($transport.addrs[0]).endsWith("/tsnet")
+    let readyPayload = transport.tailnetStatusPayload().tryGet()
+    check readyPayload["providerReady"].getBool()
+    await transport.stop()
+
+  asyncTest "self-hosted oracle fixture starts nim in-app transport status path":
+    let dir = tempStateDir("oracle")
+    copyFile(fixturePath("self_hosted_901_sin.json"), dir / "nim-tsnet-oracle.json")
+
+    let privKey = PrivateKey.random(rng[]).expect("private key")
+    var cfg = TsnetTransportBuilderConfig.init()
+    cfg.controlUrl = "https://64-176-84-12.sslip.io"
+    cfg.stateDir = dir
+    cfg.hostname = "nim-transport-test"
+    cfg.enableDebug = true
+    let transport = TsnetTransport.new(Upgrade(), privKey, cfg)
+
+    await transport.start(@[MultiAddress.init("/ip4/0.0.0.0/tcp/0/tsnet").tryGet()])
+    check transport.warmProvider().isOk()
+    let payload = transport.tailnetStatusPayload().tryGet()
+    check payload["providerKind"].getStr() == "nim-inapp"
+    check payload["tailnetDerpMapSummary"].getStr() == "901/sin"
+    check payload["providerCapabilities"]["proxyBacked"].getBool()
+    check transport.addrs.len == 1
+    check ($transport.addrs[0]).endsWith("/tsnet")
     await transport.stop()
 
   test "handles rejects malformed /tsnet shapes":

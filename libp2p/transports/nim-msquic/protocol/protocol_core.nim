@@ -91,7 +91,8 @@ proc encodeInitialPacket*(destCid, srcCid: ConnectionId, token: seq[byte],
   # Length (VarInt)
   # Length field includes Packet Number length + Payload length
   let pnLen = 4'u64
-  let lengthVal = pnLen + uint64(payload.len)
+  # Long-header payload length covers packet number + ciphertext + AEAD tag.
+  let lengthVal = pnLen + uint64(payload.len) + 16'u64
   result.writeVarInt(lengthVal)
 
   # Packet Number (4 bytes, unencrypted for skeleton)
@@ -114,7 +115,7 @@ proc encodeHandshakePacket*(destCid, srcCid: ConnectionId;
   result.add(byte(srcCid.len))
   result.add(srcCid)
   let pnLen = 4'u64
-  let lengthVal = pnLen + uint64(payload.len)
+  let lengthVal = pnLen + uint64(payload.len) + 16'u64
   result.writeVarInt(lengthVal)
   result.writeUint32(packetNumber)
   result.add(payload)
@@ -424,6 +425,8 @@ type
     destConnectionId*: ConnectionId
     srcConnectionId*: ConnectionId
     payloadOffset*: int
+    payloadLength*: uint64
+    packetLength*: int
 
 proc parseUnprotectedHeader*(data: seq[byte]): UnprotectedHeader =
   if data.len == 0: return
@@ -467,10 +470,31 @@ proc parseUnprotectedHeader*(data: seq[byte]): UnprotectedHeader =
     # Length field is part of the Unprotected Header?
     # Actually, the Length field itself is NOT protected, but it tells us the size.
     # We parse it here to be helpful.
-    let _ = readVarInt(data, pos)
-    
+    let payloadLen = readVarInt(data, pos)
+    result.payloadLength = payloadLen
+
     # Now `pos` is pointing to Packet Number (Protected)
     result.payloadOffset = pos
+    let totalLen = pos + int(payloadLen)
+    if totalLen > 0 and totalLen <= data.len:
+      result.packetLength = totalLen
+    else:
+      result.packetLength = data.len
+  else:
+    result.packetLength = data.len
+
+proc splitCoalescedPackets*(data: seq[byte]): seq[seq[byte]] =
+  if data.len == 0:
+    return
+  var pos = 0
+  while pos < data.len:
+    let remaining = data[pos .. ^1]
+    let header = parseUnprotectedHeader(remaining)
+    var packetLen = header.packetLength
+    if packetLen <= 0 or packetLen > remaining.len:
+      packetLen = remaining.len
+    result.add(remaining[0 ..< packetLen])
+    pos += packetLen
 
 proc parseCryptoFrame*(data: openArray[byte], pos: var int): CryptoFrame =
   # Assumes caller checked Type == 0x06

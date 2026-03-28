@@ -228,6 +228,43 @@ suite "Connection Manager":
 
     await connMngr.close()
 
+  asyncTest "select muxer ignores closed connections":
+    let connMngr = ConnManager.new(maxConnsPerPeer = 2)
+    let peerId = PeerId.init(PrivateKey.random(ECDSA, (newRng())[]).tryGet()).tryGet()
+    let staleMux = getMuxer(peerId, Direction.Out)
+    let liveMux = getMuxer(peerId, Direction.Out)
+
+    connMngr.storeMuxer(staleMux)
+    connMngr.storeMuxer(liveMux)
+    await staleMux.connection.close()
+
+    check connMngr.connCount(peerId) == 1
+    check connMngr.selectMuxer(peerId, Direction.Out) == liveMux
+    check peerId in connMngr
+
+    await liveMux.close()
+    await connMngr.close()
+
+  asyncTest "reindex muxer when peer id becomes known after identify":
+    let connMngr = ConnManager.new()
+    let unresolvedPeer = default(PeerId)
+    let resolvedPeer = PeerId.init(PrivateKey.random(ECDSA, (newRng())[]).tryGet()).tryGet()
+    let mux = getMuxer(unresolvedPeer, Direction.Out)
+
+    connMngr.storeMuxer(mux)
+    check connMngr.connCount(unresolvedPeer) == 1
+    check connMngr.connCount(resolvedPeer) == 0
+
+    mux.connection.peerId = resolvedPeer
+    connMngr.reindexMuxerPeerId(mux, unresolvedPeer, resolvedPeer)
+
+    check connMngr.connCount(unresolvedPeer) == 0
+    check connMngr.connCount(resolvedPeer) == 1
+    check connMngr.selectMuxer(resolvedPeer, Direction.Out) == mux
+    check resolvedPeer in connMngr.connectedPeers(Direction.Out)
+
+    await connMngr.close()
+
   asyncTest "drop connections for peer":
     let connMngr = ConnManager.new()
     let peerId = PeerId.init(PrivateKey.random(ECDSA, (newRng())[]).tryGet()).tryGet()

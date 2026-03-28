@@ -84,6 +84,15 @@ type
     connManager: ConnManager
     direction: Direction
 
+proc isActiveMuxer(muxer: Muxer): bool {.inline.} =
+  not muxer.isNil and
+    not muxer.connection.isNil and
+    not muxer.connection.closed and
+    not muxer.connection.atEof
+
+proc liveMuxers(c: ConnManager, peerId: PeerId): seq[Muxer] =
+  c.muxed.getOrDefault(peerId).filterIt(isActiveMuxer(it))
+
 proc newTooManyConnectionsError(): ref TooManyConnectionsError {.inline.} =
   result = newException(TooManyConnectionsError, "Too many connections")
 
@@ -107,12 +116,12 @@ proc new*(
   C(maxConnsPerPeer: maxConnsPerPeer, inSema: inSema, outSema: outSema)
 
 proc connCount*(c: ConnManager, peerId: PeerId): int =
-  c.muxed.getOrDefault(peerId).len
+  c.liveMuxers(peerId).len
 
 proc connectedPeers*(c: ConnManager, dir: Direction): seq[PeerId] =
   var peers = newSeq[PeerId]()
   for peerId, mux in c.muxed:
-    if mux.anyIt(it.connection.dir == dir):
+    if mux.anyIt(isActiveMuxer(it) and it.connection.dir == dir):
       peers.add(peerId)
   return peers
 
@@ -209,7 +218,7 @@ proc expectConnection*(
     c.expectedConnectionsOverLimit.del(key)
 
 proc contains*(c: ConnManager, peerId: PeerId): bool =
-  peerId in c.muxed
+  c.connCount(peerId) > 0
 
 proc contains*(c: ConnManager, muxer: Muxer): bool =
   ## checks if a muxer is being tracked by the connection
@@ -220,7 +229,9 @@ proc contains*(c: ConnManager, muxer: Muxer): bool =
     return false
 
   let conn = muxer.connection
-  return muxer in c.muxed.getOrDefault(conn.peerId)
+  if conn.isNil:
+    return false
+  return muxer in c.liveMuxers(conn.peerId)
 
 proc closeMuxer(muxer: Muxer) {.async: (raises: [CancelledError]).} =
   trace "Cleaning up muxer", m = muxer
@@ -272,7 +283,7 @@ proc onClose(c: ConnManager, mux: Muxer) {.async: (raises: []).} =
 proc selectMuxer*(c: ConnManager, peerId: PeerId, dir: Direction): Muxer =
   ## Select a connection for the provided peer and direction
   ##
-  let conns = toSeq(c.muxed.getOrDefault(peerId)).filterIt(it.connection.dir == dir)
+  let conns = c.liveMuxers(peerId).filterIt(it.connection.dir == dir)
 
   if conns.len > 0:
     return conns[0]
@@ -315,7 +326,7 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
 
   # we use getOrDefault in the if below instead of [] to avoid the KeyError
   try:
-    if c.muxed.getOrDefault(peerId).len > c.maxConnsPerPeer:
+    if c.liveMuxers(peerId).len > c.maxConnsPerPeer:
       let key = (peerId, dir)
       let expectedConn = c.expectedConnectionsOverLimit.getOrDefault(key)
       if expectedConn != nil and not expectedConn.finished:
@@ -328,6 +339,9 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
 
     var newPeer = false
     c.muxed.withValue(peerId, muxers):
+      let activeMuxers = muxers[].filterIt(isActiveMuxer(it))
+      if activeMuxers.len != muxers[].len:
+        muxers[] = activeMuxers
       if muxers[].len == 0:
         # Unexpected empty entry; treat as a fresh peer record instead of aborting.
         muxers[] = @[muxer]
@@ -364,6 +378,47 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
   asyncSpawn c.onClose(muxer)
 
   trace "Stored muxer", muxer, direction = $muxer.connection.dir, peers = c.muxed.len
+
+proc reindexMuxerPeerId*(
+    c: ConnManager, muxer: Muxer, previousPeerId: PeerId, currentPeerId: PeerId
+) =
+  ## Move an already tracked muxer to its resolved peer id after identify/secure
+  ## upgrade finishes. This fixes the case where transports temporarily register a
+  ## muxer under an empty/placeholder peer id before the remote identity becomes
+  ## known.
+  if isNil(c) or isNil(muxer) or isNil(muxer.connection):
+    return
+  if currentPeerId.len == 0 or previousPeerId == currentPeerId:
+    return
+
+  var removed = false
+  c.muxed.withValue(previousPeerId, muxers):
+    let remaining = muxers[].filterIt(isActiveMuxer(it) and it != muxer)
+    if remaining.len > 0:
+      muxers[] = remaining
+    else:
+      c.muxed.del(previousPeerId)
+    removed = true
+  do:
+    discard
+
+  if not removed:
+    return
+
+  c.muxed.withValue(currentPeerId, muxers):
+    let activeMuxers = muxers[].filterIt(isActiveMuxer(it))
+    muxers[] = activeMuxers
+    if muxer notin muxers[]:
+      muxers[].add(muxer)
+  do:
+    c.muxed[currentPeerId] = @[muxer]
+
+  libp2p_peers.set(c.muxed.len.int64)
+  trace "Reindexed muxer peer id",
+    previousPeerId,
+    currentPeerId,
+    direction = $muxer.connection.dir,
+    peers = c.muxed.len
 
 proc getIncomingSlot*(
     c: ConnManager

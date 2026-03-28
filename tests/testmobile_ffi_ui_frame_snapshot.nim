@@ -147,6 +147,8 @@ suite "Mobile FFI UI frame snapshot":
     check snapshot["discovery"]["transportHealth"]["quicRuntime"].hasKey("compileTimeBuiltin")
     check snapshot["discovery"]["transportHealth"]["quicRuntime"].hasKey("pureNim")
     check snapshot["discovery"]["transportHealth"]["quicRuntime"].hasKey("requestedPreference")
+    when defined(libp2p_msquic_experimental) and defined(libp2p_msquic_builtin):
+      check snapshot["discovery"]["transportHealth"]["quicRuntime"]["requestedPreference"].getStr() == "builtin_only"
     check snapshot["discovery"]["transportHealth"]["quicRuntime"].hasKey("requestedLibraryPath")
     check snapshot["discovery"]["hostNetworkStatus"]["networkType"].getStr() == "wifi"
     check snapshot["discovery"]["hostNetworkStatus"].hasKey("publicIpv4")

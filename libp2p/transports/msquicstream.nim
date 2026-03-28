@@ -1,6 +1,6 @@
 ## MsQuic 流适配：桥接 msquicdriver 的事件队列与 LPStream 接口。
 
-import std/[sequtils, strformat]
+import std/[sequtils, strformat, strutils]
 import results
 import chronos, chronicles
 
@@ -22,12 +22,15 @@ type
     handle: msquicdrv.MsQuicTransportHandle
     peerId: PeerId
     protocol*: string
+    protocolGate: AsyncLock
     bandwidth*: BandwidthManager
     cached: seq[byte]
     activity: bool
 
 const
   MsQuicStreamReadChunk = 16 * 1024
+  MsQuicReadRetryAttempts = 4
+  MsQuicReadRetryDelay = 50.milliseconds
 
 proc msquicStreamError(msg: string; parent: ref Exception = nil): ref LPStreamError =
   (ref LPStreamError)(msg: msg, parent: parent)
@@ -43,7 +46,8 @@ proc newMsQuicStream*(
     handle: msquicdrv.MsQuicTransportHandle,
     dir: Direction,
     peerId: PeerId = PeerId(),
-    protocol: string = ""
+    protocol: string = "",
+    protocolGate: AsyncLock = nil
 ): MsQuicStream =
   if state.isNil or handle.isNil:
     raise msquicStreamError("MsQuic stream requires valid state/handle")
@@ -52,6 +56,7 @@ proc newMsQuicStream*(
     handle: handle,
     peerId: peerId,
     protocol: protocol,
+    protocolGate: protocolGate,
     cached: @[]
   )
   result.dir = dir
@@ -61,12 +66,74 @@ proc newMsQuicStream*(
 proc setBandwidthManager*(stream: MsQuicStream; manager: BandwidthManager) =
   stream.bandwidth = manager
 
+proc takeCachedBytes*(stream: MsQuicStream): seq[byte] {.gcsafe, raises: [].} =
+  if stream.isNil or stream.cached.len == 0:
+    return @[]
+  swap(result, stream.cached)
+
+proc restoreCachedBytes*(stream: MsQuicStream; payload: seq[byte]) {.gcsafe, raises: [].} =
+  if stream.isNil:
+    return
+  if payload.len == 0:
+    stream.cached.setLen(0)
+  elif stream.cached.len == 0:
+    stream.cached = payload
+  else:
+    var merged = newSeqOfCap[byte](payload.len + stream.cached.len)
+    merged.add(payload)
+    merged.add(stream.cached)
+    stream.cached = merged
+
 proc ensureOpen(stream: MsQuicStream) =
   if stream.isNil or stream.state.isNil:
     raise newLPStreamConnDownError()
 
+proc releaseProtocolGate*(stream: MsQuicStream) {.gcsafe, raises: [].} =
+  if stream.isNil or stream.protocolGate.isNil:
+    return
+  try:
+    stream.protocolGate.release()
+  except AsyncLockError:
+    discard
+
+proc shouldRetryCancelledRead(stream: MsQuicStream): bool {.gcsafe, raises: [].} =
+  if stream.isNil or stream.state.isNil or stream.state.closed:
+    return false
+  let connState = stream.state.connectionState
+  if connState.isNil or connState.closed:
+    return false
+  try:
+    let handshakeComplete = msquicdrv.connectionHandshakeComplete(connState)
+    let closeReason = msquicdrv.connectionCloseReason(connState)
+    handshakeComplete and closeReason.len == 0
+  except CatchableError:
+    false
+  except Exception:
+    false
+
+proc shouldRetryReadFailure*(
+    stream: MsQuicStream,
+    errMsg: string
+): bool {.gcsafe, raises: [].} =
+  if errMsg.len == 0:
+    return false
+  if errMsg.contains("Future operation cancelled") or
+      errMsg.toLowerAscii().contains("cancelled"):
+    return stream.shouldRetryCancelledRead()
+  false
+
 method getWrapped*(stream: MsQuicStream): LPStream =
   stream
+
+method beginProtocolNegotiation*(
+    stream: MsQuicStream
+): Future[void] {.gcsafe, async: (raises: [CancelledError]).} =
+  if stream.isNil or stream.protocolGate.isNil:
+    return
+  await stream.protocolGate.acquire()
+
+method endProtocolNegotiation*(stream: MsQuicStream) {.gcsafe.} =
+  stream.releaseProtocolGate()
 
 method readOnce*(
     stream: MsQuicStream, pbytes: pointer, nbytes: int
@@ -76,29 +143,59 @@ method readOnce*(
   stream.ensureOpen()
   if stream.cached.len == 0:
     var chunk: seq[byte]
-    try:
-      when defined(ohos):
-        warn "MsQuic readOnce begin",
-          stream = cast[uint64](stream.state.stream),
-          requested = nbytes,
-          cached = stream.cached.len
-      chunk = await msquicdrv.readStream(stream.state)
-      when defined(ohos):
-        warn "MsQuic readOnce chunk",
-          stream = cast[uint64](stream.state.stream),
-          bytes = chunk.len
-    except msquicdrv.QuicRuntimeEventQueueClosed as exc:
-      when defined(ohos):
-        warn "MsQuic readOnce queue closed",
-          stream = cast[uint64](stream.state.stream),
-          err = exc.msg
-      raise newLPStreamConnDownError(exc)
-    except CatchableError as exc:
-      when defined(ohos):
-        warn "MsQuic readOnce failed",
-          stream = cast[uint64](stream.state.stream),
-          err = exc.msg
-      raise msquicStreamError("MsQuic read failed: " & exc.msg, exc)
+    var attempt = 0
+    while true:
+      try:
+        when defined(ohos):
+          warn "MsQuic readOnce begin",
+            stream = cast[uint64](stream.state.stream),
+            requested = nbytes,
+            cached = stream.cached.len,
+            attempt = attempt + 1
+        chunk = await msquicdrv.readStream(stream.state)
+        when defined(ohos):
+          warn "MsQuic readOnce chunk",
+            stream = cast[uint64](stream.state.stream),
+            bytes = chunk.len
+        break
+      except msquicdrv.QuicRuntimeEventQueueClosed as exc:
+        when defined(ohos):
+          warn "MsQuic readOnce queue closed",
+            stream = cast[uint64](stream.state.stream),
+            err = exc.msg
+        raise newLPStreamConnDownError(exc)
+      except CancelledError as exc:
+        if attempt < MsQuicReadRetryAttempts and stream.shouldRetryCancelledRead():
+          inc attempt
+          when defined(ohos) or defined(libp2p_msquic_debug):
+            warn "MsQuic readOnce retrying cancelled read",
+              stream = cast[uint64](stream.state.stream),
+              attempt = attempt,
+              err = exc.msg
+          await sleepAsync(MsQuicReadRetryDelay)
+          continue
+        when defined(ohos):
+          warn "MsQuic readOnce cancelled",
+            stream = cast[uint64](stream.state.stream),
+            err = exc.msg
+        raise msquicStreamError("MsQuic read failed: " & exc.msg, exc)
+      except CatchableError as exc:
+        if exc.msg.contains("Future operation cancelled") and
+            attempt < MsQuicReadRetryAttempts and
+            stream.shouldRetryCancelledRead():
+          inc attempt
+          when defined(ohos) or defined(libp2p_msquic_debug):
+            warn "MsQuic readOnce retrying spurious read failure",
+              stream = cast[uint64](stream.state.stream),
+              attempt = attempt,
+              err = exc.msg
+          await sleepAsync(MsQuicReadRetryDelay)
+          continue
+        when defined(ohos):
+          warn "MsQuic readOnce failed",
+            stream = cast[uint64](stream.state.stream),
+            err = exc.msg
+        raise msquicStreamError("MsQuic read failed: " & exc.msg, exc)
     if chunk.len == 0:
       when defined(ohos):
         warn "MsQuic readOnce eof",
@@ -146,7 +243,7 @@ method write*(
     try:
       var message = ""
       msquicSafe:
-        message = msquicdrv.writeStream(stream.state, bytes)
+        message = await msquicdrv.writeStreamAndWait(stream.state, bytes)
       message
     except CatchableError as exc:
       raise msquicStreamError("MsQuic send raised: " & exc.msg, exc)
@@ -176,17 +273,21 @@ method closeWrite*(stream: MsQuicStream) {.async: (raises: []).} =
     await msquicdrv.waitStreamStart(stream.state)
   except CatchableError:
     discard
-  var nativeStream: pointer = nil
-  when declared(stream.state.stream):
-    nativeStream = cast[pointer](stream.state.stream)
   try:
-    discard msquicdrv.shutdownStream(
-      stream.handle,
-      nativeStream,
-      state = stream.state
-    )
+    if msquicdrv.beginSendFin(stream.state):
+      discard await msquicdrv.writeStreamAndWait(stream.state, @[], flags = 0x0004'u32)
   except CatchableError:
-    discard
+    var nativeStream: pointer = nil
+    when declared(stream.state.stream):
+      nativeStream = cast[pointer](stream.state.stream)
+    try:
+      discard msquicdrv.shutdownStream(
+        stream.handle,
+        nativeStream,
+        state = stream.state
+      )
+    except CatchableError:
+      discard
 
 method closeImpl*(stream: MsQuicStream) {.async: (raises: []).} =
   stream.closeState()
@@ -197,7 +298,7 @@ proc sendFin*(stream: MsQuicStream) {.async: (raises: [CancelledError, LPStreamE
   var errMsg = ""
   try:
     msquicSafe:
-      errMsg = msquicdrv.writeStream(stream.state, @[], flags = 0x0004'u32)
+      errMsg = await msquicdrv.writeStreamAndWait(stream.state, @[], flags = 0x0004'u32)
   except CatchableError as exc:
     raise msquicStreamError("MsQuic send FIN raised: " & exc.msg, exc)
   except Exception as exc:

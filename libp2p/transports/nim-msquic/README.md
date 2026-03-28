@@ -84,13 +84,14 @@
 - F3（TLS 桥接）：`api/tls_bridge.nim` 把 Nim TLS 配置转换为 MsQuic `QUIC_CREDENTIAL_CONFIG`。
 - F4（平台桥接）：`api/platform_bridge.nim` 处理 datapath、线程模型与绑定参数的下发。
 - F5（API 运行时）：`api/runtime_bridge.nim` 接线事件回调与资源生命周期，驱动实际连接/流。
-- F6（工具链支持）：`scripts/nim/bootstrap_msquic.sh` 等辅助脚本在本地/CI 检测并配置 MsQuic 运行时依赖。
+- F6（工具链支持）：默认通过 builtin 纯 Nim runtime 完成验证；`scripts/nim/bootstrap_msquic.sh` 仅保留给显式 native 对照。
 
 ## 运行 MsQuic FFI 底座
 
-- 运行时需预先安装官方 MsQuic 动态库。可通过设置环境变量 `NIM_MSQUIC_LIB` 指向库的绝对路径，或将库放入系统默认搜索路径（Windows: `msquic.dll` / `msquic.lib`，Linux: `libmsquic.so`，macOS: `libmsquic.dylib`）。
+- 默认验证与产品构建优先使用 builtin 纯 Nim runtime；执行 `scripts/nim/validate.sh` 时会直接以 `-d:libp2p_msquic_experimental -d:libp2p_msquic_builtin` 编译并运行验证用例。
+- 如需显式验证原生 MsQuic 动态库，可设置 `NIM_MSQUIC_VALIDATE_MODE=native` 后执行 `scripts/nim/validate.sh`，或手动设置环境变量 `NIM_MSQUIC_LIB` 指向库的绝对路径（Windows: `msquic.dll` / `msquic.lib`，Linux: `libmsquic.so`，macOS: `libmsquic.dylib`）。
 - `api/ffi_loader.nim` 会优先尝试 `MsQuicOpenVersion`（默认请求版本 `0x00000002`），若符号缺失则回退到 `MsQuicOpen`，并在卸载时调用 `MsQuicClose` 释放 `QUIC_API_TABLE`；模板 `asQuicApiTable[T]` 可帮助将底层指针转换为目标结构类型。
-- 脚本 `scripts/nim/bootstrap_msquic.sh env` 会在本地/CI 环境自动探测 MsQuic 库（必要时下载官方发布包），并输出可 `eval` 的 `export NIM_MSQUIC_LIB=...` 语句；`scripts/nim/validate.sh` 已默认调用该脚本，可通过 `NIM_MSQUIC_BOOTSTRAP_SKIP=1` 跳过。
+- 脚本 `scripts/nim/bootstrap_msquic.sh env` 会在本地/CI 环境自动探测 MsQuic 库（必要时下载官方发布包），并输出可 `eval` 的 `export NIM_MSQUIC_LIB=...` 语句；只有在 native 验证模式下才需要它，可通过 `NIM_MSQUIC_BOOTSTRAP_SKIP=1` 跳过自动探测并直接消费现有 `NIM_MSQUIC_LIB`。
 
 ## 最小可用实现 —— 工具链（B6）
 

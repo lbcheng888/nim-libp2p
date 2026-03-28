@@ -8,11 +8,14 @@
 
 文件名保留 `nim_quic_roadmap.md` 只是为了兼容现有引用。路线本身已经收敛为一套
 `QuicRuntime` 契约下的两种 backend 形态：native MsQuic 与 builtin 纯 Nim runtime。
+当前代码策略里，产品和 FFI 默认已经固定到 builtin-only；本路线图讨论的重点不再是
+“何时切默认”，而是“如何把已默认的 builtin runtime 硬化到可自证的生产标准”。
 
 ## 目标与边界
 
-- 长期目标：把 builtin 纯 Nim runtime 提升为默认 QUIC backend。
-- 保留目标：native MsQuic 持续保留为行为基线、性能基线、兼容路径和显式回退路径。
+- 当前事实：builtin 纯 Nim runtime 已经是默认且唯一的产品 QUIC backend。
+- 长期目标：把 builtin-only 策略补齐到协议完备、业务语义对齐、性能可比、长稳可证。
+- 保留目标：native MsQuic 持续保留为行为基线、性能基线和显式验证路径。
 - 架构目标：上层 transport、builder、diagnostics、业务协议只依赖统一 `QuicRuntime`
   契约，不感知 backend 差异。
 - 范围：传输层、握手、拥塞恢复、流/数据报、HTTP/3、WebTransport、诊断与回滚。
@@ -21,8 +24,8 @@
 
 ## 长期运行策略
 
-- `builtin` 是长期默认生产目标，但不是立刻切默认。
-- `native` 在整个路线期内都必须继续可选、可测、可回退，不因为 builtin 进展而删除。
+- `builtin` 已经是当前默认生产路径；后续不能再靠 “切默认” 掩盖未完成项。
+- `native` 在整个路线期内都必须继续可测、可对照，但不再属于产品自动选择路径。
 - 所有新增能力都优先落在 `QuicRuntime` 契约和 transport-neutral 测试矩阵上，避免为
   builtin 单独分叉上层接口。
 - 行为与性能对照只以 native MsQuic 为唯一基线。
@@ -30,8 +33,8 @@
 ## 现状摘要
 
 - 已有两种运行形态：
-  - native MsQuic runtime
-  - builtin 纯 Nim MsQuic-compatible runtime
+  - builtin 纯 Nim MsQuic-compatible runtime：默认产品路径
+  - native MsQuic runtime：显式验证/对照路径
 - 已具备：
   - `QuicRuntime` 统一契约
   - runtime 选择策略与诊断字段
@@ -40,7 +43,7 @@
   - builtin runtime 的协议完整性
   - builtin 与 native 的业务语义对齐
   - builtin 的性能追平与生产硬化
-  - builtin 成为默认 backend 的客观切换门槛
+  - builtin-only 策略达到可自证的硬化标准
 
 ## 路线分期
 
@@ -88,18 +91,18 @@
 - builtin 的性能达到默认切换门槛。
 - 性能回归可以通过指标或基准测试稳定发现。
 
-### P4 - 生产硬化与默认切换
+### P4 - 生产硬化与默认策略固化
 
 - 补齐 metrics、diagnostics、fuzz、长压测、多平台 soak。
 - 定义灰度、回滚、事故诊断和强制回退文档。
-- 在满足默认切换门槛后，将 builder/runtime 默认偏好切到 builtin。
+- 在满足硬化门槛后，确认 builtin-only 产品策略，并决定是否保留 native 仅作显式验证。
 
 验收：
-- builtin 满足默认切换标准。
-- native 仍保留显式选择入口和回退文档。
-- 默认切换不会改变上层 API 和业务接线。
+- builtin 满足硬化标准。
+- native 仍保留显式验证入口和回退文档。
+- builtin-only 策略不会改变上层 API 和业务接线。
 
-## 默认切换标准
+## builtin 硬化标准
 
 - 功能门槛：
   - builtin 通过现有 QUIC transport、DirectMessage、Feed、WebTransport 测试矩阵。
@@ -113,11 +116,11 @@
   - 吞吐不低于 native 的 70%。
   - CPU 与内存放大不高于 native 的 1.5x。
 - 切换策略：
-  - 仅切换默认偏好，不删除 native 路径。
-  - native 继续作为行为/性能基线和显式回退选项存在。
+  - 保持 builtin-only 产品默认，不删除 native 验证路径。
+  - native 继续作为行为/性能基线和显式对照选项存在。
 
 ## 近期推进项
 
 1. 先完成 P1，把 builtin 的 QUIC core、TLS 1.3 和错误语义补成闭环。
 2. 再完成 P2，把 HTTP/3 / WebTransport 业务语义拉齐到现有 transport 入口。
-3. 然后进入 P3/P4，用 native 做唯一对照，推动 builtin 达到默认切换门槛。
+3. 然后进入 P3/P4，用 native 做唯一对照，推动 builtin 达到可自证的硬化标准。

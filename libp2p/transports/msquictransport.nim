@@ -21,6 +21,7 @@ import ./quicruntime as msquicdrv
 import ./msquicconnection
 import ./msquicstream
 import ./quicruntime
+import ./qpackhuffman
 import ./webtransport_common
 when defined(libp2p_pure_crypto):
   import tls/certificate_pure
@@ -58,7 +59,7 @@ export quicruntime.useBuiltinRuntime
 
 const
   MsQuicDialEventTimeout = chronos.seconds(2)
-  MsQuicDialMaxEvents = 12
+  MsQuicDialWaitBudget = chronos.seconds(60)
   DefaultWebtransportPath* = "/.well-known/libp2p-webtransport"
   DefaultWebtransportQuery* = "?type=noise"
   DefaultWebtransportDraft* = "draft02"
@@ -237,13 +238,19 @@ type
     webtransportActiveSessions: uint32
     pendingCerthashHistory: seq[string]
     tlsOverride: Option[mstls.TlsConfig]
+    tlsResumptionTicket: Option[seq[uint8]]
+    tlsZeroRttEnabled: bool
+    tlsZeroRttAllowedAlpns: HashSet[string]
     tlsTempDir: string
     connections: seq[MsQuicConnection]
   MsQuicConnectionSnapshot* = object
     peerId*: string
     protocol*: string
+    handshakeComplete*: bool
+    closeReason*: string
     datagramSendEnabled*: bool
     datagramMaxSend*: uint16
+    sessionResumed*: bool
     isWebtransport*: bool
     webtransportReady*: bool
     webtransportAuthority*: string
@@ -251,6 +258,9 @@ type
     webtransportSessionId*: uint64
     handshakeStartMs*: Option[int64]
     handshakeReadyMs*: Option[int64]
+    activePathId*: Option[uint8]
+    knownPathCount*: Option[uint8]
+    pathStates*: seq[msquicdrv.MsQuicConnectionPathState]
     observedAddr*: Option[string]
     localAddr*: Option[string]
   MsQuicTransportStats* = object
@@ -259,12 +269,16 @@ type
     connectionCount*: int
     datagramEnabled*: int
     datagramDisabled*: int
+    resumedConnections*: int
     webtransportReady*: int
     webtransportPending*: int
     webtransportActiveSlots*: uint32
     webtransportSlotLimit*: uint32
     currentCerthash*: string
     certhashHistory*: seq[string]
+    zeroRttEnabled*: bool
+    zeroRttAllowedAlpns*: seq[string]
+    resumptionTicketConfigured*: bool
     rejection*: WebtransportRejectionStats
     readyHandshakeAverage*: float
     pendingHandshakeAverage*: float
@@ -296,6 +310,11 @@ proc newMsQuicChannel(
     session: MsQuicConnection, stream: MsQuicStream
 ): MsQuicChannel {.gcsafe, raises: [].} =
   try:
+    let version =
+      if session.isNil or session.multistreamVersion == msvUnknown:
+        msv1
+      else:
+        session.multistreamVersion
     let channel = MsQuicChannel(
       stream: stream,
       peerId: session.peerId,
@@ -304,7 +323,7 @@ proc newMsQuicChannel(
       localAddr: session.localAddr,
       protocol: session.protocol,
       negotiatedMuxer: "msquic",
-      multistreamVersion: msv1,
+      multistreamVersion: version,
     )
     if not session.bandwidthManager.isNil:
       channel.bandwidthManager = session.bandwidthManager
@@ -340,6 +359,21 @@ method closeImpl*(s: MsQuicChannel) {.async: (raises: []).} =
     discard
   await procCall Connection(s).closeImpl()
 
+method beginProtocolNegotiation*(
+    s: MsQuicChannel
+): Future[void] {.gcsafe, async: (raises: [CancelledError]).} =
+  if s.isNil or s.stream.isNil:
+    return
+  await s.stream.beginProtocolNegotiation()
+
+method endProtocolNegotiation*(s: MsQuicChannel) {.gcsafe.} =
+  if s.isNil or s.stream.isNil:
+    return
+  try:
+    s.stream.releaseProtocolGate()
+  except CatchableError:
+    discard
+
 method getWrapped*(s: MsQuicChannel): Connection =
   nil
 
@@ -368,7 +402,11 @@ proc channelFromState(
       muxer.session.transportHandle(),
       dir,
       peerId = muxer.session.peerId,
-      protocol = muxer.session.protocol
+      protocol = muxer.session.protocol,
+      # Each accepted peer stream negotiates its own multistream codec.
+      # Sharing the connection gate here can stall unrelated inbound streams
+      # on the same QUIC session, which is exactly what live DM/identify does.
+      protocolGate = newAsyncLock()
     )
     newMsQuicChannel(muxer.session, stream)
   except CatchableError as exc:
@@ -380,6 +418,13 @@ proc nextIncomingChannel(
 ): Future[Connection] {.async: (raises: [CancelledError, QuicTransportError]).} =
   if muxer.isNil or muxer.session.isNil or muxer.session.connectionState().isNil:
     raise (ref QuicTransportError)(msg: "MsQuic muxer session unavailable")
+  if not muxer.bootstrapInbound.isNil:
+    let channel = muxer.bootstrapInbound
+    muxer.bootstrapInbound = nil
+    warn "MsQuic muxer accepted bootstrap inbound stream",
+      peerId = muxer.session.peerId,
+      protocol = muxer.session.protocol
+    return channel
   let connState = muxer.session.connectionState()
   warn "MsQuic muxer waiting for incoming stream",
     peerId = muxer.session.peerId,
@@ -388,14 +433,13 @@ proc nextIncomingChannel(
     var pending = msquicdrv.popPendingStreamState(connState)
     if pending.isNone:
       try:
-        discard await msquicdrv.awaitPendingStreamState(connState)
+        pending = some(await msquicdrv.awaitPendingStreamState(connState))
       except CancelledError as exc:
         raise exc
       except CatchableError as exc:
         raise (ref QuicTransportError)(
           msg: "MsQuic pending stream wait failed: " & exc.msg
         )
-      pending = msquicdrv.popPendingStreamState(connState)
       if pending.isNone:
         continue
     let state = pending.get()
@@ -727,10 +771,54 @@ proc configureTls*(
       var base = default(mstls.TlsConfig)
       base.role = mstls.tlsServer
       base.useSharedSessionCache = true
-      base.enableZeroRtt = false
+      base.resumptionTicket = transport.tlsResumptionTicket
+      base.enableZeroRtt = transport.tlsZeroRttEnabled
       base
   mutator(cfg)
   transport.tlsOverride = some(cfg)
+
+proc setTlsResumptionTicket*(
+    transport: MsQuicTransport, ticket: openArray[byte]
+) =
+  if ticket.len == 0:
+    transport.tlsResumptionTicket = none(seq[uint8])
+  else:
+    transport.tlsResumptionTicket = some(@ticket)
+
+proc clearTlsResumptionTicket*(transport: MsQuicTransport) =
+  transport.tlsResumptionTicket = none(seq[uint8])
+
+proc setTlsZeroRttEnabled*(transport: MsQuicTransport, enabled: bool) =
+  transport.tlsZeroRttEnabled = enabled
+
+proc setTlsZeroRttAllowedAlpns*(
+    transport: MsQuicTransport, alpns: openArray[string]
+) =
+  transport.tlsZeroRttAllowedAlpns.clear()
+  for alpn in alpns:
+    let normalized = alpn.strip()
+    if normalized.len > 0:
+      transport.tlsZeroRttAllowedAlpns.incl(normalized)
+
+proc currentTlsZeroRttAllowedAlpns*(
+    transport: MsQuicTransport
+): seq[string] =
+  if transport.isNil:
+    return @[]
+  for alpn in transport.tlsZeroRttAllowedAlpns.items:
+    result.add(alpn)
+
+proc zeroRttAllowedForConfig(
+    transport: MsQuicTransport, alpns: seq[string]
+): bool =
+  if transport.isNil or not transport.tlsZeroRttEnabled:
+    return false
+  if transport.tlsZeroRttAllowedAlpns.len == 0:
+    return false
+  for alpn in alpns:
+    if alpn in transport.tlsZeroRttAllowedAlpns:
+      return true
+  false
 
 proc clearTlsOverrides*(transport: MsQuicTransport) =
   transport.tlsOverride = none(mstls.TlsConfig)
@@ -1385,11 +1473,34 @@ proc connectionToSnapshot(
   var handshakeReadyMs = none(int64)
   conn.webtransportHandshakeReadyAt.withValue(readyMoment):
     handshakeReadyMs = some(momentToMillis(readyMoment))
+  var handshakeComplete = false
+  var closeReason = ""
+  var activePathId = none(uint8)
+  var knownPathCount = none(uint8)
+  var pathStates: seq[msquicdrv.MsQuicConnectionPathState] = @[]
+  let connState = conn.connectionState()
+  if not conn.isNil and not connState.isNil:
+    handshakeComplete = msquicdrv.connectionHandshakeComplete(connState)
+    closeReason = msquicdrv.connectionCloseReason(connState)
+    let activePathRes = msquicdrv.activeConnectionPathId(connState)
+    if activePathRes.isOk():
+      activePathId = some(activePathRes.get())
+    let pathCountRes = msquicdrv.knownConnectionPathCount(connState)
+    if pathCountRes.isOk():
+      let count = pathCountRes.get()
+      knownPathCount = some(count)
+      for pathIdx in 0 ..< int(count):
+        let stateRes = msquicdrv.connectionPathState(connState, uint8(pathIdx))
+        if stateRes.isOk():
+          pathStates.add(stateRes.get())
   MsQuicConnectionSnapshot(
     peerId: $conn.peerId,
     protocol: conn.protocol,
+    handshakeComplete: handshakeComplete,
+    closeReason: closeReason,
     datagramSendEnabled: conn.datagramSendEnabled,
     datagramMaxSend: conn.datagramMaxSend,
+    sessionResumed: conn.sessionResumed,
     isWebtransport: conn.isWebtransport,
     webtransportReady: conn.webtransportReady,
     webtransportAuthority: conn.webtransportAuthority,
@@ -1397,6 +1508,9 @@ proc connectionToSnapshot(
     webtransportSessionId: conn.webtransportSessionId,
     handshakeStartMs: handshakeStartMs,
     handshakeReadyMs: handshakeReadyMs,
+    activePathId: activePathId,
+    knownPathCount: knownPathCount,
+    pathStates: pathStates,
     observedAddr: observed,
     localAddr: local
   )
@@ -1432,6 +1546,9 @@ proc collectMsQuicTransportStats*(
     trace "failed to fetch certhash history", error = exc.msg
   stats.webtransportActiveSlots = transport.webtransportActiveSessions
   stats.webtransportSlotLimit = transport.currentWebtransportMaxSessions()
+  stats.zeroRttEnabled = transport.tlsZeroRttEnabled
+  stats.zeroRttAllowedAlpns = transport.currentTlsZeroRttAllowedAlpns()
+  stats.resumptionTicketConfigured = transport.tlsResumptionTicket.isSome
   stats.rejection = transport.webtransportRejection
   let snapshots = transport.connectionSnapshots()
   stats.connectionCount = snapshots.len
@@ -1446,6 +1563,8 @@ proc collectMsQuicTransportStats*(
       inc stats.datagramEnabled
     else:
       inc stats.datagramDisabled
+    if snap.sessionResumed:
+      inc stats.resumedConnections
     if snap.isWebtransport:
       if snap.webtransportReady:
         inc stats.webtransportReady
@@ -1530,6 +1649,10 @@ proc makeTlsConfig(transport: MsQuicTransport): mstls.TlsConfig =
       cfg.tempDirectory = some(transport.tlsTempDir)
     if cfg.transportParameters.len == 0:
       cfg.transportParameters = @[]
+    if cfg.resumptionTicket.isNone and transport.tlsResumptionTicket.isSome:
+      cfg.resumptionTicket = transport.tlsResumptionTicket
+    cfg.enableZeroRtt =
+      cfg.enableZeroRtt and transport.zeroRttAllowedForConfig(cfg.alpns)
     cfg
   else:
     let cert = transport.ensureCertificate()
@@ -1543,8 +1666,8 @@ proc makeTlsConfig(transport: MsQuicTransport): mstls.TlsConfig =
       serverName: none(string),
       certificatePem: some(bytesToString(cert.certificate)),
       privateKeyPem: some(bytesToString(cert.privateKey)),
-      resumptionTicket: none(seq[uint8]),
-      enableZeroRtt: false,
+      resumptionTicket: transport.tlsResumptionTicket,
+      enableZeroRtt: transport.zeroRttAllowedForConfig(alpns),
       useSharedSessionCache: true,
       disableCertificateValidation: false,
       requireClientAuth: true,
@@ -1769,17 +1892,24 @@ proc decodePrefixedInt(
 
 proc encodeStringLiteralCustom(
     prefixBits: int, prefixBase: byte, value: string
-): seq[byte] =
+): seq[byte] {.gcsafe, raises: [].} =
   let mask = (1 shl prefixBits) - 1
-  let length = value.len.uint64
+  let encodedHuffman = qpackHuffmanEncode(value)
+  let useHuffman = encodedHuffman.len < value.len
+  let payloadLen =
+    if useHuffman: encodedHuffman.len.uint64
+    else: value.len.uint64
+  let huffmanBit =
+    if useHuffman: byte(1 shl prefixBits)
+    else: 0'u8
   var first = prefixBase
-  if length < mask.uint64:
-    first = first or byte(length)
+  if payloadLen < mask.uint64:
+    first = first or huffmanBit or byte(payloadLen)
     result.add(first)
   else:
-    first = first or byte(mask)
+    first = first or huffmanBit or byte(mask)
     result.add(first)
-    var extra = length - mask.uint64
+    var extra = payloadLen - mask.uint64
     while true:
       var b = byte(extra and 0x7f)
       extra = extra shr 7
@@ -1788,24 +1918,27 @@ proc encodeStringLiteralCustom(
       else:
         result.add(b)
         break
-  for ch in value:
-    result.add(byte(ch))
+  if useHuffman:
+    result.add(encodedHuffman)
+  else:
+    for ch in value:
+      result.add(byte(ch))
 
-proc encodeStringLiteral(prefixBits: int, value: string): seq[byte] =
+proc encodeStringLiteral(prefixBits: int, value: string): seq[byte] {.gcsafe, raises: [].} =
   encodeStringLiteralCustom(prefixBits, 0, value)
+
+proc qpackHuffmanDecodeSafe(data: openArray[byte]): string {.gcsafe, raises: [ValueError].} =
+  {.cast(gcsafe).}:
+    qpackHuffmanDecode(data)
 
 proc decodeStringLiteral(
     data: seq[byte], pos: var int, prefixBits: int
-): string {.raises: [QuicTransportError].} =
+): string {.gcsafe, raises: [QuicTransportError].} =
   if pos >= data.len:
     raise (ref QuicTransportError)(msg: "unexpected EOF decoding string literal")
   let first = data[pos]
   inc pos
   let huffman = ((first shr prefixBits) and 0x1) == 1
-  if huffman:
-    raise (ref QuicTransportError)(
-      msg: "Huffman-encoded QPACK strings are not supported"
-    )
   let mask = (1 shl prefixBits) - 1
   var length = uint64(first and mask.byte)
   if length == mask.uint64:
@@ -1826,13 +1959,22 @@ proc decodeStringLiteral(
       msg: "unexpected EOF decoding string literal payload"
     )
   let endPos = pos + int(length)
-  var s = newString(int(length))
-  var idx = 0
-  while pos < endPos:
-    s[idx] = char(data[pos])
-    inc idx
-    inc pos
-  s
+  if huffman:
+    let decoded =
+      try:
+        qpackHuffmanDecodeSafe(data.toOpenArray(pos, endPos - 1))
+      except ValueError as exc:
+        raise (ref QuicTransportError)(msg: exc.msg)
+    pos = endPos
+    decoded
+  else:
+    var s = newString(int(length))
+    var idx = 0
+    while pos < endPos:
+      s[idx] = char(data[pos])
+      inc idx
+      inc pos
+    s
 
 proc qpackIndexedStatic(index: uint64): seq[byte] =
   encodePrefixedInt(0b11000000'u8, 6, index)
@@ -1905,7 +2047,7 @@ proc qpackStaticHeader(index: uint64): (string, string) {.raises: [QuicTransport
 
 proc decodeHeadersBlock(
     payload: seq[byte]
-): Table[string, string] {.raises: [QuicTransportError].} =
+): Table[string, string] {.gcsafe, raises: [QuicTransportError].} =
   var pos = 0
   if payload.len < 2:
     raise (ref QuicTransportError)(msg: "invalid QPACK field section")
@@ -2176,6 +2318,26 @@ proc awaitPeerStream(
 ): Future[(pointer, bool)] {.async: (raises: [CancelledError, QuicTransportError]).} =
   let state = conn.connectionState()
   await awaitPeerStreamState(state)
+
+proc peekBidirectionalPeerStream(
+    state: msquicdrv.MsQuicConnectionState
+): pointer {.gcsafe, raises: [].} =
+  if state.isNil:
+    return nil
+  let pendingOpt = msquicdrv.peekPendingStreamState(state)
+  if pendingOpt.isNone:
+    return nil
+  let pending = pendingOpt.get()
+  if pending.isNil or pending.stream.isNil:
+    return nil
+  let idRes = block:
+    var tmp: Result[uint64, string]
+    msquicSafe:
+      tmp = msquicdrv.streamId(pending)
+    tmp
+  if idRes.isOk and ((idRes.get() and 0x2'u64) != 0'u64):
+    return nil
+  cast[pointer](pending.stream)
 
 proc performClientWebtransportHandshake(
     transport: MsQuicTransport,
@@ -2453,7 +2615,11 @@ proc awaitMsQuicDial(
     return (false, "MsQuic connection state unavailable")
   var attempt = 0
   var timeoutCount = 0
-  while attempt < MsQuicDialMaxEvents:
+  let deadline = Moment.now() + MsQuicDialWaitBudget
+  while Moment.now() < deadline:
+    if msquicdrv.connectionHandshakeComplete(state):
+      warn "MsQuic dial handshake complete via state poll", attempt = attempt
+      return (true, "handshake_complete_poll")
     inc attempt
     trace "MsQuic dial awaiting connection event", attempt = attempt
     let fut = state.nextQuicConnectionEvent()
@@ -2462,6 +2628,9 @@ proc awaitMsQuicDial(
     if winner == cast[FutureBase](timeoutFut):
       fut.cancel()
       inc timeoutCount
+      if msquicdrv.connectionHandshakeComplete(state):
+        warn "MsQuic dial handshake complete after timeout", attempt = attempt
+        return (true, "handshake_complete_poll")
       trace "MsQuic dial event timeout", attempt = attempt, timeoutCount = timeoutCount
       continue
     timeoutFut.cancel()
@@ -2475,17 +2644,30 @@ proc awaitMsQuicDial(
       warn "MsQuic dial connected", attempt = attempt
       return (true, "connected")
     of msquicdrv.qceShutdownInitiated:
-      warn "MsQuic dial shutdown initiated", attempt = attempt
-      return (false, "MsQuic connection shutdown initiated")
+      let closeReason = msquicdrv.connectionCloseReason(state)
+      warn "MsQuic dial shutdown initiated", attempt = attempt, reason = closeReason
+      return (
+        false,
+        "MsQuic connection shutdown initiated" &
+          (if closeReason.len > 0: " reason=" & closeReason else: "")
+      )
     of msquicdrv.qceShutdownComplete:
-      warn "MsQuic dial shutdown complete", attempt = attempt
-      return (false, "MsQuic connection shutdown complete")
+      let closeReason = msquicdrv.connectionCloseReason(state)
+      warn "MsQuic dial shutdown complete", attempt = attempt, reason = closeReason
+      return (
+        false,
+        "MsQuic connection shutdown complete" &
+          (if closeReason.len > 0: " reason=" & closeReason else: "")
+      )
     else:
       discard
+  if msquicdrv.connectionHandshakeComplete(state):
+    warn "MsQuic dial handshake complete via final state poll"
+    return (true, "handshake_complete_poll")
   if timeoutCount > 0:
     (false, "timeout waiting for MsQuic connection event")
   else:
-    (false, "MsQuic dial exceeded event budget")
+    (false, "MsQuic dial exceeded wait budget")
 
 proc newMsQuicTransport*(
     upgrader: Upgrade,
@@ -2505,6 +2687,9 @@ proc newMsQuicTransport*(
     certificateDer: @[],
     webtransportSessions: @[],
     tlsOverride: none(mstls.TlsConfig),
+    tlsResumptionTicket: none(seq[uint8]),
+    tlsZeroRttEnabled: false,
+    tlsZeroRttAllowedAlpns: initHashSet[string](),
     tlsTempDir: "",
     connections: @[]
   )
@@ -2854,43 +3039,13 @@ method accept*(
           connection = cast[uint64](inboundState.connection)
       let listenerMeta = self.listeners[idx]
       try:
-        var primaryStream: pointer = nil
-        if not listenerMeta.webtransport:
-          when defined(libp2p_msquic_debug):
-            warn "MsQuic accept awaiting peer stream",
-              webtransport = listenerMeta.webtransport
-          try:
-            while primaryStream.isNil:
-              let (streamPtr, uni) = await awaitPeerStreamState(inboundState)
-              if uni:
-                when defined(libp2p_msquic_debug):
-                  warn "MsQuic accept skipping unidirectional peer stream",
-                    stream = cast[uint64](streamPtr)
-                let adoptRes = block:
-                  var tmp: tuple[state: Option[msquicdrv.MsQuicStreamState], error: string]
-                  try:
-                    msquicSafe:
-                      tmp = msquicdrv.adoptStream(self.handle, streamPtr, inboundState)
-                  except Exception as exc:
-                    tmp = (none(msquicdrv.MsQuicStreamState), "MsQuic adoptStream raised: " & exc.msg)
-                  tmp
-                if adoptRes.state.isSome:
-                  msquicSafe:
-                    msquicdrv.closeStream(self.handle, streamPtr, adoptRes.state.get())
-                else:
-                  msquicSafe:
-                    msquicdrv.closeStream(self.handle, streamPtr)
-                continue
-              primaryStream = streamPtr
-            when defined(libp2p_msquic_debug):
-              warn "MsQuic accept selected primary stream",
-                stream = cast[uint64](primaryStream)
-          except CancelledError as exc:
-            raise exc
-          except QuicTransportError as exc:
-            warn "MsQuic await peer stream failed", error = exc.msg
-            cleanupMsQuicDial(self, event.connection, inboundState)
-            continue
+        let primaryStream =
+          if listenerMeta.webtransport: nil
+          else: peekBidirectionalPeerStream(inboundState)
+        when defined(libp2p_msquic_debug):
+          if not primaryStream.isNil:
+            warn "MsQuic accept selected pending primary stream",
+              stream = cast[uint64](primaryStream)
 
         var observedAddr = Opt.none(MultiAddress)
         var localAddr = Opt.none(MultiAddress)
@@ -2915,6 +3070,7 @@ method accept*(
           event.connection,
           inboundState,
           primaryStream = primaryStream,
+          createPrimaryStream = false,
           observed = observedAddr,
           local = localAddr,
           onClosed = proc(c: MsQuicConnection): Future[void] {.async.} =
@@ -3067,6 +3223,7 @@ method dial*(
       self.handle,
       connPtr,
       connState,
+      createPrimaryStream = false,
       observed = Opt.some(address),
       local = localAddr,
       onClosed = proc(c: MsQuicConnection): Future[void] {.async.} =
@@ -3138,7 +3295,12 @@ method upgrade*(
   let detached = session.detachPrimaryStreamState()
   let muxer = MsQuicMuxer(session: session, connection: conn)
   if not detached.state.isNil:
-    closePendingMsQuicState(session.transportHandle(), detached.state)
+    if detached.localInitiated:
+      closePendingMsQuicState(session.transportHandle(), detached.state)
+    else:
+      muxer.bootstrapInbound = muxer.channelFromState(detached.state, Direction.In)
+      if muxer.bootstrapInbound.isNil:
+        msquicdrv.restorePendingStreamState(session.connectionState(), detached.state)
 
   muxer.streamHandler = proc(streamConn: Connection) {.async: (raises: []).} =
     try:

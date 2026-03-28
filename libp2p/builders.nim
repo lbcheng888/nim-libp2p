@@ -19,6 +19,7 @@ import options, tables, chronos, chronicles, sequtils, strutils, stew/byteutils
 import features
 import
   switch,
+  lsmr,
   peerid,
   peerinfo,
   stream/connection,
@@ -74,7 +75,8 @@ import protocols/[
   providers/bitswapadvertiser
 import services/[wildcardresolverservice, metricsservice, otelmetricsservice,
   noderesourceservice, mobilemeshservice, synccastcontrolservice,
-  distributedinferenceservice, autorelayservice, hpservice, wanbootstrapservice]
+  distributedinferenceservice, autorelayservice, hpservice, wanbootstrapservice,
+  lsmrservice]
 when libp2pDataTransferEnabled:
   import services/[otellogsservice, oteltracesservice]
 
@@ -185,6 +187,9 @@ type
     delegatedRoutingServer: DelegatedRoutingServer
     delegatedRoutingRoutesRegistered: bool
     rendezVousPolicies: Table[string, NamespacePolicy]
+    lsmrConfig: Opt[LsmrConfig]
+    routingMode: RoutingPlaneMode
+    primaryRoutingPlane: PrimaryRoutingPlane
     when defined(libp2p_msquic_experimental) or defined(libp2p_quic_support):
       webtransportRotation: Opt[WebtransportRotationSettings]
       when defined(libp2p_msquic_experimental):
@@ -239,7 +244,10 @@ proc new*(T: type[SwitchBuilder]): T {.public.} =
     delegatedRoutingStore: nil,
     delegatedRoutingServer: nil,
     delegatedRoutingRoutesRegistered: false,
-    rendezVousPolicies: initTable[string, NamespacePolicy]()
+    rendezVousPolicies: initTable[string, NamespacePolicy](),
+    lsmrConfig: Opt.none(LsmrConfig),
+    routingMode: RoutingPlaneMode.legacyOnly,
+    primaryRoutingPlane: PrimaryRoutingPlane.legacy
   )
   when defined(libp2p_msquic_experimental) or defined(libp2p_quic_support):
     builder.webtransportRotation = Opt.none(WebtransportRotationSettings)
@@ -784,20 +792,146 @@ proc withMobileMeshService*(
   b.services.add(svc)
   b
 
+proc conservativeTrust(
+    left, right: WanBootstrapTrust
+): WanBootstrapTrust =
+  if left == WanBootstrapTrust.rejected or right == WanBootstrapTrust.rejected:
+    WanBootstrapTrust.rejected
+  elif left == WanBootstrapTrust.quarantine or right == WanBootstrapTrust.quarantine:
+    WanBootstrapTrust.quarantine
+  else:
+    WanBootstrapTrust.trusted
+
+proc wrapWanBootstrapAttester(
+    config: LsmrConfig,
+    existing: WanBootstrapAttester,
+): WanBootstrapAttester =
+  proc lsmrAttester(
+      switch: Switch,
+      peerId: PeerId,
+      addrs: seq[MultiAddress],
+      sources: seq[string],
+      currentTrust: WanBootstrapTrust,
+      stage: string,
+  ): Future[WanBootstrapTrust] {.async: (raises: []), gcsafe.} =
+    let snapshot = validateLsmrPeer(switch, config, peerId)
+    let lsmrSvc = getLsmrService(switch)
+    if not lsmrSvc.isNil:
+      case snapshot.trust
+      of LsmrValidationTrust.rejected:
+        inc lsmrSvc.validationRejected
+        if snapshot.reason in ["invalid_coordinate_signature", "invalid_witness_signature",
+            "witness_subject_mismatch", "witness_network_mismatch", "unknown_anchor",
+            "invalid_anchor_claim", "coordinate_prefix_mismatch", "coordinate_network_mismatch"]:
+          inc lsmrSvc.forgedRecords
+      of LsmrValidationTrust.quarantine:
+        inc lsmrSvc.validationQuarantine
+        if snapshot.reason == "stale_record" or snapshot.reason == "stale_witnesses":
+          inc lsmrSvc.staleRecords
+      of LsmrValidationTrust.trusted:
+        inc lsmrSvc.validationTrusted
+    var lsmrTrust =
+      case snapshot.trust
+      of LsmrValidationTrust.rejected:
+        WanBootstrapTrust.rejected
+      of LsmrValidationTrust.quarantine:
+        if config.softIsolation:
+          WanBootstrapTrust.quarantine
+        else:
+          WanBootstrapTrust.rejected
+      of LsmrValidationTrust.trusted:
+        WanBootstrapTrust.trusted
+    if existing.isNil or lsmrTrust == WanBootstrapTrust.rejected:
+      return conservativeTrust(currentTrust, lsmrTrust)
+    let existingTrust = await existing(
+      switch, peerId, addrs, sources, currentTrust, stage
+    )
+    conservativeTrust(conservativeTrust(currentTrust, lsmrTrust), existingTrust)
+  lsmrAttester
+
 proc withWanBootstrapService*(
     b: SwitchBuilder,
     config: WanBootstrapConfig = WanBootstrapConfig.init(),
-): SwitchBuilder {.public.} =
-  let svc = WanBootstrapService.new(config = config)
+): SwitchBuilder {.public, gcsafe.} =
+  var resolved = config
+  if resolved.routingMode == RoutingPlaneMode.legacyOnly and
+      resolved.primaryPlane == PrimaryRoutingPlane.legacy:
+    resolved.routingMode = b.routingMode
+    resolved.primaryPlane = b.primaryRoutingPlane
+  b.lsmrConfig.withValue(lsmrCfg):
+    resolved.lsmrConfig = some(lsmrCfg)
+    resolved.attestPeer = wrapWanBootstrapAttester(lsmrCfg, resolved.attestPeer)
+  let svc = WanBootstrapService.new(config = resolved)
   b.services.keepItIf(not (it of WanBootstrapService))
   b.services.add(svc)
+  b
+
+proc withLsmr*(
+    b: SwitchBuilder,
+    config: LsmrConfig = LsmrConfig.init(),
+): SwitchBuilder {.public, gcsafe.} =
+  if b.rng.isNil:
+    b.rng = newRng()
+  b.lsmrConfig = Opt.some(config)
+  let svc = LsmrService.new(config = config, rng = b.rng)
+  var updatedServices: seq[Service] = @[]
+  var inserted = false
+  for service in b.services:
+    if service of LsmrService:
+      continue
+    if not inserted and service of WanBootstrapService:
+      updatedServices.add(svc)
+      inserted = true
+      let wanSvc = WanBootstrapService(service)
+      wanSvc.config.attestPeer = wrapWanBootstrapAttester(config, wanSvc.config.attestPeer)
+    updatedServices.add(service)
+  if not inserted:
+    updatedServices.add(svc)
+  b.services = updatedServices
+  b.sendSignedPeerRecord = true
+  b
+
+proc withRoutingPlanes*(
+    b: SwitchBuilder,
+    mode: RoutingPlaneMode,
+    primary: PrimaryRoutingPlane = PrimaryRoutingPlane.legacy,
+): SwitchBuilder {.public, gcsafe.} =
+  b.routingMode = mode
+  b.primaryRoutingPlane = primary
+  for idx in 0 ..< b.services.len:
+    if b.services[idx] of WanBootstrapService:
+      let svc = WanBootstrapService(b.services[idx])
+      svc.config.routingMode = mode
+      svc.config.primaryPlane = primary
   b
 
 proc withWanBootstrapProfile*(
     b: SwitchBuilder,
     config: WanBootstrapConfig = WanBootstrapConfig.init(),
     hpConfig: HPServiceConfig = HPServiceConfig.init(),
-): SwitchBuilder {.public.} =
+): SwitchBuilder {.public, gcsafe.}
+
+proc withWanBootstrapDualStackProfile*(
+    b: SwitchBuilder,
+    wanConfig: WanBootstrapConfig = WanBootstrapConfig.init(),
+    lsmrConfig: LsmrConfig = LsmrConfig.init(),
+    primary: PrimaryRoutingPlane = PrimaryRoutingPlane.legacy,
+): SwitchBuilder {.public, gcsafe.} =
+  var resolvedWan = wanConfig
+  resolvedWan.routingMode = RoutingPlaneMode.dualStack
+  resolvedWan.primaryPlane = primary
+  resolvedWan.lsmrConfig = some(lsmrConfig)
+  resolvedWan.legacyDiscoveryEnabled = true
+  resolvedWan.legacyCompatibilityOnly = primary == PrimaryRoutingPlane.lsmr
+  b.withRoutingPlanes(RoutingPlaneMode.dualStack, primary)
+    .withLsmr(lsmrConfig)
+    .withWanBootstrapProfile(resolvedWan)
+
+proc withWanBootstrapProfile*(
+    b: SwitchBuilder,
+    config: WanBootstrapConfig = WanBootstrapConfig.init(),
+    hpConfig: HPServiceConfig = HPServiceConfig.init(),
+): SwitchBuilder {.public, gcsafe.} =
   if b.rng.isNil:
     b.rng = newRng()
   let next = b.withSignedPeerRecord(true).withWanBootstrapService(config)

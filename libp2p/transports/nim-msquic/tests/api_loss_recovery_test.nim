@@ -965,6 +965,57 @@ suite "MsQuic ACK-driven loss recovery":
       check foundAck
     )
 
+  test "completeServerHandshake flushes queued peer-started stream chunks":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard registration
+      discard api
+      let remoteHost = "10.0.2.191"
+      let remotePort = 5191'u16
+      check seedConnectionIdsForTest(
+        connection,
+        @[0xAA'u8, 0xBB, 0xCC, 0xDD],
+        @[0x01'u8, 0x02, 0x03, 0x04],
+        isClient = false
+      )
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+
+      var peerStream: HQUIC = nil
+      registerConnectionEventHandler(connection, proc(ev: ConnectionEvent) =
+        if ev.kind == cePeerStreamStarted and peerStream.isNil and not ev.stream.isNil:
+          peerStream = cast[HQUIC](ev.stream)
+      )
+      let clientPayload = proto.encodeStreamFrame(0'u64, @[0x11'u8], 0'u64, false)
+      check receiveOneRttPayloadForTest(connection, 1'u64, clientPayload, remoteHost, remotePort)
+      check not peerStream.isNil
+
+      var sentBefore = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentBefore)
+
+      check prependPendingStreamChunkForTest(peerStream, 0'u64, @[0x21'u8, 0x31, 0x41], false)
+      check setConnectionHandshakeStateForTest(connection, false)
+      check completeServerHandshakeForTest(connection)
+
+      var sentAfter = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentAfter)
+      check sentAfter > sentBefore
+
+      var sawStream = false
+      for idx in sentBefore ..< sentAfter:
+        var frameKind = sfkAck
+        var payload: seq[byte] = @[]
+        var host = ""
+        var port = 0'u16
+        check getConnectionSentFrameKindAtForTest(connection, idx, frameKind)
+        check getConnectionSentFramePayloadAtForTest(connection, idx, payload)
+        check getConnectionSentTargetRemoteAtForTest(connection, idx, host, port)
+        if frameKind == sfkStream:
+          sawStream = true
+          check payload == proto.encodeStreamFrame(0'u64, @[0x21'u8, 0x31, 0x41], 0'u64, false)
+          check port == remotePort
+          check host.contains(remoteHost)
+      check sawStream
+    )
+
   test "pending one-rtt ack is consumed after flush and not resent without new packets":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard api
@@ -1532,6 +1583,40 @@ suite "MsQuic ACK-driven loss recovery":
       check count == 3'u32
       check frameKind == sfkStream
       check payloadLen == uint32(streamPayload.len)
+      check payload == streamPayload
+    )
+
+  test "connection maintenance loop triggers one-rtt PTO without manual tick":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs()
+      let streamPayload = proto.encodeStreamFrame(0'u64, @[0x51'u8, 0x52, 0x53], 0'u64, false)
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
+      check seedSentPacketForTest(
+        connection,
+        packet_model.ceOneRtt,
+        1'u64,
+        base - 500_000'u64,
+        1200'u16,
+        frameKind = sfkStream,
+        framePayload = streamPayload
+      )
+
+      var count = 0'u32
+      check getConnectionSentPacketCountForTest(connection, count)
+      check count == 1'u32
+
+      waitFor sleepAsync(250)
+
+      var payload: seq[byte] = @[]
+      var frameKind = sfkAck
+      check getConnectionSentPacketCountForTest(connection, count)
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check count == 3'u32
+      check frameKind == sfkStream
       check payload == streamPayload
     )
 
@@ -2104,6 +2189,63 @@ suite "MsQuic ACK-driven loss recovery":
       check payload == proto.encodeStreamFrame(0'u64, @[0x21'u8, 0x31, 0x41], 0'u64, false)
       check port == 5211'u16
       check host.contains("10.0.2.211")
+    )
+
+  test "ACK flushes queued peer-started stream chunks":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard registration
+      discard api
+      let remoteHost = "10.0.2.231"
+      let remotePort = 5231'u16
+      check seedConnectionIdsForTest(
+        connection,
+        @[0xAA'u8, 0xBC, 0xCD, 0xDE],
+        @[0x01'u8, 0x13, 0x24, 0x35],
+        isClient = false
+      )
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+
+      var peerStream: HQUIC = nil
+      registerConnectionEventHandler(connection, proc(ev: ConnectionEvent) =
+        if ev.kind == cePeerStreamStarted and peerStream.isNil and not ev.stream.isNil:
+          peerStream = cast[HQUIC](ev.stream)
+      )
+      let clientPayload = proto.encodeStreamFrame(0'u64, @[0x41'u8], 0'u64, false)
+      check receiveOneRttPayloadForTest(connection, 3'u64, clientPayload, remoteHost, remotePort)
+      check not peerStream.isNil
+
+      var sentBefore = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentBefore)
+
+      check prependPendingStreamChunkForTest(peerStream, 0'u64, @[0x51'u8, 0x61], false)
+      check seedSentPacketForTest(
+        connection,
+        packet_model.ceOneRtt,
+        7'u64,
+        nowUs(),
+        1200'u16
+      )
+      check applyAckForTest(connection, packet_model.ceOneRtt, 7'u64)
+
+      var sentAfter = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentAfter)
+      check sentAfter > sentBefore
+
+      var sawStream = false
+      for idx in sentBefore ..< sentAfter:
+        var frameKind = sfkAck
+        var payload: seq[byte] = @[]
+        var host = ""
+        var port = 0'u16
+        check getConnectionSentFrameKindAtForTest(connection, idx, frameKind)
+        check getConnectionSentFramePayloadAtForTest(connection, idx, payload)
+        check getConnectionSentTargetRemoteAtForTest(connection, idx, host, port)
+        if frameKind == sfkStream:
+          sawStream = true
+          check payload == proto.encodeStreamFrame(0'u64, @[0x51'u8, 0x61], 0'u64, false)
+          check port == remotePort
+          check host.contains(remoteHost)
+      check sawStream
     )
 
   test "flushPendingDatagrams preserves pending datagram original remote":

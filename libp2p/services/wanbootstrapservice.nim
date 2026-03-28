@@ -12,10 +12,12 @@ import ../nameresolving/nameresolver
 import ../peerid
 import ../peerinfo
 import ../peerstore
+import ../lsmr
 import ../protocols/kademlia/kademlia
 import ../protocols/protocol
 import ../protocols/rendezvous
 import ../routing_record
+import ./lsmrservice as lsmrsvc
 import ../stream/connection
 import ../switch
 import ../utility
@@ -91,6 +93,11 @@ type
   WanBootstrapConfig* = object
     networkId*: string
     role*: WanBootstrapRole
+    routingMode*: RoutingPlaneMode
+    primaryPlane*: PrimaryRoutingPlane
+    lsmrConfig*: Option[LsmrConfig]
+    legacyDiscoveryEnabled*: bool
+    legacyCompatibilityOnly*: bool
     journalPath*: string
     authoritativePeerIds*: seq[string]
     deferAutoJoinUntilRelayReady*: bool
@@ -124,6 +131,12 @@ type
     trust*: WanBootstrapTrust
     relayCapable*: bool
     signedPeerRecordSeen*: bool
+    lsmrRecordSeen*: bool
+    lsmrPrefix*: LsmrPath
+    lsmrConfidence*: uint8
+    lsmrWitnessCount*: int
+    lsmrExpiresAtMs*: int64
+    lsmrDistance*: int
 
   WanBootstrapSnapshotEntry* = object
     peerId*: PeerId
@@ -134,6 +147,10 @@ type
     relayCapable*: bool
     signedPeerRecordSeen*: bool
     signedPeerRecord*: string
+    lsmrRecordSeen*: bool
+    lsmrCoordinateRecord*: string
+    lsmrMigrationRecords*: seq[string]
+    lsmrIsolationEvidence*: seq[string]
 
   WanBootstrapJoinAttempt* = object
     stage*: string
@@ -179,10 +196,23 @@ type
     kadBootstrapRuns*: int64
     kadBootstrapProtocols*: int64
     kadBootstrapFailures*: int64
+    lsmrWitnessRequests*: int64
+    lsmrWitnessSuccess*: int64
+    lsmrWitnessQuorumSuccess*: int64
+    lsmrWitnessQuorumFailure*: int64
+    lsmrValidationTrusted*: int64
+    lsmrValidationQuarantine*: int64
+    lsmrValidationRejected*: int64
+    lsmrStaleRecords*: int64
+    lsmrForgedRecords*: int64
+    lsmrBiasReorders*: int64
 
   WanBootstrapStateSnapshot* = object
     networkId*: string
     role*: WanBootstrapRole
+    routingMode*: RoutingPlaneMode
+    primaryPlane*: PrimaryRoutingPlane
+    shadowMode*: bool
     exactSeedDialPolicy*: ExactSeedDialPolicy
     running*: bool
     journalLoaded*: bool
@@ -194,6 +224,7 @@ type
     selectedCandidates*: seq[WanBootstrapCandidate]
     lastRefresh*: WanBootstrapRefreshReport
     metrics*: WanBootstrapMetricsSnapshot
+    routingStatus*: RoutingPlaneStatus
     hasLastJoinResult*: bool
     lastJoinResult*: WanBootstrapJoinResult
 
@@ -277,21 +308,31 @@ proc maxTrust(a, b: WanBootstrapTrust): WanBootstrapTrust =
 
 proc trustToString(value: WanBootstrapTrust): string =
   case value
-  of rejected:
+  of WanBootstrapTrust.rejected:
     "rejected"
-  of quarantine:
+  of WanBootstrapTrust.quarantine:
     "quarantine"
-  of trusted:
+  of WanBootstrapTrust.trusted:
     "trusted"
 
 proc parseTrust(text: string): WanBootstrapTrust =
   case text.strip().toLowerAscii()
   of "trusted":
-    trusted
+    WanBootstrapTrust.trusted
   of "rejected":
-    rejected
+    WanBootstrapTrust.rejected
   else:
-    quarantine
+    WanBootstrapTrust.quarantine
+
+proc lsmrDiscoveryActive(config: WanBootstrapConfig): bool =
+  config.routingMode in {RoutingPlaneMode.dualStack, RoutingPlaneMode.lsmrOnly} and
+    config.lsmrConfig.isSome()
+
+proc legacyDiscoveryActive(config: WanBootstrapConfig): bool =
+  config.legacyDiscoveryEnabled and config.routingMode != RoutingPlaneMode.lsmrOnly
+
+proc shadowMode(config: WanBootstrapConfig): bool =
+  config.routingMode == RoutingPlaneMode.dualStack
 
 proc roleLabel(role: WanBootstrapRole): string =
   case role
@@ -414,6 +455,11 @@ proc init*(
     _: type WanBootstrapConfig,
     networkId = "default",
     role = WanBootstrapRole.publicNode,
+    routingMode = RoutingPlaneMode.legacyOnly,
+    primaryPlane = PrimaryRoutingPlane.legacy,
+    lsmrConfig = none(LsmrConfig),
+    legacyDiscoveryEnabled = true,
+    legacyCompatibilityOnly = false,
     journalPath = "",
     authoritativePeerIds: seq[string] = @[],
     deferAutoJoinUntilRelayReady = false,
@@ -438,6 +484,8 @@ proc init*(
     enableKadAfterJoin = true,
     attestPeer: WanBootstrapAttester = nil,
 ): WanBootstrapConfig =
+  let legacyEnabled =
+    legacyDiscoveryEnabled and routingMode != RoutingPlaneMode.lsmrOnly
   let dialConcurrency =
     if maxConcurrentBootstrapDials > 0:
       maxConcurrentBootstrapDials
@@ -454,6 +502,11 @@ proc init*(
   WanBootstrapConfig(
     networkId: if networkId.len == 0: "default" else: networkId,
     role: role,
+    routingMode: routingMode,
+    primaryPlane: primaryPlane,
+    lsmrConfig: lsmrConfig,
+    legacyDiscoveryEnabled: legacyEnabled,
+    legacyCompatibilityOnly: legacyCompatibilityOnly or primaryPlane == PrimaryRoutingPlane.lsmr,
     journalPath: journalPath,
     authoritativePeerIds: authoritativePeerIds,
     deferAutoJoinUntilRelayReady: deferAutoJoinUntilRelayReady,
@@ -466,9 +519,9 @@ proc init*(
     stopAfterConnected: max(1, stopAfterConnected),
     connectTimeout: clampDuration(connectTimeout, 8.seconds),
     fallbackDnsAddrs: fallbackDnsAddrs,
-    enableDnsaddrFallback: enableDnsaddrFallback and fallbackDnsAddrs.len > 0,
-    enableRendezvous: enableRendezvous,
-    mountRendezvousProtocol: mountRendezvousProtocol and enableRendezvous,
+    enableDnsaddrFallback: legacyEnabled and enableDnsaddrFallback and fallbackDnsAddrs.len > 0,
+    enableRendezvous: legacyEnabled and enableRendezvous,
+    mountRendezvousProtocol: legacyEnabled and mountRendezvousProtocol and enableRendezvous,
     enableSnapshotProtocol: enableSnapshotProtocol,
     snapshotCodec:
       if snapshotCodec.len == 0:
@@ -479,7 +532,7 @@ proc init*(
     maxSnapshotPeers: max(1, maxSnapshotPeers),
     rendezvousAdvertiseTtl: clampDuration(rendezvousAdvertiseTtl, 2.hours),
     rendezvousRefreshInterval: clampDuration(rendezvousRefreshInterval, 30.minutes),
-    enableKadAfterJoin: enableKadAfterJoin,
+    enableKadAfterJoin: legacyEnabled and enableKadAfterJoin,
     attestPeer: attestPeer,
   )
 
@@ -554,11 +607,11 @@ proc recordAttestationResult(svc: WanBootstrapService, trust: WanBootstrapTrust,
   libp2p_wanbootstrap_attest_runs.inc(labelValues = [trustToString(trust)])
   inc svc.metricsSnapshot.attestRuns
   case trust
-  of trusted:
+  of WanBootstrapTrust.trusted:
     inc svc.metricsSnapshot.attestTrusted
-  of quarantine:
+  of WanBootstrapTrust.quarantine:
     inc svc.metricsSnapshot.attestQuarantine
-  of rejected:
+  of WanBootstrapTrust.rejected:
     inc svc.metricsSnapshot.attestRejected
 
 proc recordKadBootstrapResult(
@@ -651,22 +704,22 @@ proc candidateTrust(
     signedPeerRecordSeen: bool,
 ): WanBootstrapTrust =
   result = svc.trustBuckets.getOrDefault(peerId, WanBootstrapTrust.quarantine)
-  if result == trusted or result == rejected:
+  if result == WanBootstrapTrust.trusted or result == WanBootstrapTrust.rejected:
     return
   if not svc.config.attestPeer.isNil:
     if sources.len > 0:
-      return maxTrust(result, quarantine)
-    return rejected
+      return maxTrust(result, WanBootstrapTrust.quarantine)
+    return WanBootstrapTrust.rejected
   if "Connected" in sources:
-    result = maxTrust(result, trusted)
+    result = maxTrust(result, WanBootstrapTrust.trusted)
   elif signedPeerRecordSeen:
-    result = maxTrust(result, trusted)
+    result = maxTrust(result, WanBootstrapTrust.trusted)
   elif distinctSourceClasses(sources) >= 2:
-    result = maxTrust(result, trusted)
+    result = maxTrust(result, WanBootstrapTrust.trusted)
   elif sources.len > 0:
-    result = maxTrust(result, quarantine)
+    result = maxTrust(result, WanBootstrapTrust.quarantine)
   else:
-    result = rejected
+    result = WanBootstrapTrust.rejected
 
 proc markBootstrapSeen*(
     svc: WanBootstrapService,
@@ -678,7 +731,8 @@ proc markBootstrapSeen*(
     return false
   let ts = if seenAtMs > 0: seenAtMs else: nowMillis()
   svc.lastSeen[peerId] = max(svc.lastSeen.getOrDefault(peerId, 0'i64), ts)
-  svc.trustBuckets[peerId] = maxTrust(svc.trustBuckets.getOrDefault(peerId, quarantine), trust)
+  svc.trustBuckets[peerId] =
+    maxTrust(svc.trustBuckets.getOrDefault(peerId, WanBootstrapTrust.quarantine), trust)
   svc.journalDirty = true
   true
 
@@ -752,9 +806,13 @@ proc registerSignedPeerRecord*(
       svc.switch.peerStore[SPRBook][peerId] = spr.envelope
     except CatchableError as exc:
       debug "failed to store signed peer record", peerId = peerId, err = exc.msg
-  let importedTrust = if svc.config.attestPeer.isNil: trusted else: quarantine
+  let importedTrust =
+    if svc.config.attestPeer.isNil:
+      WanBootstrapTrust.trusted
+    else:
+      WanBootstrapTrust.quarantine
   svc.trustBuckets[peerId] = maxTrust(
-    svc.trustBuckets.getOrDefault(peerId, quarantine), importedTrust
+    svc.trustBuckets.getOrDefault(peerId, WanBootstrapTrust.quarantine), importedTrust
   )
   result = svc.registerBootstrapHint(
     peerId, spr.data.peerRecordAddresses(), source = source, trust = importedTrust
@@ -792,6 +850,104 @@ proc decodeSignedPeerRecord(encoded: string): Option[SignedPeerRecord] =
     some(spr)
   except CatchableError:
     none(SignedPeerRecord)
+
+proc encodeLsmrCoordinateRecord(svc: WanBootstrapService, peerId: PeerId): string =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return ""
+  try:
+    let record =
+      if svc.switch.peerStore[ActiveLsmrBook].contains(peerId):
+        some(svc.switch.peerStore[ActiveLsmrBook][peerId])
+      elif svc.switch.peerStore[LsmrBook].contains(peerId):
+        some(svc.switch.peerStore[LsmrBook][peerId])
+      else:
+        none(SignedLsmrCoordinateRecord)
+    if record.isNone():
+      return ""
+    let encoded = record.get().encode().valueOr:
+      return ""
+    base64.encode(bytesToString(encoded))
+  except CatchableError:
+    ""
+
+proc decodeLsmrCoordinateRecord(
+    encoded: string
+): Option[SignedLsmrCoordinateRecord] =
+  if encoded.len == 0:
+    return none(SignedLsmrCoordinateRecord)
+  try:
+    let decoded = base64.decode(encoded).toBytes()
+    let record = SignedLsmrCoordinateRecord.decode(decoded).valueOr:
+      return none(SignedLsmrCoordinateRecord)
+    some(record)
+  except CatchableError:
+    none(SignedLsmrCoordinateRecord)
+
+proc encodeLsmrMigrationRecords(
+    svc: WanBootstrapService, peerId: PeerId
+): seq[string] =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return @[]
+  for record in svc.switch.peerStore[LsmrMigrationBook][peerId]:
+    let encoded = record.encode().valueOr:
+      continue
+    result.add(base64.encode(bytesToString(encoded)))
+
+proc decodeLsmrMigrationRecord(encoded: string): Option[SignedLsmrMigrationRecord] =
+  if encoded.len == 0:
+    return none(SignedLsmrMigrationRecord)
+  try:
+    let decoded = base64.decode(encoded).toBytes()
+    let record = SignedLsmrMigrationRecord.decode(decoded).valueOr:
+      return none(SignedLsmrMigrationRecord)
+    some(record)
+  except CatchableError:
+    none(SignedLsmrMigrationRecord)
+
+proc encodeLsmrIsolationEvidence(
+    svc: WanBootstrapService, peerId: PeerId
+): seq[string] =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return @[]
+  for evidence in svc.switch.peerStore[LsmrIsolationBook][peerId]:
+    let encoded = evidence.encode().valueOr:
+      continue
+    result.add(base64.encode(bytesToString(encoded)))
+
+proc decodeLsmrIsolationEvidence(
+    encoded: string
+): Option[SignedLsmrIsolationEvidence] =
+  if encoded.len == 0:
+    return none(SignedLsmrIsolationEvidence)
+  try:
+    let decoded = base64.decode(encoded).toBytes()
+    let evidence = SignedLsmrIsolationEvidence.decode(decoded).valueOr:
+      return none(SignedLsmrIsolationEvidence)
+    some(evidence)
+  except CatchableError:
+    none(SignedLsmrIsolationEvidence)
+
+proc lsmrSnapshotForPeer(
+    svc: WanBootstrapService, peerId: PeerId
+): lsmrsvc.LsmrValidationSnapshot =
+  let lsmrService = lsmrsvc.getLsmrService(svc.switch)
+  if lsmrService.isNil:
+    return lsmrsvc.LsmrValidationSnapshot(
+      trust: lsmrsvc.LsmrValidationTrust(1),
+      reason: "disabled",
+      recordSeen: false,
+      attestedPrefix: @[],
+      confidence: 0'u8,
+      witnessCount: 0,
+      expiresAtMs: 0'i64,
+      distance: high(int),
+    )
+  let snapshot = lsmrsvc.validateLsmrPeer(svc.switch, lsmrService.config, peerId)
+  if snapshot.trust == lsmrsvc.LsmrValidationTrust.trusted:
+    discard lsmrsvc.promoteValidatedCoordinateRecord(
+      svc.switch, lsmrService.config, peerId
+    )
+  snapshot
 
 proc collectBootstrapCandidates*(svc: WanBootstrapService): seq[WanBootstrapCandidate] =
   if svc.isNil or svc.switch.isNil:
@@ -863,8 +1019,9 @@ proc collectBootstrapCandidates*(svc: WanBootstrapService): seq[WanBootstrapCand
       seenAt = nowTs - 1
     let signedPeerRecordSeen = svc.hasSignedPeerRecord(item.peerId)
     let trust = svc.candidateTrust(item.peerId, item.sources, signedPeerRecordSeen)
-    if trust == rejected:
+    if trust == WanBootstrapTrust.rejected:
       continue
+    let lsmr = svc.lsmrSnapshotForPeer(item.peerId)
     result.add(
       WanBootstrapCandidate(
         peerId: item.peerId,
@@ -875,17 +1032,23 @@ proc collectBootstrapCandidates*(svc: WanBootstrapService): seq[WanBootstrapCand
         trust: trust,
         relayCapable: relayCapableFromAddrs(item.addrs),
         signedPeerRecordSeen: signedPeerRecordSeen,
+        lsmrRecordSeen: lsmr.recordSeen,
+        lsmrPrefix: lsmr.attestedPrefix,
+        lsmrConfidence: lsmr.confidence,
+        lsmrWitnessCount: lsmr.witnessCount,
+        lsmrExpiresAtMs: lsmr.expiresAtMs,
+        lsmrDistance: lsmr.distance,
       )
     )
 
 proc bootstrapSourceScore(candidate: WanBootstrapCandidate): int =
   result = min(candidate.addrs.len, 8)
   case candidate.trust
-  of trusted:
+  of WanBootstrapTrust.trusted:
     result += 300
-  of quarantine:
+  of WanBootstrapTrust.quarantine:
     result += 120
-  of rejected:
+  of WanBootstrapTrust.rejected:
     result -= 500
   if candidate.signedPeerRecordSeen:
     result += 160
@@ -911,10 +1074,24 @@ proc bootstrapSourceScore(candidate: WanBootstrapCandidate): int =
       elif isSnapshotSource(source):
         result += 180
 
-proc compareBootstrapCandidates(a, b: WanBootstrapCandidate): int =
+proc compareBootstrapCandidates(
+    svc: WanBootstrapService, a, b: WanBootstrapCandidate
+): int =
   result = cmp(b.lastSeenAtMs, a.lastSeenAtMs)
   if result == 0:
     result = cmp(ord(b.trust), ord(a.trust))
+  let lsmrService =
+    if not svc.isNil and not svc.switch.isNil:
+      lsmrsvc.getLsmrService(svc.switch)
+    else:
+      nil
+  if result == 0 and not lsmrService.isNil and lsmrService.config.enableBootstrapBias:
+    let aValid = a.lsmrDistance != high(int)
+    let bValid = b.lsmrDistance != high(int)
+    if aValid and bValid:
+      result = cmp(a.lsmrDistance, b.lsmrDistance)
+    elif aValid xor bValid:
+      result = if aValid: -1 else: 1
   if result == 0:
     result = cmp(bootstrapSourceScore(b), bootstrapSourceScore(a))
   if result == 0:
@@ -988,8 +1165,85 @@ proc awaitConnectFutureOrPeerConnected[T](
     await sleepAsync(min(chronos.milliseconds(50), remaining))
   (true, false)
 
-proc sortBootstrapCandidates(candidates: var seq[WanBootstrapCandidate]) =
-  candidates.sort(compareBootstrapCandidates)
+proc sortBootstrapCandidates(
+    svc: WanBootstrapService, candidates: var seq[WanBootstrapCandidate]
+) =
+  let before = candidates.mapIt(peerIdText(it.peerId))
+  candidates.sort(proc(a, b: WanBootstrapCandidate): int = compareBootstrapCandidates(svc, a, b))
+  let lsmrService =
+    if not svc.isNil and not svc.switch.isNil:
+      lsmrsvc.getLsmrService(svc.switch)
+    else:
+      nil
+  if not lsmrService.isNil and lsmrService.config.enableBootstrapBias:
+    let after = candidates.mapIt(peerIdText(it.peerId))
+    if before != after:
+      inc lsmrService.biasReorders
+
+proc lsmrSelectionTargetPath(svc: WanBootstrapService): LsmrPath =
+  if svc.isNil or svc.switch.isNil:
+    return @[]
+  let localActive = activeCoordinateRecord(svc.switch, svc.switch.peerInfo.peerId)
+  if localActive.isSome():
+    return localActive.get().data.certifiedPrefix()
+  let localRaw = localCoordinateRecord(svc.switch)
+  if localRaw.isSome():
+    return localRaw.get().data.certifiedPrefix()
+  if svc.config.lsmrConfig.isSome():
+    let cfg = svc.config.lsmrConfig.get()
+    for anchor in cfg.anchors:
+      if anchor.attestedPrefix.len > 0:
+        return anchor.attestedPrefix
+      if isValidLsmrDigit(anchor.regionDigit):
+        return @[anchor.regionDigit]
+  @[]
+
+proc selectLsmrBootstrapCandidates(
+    svc: WanBootstrapService, limit = 0
+): seq[WanBootstrapCandidate] =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return @[]
+  let target = svc.clampBootstrapLimit(limit)
+  var candidatesById = initTable[string, WanBootstrapCandidate]()
+  for candidate in svc.collectBootstrapCandidates():
+    if not svc.switch.peerStore[ActiveLsmrBook].contains(candidate.peerId):
+      continue
+    var promoted = candidate
+    let active = svc.switch.peerStore[ActiveLsmrBook][candidate.peerId]
+    promoted.trust = WanBootstrapTrust.trusted
+    promoted.lsmrRecordSeen = true
+    promoted.lsmrPrefix = active.data.certifiedPrefix()
+    promoted.lsmrConfidence = active.data.confidence
+    promoted.lsmrWitnessCount = active.data.witnesses.len
+    promoted.lsmrExpiresAtMs = active.data.expiresAtMs
+    promoted.lsmrDistance =
+      if promoted.lsmrPrefix.len > 0:
+        lsmrDistance(promoted.lsmrPrefix, svc.lsmrSelectionTargetPath())
+      else:
+        high(int)
+    candidatesById[peerIdText(candidate.peerId)] = promoted
+  if candidatesById.len == 0:
+    return @[]
+
+  let targetPath = svc.lsmrSelectionTargetPath()
+  var orderedPeerIds: seq[PeerId] = @[]
+  if targetPath.len > 0:
+    orderedPeerIds = svc.switch.peerStore.closestCertifiedPeers(targetPath)
+  else:
+    let orderedKeys = candidatesById.keys.toSeq().sorted(system.cmp[string])
+    for key in orderedKeys:
+      let parsed = PeerId.init(key).valueOr:
+        continue
+      orderedPeerIds.add(parsed)
+  for peerId in orderedPeerIds:
+    if result.len >= target:
+      break
+    let key = peerIdText(peerId)
+    if not candidatesById.hasKey(key):
+      continue
+    var selected = candidatesById.getOrDefault(key)
+    selected.selectionReason = "lsmr_certified"
+    result.add(selected)
 
 proc selectBootstrapCandidates*(
     svc: WanBootstrapService, limit = 0
@@ -997,11 +1251,15 @@ proc selectBootstrapCandidates*(
   if svc.isNil:
     return @[]
 
+  if svc.config.primaryPlane == PrimaryRoutingPlane.lsmr or
+      svc.config.routingMode == RoutingPlaneMode.lsmrOnly:
+    return svc.selectLsmrBootstrapCandidates(limit)
+
   let target = svc.clampBootstrapLimit(limit)
   var ordered = svc.collectBootstrapCandidates()
   if ordered.len == 0:
     return @[]
-  sortBootstrapCandidates(ordered)
+  sortBootstrapCandidates(svc, ordered)
   var selected: seq[WanBootstrapCandidate] = @[]
   var selectedPeerIds = initHashSet[string]()
 
@@ -1115,6 +1373,13 @@ proc snapshotEntryToJson(entry: WanBootstrapSnapshotEntry): JsonNode =
   result["signedPeerRecordSeen"] = %entry.signedPeerRecordSeen
   if entry.signedPeerRecord.len > 0:
     result["signedPeerRecord"] = %entry.signedPeerRecord
+  result["lsmrRecordSeen"] = %entry.lsmrRecordSeen
+  if entry.lsmrCoordinateRecord.len > 0:
+    result["lsmrCoordinateRecord"] = %entry.lsmrCoordinateRecord
+  if entry.lsmrMigrationRecords.len > 0:
+    result["lsmrMigrationRecords"] = %entry.lsmrMigrationRecords
+  if entry.lsmrIsolationEvidence.len > 0:
+    result["lsmrIsolationEvidence"] = %entry.lsmrIsolationEvidence
 
 proc candidateToJson(candidate: WanBootstrapCandidate): JsonNode =
   result = newJObject()
@@ -1132,6 +1397,17 @@ proc candidateToJson(candidate: WanBootstrapCandidate): JsonNode =
   result["trust"] = %trustToString(candidate.trust)
   result["relayCapable"] = %candidate.relayCapable
   result["signedPeerRecordSeen"] = %candidate.signedPeerRecordSeen
+  result["lsmrRecordSeen"] = %candidate.lsmrRecordSeen
+  if candidate.lsmrPrefix.len > 0:
+    var prefixNode = newJArray()
+    for digit in candidate.lsmrPrefix:
+      prefixNode.add(%int(digit))
+    result["lsmrPrefix"] = prefixNode
+  result["lsmrConfidence"] = %int(candidate.lsmrConfidence)
+  result["lsmrWitnessCount"] = %candidate.lsmrWitnessCount
+  result["lsmrExpiresAtMs"] = %candidate.lsmrExpiresAtMs
+  if candidate.lsmrDistance != high(int):
+    result["lsmrDistance"] = %candidate.lsmrDistance
 
 proc joinAttemptToJson(attempt: WanBootstrapJoinAttempt): JsonNode =
   result = newJObject()
@@ -1186,6 +1462,16 @@ proc metricsSnapshotToJson(metrics: WanBootstrapMetricsSnapshot): JsonNode =
   result["kadBootstrapRuns"] = %metrics.kadBootstrapRuns
   result["kadBootstrapProtocols"] = %metrics.kadBootstrapProtocols
   result["kadBootstrapFailures"] = %metrics.kadBootstrapFailures
+  result["lsmrWitnessRequests"] = %metrics.lsmrWitnessRequests
+  result["lsmrWitnessSuccess"] = %metrics.lsmrWitnessSuccess
+  result["lsmrWitnessQuorumSuccess"] = %metrics.lsmrWitnessQuorumSuccess
+  result["lsmrWitnessQuorumFailure"] = %metrics.lsmrWitnessQuorumFailure
+  result["lsmrValidationTrusted"] = %metrics.lsmrValidationTrusted
+  result["lsmrValidationQuarantine"] = %metrics.lsmrValidationQuarantine
+  result["lsmrValidationRejected"] = %metrics.lsmrValidationRejected
+  result["lsmrStaleRecords"] = %metrics.lsmrStaleRecords
+  result["lsmrForgedRecords"] = %metrics.lsmrForgedRecords
+  result["lsmrBiasReorders"] = %metrics.lsmrBiasReorders
 
 proc parseSnapshotEntry(node: JsonNode): Option[WanBootstrapSnapshotEntry] =
   if node.kind != JObject or not node.hasKey("peerId"):
@@ -1219,7 +1505,7 @@ proc parseSnapshotEntry(node: JsonNode): Option[WanBootstrapSnapshotEntry] =
         if not node{"trust"}.isNil:
           parseTrust(node{"trust"}.getStr())
         else:
-          quarantine,
+          WanBootstrapTrust.quarantine,
       relayCapable:
         if not node{"relayCapable"}.isNil:
           node{"relayCapable"}.getBool()
@@ -1235,6 +1521,26 @@ proc parseSnapshotEntry(node: JsonNode): Option[WanBootstrapSnapshotEntry] =
           node{"signedPeerRecord"}.getStr()
         else:
           "",
+      lsmrRecordSeen:
+        if not node{"lsmrRecordSeen"}.isNil:
+          node{"lsmrRecordSeen"}.getBool()
+        else:
+          false,
+      lsmrCoordinateRecord:
+        if not node{"lsmrCoordinateRecord"}.isNil:
+          node{"lsmrCoordinateRecord"}.getStr()
+        else:
+          "",
+      lsmrMigrationRecords:
+        if not node{"lsmrMigrationRecords"}.isNil and node{"lsmrMigrationRecords"}.kind == JArray:
+          node{"lsmrMigrationRecords"}.items().toSeq().filterIt(it.kind == JString).mapIt(it.getStr())
+        else:
+          @[],
+      lsmrIsolationEvidence:
+        if not node{"lsmrIsolationEvidence"}.isNil and node{"lsmrIsolationEvidence"}.kind == JArray:
+          node{"lsmrIsolationEvidence"}.items().toSeq().filterIt(it.kind == JString).mapIt(it.getStr())
+        else:
+          @[],
     )
   )
 
@@ -1243,7 +1549,7 @@ proc bootstrapSnapshot*(svc: WanBootstrapService, limit = 0): seq[WanBootstrapSn
     return @[]
   let capped = svc.snapshotLimit(limit)
   var candidates = svc.collectBootstrapCandidates()
-  sortBootstrapCandidates(candidates)
+  sortBootstrapCandidates(svc, candidates)
   for candidate in candidates:
     if result.len >= capped:
       break
@@ -1257,6 +1563,10 @@ proc bootstrapSnapshot*(svc: WanBootstrapService, limit = 0): seq[WanBootstrapSn
         relayCapable: candidate.relayCapable,
         signedPeerRecordSeen: candidate.signedPeerRecordSeen,
         signedPeerRecord: svc.encodeSignedPeerRecord(candidate.peerId),
+        lsmrRecordSeen: candidate.lsmrRecordSeen,
+        lsmrCoordinateRecord: svc.encodeLsmrCoordinateRecord(candidate.peerId),
+        lsmrMigrationRecords: svc.encodeLsmrMigrationRecords(candidate.peerId),
+        lsmrIsolationEvidence: svc.encodeLsmrIsolationEvidence(candidate.peerId),
       )
     )
 
@@ -1266,12 +1576,45 @@ proc bootstrapSnapshot*(switch: Switch, limit = 0): seq[WanBootstrapSnapshotEntr
     return @[]
   svc.bootstrapSnapshot(limit)
 
+proc routingPlaneStatus*(svc: WanBootstrapService): RoutingPlaneStatus =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return RoutingPlaneStatus()
+  result.mode = svc.config.routingMode
+  result.primary = svc.config.primaryPlane
+  result.shadowMode = svc.config.shadowMode()
+  result.legacyCandidates = svc.collectBootstrapCandidates().len
+  for candidate in svc.collectBootstrapCandidates():
+    if candidate.trust == WanBootstrapTrust.trusted:
+      inc result.legacyTrusted
+  result.lsmrActiveCertificates = svc.switch.peerStore[ActiveLsmrBook].len
+  result.lsmrMigrations = svc.switch.peerStore[LsmrMigrationBook].len
+  result.lsmrIsolations = svc.switch.peerStore[LsmrIsolationBook].len
+
+proc routingPlaneStatus*(switch: Switch): RoutingPlaneStatus =
+  let svc = getWanBootstrapService(switch)
+  if svc.isNil:
+    return RoutingPlaneStatus()
+  svc.routingPlaneStatus()
+
 proc bootstrapStateSnapshot*(
     svc: WanBootstrapService, candidateLimit = 0
 ): WanBootstrapStateSnapshot =
   if svc.isNil:
     return WanBootstrapStateSnapshot()
   let connectedPeers = svc.connectedPeerIds()
+  var metrics = svc.metricsSnapshot
+  let lsmrService = lsmrsvc.getLsmrService(svc.switch)
+  if not lsmrService.isNil:
+    metrics.lsmrWitnessRequests = lsmrService.witnessRequests
+    metrics.lsmrWitnessSuccess = lsmrService.witnessSuccess
+    metrics.lsmrWitnessQuorumSuccess = lsmrService.witnessQuorumSuccess
+    metrics.lsmrWitnessQuorumFailure = lsmrService.witnessQuorumFailure
+    metrics.lsmrValidationTrusted = lsmrService.validationTrusted
+    metrics.lsmrValidationQuarantine = lsmrService.validationQuarantine
+    metrics.lsmrValidationRejected = lsmrService.validationRejected
+    metrics.lsmrStaleRecords = lsmrService.staleRecords
+    metrics.lsmrForgedRecords = lsmrService.forgedRecords
+    metrics.lsmrBiasReorders = lsmrService.biasReorders
   let selected =
     svc.selectBootstrapCandidates(
       if candidateLimit > 0: candidateLimit else: svc.config.maxBootstrapCandidates
@@ -1279,6 +1622,9 @@ proc bootstrapStateSnapshot*(
   WanBootstrapStateSnapshot(
     networkId: svc.config.networkId,
     role: svc.config.role,
+    routingMode: svc.config.routingMode,
+    primaryPlane: svc.config.primaryPlane,
+    shadowMode: svc.config.shadowMode(),
     exactSeedDialPolicy: svc.config.exactSeedDialPolicy,
     running: svc.running,
     journalLoaded: svc.journalLoaded,
@@ -1289,7 +1635,8 @@ proc bootstrapStateSnapshot*(
     connectedPeers: connectedPeers,
     selectedCandidates: selected,
     lastRefresh: svc.lastRefreshReport,
-    metrics: svc.metricsSnapshot,
+    metrics: metrics,
+    routingStatus: svc.routingPlaneStatus(),
     hasLastJoinResult: svc.hasLastJoinResult,
     lastJoinResult: svc.lastJoinResult,
   )
@@ -1309,6 +1656,9 @@ proc bootstrapStateJson*(
   result = newJObject()
   result["networkId"] = %snapshot.networkId
   result["role"] = %roleLabel(snapshot.role)
+  result["routingMode"] = %($snapshot.routingMode)
+  result["primaryPlane"] = %($snapshot.primaryPlane)
+  result["shadowMode"] = %snapshot.shadowMode
   result["exactSeedDialPolicy"] = %exactSeedDialPolicyLabel(snapshot.exactSeedDialPolicy)
   result["exactSeedAddrFallbackAllowed"] = %(snapshot.exactSeedDialPolicy != ExactSeedDialPolicy.single)
   result["exactSeedParallelDial"] = %(snapshot.exactSeedDialPolicy == ExactSeedDialPolicy.parallel)
@@ -1345,6 +1695,26 @@ proc bootstrapStateJson*(
   result["joinAttempts"] = %snapshot.metrics.joinAttempts
   result["joinConnected"] = %snapshot.metrics.joinConnected
   result["joinFailed"] = %snapshot.metrics.joinFailed
+  result["lsmrWitnessRequests"] = %snapshot.metrics.lsmrWitnessRequests
+  result["lsmrWitnessSuccess"] = %snapshot.metrics.lsmrWitnessSuccess
+  result["lsmrWitnessQuorumSuccess"] = %snapshot.metrics.lsmrWitnessQuorumSuccess
+  result["lsmrWitnessQuorumFailure"] = %snapshot.metrics.lsmrWitnessQuorumFailure
+  result["lsmrValidationTrusted"] = %snapshot.metrics.lsmrValidationTrusted
+  result["lsmrValidationQuarantine"] = %snapshot.metrics.lsmrValidationQuarantine
+  result["lsmrValidationRejected"] = %snapshot.metrics.lsmrValidationRejected
+  result["lsmrStaleRecords"] = %snapshot.metrics.lsmrStaleRecords
+  result["lsmrForgedRecords"] = %snapshot.metrics.lsmrForgedRecords
+  result["lsmrBiasReorders"] = %snapshot.metrics.lsmrBiasReorders
+  result["routingStatus"] = %*{
+    "mode": $snapshot.routingStatus.mode,
+    "primary": $snapshot.routingStatus.primary,
+    "shadowMode": snapshot.routingStatus.shadowMode,
+    "legacyCandidates": snapshot.routingStatus.legacyCandidates,
+    "legacyTrusted": snapshot.routingStatus.legacyTrusted,
+    "lsmrActiveCertificates": snapshot.routingStatus.lsmrActiveCertificates,
+    "lsmrIsolations": snapshot.routingStatus.lsmrIsolations,
+    "lsmrMigrations": snapshot.routingStatus.lsmrMigrations,
+  }
   result["hasLastJoinResult"] = %snapshot.hasLastJoinResult
   if snapshot.hasLastJoinResult:
     result["lastJoinResult"] = joinResultToJson(snapshot.lastJoinResult)
@@ -1414,7 +1784,10 @@ proc loadBootstrapJournal*(svc: WanBootstrapService): bool =
       if imported:
         discard svc.markBootstrapSeen(entry.peerId, entry.lastSeenAtMs, entry.trust)
         svc.trustBuckets[entry.peerId] =
-          maxTrust(svc.trustBuckets.getOrDefault(entry.peerId, quarantine), entry.trust)
+          maxTrust(
+            svc.trustBuckets.getOrDefault(entry.peerId, WanBootstrapTrust.quarantine),
+            entry.trust,
+          )
     svc.journalDirty = false
     svc.updateObservability()
     true
@@ -1481,7 +1854,9 @@ proc refreshFromDnsaddrFallback*(
     return 0
   let resolved = await svc.resolveBootstrapFallbacks()
   for (peerId, addrs) in resolved:
-    if svc.registerBootstrapHint(peerId, addrs, source = "dnsaddr", trust = quarantine):
+    if svc.registerBootstrapHint(
+        peerId, addrs, source = "dnsaddr", trust = WanBootstrapTrust.quarantine
+    ):
       inc result
   svc.recordRefreshRun("dnsaddr", result)
   svc.updateObservability()
@@ -1594,11 +1969,15 @@ proc refreshFromRendezvousNamespaces*(
         let addrs = record.peerRecordAddresses()
         if record.peerId == svc.switch.peerInfo.peerId or addrs.len == 0:
           continue
-        if svc.registerBootstrapHint(
-            record.peerId, addrs, source = "rendezvous", trust = trusted
-        ):
+        let imported = svc.registerBootstrapHint(
+          record.peerId,
+          addrs,
+          source = "rendezvous",
+          trust = WanBootstrapTrust.trusted,
+        )
+        if imported:
           inc result
-        discard svc.markBootstrapSeen(record.peerId, trust = trusted)
+          discard svc.markBootstrapSeen(record.peerId, trust = WanBootstrapTrust.trusted)
       if records.len > 0:
         debug "rendezvous namespace refreshed", namespace = namespace, discovered = records.len
     except CatchableError as exc:
@@ -1616,9 +1995,11 @@ proc refreshFromRendezvousNamespaces*(
 
 proc buildSnapshotResponse(svc: WanBootstrapService, limit: int): JsonNode =
   result = newJObject()
-  result["version"] = %1
+  result["version"] = %2
   result["networkId"] = %svc.config.networkId
   result["role"] = %roleLabel(svc.config.role)
+  result["routingMode"] = %($svc.config.routingMode)
+  result["primaryPlane"] = %($svc.config.primaryPlane)
   result["timestampMs"] = %nowMillis()
   var entriesNode = newJArray()
   for entry in svc.bootstrapSnapshot(limit):
@@ -1710,6 +2091,20 @@ proc refreshFromBootstrapSnapshots*(
       var imported = false
       decodeSignedPeerRecord(entry.signedPeerRecord).withValue(spr):
         imported = svc.registerSignedPeerRecord(spr, "snapshot:" & peerIdText(peerId))
+      decodeLsmrCoordinateRecord(entry.lsmrCoordinateRecord).withValue(record):
+        if not svc.switch.peerStore.isNil:
+          svc.switch.peerStore[LsmrBook][entry.peerId] = record
+          let lsmrService = lsmrsvc.getLsmrService(svc.switch)
+          if not lsmrService.isNil:
+            discard lsmrsvc.promoteValidatedCoordinateRecord(
+              svc.switch, lsmrService.config, entry.peerId
+            )
+      for encoded in entry.lsmrMigrationRecords:
+        decodeLsmrMigrationRecord(encoded).withValue(record):
+          discard lsmrsvc.installMigrationRecord(svc.switch, record)
+      for encoded in entry.lsmrIsolationEvidence:
+        decodeLsmrIsolationEvidence(encoded).withValue(evidence):
+          discard lsmrsvc.installIsolationEvidence(svc.switch, evidence)
       if not imported:
         imported = svc.registerBootstrapHint(
           entry.peerId,
@@ -1720,7 +2115,10 @@ proc refreshFromBootstrapSnapshots*(
       if imported:
         discard svc.markBootstrapSeen(entry.peerId, entry.lastSeenAtMs, entry.trust)
         svc.trustBuckets[entry.peerId] =
-          maxTrust(svc.trustBuckets.getOrDefault(entry.peerId, quarantine), entry.trust)
+          maxTrust(
+            svc.trustBuckets.getOrDefault(entry.peerId, WanBootstrapTrust.quarantine),
+            entry.trust,
+          )
         inc result
   svc.recordRefreshRun("snapshot", result)
   svc.updateObservability()
@@ -1739,12 +2137,16 @@ proc refreshBootstrapState*(
   if svc.isNil:
     return 0
   var report = WanBootstrapRefreshReport(timestampMs: nowMillis())
+  let lsmrService = lsmrsvc.getLsmrService(svc.switch)
+  if not lsmrService.isNil and svc.config.lsmrDiscoveryActive():
+    discard await lsmrService.refreshCoordinateRecord()
   if not svc.journalLoaded:
     discard svc.loadBootstrapJournal()
-  if not svc.switch.isNil and svc.connectedPeerIds().len == 0 and svc.config.enableDnsaddrFallback:
+  if not svc.switch.isNil and svc.connectedPeerIds().len == 0 and svc.config.enableDnsaddrFallback and
+      svc.config.legacyDiscoveryActive():
     report.dnsaddrImported = await svc.refreshFromDnsaddrFallback()
     result += report.dnsaddrImported
-  if svc.rendezvousPeers().len > 0:
+  if svc.config.legacyDiscoveryActive() and svc.rendezvousPeers().len > 0:
     report.rendezvousAdvertised = await svc.advertiseRendezvousNamespaces()
     result += report.rendezvousAdvertised
     report.rendezvousImported = await svc.refreshFromRendezvousNamespaces()
@@ -1792,9 +2194,9 @@ proc attestConnectedPeer(
     async: (raises: [CancelledError])
 .} =
   if svc.isNil:
-    return (false, rejected)
+    return (false, WanBootstrapTrust.rejected)
   if svc.config.attestPeer.isNil:
-    return (true, trusted)
+    return (true, WanBootstrapTrust.trusted)
   try:
     warn "wan bootstrap attestation begin", peerId = candidate.peerId, stage = stage
     let trust = await svc.config.attestPeer(
@@ -1807,16 +2209,16 @@ proc attestConnectedPeer(
     )
     warn "wan bootstrap attestation completed", peerId = candidate.peerId, stage = stage, trust = trust
     svc.recordAttestationResult(trust)
-    if trust == rejected:
+    if trust == WanBootstrapTrust.rejected:
       await svc.switch.disconnect(candidate.peerId)
-      return (false, rejected)
+      return (false, WanBootstrapTrust.rejected)
     return (true, trust)
   except CancelledError as exc:
     raise exc
   except CatchableError as exc:
     debug "wan bootstrap attestation failed", peerId = candidate.peerId, stage = stage, err = exc.msg
-    svc.recordAttestationResult(quarantine, failed = true)
-    return (true, quarantine)
+    svc.recordAttestationResult(WanBootstrapTrust.quarantine, failed = true)
+    return (true, WanBootstrapTrust.quarantine)
 
 proc bootstrapMountedKadDHTs(
     svc: WanBootstrapService
@@ -1853,11 +2255,12 @@ proc finalizeBootstrapConnectedCandidate(
     attemptedAddr = attemptedAddr
   let provisionalTrust =
     if svc.config.attestPeer.isNil:
-      trusted
+      WanBootstrapTrust.trusted
     else:
-      maxTrust(candidate.trust, quarantine)
+      maxTrust(candidate.trust, WanBootstrapTrust.quarantine)
   svc.trustBuckets[candidate.peerId] = maxTrust(
-    svc.trustBuckets.getOrDefault(candidate.peerId, quarantine), provisionalTrust
+    svc.trustBuckets.getOrDefault(candidate.peerId, WanBootstrapTrust.quarantine),
+    provisionalTrust,
   )
   discard svc.markBootstrapSeen(candidate.peerId, trust = provisionalTrust)
   let acceptedResult =
@@ -1871,8 +2274,8 @@ proc finalizeBootstrapConnectedCandidate(
       )
   let (accepted, attestedTrust) = acceptedResult
   if not accepted:
-    svc.trustBuckets[candidate.peerId] = rejected
-    discard svc.markBootstrapSeen(candidate.peerId, trust = rejected)
+    svc.trustBuckets[candidate.peerId] = WanBootstrapTrust.rejected
+    discard svc.markBootstrapSeen(candidate.peerId, trust = WanBootstrapTrust.rejected)
     warn "wan bootstrap finalize connected candidate rejected",
       peerId = candidate.peerId,
       stage = stage,
@@ -1883,7 +2286,8 @@ proc finalizeBootstrapConnectedCandidate(
       error: "attestation_rejected",
     )
   svc.trustBuckets[candidate.peerId] = maxTrust(
-    svc.trustBuckets.getOrDefault(candidate.peerId, quarantine), attestedTrust
+    svc.trustBuckets.getOrDefault(candidate.peerId, WanBootstrapTrust.quarantine),
+    attestedTrust,
   )
   discard svc.markBootstrapSeen(candidate.peerId, trust = attestedTrust)
   warn "wan bootstrap finalize connected candidate completed",
@@ -1905,11 +2309,17 @@ proc connectBootstrapCandidate(
   for addr in ordered:
     attemptedAddr = $addr
     let fut = svc.switch.connect(candidate.peerId, @[addr], forceDial = true)
-    let completed = await withTimeout(fut, svc.config.connectTimeout)
-    if not completed:
+    let waitRes = await svc.awaitConnectFutureOrPeerConnected(
+      fut,
+      candidate.peerId,
+      svc.bootstrapExactConnectBudget(addr),
+    )
+    if not waitRes.completed and not waitRes.observedConnected:
       fut.cancelSoon()
       lastError = "timeout"
       continue
+    if waitRes.observedConnected:
+      return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
     try:
       await fut
       return await svc.finalizeBootstrapConnectedCandidate(candidate, stage, attemptedAddr)
@@ -2128,7 +2538,9 @@ proc joinViaSeedBootstrapImpl(
 
   let hintSource = source.strip()
   let effectiveSource = if hintSource.len > 0: hintSource else: "seeded_join"
-  discard svc.registerBootstrapHint(peerId, normalized, effectiveSource, quarantine)
+  discard svc.registerBootstrapHint(
+    peerId, normalized, effectiveSource, WanBootstrapTrust.quarantine
+  )
 
   let signedPeerRecordSeen = svc.hasSignedPeerRecord(peerId)
   let candidateSources = @["Hints", "Hint:" & effectiveSource]
@@ -2205,7 +2617,9 @@ proc recordConnectedBootstrapPeer*(
       hintSource
     else:
       "direct_exact_connect"
-  discard svc.registerBootstrapHint(peerId, normalized, effectiveSource, quarantine)
+  discard svc.registerBootstrapHint(
+    peerId, normalized, effectiveSource, WanBootstrapTrust.quarantine
+  )
 
   let signedPeerRecordSeen = svc.hasSignedPeerRecord(peerId)
   let candidateSources = @["Connected", "Hints", "Hint:" & effectiveSource]
@@ -2523,6 +2937,35 @@ proc bootstrapRoleConfig*(
       connectTimeout = 3.seconds,
     )
 
+proc bootstrapDualStackRoleConfig*(
+    role: WanBootstrapRole,
+    lsmrConfig: LsmrConfig,
+    networkId = "default",
+    journalPath = "",
+    authoritativePeerIds: seq[string] = @[],
+    deferAutoJoinUntilRelayReady = false,
+    fallbackDnsAddrs: seq[MultiAddress] = @[],
+    primaryPlane = PrimaryRoutingPlane.legacy,
+): WanBootstrapConfig =
+  var cfg = bootstrapRoleConfig(
+    role = role,
+    networkId = networkId,
+    journalPath = journalPath,
+    authoritativePeerIds = authoritativePeerIds,
+    deferAutoJoinUntilRelayReady = deferAutoJoinUntilRelayReady,
+    fallbackDnsAddrs = fallbackDnsAddrs,
+  )
+  cfg.routingMode = RoutingPlaneMode.dualStack
+  cfg.primaryPlane = primaryPlane
+  cfg.lsmrConfig = some(lsmrConfig)
+  cfg.legacyDiscoveryEnabled = true
+  cfg.legacyCompatibilityOnly = primaryPlane == PrimaryRoutingPlane.lsmr
+  cfg.enableRendezvous = cfg.legacyDiscoveryActive() and cfg.enableRendezvous
+  cfg.mountRendezvousProtocol = cfg.legacyDiscoveryActive() and cfg.mountRendezvousProtocol
+  cfg.enableDnsaddrFallback = cfg.legacyDiscoveryActive() and cfg.enableDnsaddrFallback
+  cfg.enableKadAfterJoin = cfg.legacyDiscoveryActive() and cfg.enableKadAfterJoin
+  cfg
+
 proc syncLoop(svc: WanBootstrapService) {.async: (raises: [CancelledError]).} =
   when defined(ohos):
     const allowMobileEdgeAutoJoin = false
@@ -2578,7 +3021,7 @@ proc syncLoop(svc: WanBootstrapService) {.async: (raises: [CancelledError]).} =
     await sleepAsync(sleepFor)
 
 proc configureManagedRendezvous(svc: WanBootstrapService) =
-  if svc.isNil or not svc.config.enableRendezvous:
+  if svc.isNil or not svc.config.enableRendezvous or not svc.config.legacyDiscoveryActive():
     return
   if svc.rendezvous.isNil:
     let minDuration =
@@ -2638,7 +3081,11 @@ method setup*(
     svc.connectedHandler = proc(
         peerId: PeerId, event: ConnEvent
     ): Future[void] {.async: (raises: [CancelledError]).} =
-      let connectedTrust = if svc.config.attestPeer.isNil: trusted else: quarantine
+      let connectedTrust =
+        if svc.config.attestPeer.isNil:
+          WanBootstrapTrust.trusted
+        else:
+          WanBootstrapTrust.quarantine
       discard svc.markBootstrapSeen(peerId, trust = connectedTrust)
     switch.addConnEventHandler(svc.connectedHandler, ConnEventKind.Connected)
     await svc.run(switch)

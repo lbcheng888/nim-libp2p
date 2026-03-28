@@ -33,26 +33,18 @@ template protocolSelectWriteTimeout(): untyped =
 template protocolSelectReadTimeout(): untyped =
   chronos.seconds(15)
 
-template writeLpWithin(
-    conn: Connection,
-    payload: untyped,
+type
+  MultiStreamError* = object of LPError
+
+proc awaitFutureWithin[T](
+    fut: Future[T],
     timeout: Duration,
-    stage: string
-): untyped =
-  block:
-    let writeFuture = conn.writeLp(payload)
-    let writeReady = await withTimeout(writeFuture, timeout)
-    if not writeReady:
-      writeFuture.cancelSoon()
-      raise (ref MultiStreamError)(
-        msg: "MultistreamSelect " & stage & " write timeout"
-      )
-    await writeFuture
+    stage: string,
+    op: string
+): Future[T] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).}
 
 type
   Matcher* = proc(proto: string): bool {.gcsafe, raises: [].}
-
-  MultiStreamError* = object of LPError
 
   ProtocolSelectStatus = enum
     psSuccess,
@@ -74,6 +66,42 @@ type
     version: uint32
     protocols: seq[string]
 
+proc awaitFutureWithin[T](
+    fut: Future[T],
+    timeout: Duration,
+    stage: string,
+    op: string
+): Future[T] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
+  let timeoutFut = sleepAsync(timeout)
+  let winner = await race(cast[FutureBase](fut), cast[FutureBase](timeoutFut))
+  if winner == cast[FutureBase](timeoutFut):
+    fut.cancelSoon()
+    raise (ref MultiStreamError)(
+      msg: "MultistreamSelect " & stage & " " & op & " timeout"
+    )
+  timeoutFut.cancelSoon()
+  try:
+    return await fut
+  except CancelledError as exc:
+    raise exc
+  except LPStreamError as exc:
+    raise exc
+  except CatchableError as exc:
+    raise (ref MultiStreamError)(
+      msg: "MultistreamSelect " & stage & " " & op & " failed: " & exc.msg,
+      parent: exc,
+    )
+
+template writeLpWithin(
+    conn: Connection,
+    payload: untyped,
+    timeout: Duration,
+    stage: string
+): untyped =
+  block:
+    let writeFuture = conn.writeLp(payload)
+    await awaitFutureWithin(writeFuture, timeout, stage, "write")
+
 proc readSmallLpWithin(
     conn: Connection,
     maxSize: int,
@@ -87,7 +115,7 @@ proc readSmallLpWithin(
       MsgSize + 10
     else:
       max(maxSize + 10, 64)
-  var buffer: seq[byte] = @[]
+  var buffer = conn.takePendingReadReplay()
 
   while true:
     if buffer.len > 0:
@@ -100,6 +128,8 @@ proc readSmallLpWithin(
             msg: "MultistreamSelect " & stage & " exceeds maximum length"
           )
         if length == 0'u64:
+          if buffer.len > consumed:
+            conn.restorePendingReadReplay(buffer[consumed ..< buffer.len])
           return @[]
         if length > uint64(high(int)):
           raise (ref MultiStreamError)(
@@ -107,6 +137,8 @@ proc readSmallLpWithin(
           )
         let total = consumed + int(length)
         if buffer.len >= total:
+          if buffer.len > total:
+            conn.restorePendingReadReplay(buffer[total ..< buffer.len])
           return buffer[consumed ..< total]
       elif decodeRes.error() != VarintError.Incomplete:
         raise (ref MultiStreamError)(
@@ -121,13 +153,7 @@ proc readSmallLpWithin(
 
     var chunk = newSeqUninit[byte](readChunkSize)
     let readFuture = conn.readOnce(addr chunk[0], chunk.len)
-    let readReady = await withTimeout(readFuture, remaining)
-    if not readReady:
-      readFuture.cancelSoon()
-      raise (ref MultiStreamError)(
-        msg: "MultistreamSelect " & stage & " read timeout"
-      )
-    let readCount = await readFuture
+    let readCount = await awaitFutureWithin(readFuture, remaining, stage, "read")
     if readCount <= 0:
       raise (ref MultiStreamError)(
         msg: "MultistreamSelect " & stage & " empty read"
@@ -305,16 +331,13 @@ proc performDialerHandshake(
       async: (raises: [CancelledError, LPStreamError, MultiStreamError])
   .} =
     let writeFuture = conn.writeLp(payload)
-    let writeReady = await withTimeout(writeFuture, handshakeWriteTimeout)
-    if not writeReady:
-      writeFuture.cancelSoon()
+    try:
+      await awaitFutureWithin(writeFuture, handshakeWriteTimeout, stage, "write")
+    except MultiStreamError as exc:
       when defined(ohos):
         warn "multistream dialer handshake write timeout", conn, stage,
           timeoutMs = handshakeWriteTimeout.milliseconds
-      raise (ref MultiStreamError)(
-        msg: "MultistreamSelect " & stage & " write timeout"
-      )
-    await writeFuture
+      raise exc
 
   warn "multistream dialer handshake begin", conn, attemptV2
   await writeHandshakeWithTimeout(CodecV1 & "\n", "response1")
@@ -545,6 +568,8 @@ proc select*(
         "select_first_proto",
       )
     )
+    warn "multistream dialer got select_first_proto response",
+      conn, requested = firstProto, bytes = response.len
     validateSuffix(response)
 
     if response == firstProto:
@@ -598,6 +623,8 @@ proc select*(
           "select_proto",
         )
       )
+      warn "multistream dialer got select_proto response",
+        conn, requested = p, bytes = response.len
       validateSuffix(response)
       if response == p:
         trace "selected protocol", conn, protocol = response
@@ -684,8 +711,8 @@ proc handleMultistreamV1Loop(
         await conn.writeLp(CodecV1 & "\n")
         isHandshaked = true
       else:
-        trace "handle: sending `na` for duplicate handshake while handshaked", conn
-        await conn.writeLp(Na)
+        trace "handle: acknowledging duplicate handshake while handshaked", conn
+        await conn.writeLp(CodecV1 & "\n")
     elif ms in protos or matchers.anyIt(it(ms)):
       trace "found handler", conn, protocol = ms
       await conn.writeLp(ms & "\n")
@@ -737,7 +764,13 @@ proc processListenerHandshake(
   var pending: seq[byte] = @[]
   var version = msv1
 
-  let nextMessage = await conn.readLp(MsgSize)
+  let nextMessage =
+    await readLpMessageWithin(
+      conn,
+      MsgSize,
+      protocolSelectReadTimeout(),
+      "listener post-handshake",
+    )
   warn "multistream listener got post-handshake message", conn, bytes = nextMessage.len
   if nextMessage.len > 0:
     var nextStr = string.fromBytes(nextMessage)
@@ -794,6 +827,9 @@ proc handleProtocolSelect(
   trace "protocol select: found handler", conn, protocol = selected
   let response = encodeProtocolSelect(@[selected])
   await conn.writeLp(response.buffer)
+  warn "multistream listener sent protocol_select response",
+    conn, protocol = selected, bytes = response.buffer.len
+  conn.suppressNextReplayLp(first)
   conn.protocol = selected
   selected
 
@@ -846,7 +882,12 @@ proc handle*(
       protos.add(proto)
 
   try:
-    let ms = await MultistreamSelect.handle(conn, protos, matchers, active)
+    await conn.beginProtocolNegotiation()
+    let ms =
+      try:
+        await MultistreamSelect.handle(conn, protos, matchers, active)
+      finally:
+        conn.endProtocolNegotiation()
     for h in m.handlers:
       if (h.match != nil and h.match(ms)) or h.protos.contains(ms):
         trace "found handler", conn, protocol = ms
@@ -872,7 +913,17 @@ proc handle*(
           return
         protocolHolder.openedStreams.inc(conn.peerId)
         try:
+          warn "multistream handler invoke protocol", conn, protocol = ms
           await protocolHolder.protocol.handler(conn, ms)
+          warn "multistream handler protocol done", conn, protocol = ms
+        except CancelledError as exc:
+          warn "multistream handler protocol cancelled", conn, protocol = ms,
+            description = exc.msg
+          raise exc
+        except CatchableError as exc:
+          warn "multistream handler protocol failed", conn, protocol = ms,
+            description = exc.msg
+          raise exc
         finally:
           protocolHolder.openedStreams.inc(conn.peerId, -1)
           if protocolHolder.openedStreams.getOrDefault(conn.peerId) <= 0:

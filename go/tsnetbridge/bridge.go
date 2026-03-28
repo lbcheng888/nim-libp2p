@@ -523,6 +523,14 @@ func (b *bridge) ensureStarted() error {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return fmt.Errorf("create_state_dir:%w", err)
 	}
+	authKey := strings.TrimSpace(b.cfg.AuthKey)
+	if authKey != "" {
+		statePath := filepath.Join(stateDir, "tailscaled.state")
+		if info, err := os.Stat(statePath); err == nil && !info.IsDir() {
+			b.logf("tsnetbridge: state file %q exists; reusing logged-in state and ignoring auth key", statePath)
+			authKey = ""
+		}
+	}
 	if err := os.Setenv("TS_LOGS_DIR", stateDir); err != nil {
 		b.logf("tsnetbridge: failed to set TS_LOGS_DIR=%q: %v", stateDir, err)
 	}
@@ -531,7 +539,7 @@ func (b *bridge) ensureStarted() error {
 	server := &tsnet.Server{
 		Dir:        stateDir,
 		Hostname:   hostname,
-		AuthKey:    strings.TrimSpace(b.cfg.AuthKey),
+		AuthKey:    authKey,
 		ControlURL: strings.TrimSpace(b.cfg.ControlURL),
 		Port:       uint16(max(0, min(65535, b.cfg.WireGuardPort))),
 	}

@@ -80,10 +80,6 @@ fi
 REPO_ROOT="$(pwd)"
 BUILD_ROOT="$REPO_ROOT/build/android-tests"
 
-MSQUIC_BOOTSTRAP="$REPO_ROOT/nim-libp2p/scripts/nim/bootstrap_msquic.sh"
-if [[ -x "$MSQUIC_BOOTSTRAP" ]]; then
-  eval "$("$MSQUIC_BOOTSTRAP" env || true)"
-fi
 BIN_DIR="$BUILD_ROOT/bin"
 LIB_DIR="$BUILD_ROOT/lib"
 
@@ -102,6 +98,7 @@ COMMON_NIM_FLAGS=(
   "--cc:clang"
   "--define:release"
   "--define:libp2p_msquic_experimental"
+  "--define:libp2p_msquic_builtin"
   "--stacktrace:off"
   "--lineTrace:off"
   "--path:."

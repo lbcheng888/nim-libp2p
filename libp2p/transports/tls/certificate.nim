@@ -106,13 +106,10 @@ func makeSignatureMessage(pubKey: seq[byte]): seq[byte] {.inline.} =
   return msg
 
 func makeIssuerDN(identityKeyPair: KeyPair): string {.inline.} =
-  let issuerDN =
-    try:
-      "CN=" & $(PeerId.init(identityKeyPair.pubkey).tryGet())
-    except LPError:
-      raiseAssert "pubkey must be set"
-
-  return issuerDN
+  let peerIdRes = PeerId.init(identityKeyPair.pubkey)
+  if peerIdRes.isErr:
+    raiseAssert "pubkey must be set"
+  "CN=" & $peerIdRes.get()
 
 proc makeASN1Time(time: Time): string {.inline.} =
   let str =

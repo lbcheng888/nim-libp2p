@@ -9,7 +9,8 @@
 
 {.push raises: [].}
 
-import std/[json, locks, os, strutils, tables]
+import std/[json, locks, strutils, tables]
+from std/times import epochTime
 import chronos, chronicles
 
 import ../crypto/crypto
@@ -22,7 +23,7 @@ import ../upgrademngrs/upgrade
 import ../utility
 import ./transport
 import ./tcptransport
-import ./tsnetbridge as tsbridge
+import ./tsnetprovider
 
 when defined(libp2p_msquic_experimental):
   import ./msquictransport
@@ -33,6 +34,9 @@ logScope:
 template tsnetSafe(body: untyped) =
   {.cast(gcsafe).}:
     body
+
+proc currentUnixMilli(): int64 =
+  int64(epochTime() * 1000.0)
 
 type
   TsnetPathKind* {.pure.} = enum
@@ -51,6 +55,9 @@ type
 
   TsnetTransportBuilderConfig* = object
     controlUrl*: string
+    controlProtocol*: string
+    controlEndpoint*: string
+    relayEndpoint*: string
     authKey*: string
     hostname*: string
     stateDir*: string
@@ -73,6 +80,7 @@ type
     full: MultiAddress
 
   TsnetListenerMapping = object
+    published: bool
     raw: MultiAddress
     advertised: MultiAddress
 
@@ -81,7 +89,8 @@ type
     tcpTransport: TcpTransport
     when defined(libp2p_msquic_experimental):
       quicTransport: MsQuicTransport
-    bridge: tsbridge.TsnetBridge
+    provider: TsnetProvider
+    providerListenersActivated: bool
     acceptFuts: seq[Future[Connection]]
     acceptKinds: seq[TsnetPathKind]
     listenerMappings: seq[TsnetListenerMapping]
@@ -101,6 +110,9 @@ initLock(tsnetRegistryLock)
 proc init*(_: type[TsnetTransportBuilderConfig]): TsnetTransportBuilderConfig =
   result = TsnetTransportBuilderConfig(
     controlUrl: "",
+    controlProtocol: TsnetControlProtocolAuto,
+    controlEndpoint: "",
+    relayEndpoint: "",
     authKey: "",
     hostname: "",
     stateDir: "",
@@ -113,6 +125,22 @@ proc init*(_: type[TsnetTransportBuilderConfig]): TsnetTransportBuilderConfig =
   when defined(libp2p_msquic_experimental):
     result.quicConfig = MsQuicTransportConfig()
     result.quicTlsTempDir = ""
+
+proc providerConfig(cfg: TsnetTransportBuilderConfig): TsnetProviderConfig =
+  TsnetProviderConfig(
+    controlUrl: cfg.controlUrl,
+    controlProtocol: cfg.controlProtocol,
+    controlEndpoint: cfg.controlEndpoint,
+    relayEndpoint: cfg.relayEndpoint,
+    authKey: cfg.authKey,
+    hostname: cfg.hostname,
+    stateDir: cfg.stateDir,
+    wireguardPort: cfg.wireguardPort,
+    bridgeLibraryPath: cfg.bridgeLibraryPath,
+    logLevel: cfg.logLevel,
+    enableDebug: cfg.enableDebug,
+    bridgeExtraJson: cfg.bridgeExtraJson
+  )
 
 proc parseKnownAddress(text: string): MultiAddress {.gcsafe.} =
   MultiAddress.init(text).expect("tsnet transport constructed a valid multiaddr")
@@ -164,125 +192,295 @@ proc syntheticTailnetIPv4(id: int): string {.gcsafe.} =
 proc syntheticTailnetIPv6(id: int): string {.gcsafe.} =
   "fd7a:115c:a1e0::" & toHex(id and 0xFFFF, 4).toLowerAscii()
 
-proc bridgeRequested(self: TsnetTransport): bool =
-  self.cfg.bridgeLibraryPath.strip().len > 0 or
-  self.cfg.controlUrl.strip().len > 0 or
-  self.cfg.authKey.strip().len > 0 or
-  self.cfg.hostname.strip().len > 0 or
-  self.cfg.stateDir.strip().len > 0 or
-  getEnv(tsbridge.DefaultTsnetBridgeEnvVar).strip().len > 0
+proc providerUsesProxyRouting(self: TsnetTransport): bool {.gcsafe.} =
+  tsnetSafe:
+    result = not self.provider.isNil and self.provider.isProxyBacked()
 
-proc bridgeConfigJson(self: TsnetTransport): string =
-  var payload =
-    block:
-      let raw = self.cfg.bridgeExtraJson.strip()
-      if raw.len == 0:
-        newJObject()
+proc providerCapabilitiesSafe(self: TsnetTransport): TsnetProviderCapabilities {.gcsafe.} =
+  tsnetSafe:
+    result =
+      if self.provider.isNil:
+        capabilities(TsnetProviderKind.BuiltinSynthetic)
       else:
-        try:
-          let parsed = parseJson(raw)
-          if parsed.kind == JObject:
-            parsed
-          else:
-            newJObject()
-        except CatchableError:
-          newJObject()
-  payload["controlUrl"] = %self.cfg.controlUrl
-  payload["authKey"] = %self.cfg.authKey
-  payload["hostname"] = %self.cfg.hostname
-  payload["stateDir"] = %self.cfg.stateDir
-  payload["wireguardPort"] = %self.cfg.wireguardPort
-  payload["logLevel"] = %self.cfg.logLevel
-  payload["enableDebug"] = %self.cfg.enableDebug
-  $payload
+        self.provider.capabilities()
 
-proc bridgeActive(self: TsnetTransport): bool =
-  not self.bridge.isNil and self.bridge.handle > 0
+proc parseTsnetAddress(
+    address: MultiAddress, listen: bool
+): Result[TsnetParsedAddress, string] {.gcsafe.}
+proc providerListenTcpSafe(
+    self: TsnetTransport,
+    family: string,
+    port: int,
+    localAddress: MultiAddress
+): Result[MultiAddress, string] {.gcsafe.}
+proc providerListenUdpSafe(
+    self: TsnetTransport,
+    family: string,
+    port: int,
+    localAddress: MultiAddress
+): Result[MultiAddress, string] {.gcsafe.}
 
-proc ensureBridge(self: TsnetTransport): Result[bool, string] =
-  if self.bridgeActive():
-    return ok(true)
-  let preferred = self.bridgeRequested()
-  let opened = tsbridge.openTsnetBridge(self.bridgeConfigJson(), self.cfg.bridgeLibraryPath).valueOr:
-    if preferred:
+proc refreshListenerMapping(
+    transport: TsnetTransport,
+    index: int,
+    advertised: MultiAddress
+): Result[void, string] {.gcsafe.} =
+  tsnetSafe:
+    if index < 0 or index >= transport.listenerMappings.len:
+      return err("tsnet listener mapping index out of range")
+    let raw = transport.listenerMappings[index].raw
+    let oldAdvertised = transport.listenerMappings[index].advertised
+    let advertisedKey = $advertised
+    let rawKey = $raw
+    let oldAdvertisedKey = $oldAdvertised
+    withLock(tsnetRegistryLock):
+      let existing = tsnetAdvertisedToRaw.getOrDefault(advertisedKey)
+      if existing.len > 0 and existing != rawKey:
+        return err("duplicate /tsnet listener registration: " & advertisedKey)
+      if transport.listenerMappings[index].published and oldAdvertisedKey != advertisedKey:
+        if tsnetAdvertisedToRaw.getOrDefault(oldAdvertisedKey) == rawKey:
+          tsnetAdvertisedToRaw.del(oldAdvertisedKey)
+      tsnetAdvertisedToRaw[advertisedKey] = rawKey
+      tsnetRawListenerToAdvertised[rawKey] = advertisedKey
+    transport.listenerMappings[index].published = true
+    transport.listenerMappings[index].advertised = advertised
+  ok()
+
+proc activateProviderListeners(
+    self: TsnetTransport
+): Result[void, string] {.gcsafe.} =
+  tsnetSafe:
+    if self.isNil:
+      return err("tsnet transport is nil")
+    if self.providerListenersActivated or not self.providerUsesProxyRouting():
+      return ok()
+    var activated: seq[MultiAddress] = @[]
+    for idx, mapping in self.listenerMappings:
+      let parsed = parseTsnetAddress(mapping.advertised, listen = true).valueOr:
+        return err(error)
+      let upgraded =
+        case parsed.kind
+        of TsnetPathKind.Tcp:
+          self.providerListenTcpSafe(parsed.family, parsed.port, mapping.raw)
+        of TsnetPathKind.Quic:
+          self.providerListenUdpSafe(parsed.family, parsed.port, mapping.raw)
+      let advertised = upgraded.valueOr:
+        return err(error)
+      let refreshed = self.refreshListenerMapping(idx, advertised)
+      if refreshed.isErr():
+        return err(refreshed.error)
+      activated.add(advertised)
+    if self.running:
+      self.addrs = activated
+    self.providerListenersActivated = true
+  ok()
+
+proc prewarmProvider*(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.start()
+
+proc providerStartSafe(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
+  tsnetSafe:
+    let started = self.provider.start().valueOr:
       return err(error)
-    return ok(false)
-  self.bridge = opened
-  ok(true)
+    if self.providerUsesProxyRouting():
+      let activated = self.activateProviderListeners()
+      if activated.isErr():
+        return err(activated.error)
+    result = ok(started)
 
-proc bridgeEnsureSafe(self: TsnetTransport): Result[bool, string] {.gcsafe.} =
+proc warmProvider*(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
+  self.providerStartSafe()
+
+proc publishedAddrs*(self: TsnetTransport): seq[MultiAddress] {.gcsafe.} =
+  if self.isNil:
+    return @[]
+  for mapping in self.listenerMappings:
+    if mapping.published:
+      result.add(mapping.advertised)
+  if result.len == 0:
+    result = self.addrs
+
+proc providerResetSafe(self: TsnetTransport) {.gcsafe.} =
   tsnetSafe:
-    result = self.ensureBridge()
+    discard self.provider.reset()
 
-proc bridgeResetSafe(self: TsnetTransport) {.gcsafe.} =
+proc providerStopSafe(self: TsnetTransport) {.gcsafe.} =
   tsnetSafe:
-    if self.bridgeActive():
-      discard tsbridge.reset(self.bridge)
+    self.provider.stop()
 
-proc bridgeCloseSafe(self: TsnetTransport) {.gcsafe.} =
-  tsnetSafe:
-    if self.bridgeActive():
-      self.bridge.close()
-      self.bridge = nil
+proc deferredStatusPayload(
+    self: TsnetTransport,
+    reason: string
+): JsonNode {.gcsafe.} =
+  self.provider.annotatePayload(%*{
+    "ok": false,
+    "deferred": true,
+    "providerStage": "deferred",
+    "reason": reason,
+    "started": self.running,
+    "tailnetIPs": newJArray(),
+    "tailnetPath": "",
+    "tailnetRelay": "",
+    "tailnetDerpMapSummary": "",
+    "tailnetPeers": newJArray(),
+  })
 
-proc bridgeListenTcpSafe(
+proc providerListenTcpSafe(
     self: TsnetTransport,
     family: string,
     port: int,
     localAddress: MultiAddress
 ): Result[MultiAddress, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.listenTcpProxy(self.bridge, family, port, localAddress)
+    result = self.provider.listenTcpProxy(family, port, localAddress)
 
-proc bridgeListenUdpSafe(
+proc providerListenUdpSafe(
     self: TsnetTransport,
     family: string,
     port: int,
     localAddress: MultiAddress
 ): Result[MultiAddress, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.listenUdpProxy(self.bridge, family, port, localAddress)
+    result = self.provider.listenUdpProxy(family, port, localAddress)
 
-proc bridgeDialTcpSafe(
+proc providerDialTcpSafe(
     self: TsnetTransport,
     family, ip: string,
     port: int
 ): Result[MultiAddress, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.dialTcpProxy(self.bridge, family, ip, port)
+    result = self.provider.dialTcpProxy(family, ip, port)
 
-proc bridgeDialUdpSafe(
+proc providerDialUdpSafe(
     self: TsnetTransport,
     family, ip: string,
     port: int
 ): Result[MultiAddress, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.dialUdpProxy(self.bridge, family, ip, port)
+    result = self.provider.dialUdpProxy(family, ip, port)
 
-proc bridgeResolveRemoteSafe(
+proc providerDialUdpFallbackSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.dialUdpProxyRelayFallback(family, ip, port)
+
+proc providerMarkFailedDirectUdpSafe(
+    self: TsnetTransport,
+    advertised: MultiAddress,
+    rawAddress: MultiAddress
+): Result[void, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.markFailedDirectProxyRoute(advertised, rawAddress)
+
+proc providerUdpDialStateSafe(
+    self: TsnetTransport,
+    rawAddress: MultiAddress
+): tuple[
+    known, ready: bool,
+    error, phase, detail: string,
+    attempts: int,
+    updatedUnixMilli: int64
+  ] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.udpDialState(rawAddress)
+
+proc providerResolveRemoteSafe(
     self: TsnetTransport,
     rawAddress: MultiAddress
 ): Result[MultiAddress, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.resolveRemote(self.bridge, rawAddress)
+    result = self.provider.resolveRemote(rawAddress)
 
-proc bridgeStatusPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
+proc providerStatusPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
   tsnetSafe:
-    if not self.bridgeActive():
-      result = err("tsnet bridge is not active")
-    else:
-      result = tsbridge.statusPayload(self.bridge)
+    result = self.provider.statusPayload()
 
-proc bridgePingPayloadSafe(
+proc providerPingPayloadSafe(
     self: TsnetTransport,
     payload: JsonNode
 ): Result[JsonNode, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.pingPayload(self.bridge, payload)
+    result = self.provider.pingPayload(payload)
 
-proc bridgeDerpMapPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
+proc providerDerpMapPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
   tsnetSafe:
-    result = tsbridge.derpMapPayload(self.bridge)
+    result = self.provider.derpMapPayload()
+
+proc waitForProviderUdpDialReady(
+    self: TsnetTransport,
+    rawAddress: MultiAddress
+) {.async: (raises: [CancelledError, transport.TransportError]).} =
+  const
+    pollStep = 25.milliseconds
+    dialReadyTimeout = 30.seconds
+    dialProgressStallNoticeMs = 3_000'i64
+
+  let deadline = Moment.now() + dialReadyTimeout
+  var lastPhase = ""
+  var lastDetail = ""
+  var lastAttempts = -1
+  var lastUpdate = int64(0)
+  var lastStallNoticeUpdate = int64(-1)
+  while true:
+    let state = self.providerUdpDialStateSafe(rawAddress)
+    if not state.known:
+      return
+    if state.ready:
+      return
+    if state.phase.len > 0 and (
+        state.phase != lastPhase or
+        state.detail != lastDetail or
+        state.attempts != lastAttempts or
+        state.updatedUnixMilli != lastUpdate
+      ):
+      trace "tsnet udp dial progress",
+        rawAddress = $rawAddress,
+        phase = state.phase,
+        detail = state.detail,
+        attempts = state.attempts
+      lastPhase = state.phase
+      lastDetail = state.detail
+      lastAttempts = state.attempts
+      lastUpdate = state.updatedUnixMilli
+      lastStallNoticeUpdate = int64(-1)
+    if state.error.len > 0:
+      raise newException(
+        TsnetTransportDialError,
+        "tsnet udp relay dial failed for " & $rawAddress & ": " & state.error &
+          (if state.phase.len > 0: " (phase=" & state.phase & ")" else: "") &
+          (if state.attempts > 0: " attempts=" & $state.attempts else: "")
+      )
+    if state.updatedUnixMilli > 0 and state.phase.len > 0:
+      let ageMs = currentUnixMilli() - state.updatedUnixMilli
+      if ageMs >= dialProgressStallNoticeMs and
+          state.updatedUnixMilli != lastStallNoticeUpdate:
+        trace "tsnet udp dial stalled",
+          rawAddress = $rawAddress,
+          phase = state.phase,
+          detail = state.detail,
+          attempts = state.attempts,
+          stallMs = ageMs
+        lastStallNoticeUpdate = state.updatedUnixMilli
+    if Moment.now() >= deadline:
+      let extra =
+        if state.phase.len == 0:
+          ""
+        else:
+          " lastPhase=" & state.phase &
+            (if state.detail.len > 0: " detail=" & state.detail else: "") &
+            (if state.attempts > 0: " attempts=" & $state.attempts else: "") &
+            (if state.updatedUnixMilli > 0:
+              " ageMs=" & $(max(int64(0), currentUnixMilli() - state.updatedUnixMilli))
+             else: "")
+      raise newException(
+        TsnetTransportDialError,
+        "timeout waiting for tsnet udp relay readiness for " & $rawAddress & extra
+      )
+    await sleepAsync(pollStep)
 
 proc hasTsnetSuffix(address: MultiAddress): bool {.gcsafe.} =
   let text = $address
@@ -320,6 +518,24 @@ proc familyFromAddress(address: MultiAddress): string {.gcsafe.} =
     return parts[0]
   ""
 
+proc hostFromAddress(address: MultiAddress): string {.gcsafe.} =
+  let parts = splitAddressParts(address)
+  if parts.len >= 2 and (parts[0] == "ip4" or parts[0] == "ip6"):
+    return parts[1]
+  ""
+
+proc quicDialHostname*(
+    self: TsnetTransport,
+    requestedHostname: string,
+    rawTarget: MultiAddress
+): string =
+  if self.providerUsesProxyRouting():
+    let rawHost = hostFromAddress(rawTarget)
+    if rawHost.len > 0:
+      return rawHost
+    return ""
+  requestedHostname
+
 proc buildTsnetAddress(
     family, ip: string, port: int, kind: TsnetPathKind
 ): MultiAddress {.gcsafe.} =
@@ -340,6 +556,17 @@ proc buildRawLoopbackAddress(parsed: TsnetParsedAddress): MultiAddress {.gcsafe.
     parseKnownAddress("/" & parsed.family & "/" & host & "/tcp/0")
   of TsnetPathKind.Quic:
     parseKnownAddress("/" & parsed.family & "/" & host & "/udp/0/quic-v1")
+
+proc preferSingleQuicRelayFamily(transport: TsnetTransport): bool =
+  transport.cfg.relayEndpoint.strip().toLowerAscii().startsWith("quic://")
+
+proc primaryQuicRelayFamily(requested: seq[TsnetParsedAddress]): string =
+  for item in requested:
+    if item.family == "ip4":
+      return "ip4"
+  if requested.len > 0:
+    return requested[0].family
+  ""
 
 proc parseTsnetAddress(
     address: MultiAddress, listen: bool
@@ -400,13 +627,8 @@ proc advertisedAddress(
       portFromAddress(rawActual)
   buildTsnetAddress(parsed.family, ip, port, parsed.kind)
 
-proc bridgeStatusPayload(self: TsnetTransport): Result[JsonNode, string] =
-  if not self.bridgeActive():
-    return err("tsnet bridge is not active")
-  tsbridge.statusPayload(self.bridge)
-
-proc bridgeTailnetIp(self: TsnetTransport, family: string): string =
-  let payload = self.bridgeStatusPayloadSafe().valueOr:
+proc providerTailnetIp(self: TsnetTransport, family: string): string =
+  let payload = self.providerStatusPayloadSafe().valueOr:
     return if family == "ip6": self.syntheticIPv6 else: self.syntheticIPv4
   for candidate in jsonFieldStrings(payload, "tailnetIPs"):
     let lowered = candidate.toLowerAscii()
@@ -432,18 +654,32 @@ proc synthesizedEndpoint(
       transport.syntheticIPv4
   buildTsnetAddress(family, ip, portFromAddress(rawAddr), kind)
 
-proc bridgeSynthesizedEndpoint(
+proc providerSynthesizedEndpoint(
     transport: TsnetTransport, rawAddr: MultiAddress, kind: TsnetPathKind
 ): MultiAddress =
   let family = familyFromAddress(rawAddr)
-  let ip = transport.bridgeTailnetIp(family)
+  let ip = transport.providerTailnetIp(family)
   buildTsnetAddress(family, ip, portFromAddress(rawAddr), kind)
 
-proc bridgeSynthesizedEndpointSafe(
+proc providerSynthesizedEndpointSafe(
     transport: TsnetTransport, rawAddr: MultiAddress, kind: TsnetPathKind
 ): MultiAddress {.gcsafe.} =
   tsnetSafe:
-    result = transport.bridgeSynthesizedEndpoint(rawAddr, kind)
+    result = transport.providerSynthesizedEndpoint(rawAddr, kind)
+
+proc fallbackDialEndpoint(
+    transport: TsnetTransport,
+    family: string,
+    kind: TsnetPathKind
+): MultiAddress =
+  let ip =
+    if transport.providerUsesProxyRouting():
+      transport.providerTailnetIp(family)
+    elif family == "ip6":
+      transport.syntheticIPv6
+    else:
+      transport.syntheticIPv4
+  buildTsnetAddress(family, ip, 0, kind)
 
 proc registerListenerMapping(
     transport: TsnetTransport, advertised: MultiAddress, raw: MultiAddress
@@ -456,13 +692,25 @@ proc registerListenerMapping(
         return err("duplicate /tsnet listener registration: " & advertisedKey)
       tsnetAdvertisedToRaw[advertisedKey] = rawKey
       tsnetRawListenerToAdvertised[rawKey] = advertisedKey
-  transport.listenerMappings.add(TsnetListenerMapping(raw: raw, advertised: advertised))
+  transport.listenerMappings.add(
+    TsnetListenerMapping(published: true, raw: raw, advertised: advertised)
+  )
+  ok()
+
+proc rememberListenerMapping(
+    transport: TsnetTransport, advertised: MultiAddress, raw: MultiAddress
+): Result[void, string] {.gcsafe.} =
+  transport.listenerMappings.add(
+    TsnetListenerMapping(published: false, raw: raw, advertised: advertised)
+  )
   ok()
 
 proc clearListenerMappings(transport: TsnetTransport) {.gcsafe.} =
   tsnetSafe:
     withLock(tsnetRegistryLock):
       for mapping in transport.listenerMappings:
+        if not mapping.published:
+          continue
         let advertisedKey = $mapping.advertised
         let rawKey = $mapping.raw
         if tsnetAdvertisedToRaw.getOrDefault(advertisedKey) == rawKey:
@@ -512,8 +760,8 @@ proc rewriteAcceptedConnection(
     let observedOpt = lookupAdvertisedForRaw(conn.observedAddr.get())
     if observedOpt.isSome:
       conn.observedAddr = Opt.some(observedOpt.get())
-    elif transport.bridgeActive():
-      let remoteRes = transport.bridgeResolveRemoteSafe(conn.observedAddr.get())
+    elif transport.providerUsesProxyRouting():
+      let remoteRes = transport.providerResolveRemoteSafe(conn.observedAddr.get())
       if remoteRes.isOk:
         conn.observedAddr = Opt.some(remoteRes.get())
       else:
@@ -535,11 +783,13 @@ proc new*(
     cfg: cfg,
     upgrader: upgrader,
     networkReachability: NetworkReachability.Unknown,
+    providerListenersActivated: false,
     acceptFuts: @[],
     acceptKinds: @[],
     listenerMappings: @[],
     syntheticIPv4: syntheticTailnetIPv4(syntheticId),
-    syntheticIPv6: syntheticTailnetIPv6(syntheticId)
+    syntheticIPv6: syntheticTailnetIPv6(syntheticId),
+    provider: TsnetProvider.new(providerConfig(cfg))
   )
   procCall Transport(result).initialize()
   result.tcpTransport = TcpTransport.new(flags = {ServerFlags.TcpNoDelay}, upgrade = upgrader)
@@ -567,8 +817,9 @@ method start*(
   var tcpRaw: seq[MultiAddress] = @[]
   var quicRequested: seq[TsnetParsedAddress] = @[]
   var quicRaw: seq[MultiAddress] = @[]
-  let useBridge = self.bridgeEnsureSafe().valueOr:
-    raise newException(TsnetTransportError, error)
+  self.providerListenersActivated = false
+  let runtimeRequested = not self.provider.isNil and self.provider.runtimeRequested()
+  let useProxyProvider = self.providerUsesProxyRouting()
 
   for address in addrs:
     let parsed = parseTsnetAddress(address, listen = true).valueOr:
@@ -587,70 +838,83 @@ method start*(
           "QUIC /tsnet listeners require -d:libp2p_msquic_experimental"
         )
 
+  if self.preferSingleQuicRelayFamily() and quicRequested.len > 1:
+    let selectedFamily = primaryQuicRelayFamily(quicRequested)
+    if selectedFamily.len > 0:
+      var filteredRequested: seq[TsnetParsedAddress] = @[]
+      var filteredRaw: seq[MultiAddress] = @[]
+      for idx, parsed in quicRequested:
+        if parsed.family == selectedFamily:
+          filteredRequested.add(parsed)
+          filteredRaw.add(quicRaw[idx])
+      if filteredRequested.len > 0:
+        quicRequested = filteredRequested
+        quicRaw = filteredRaw
+
   try:
     if tcpRaw.len > 0:
       await self.tcpTransport.start(tcpRaw)
       for idx, rawActual in self.tcpTransport.addrs:
-        let advertised =
-          if useBridge:
-            self.bridgeListenTcpSafe(
+        let registerRes =
+          if useProxyProvider:
+            let advertised = self.providerListenTcpSafe(
               tcpRequested[idx].family,
               tcpRequested[idx].port,
               rawActual
             ).valueOr:
               raise newException(TsnetTransportError, error)
+            self.registerListenerMapping(advertised, rawActual)
+          elif runtimeRequested:
+            self.rememberListenerMapping(tcpRequested[idx].full, rawActual)
           else:
-            self.advertisedAddress(tcpRequested[idx], rawActual)
-        let registerRes = self.registerListenerMapping(
-          advertised,
-          rawActual
-        )
+            let advertised = self.advertisedAddress(tcpRequested[idx], rawActual)
+            self.registerListenerMapping(advertised, rawActual)
         if registerRes.isErr:
           raise newException(TsnetTransportError, registerRes.error)
     when defined(libp2p_msquic_experimental):
       if quicRaw.len > 0:
         await self.quicTransport.start(quicRaw)
         for idx, rawActual in self.quicTransport.addrs:
-          let advertised =
-            if useBridge:
-              self.bridgeListenUdpSafe(
+          let registerRes =
+            if useProxyProvider:
+              let advertised = self.providerListenUdpSafe(
                 quicRequested[idx].family,
                 quicRequested[idx].port,
                 rawActual
               ).valueOr:
                 raise newException(TsnetTransportError, error)
+              self.registerListenerMapping(advertised, rawActual)
+            elif runtimeRequested:
+              self.rememberListenerMapping(quicRequested[idx].full, rawActual)
             else:
-              self.advertisedAddress(quicRequested[idx], rawActual)
-          let registerRes = self.registerListenerMapping(
-            advertised,
-            rawActual
-          )
+              let advertised = self.advertisedAddress(quicRequested[idx], rawActual)
+              self.registerListenerMapping(advertised, rawActual)
           if registerRes.isErr:
             raise newException(TsnetTransportError, registerRes.error)
   except CancelledError as exc:
     self.clearListenerMappings()
-    self.bridgeResetSafe()
+    self.providerResetSafe()
     await noCancel self.tcpTransport.stop()
     when defined(libp2p_msquic_experimental):
       await noCancel self.quicTransport.stop()
     raise exc
   except LPError as exc:
     self.clearListenerMappings()
-    self.bridgeResetSafe()
+    self.providerResetSafe()
     await noCancel self.tcpTransport.stop()
     when defined(libp2p_msquic_experimental):
       await noCancel self.quicTransport.stop()
     raise exc
   except transport.TransportError as exc:
     self.clearListenerMappings()
-    self.bridgeResetSafe()
+    self.providerResetSafe()
     await noCancel self.tcpTransport.stop()
     when defined(libp2p_msquic_experimental):
       await noCancel self.quicTransport.stop()
     raise exc
   except CatchableError as exc:
     self.clearListenerMappings()
-    self.bridgeResetSafe()
+    self.providerResetSafe()
     await noCancel self.tcpTransport.stop()
     when defined(libp2p_msquic_experimental):
       await noCancel self.quicTransport.stop()
@@ -658,7 +922,8 @@ method start*(
 
   var advertised: seq[MultiAddress] = @[]
   for mapping in self.listenerMappings:
-    advertised.add(mapping.advertised)
+    if mapping.published:
+      advertised.add(mapping.advertised)
   await procCall Transport(self).start(advertised)
 
 method stop*(self: TsnetTransport) {.async: (raises: []).} =
@@ -672,8 +937,9 @@ method stop*(self: TsnetTransport) {.async: (raises: []).} =
   self.acceptKinds.setLen(0)
 
   self.clearListenerMappings()
-  self.bridgeResetSafe()
-  self.bridgeCloseSafe()
+  self.providerListenersActivated = false
+  self.providerResetSafe()
+  self.providerStopSafe()
   await noCancel self.tcpTransport.stop()
   when defined(libp2p_msquic_experimental):
     await noCancel self.quicTransport.stop()
@@ -735,15 +1001,18 @@ method dial*(
 ): Future[Connection] {.async: (raises: [transport.TransportError, CancelledError]).} =
   let parsed = parseTsnetAddress(address, listen = false).valueOr:
     raise newException(TsnetTransportDialError, error)
+  if not self.providerUsesProxyRouting() and not self.provider.isNil and self.provider.runtimeRequested():
+    discard self.providerStartSafe().valueOr:
+      raise newException(TsnetTransportDialError, error)
   let rawTarget =
-    if self.bridgeActive():
+    if self.providerUsesProxyRouting():
       case parsed.kind
       of TsnetPathKind.Tcp:
-        self.bridgeDialTcpSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+        self.providerDialTcpSafe(parsed.family, parsed.ip, parsed.port).valueOr:
           raise newException(TsnetTransportDialError, error)
       of TsnetPathKind.Quic:
         when defined(libp2p_msquic_experimental):
-          self.bridgeDialUdpSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+          self.providerDialUdpSafe(parsed.family, parsed.ip, parsed.port).valueOr:
             raise newException(TsnetTransportDialError, error)
         else:
           raise newException(
@@ -765,11 +1034,46 @@ method dial*(
     of TsnetPathKind.Quic:
       when defined(libp2p_msquic_experimental):
         if not self.quicTransport.running:
-          raise newException(
-            TsnetTransportDialError,
-            "tsnet QUIC path is not running"
-          )
-        await self.quicTransport.dial(hostname, rawTarget, peerId)
+          try:
+            # QUIC clients may dial without registering a local /tsnet listener first.
+            await self.quicTransport.start(@[])
+          except CancelledError as exc:
+            raise exc
+          except transport.TransportError as exc:
+            raise newException(TsnetTransportDialError, exc.msg, exc)
+          except LPError as exc:
+            raise newException(TsnetTransportDialError, exc.msg, exc)
+          except CatchableError as exc:
+            raise newException(TsnetTransportDialError, exc.msg, exc)
+        if self.providerUsesProxyRouting():
+          await self.waitForProviderUdpDialReady(rawTarget)
+        let dialHostname = self.quicDialHostname(hostname, rawTarget)
+        try:
+          await self.quicTransport.dial(dialHostname, rawTarget, peerId)
+        except CancelledError as exc:
+          raise exc
+        except CatchableError as exc:
+          if self.providerUsesProxyRouting():
+            let status = self.providerStatusPayloadSafe()
+            let path =
+              if status.isOk():
+                normalizeTailnetPath(jsonFieldStr(status.get(), "tailnetPath", ""))
+              else:
+                ""
+            if path in [TsnetPathDirect, TsnetPathPunchedDirect]:
+              discard self.providerMarkFailedDirectUdpSafe(parsed.full, rawTarget)
+              let fallbackTarget = self.providerDialUdpFallbackSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+                raise newException(TsnetTransportDialError, exc.msg, exc)
+              if $fallbackTarget != $rawTarget:
+                await self.waitForProviderUdpDialReady(fallbackTarget)
+                let fallbackHostname = self.quicDialHostname(hostname, fallbackTarget)
+                try:
+                  return await self.quicTransport.dial(fallbackHostname, fallbackTarget, peerId)
+                except CancelledError as retryExc:
+                  raise retryExc
+                except CatchableError:
+                  discard
+          raise newException(TsnetTransportDialError, exc.msg, exc)
       else:
         raise newException(
           TsnetTransportDialError,
@@ -779,12 +1083,14 @@ method dial*(
   if conn.localAddr.isSome:
     let rawLocal = conn.localAddr.get()
     let advertisedLocal =
-      if self.bridgeActive():
-        self.bridgeSynthesizedEndpointSafe(rawLocal, parsed.kind)
+      if self.providerUsesProxyRouting():
+        self.providerSynthesizedEndpointSafe(rawLocal, parsed.kind)
       else:
         self.synthesizedEndpoint(rawLocal, parsed.kind)
     registerEndpoint(rawLocal, advertisedLocal)
     conn.localAddr = Opt.some(advertisedLocal)
+  else:
+    conn.localAddr = Opt.some(self.fallbackDialEndpoint(parsed.family, parsed.kind))
   conn.observedAddr = Opt.some(address)
   conn
 
@@ -797,8 +1103,9 @@ method upgrade*(
   return procCall Transport(self).upgrade(conn, peerId)
 
 proc tailnetStatus*(self: TsnetTransport): TsnetStatusSnapshot {.public, gcsafe.} =
-  if self.bridgeActive():
-    let payload = self.bridgeStatusPayloadSafe().valueOr:
+  let providerCapabilities = self.providerCapabilitiesSafe()
+  if providerCapabilities.statusApi:
+    let payload = self.providerStatusPayloadSafe().valueOr:
       return TsnetStatusSnapshot(
         tailnetIPs: @[self.syntheticIPv4, self.syntheticIPv6],
         tailnetPath: if self.listenerMappings.len > 0: "direct" else: "idle",
@@ -832,10 +1139,13 @@ proc tailnetStatus*(self: TsnetTransport): TsnetStatusSnapshot {.public, gcsafe.
     tailnetPeers: @[]
   )
 
-proc tailnetStatusPayload*(self: TsnetTransport): Result[JsonNode, string] =
-  if self.bridgeActive():
-    return self.bridgeStatusPayloadSafe()
-  ok(%*{
+proc tailnetStatusPayload*(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
+  if not self.provider.isNil and self.provider.runtimeRequested() and
+      not self.providerCapabilitiesSafe().statusApi:
+    return ok(self.deferredStatusPayload("provider_start_deferred"))
+  if self.providerCapabilitiesSafe().statusApi:
+    return self.providerStatusPayloadSafe()
+  ok(self.provider.annotatePayload(%*{
     "ok": true,
     "started": self.running,
     "tailnetIPs": @[self.syntheticIPv4, self.syntheticIPv6],
@@ -843,7 +1153,7 @@ proc tailnetStatusPayload*(self: TsnetTransport): Result[JsonNode, string] =
     "tailnetRelay": "",
     "tailnetDerpMapSummary": "",
     "tailnetPeers": newJArray(),
-  })
+  }))
 
 proc tailnetPingPayload*(
     self: TsnetTransport,
@@ -851,23 +1161,22 @@ proc tailnetPingPayload*(
     pingType = "",
     sampleCount = 0,
     timeoutMs = 0
-): Result[JsonNode, string] =
-  if not self.bridgeActive():
-    return err("tailnet ping requires a real tsnet bridge")
+): Result[JsonNode, string] {.gcsafe.} =
+  if not self.providerCapabilitiesSafe().pingApi and not self.provider.isNil and
+      self.provider.runtimeRequested():
+    discard self.providerStartSafe()
+  if not self.providerCapabilitiesSafe().pingApi:
+    return err("tailnet ping requires a real tsnet provider")
   let payload = %*{
     "peerIP": peerIp,
     "pingType": pingType,
     "sampleCount": sampleCount,
     "timeoutMs": timeoutMs,
   }
-  self.bridgePingPayloadSafe(payload)
+  self.providerPingPayloadSafe(payload)
 
-proc tailnetDerpMapPayload*(self: TsnetTransport): Result[JsonNode, string] =
-  if not self.bridgeActive():
-    return ok(%*{
-      "ok": true,
-      "omitDefaultRegions": false,
-      "regionCount": 0,
-      "regions": newJArray(),
-    })
-  self.bridgeDerpMapPayloadSafe()
+proc tailnetDerpMapPayload*(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
+  if not self.providerCapabilitiesSafe().derpMapApi and not self.provider.isNil and
+      self.provider.runtimeRequested():
+    discard self.providerStartSafe()
+  self.providerDerpMapPayloadSafe()

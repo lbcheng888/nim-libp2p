@@ -7,6 +7,7 @@ when defined(libp2p_msquic_experimental):
   import ../libp2p/[builders, multiaddress, switch]
   import ../libp2p/transports/msquicdriver as msdriver
   import ../libp2p/transports/msquictransport as quictransport
+  import ../libp2p/transports/qpackhuffman
 
   suite "MsQuic WebTransport handshake":
     teardown:
@@ -112,6 +113,8 @@ when defined(libp2p_msquic_experimental):
 
       check serverConn.isWebtransport
       check clientConn.isWebtransport
+      check serverConn.handshakeComplete
+      check clientConn.handshakeComplete
       check serverConn.webtransportReady
       check clientConn.webtransportReady
       check serverConn.datagramSendEnabled
@@ -124,10 +127,64 @@ when defined(libp2p_msquic_experimental):
       check serverConn.handshakeReadyMs.isSome
       check clientConn.handshakeStartMs.isSome
       check clientConn.handshakeReadyMs.isSome
+      when defined(libp2p_msquic_builtin):
+        check serverConn.activePathId.isSome
+        check clientConn.activePathId.isSome
+        check serverConn.knownPathCount.isSome
+        check clientConn.knownPathCount.isSome
+        check serverConn.pathStates.len >= 1
+        check clientConn.pathStates.len >= 1
+        check serverConn.pathStates.anyIt(it.active)
+        check clientConn.pathStates.anyIt(it.active)
       if serverConn.handshakeStartMs.isSome and serverConn.handshakeReadyMs.isSome:
         check serverConn.handshakeReadyMs.get >= serverConn.handshakeStartMs.get
       if clientConn.handshakeStartMs.isSome and clientConn.handshakeReadyMs.isSome:
         check clientConn.handshakeReadyMs.get >= clientConn.handshakeStartMs.get
+
+    asyncTest "MsQuic WebTransport accepts Huffman-compressed QPACK headers":
+      let (handle, initErr) = initMsQuicTransportForAsync()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+        return
+      shutdownMsQuicTransportForAsync(handle)
+
+      let listenAddr = MultiAddress.init("/ip4/127.0.0.1/udp/0/quic-v1/webtransport").tryGet()
+      let server = newStandardSwitch(
+        transport = TransportType.QUIC,
+        addrs = @[listenAddr]
+      )
+      let client = newStandardSwitch(transport = TransportType.QUIC)
+      let huffmanPath = "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      check qpackHuffmanEncodedLen(huffmanPath) < huffmanPath.len.uint64
+
+      server.setWebtransportPath(huffmanPath)
+      client.setWebtransportPath(huffmanPath)
+
+      await server.start()
+      defer:
+        await server.stop()
+
+      await client.start()
+      defer:
+        await client.stop()
+
+      await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+
+      checkUntilTimeout:
+        server.webtransportSessions().len == 1
+        server.webtransportSessions()[0].ready
+
+      checkUntilTimeout:
+        client.webtransportSessions().len == 1
+        client.webtransportSessions()[0].ready
+
+      let serverSession = server.webtransportSessions()[0]
+      let clientSession = client.webtransportSessions()[0]
+      check serverSession.path == huffmanPath
+      check clientSession.path == huffmanPath
+      check serverSession.ready
+      check clientSession.ready
 else:
   import ./helpers
   suite "MsQuic WebTransport handshake":

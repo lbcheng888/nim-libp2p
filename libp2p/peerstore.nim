@@ -24,14 +24,16 @@ runnableExamples:
 {.push raises: [].}
 
 import
-  std/[tables, sets, options, macros],
+  std/[algorithm, tables, sets, options, macros],
   chronos,
+  pkg/results,
   ../shim,
   ./crypto/crypto,
   ./protocols/identify,
   ./protocols/protocol,
   ./peerid,
   ./peerinfo,
+  ./lsmr,
   ./routing_record,
   ./multiaddress,
   ./stream/connection,
@@ -68,6 +70,10 @@ type
   LastSeenBook* {.public.} = ref object of PeerBook[Opt[MultiAddress]]
   ProtoVersionBook* {.public.} = ref object of PeerBook[string]
   SPRBook* {.public.} = ref object of PeerBook[Envelope]
+  LsmrBook* {.public.} = ref object of PeerBook[SignedLsmrCoordinateRecord]
+  ActiveLsmrBook* {.public.} = ref object of PeerBook[SignedLsmrCoordinateRecord]
+  LsmrMigrationBook* {.public.} = ref object of SeqPeerBook[SignedLsmrMigrationRecord]
+  LsmrIsolationBook* {.public.} = ref object of SeqPeerBook[SignedLsmrIsolationEvidence]
   MetadataBook* {.public.} = ref object of PeerBook[Table[string, seq[byte]]]
   BandwidthBook* {.public.} = ref object of PeerBook[BandwidthSnapshot]
 
@@ -131,26 +137,223 @@ proc addHandler*[T](peerBook: PeerBook[T], handler: PeerBookChangeHandler) {.pub
 proc len*[T](peerBook: PeerBook[T]): int {.public.} =
   peerBook.book.len
 
-##################
-# Peer Store API #
-##################
+proc ensureUnique[T](items: var seq[T], value: T) =
+  for existing in items:
+    if existing == value:
+      return
+  items.add(value)
+
+proc compareCertifiedRecords(
+    aPeer, bPeer: PeerId,
+    aRecord, bRecord: SignedLsmrCoordinateRecord,
+    targetPath: LsmrPath,
+): int =
+  let aPrefix = aRecord.data.certifiedPrefix()
+  let bPrefix = bRecord.data.certifiedPrefix()
+  let aShared = commonPrefixLen(aPrefix, targetPath)
+  let bShared = commonPrefixLen(bPrefix, targetPath)
+  result = cmp(bShared, aShared)
+  if result != 0:
+    return
+  let aDivergence = divergenceDistance(aPrefix, targetPath)
+  let bDivergence = divergenceDistance(bPrefix, targetPath)
+  result = cmp(aDivergence, bDivergence)
+  if result != 0:
+    return
+  let aDistance =
+    if aPrefix.len == 0 or targetPath.len == 0:
+      high(int)
+    else:
+      lsmrDistance(aPrefix, targetPath)
+  let bDistance =
+    if bPrefix.len == 0 or targetPath.len == 0:
+      high(int)
+    else:
+      lsmrDistance(bPrefix, targetPath)
+  result = cmp(aDistance, bDistance)
+  if result != 0:
+    return
+  result = cmp(bRecord.data.certifiedDepthValue(), aRecord.data.certifiedDepthValue())
+  if result != 0:
+    return
+  result = cmp(countCoverageBits(bRecord.data.coverageMask), countCoverageBits(aRecord.data.coverageMask))
+  if result != 0:
+    return
+  result = cmp(int(bRecord.data.confidence), int(aRecord.data.confidence))
+  if result != 0:
+    return
+  result = cmp($aPeer, $bPeer)
+
 macro getTypeName(t: type): untyped =
   # Generate unique name in form of Module.Type
   let typ = getTypeImpl(t)[1]
   newLit(repr(typ.owner()) & "." & repr(typ))
 
-proc `[]`*[T](p: PeerStore, typ: type[T]): T {.public.} =
+proc `[]`*[T: BasePeerBook](p: PeerStore, typ: type[T]): T {.public.} =
   ## Get a book from the PeerStore (ex: peerStore[AddressBook])
   let name = getTypeName(T)
-  result = T(p.books.getOrDefault(name))
+  result = cast[T](p.books.getOrDefault(name))
   if result.isNil:
     result = T.new()
     result.deletor = proc(pid: PeerId) =
-      # Manual method because generic method
-      # don't work
-      discard T(p.books.getOrDefault(name)).del(pid)
+      discard cast[T](p.books.getOrDefault(name)).del(pid)
     p.books[name] = result
-  return result
+
+proc closestCertifiedPeers*(
+    peerStore: PeerStore, targetPath: LsmrPath, limit = 0
+): seq[PeerId] {.public.} =
+  if peerStore.isNil or targetPath.len == 0:
+    return @[]
+  var ranked: seq[(PeerId, SignedLsmrCoordinateRecord)] = @[]
+  for peerId, record in peerStore[ActiveLsmrBook].book.pairs:
+    ranked.add((peerId, record))
+  ranked.sort(
+    proc(a, b: (PeerId, SignedLsmrCoordinateRecord)): int =
+      compareCertifiedRecords(a[0], b[0], a[1], b[1], targetPath)
+  )
+  let resolvedLimit =
+    if limit > 0:
+      min(limit, ranked.len)
+    else:
+      ranked.len
+  for idx in 0 ..< resolvedLimit:
+    result.add(ranked[idx][0])
+
+proc bestCertifiedPeer(
+    peerStore: PeerStore, peerIds: openArray[PeerId], targetPath: LsmrPath
+): Opt[PeerId] =
+  if peerStore.isNil or targetPath.len == 0:
+    return Opt.none(PeerId)
+  var ranked: seq[(PeerId, SignedLsmrCoordinateRecord)] = @[]
+  for peerId in peerIds:
+    if peerStore[ActiveLsmrBook].contains(peerId):
+      ranked.add((peerId, peerStore[ActiveLsmrBook][peerId]))
+  if ranked.len == 0:
+    return Opt.none(PeerId)
+  ranked.sort(
+    proc(a, b: (PeerId, SignedLsmrCoordinateRecord)): int =
+      compareCertifiedRecords(a[0], b[0], a[1], b[1], targetPath)
+  )
+  Opt.some(ranked[0][0])
+
+proc neighborsForPrefix*(
+    peerStore: PeerStore, prefix: LsmrPath, depth: int
+): seq[PeerId] {.public.} =
+  if peerStore.isNil or prefix.len == 0 or depth <= 0:
+    return @[]
+  let required = min(prefix.len, depth)
+  for peerId in peerStore.closestCertifiedPeers(prefix):
+    let record = peerStore[ActiveLsmrBook][peerId]
+    if commonPrefixLen(record.data.certifiedPrefix(), prefix) >= required:
+      result.add(peerId)
+
+proc topologyNeighborView*(
+    peerStore: PeerStore,
+    localPeerId: PeerId,
+    depth = 0,
+    perDirection = 1,
+): Opt[TopologyNeighborView] {.public.}
+
+proc routeNextHop*(
+    peerStore: PeerStore, localPeerId: PeerId, targetPath: LsmrPath
+): Opt[PeerId] {.public.} =
+  if peerStore.isNil or targetPath.len == 0 or
+      not peerStore[ActiveLsmrBook].contains(localPeerId):
+    return Opt.none(PeerId)
+  let localPrefix = peerStore[ActiveLsmrBook][localPeerId].data.certifiedPrefix()
+  var depth = min(localPrefix.len, targetPath.len)
+  while depth > 0:
+    let viewOpt = peerStore.topologyNeighborView(localPeerId, depth = depth)
+    if viewOpt.isNone():
+      dec depth
+      continue
+    let view = viewOpt.get()
+    let shared = commonPrefixLen(view.selfPrefix, targetPath)
+
+    if shared == depth - 1 and targetPath.len >= depth:
+      let targetDigit = targetPath[depth - 1]
+      for bucket in view.directionalPeers:
+        if bucket.directionDigit == targetDigit:
+          let nextHop = peerStore.bestCertifiedPeer(bucket.peers, targetPath)
+          if nextHop.isSome():
+            return nextHop
+
+    if shared >= depth:
+      let nextHop = peerStore.bestCertifiedPeer(view.sameCellPeers, targetPath)
+      if nextHop.isSome():
+        return nextHop
+
+    if depth > 1:
+      let parentHop = peerStore.bestCertifiedPeer(view.parentPrefixPeers, targetPath)
+      if parentHop.isSome():
+        return parentHop
+
+    dec depth
+  Opt.none(PeerId)
+
+proc topologyNeighborView*(
+    peerStore: PeerStore,
+    localPeerId: PeerId,
+    depth = 0,
+    perDirection = 1,
+): Opt[TopologyNeighborView] {.public.} =
+  if peerStore.isNil or not peerStore[ActiveLsmrBook].contains(localPeerId):
+    return Opt.none(TopologyNeighborView)
+  let localRecord = peerStore[ActiveLsmrBook][localPeerId]
+  let localPrefix = localRecord.data.certifiedPrefix()
+  if localPrefix.len == 0:
+    return Opt.none(TopologyNeighborView)
+
+  let targetDepth =
+    if depth > 0:
+      min(depth, localPrefix.len)
+    else:
+      localPrefix.len
+  var view = TopologyNeighborView(
+    selfPrefix: localPrefix[0 ..< targetDepth],
+    certifiedDepth: uint8(targetDepth),
+    sameCellPeers: @[],
+    parentPrefixPeers: @[],
+    directionalPeers: @[],
+  )
+  let directionLimit = max(1, perDirection)
+
+  proc bucketIndex(directionDigit: uint8): int =
+    for idx in 0 ..< view.directionalPeers.len:
+      if view.directionalPeers[idx].directionDigit == directionDigit:
+        return idx
+    -1
+
+  for peerId in peerStore.closestCertifiedPeers(view.selfPrefix):
+    if peerId == localPeerId:
+      continue
+    let remotePrefix = peerStore[ActiveLsmrBook][peerId].data.certifiedPrefix()
+    if remotePrefix.len < targetDepth:
+      continue
+
+    let shared = commonPrefixLen(remotePrefix, view.selfPrefix)
+    if shared >= targetDepth:
+      view.sameCellPeers.add(peerId)
+      continue
+
+    if targetDepth > 1 and shared >= targetDepth - 1:
+      view.parentPrefixPeers.add(peerId)
+      let directionDigit = remotePrefix[targetDepth - 1]
+      if directionDigit == view.selfPrefix[targetDepth - 1]:
+        continue
+      let idx = bucketIndex(directionDigit)
+      if idx < 0:
+        view.directionalPeers.add(
+          TopologyNeighborBucket(directionDigit: directionDigit, peers: @[peerId])
+        )
+      elif view.directionalPeers[idx].peers.len < directionLimit:
+        view.directionalPeers[idx].peers.add(peerId)
+
+  Opt.some(view)
+
+##################
+# Peer Store API #
+##################
 
 proc del*(peerStore: PeerStore, peerId: PeerId) {.public.} =
   ## Delete the provided peer from every book.
@@ -285,6 +488,11 @@ proc updatePeerInfo*(
 
   if info.metadata.len > 0:
     peerStore[MetadataBook][info.peerId] = info.metadata
+    if info.metadata.hasKey(LsmrCoordinateMetadataKey):
+      let encoded = info.metadata.getOrDefault(LsmrCoordinateMetadataKey)
+      let decoded = SignedLsmrCoordinateRecord.decode(encoded)
+      if decoded.isOk():
+        peerStore[LsmrBook][info.peerId] = decoded.get()
 
   info.bandwidthAnnouncement.withValue(bandwidth):
     peerStore[BandwidthBook][info.peerId] = bandwidth
@@ -335,6 +543,7 @@ proc identify*(
     negotiated = stream.negotiatedMuxer
 
   try:
+    await stream.beginProtocolNegotiation()
     warn "peerStore.identify multistream select begin",
       peerId = muxer.connection.peerId,
       streamPeerId = stream.peerId,
@@ -370,6 +579,7 @@ proc identify*(
         streamPeerId = stream.peerId,
         codec = peerStore.identify.codec()
   finally:
+    stream.endProtocolNegotiation()
     await stream.closeWithEOF()
 
 proc getMostObservedProtosAndPorts*(self: PeerStore): seq[MultiAddress] =

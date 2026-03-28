@@ -36,3 +36,25 @@ suite "libnimlibp2p QUIC runtime config":
     check handle.isNil
     let err = takeCString(libp2p_get_last_error())
     check err.contains("invalid QUIC runtime preference")
+
+  test "diagnostics default to builtin_only when builtin runtime is compiled in":
+    when defined(libp2p_msquic_experimental) and defined(libp2p_msquic_builtin):
+      let dataDir = getTempDir() / "nim-libp2p-libffi-quic-runtime-default"
+      createDir(dataDir)
+      let cfg = %*{
+        "dataDir": dataDir,
+        "extra": {}
+      }
+      let handle = libp2p_node_init(($cfg).cstring)
+      check not handle.isNil
+      if not handle.isNil:
+        check libp2p_node_start(handle) == 0
+        let raw = takeCString(libp2p_get_diagnostics_json(handle))
+        let diagnostics = parseJson(raw)
+        check diagnostics.kind == JObject
+        check diagnostics.hasKey("quicRuntime")
+        check diagnostics["quicRuntime"].kind == JObject
+        check diagnostics["quicRuntime"]["requestedPreference"].getStr() == "builtin_only"
+        libp2p_node_free(handle)
+    else:
+      skip()

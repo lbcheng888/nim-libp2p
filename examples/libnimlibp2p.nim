@@ -15,7 +15,7 @@ when defined(posix):
   import posix
 
 import libp2p/[bandwidthmanager, builders, connmanager, features, memorymanager, multiaddress,
-               muxers/muxer, peerid, peerstore, protocols/connectivity/relay/client,
+               lsmr, muxers/muxer, peerid, peerstore, protocols/connectivity/relay/client,
                resourcemanager, switch]
 import libp2p/discovery/discoverymngr
 import libp2p/discovery/mdns
@@ -23,6 +23,7 @@ import libp2p/crypto/[crypto, ed25519/ed25519]
 import libp2p/protocols/pubsub/[gossipsub, pubsub]
 import libp2p/protocols/dm/dmservice
 import libp2p/protocols/feed/feedservice
+import libp2p/services/wanbootstrapservice
 import nimcrypto/sha2 as nimsha2
 import nimcrypto/sysrand
 import results
@@ -580,13 +581,16 @@ when defined(libp2p_msquic_experimental):
     of "auto", "default":
       ok(some(quicruntime.qrpAuto))
     of "native", "native_only", "msquic_native":
-      ok(some(quicruntime.qrpNativeOnly))
+      err("native MsQuic runtime is disabled; use builtin_only")
     of "builtin_preferred", "prefer_builtin", "prefer_pure_nim", "prefer_nim":
-      ok(some(quicruntime.qrpBuiltinPreferred))
+      ok(some(quicruntime.qrpBuiltinOnly))
     of "builtin", "builtin_only", "pure_nim", "nim", "nim_quic", "msquic_builtin":
       ok(some(quicruntime.qrpBuiltinOnly))
     else:
       err("invalid QUIC runtime preference: " & value)
+
+  proc defaultQuicRuntimePreference(): quicruntime.QuicRuntimePreference {.raises: [], gcsafe.} =
+    quicruntime.qrpBuiltinOnly
 
   proc configuredQuicRuntimePreference(
       extra: JsonNode
@@ -636,15 +640,29 @@ when defined(libp2p_msquic_experimental):
       )
     ).strip()
 
+  proc effectiveQuicRuntimePreference(
+      extra: JsonNode
+  ): Result[quicruntime.QuicRuntimePreference, string] {.raises: [], gcsafe.} =
+    let prefRes = configuredQuicRuntimePreference(extra)
+    if prefRes.isErr:
+      return err(prefRes.error)
+    if configuredQuicRuntimeLibraryPath(extra).len > 0:
+      return err("native MsQuic runtime library path is disabled; builtin QUIC is required")
+    if prefRes.get().isSome:
+      return ok(prefRes.get().get())
+    ok(defaultQuicRuntimePreference())
+
   proc quicRuntimeInfoToJson(
       runtimeInfo: quicruntime.QuicRuntimeInfo, extra: JsonNode
   ): JsonNode {.gcsafe.} =
     let prefRes = configuredQuicRuntimePreference(extra)
     let requestedPreference =
-      if prefRes.isOk and prefRes.get().isSome:
-        quicRuntimePreferenceLabel(prefRes.get().get())
-      else:
-        quicRuntimePreferenceLabel(quicruntime.qrpAuto)
+      block:
+        let effectiveRes = effectiveQuicRuntimePreference(extra)
+        if effectiveRes.isOk:
+          quicRuntimePreferenceLabel(effectiveRes.get())
+        else:
+          quicRuntimePreferenceLabel(defaultQuicRuntimePreference())
     %* {
       "kind": quicruntime.kindLabel(runtimeInfo.kind),
       "implementation": runtimeInfo.implementation,
@@ -675,10 +693,13 @@ when defined(libp2p_msquic_experimental):
     result = newJObject()
     result["peer_id"] = %snapshot.peerId
     result["protocol"] = %snapshot.protocol
+    result["handshake_complete"] = %snapshot.handshakeComplete
     result["datagram_send_enabled"] = %snapshot.datagramSendEnabled
     result["datagram_max_send"] = %snapshot.datagramMaxSend.int
     result["is_webtransport"] = %snapshot.isWebtransport
     result["webtransport_ready"] = %snapshot.webtransportReady
+    if snapshot.closeReason.len > 0:
+      result["close_reason"] = %snapshot.closeReason
     if snapshot.webtransportAuthority.len > 0:
       result["webtransport_authority"] = %snapshot.webtransportAuthority
     if snapshot.webtransportPath.len > 0:
@@ -687,6 +708,21 @@ when defined(libp2p_msquic_experimental):
       result["webtransport_session_id"] = %snapshot.webtransportSessionId
     result["handshake_start_ms"] = optionToJson(snapshot.handshakeStartMs)
     result["handshake_ready_ms"] = optionToJson(snapshot.handshakeReadyMs)
+    snapshot.activePathId.withValue(pathId):
+      result["active_path_id"] = %int(pathId)
+    snapshot.knownPathCount.withValue(pathCount):
+      result["known_path_count"] = %int(pathCount)
+    if snapshot.pathStates.len > 0:
+      var pathArr = newJArray()
+      for state in snapshot.pathStates:
+        pathArr.add(%*{
+          "path_id": int(state.pathId),
+          "active": state.active,
+          "validated": state.validated,
+          "challenge_outstanding": state.challengeOutstanding,
+          "response_pending": state.responsePending,
+        })
+      result["path_states"] = pathArr
     snapshot.observedAddr.withValue(addrStr):
       result["observed_addr"] = %addrStr
     snapshot.localAddr.withValue(addrStr):
@@ -1665,6 +1701,250 @@ proc multiaddrsFromExtra(extra: JsonNode, key: string): seq[string] =
       if value.len > 0:
         result.add(value)
 
+proc parseRoutingPlaneMode(text: string): RoutingPlaneMode =
+  case text.strip().toLowerAscii()
+  of "dual", "dualstack", "dual_stack":
+    RoutingPlaneMode.dualStack
+  of "lsmr", "lsmronly", "lsmr_only":
+    RoutingPlaneMode.lsmrOnly
+  else:
+    RoutingPlaneMode.legacyOnly
+
+proc configuredRoutingPlaneMode(cfg: NodeConfig): RoutingPlaneMode =
+  if cfg.extra.kind == JObject:
+    return parseRoutingPlaneMode(
+      jsonGetStr(cfg.extra, "routingMode", jsonGetStr(cfg.extra, "routing_mode", ""))
+    )
+  RoutingPlaneMode.legacyOnly
+
+proc parsePrimaryRoutingPlane(text: string): PrimaryRoutingPlane =
+  case text.strip().toLowerAscii()
+  of "lsmr":
+    PrimaryRoutingPlane.lsmr
+  else:
+    PrimaryRoutingPlane.legacy
+
+proc configuredPrimaryRoutingPlane(cfg: NodeConfig): PrimaryRoutingPlane =
+  if cfg.extra.kind == JObject:
+    return parsePrimaryRoutingPlane(
+      jsonGetStr(
+        cfg.extra,
+        "primaryRoutingPlane",
+        jsonGetStr(cfg.extra, "primary_routing_plane", "")
+      )
+    )
+  PrimaryRoutingPlane.legacy
+
+proc parseLsmrPath(node: JsonNode): LsmrPath =
+  if node.isNil or node.kind != JArray:
+    return @[]
+  for item in node:
+    var digit = 0
+    case item.kind
+    of JInt:
+      digit = int(item.getInt())
+    of JString:
+      try:
+        digit = parseInt(item.getStr().strip())
+      except ValueError:
+        return @[]
+    else:
+      digit = 0
+    if digit < 1 or digit > 9:
+      return @[]
+    result.add(uint8(digit))
+
+proc configuredLsmrPath(cfg: NodeConfig): LsmrPath =
+  if cfg.extra.kind == JObject:
+    let direct = cfg.extra.getOrDefault("lsmrPath")
+    if not direct.isNil:
+      return parseLsmrPath(direct)
+    let snake = cfg.extra.getOrDefault("lsmr_path")
+    if not snake.isNil:
+      return parseLsmrPath(snake)
+  @[]
+
+proc configuredLsmrServeDepth(cfg: NodeConfig): int =
+  if cfg.extra.kind == JObject:
+    let raw = max(
+      0'i64,
+      jsonGetInt64(
+        cfg.extra,
+        "lsmrServeDepth",
+        jsonGetInt64(cfg.extra, "lsmr_serve_depth", 0)
+      )
+    )
+    if raw > 0:
+      return int(raw)
+  2
+
+proc configuredLsmrNetworkId(cfg: NodeConfig): string =
+  if cfg.extra.kind == JObject:
+    let raw = jsonGetStr(
+      cfg.extra,
+      "lsmrNetworkId",
+      jsonGetStr(
+        cfg.extra,
+        "lsmr_network_id",
+        jsonGetStr(cfg.extra, "networkId", jsonGetStr(cfg.extra, "network_id", "default"))
+      )
+    ).strip()
+    if raw.len > 0:
+      return raw
+  "default"
+
+proc configuredNearFieldBootstrapEnabled(cfg: NodeConfig): bool =
+  if cfg.extra.kind == JObject:
+    jsonGetBool(
+      cfg.extra,
+      "enableNearFieldBootstrap",
+      jsonGetBool(cfg.extra, "enable_near_field_bootstrap", false)
+    )
+  else:
+    false
+
+proc configuredNearFieldProviders(cfg: NodeConfig): seq[NearFieldBootstrapProvider] =
+  if cfg.extra.kind != JObject:
+    return @[]
+  let node =
+    if not cfg.extra.getOrDefault("nearFieldProviders").isNil:
+      cfg.extra.getOrDefault("nearFieldProviders")
+    else:
+      cfg.extra.getOrDefault("near_field_providers")
+  if node.isNil or node.kind != JArray:
+    return @[]
+  var seen = initHashSet[string]()
+  for item in node:
+    if item.kind != JString:
+      continue
+    let normalized = item.getStr().strip().toLowerAscii()
+    if normalized in seen:
+      continue
+    let provider = parseNearFieldBootstrapProvider(normalized)
+    if provider.isSome():
+      seen.incl(normalized)
+      result.add(provider.get())
+
+proc configuredLsmrAnchors(cfg: NodeConfig): seq[LsmrAnchor] =
+  if cfg.extra.kind != JObject:
+    return @[]
+  let node =
+    if not cfg.extra.getOrDefault("lsmrAnchors").isNil:
+      cfg.extra.getOrDefault("lsmrAnchors")
+    else:
+      cfg.extra.getOrDefault("lsmr_anchors")
+  if node.isNil or node.kind != JArray:
+    return @[]
+  for item in node:
+    if item.kind != JObject:
+      continue
+    let peerText = jsonGetStr(item, "peerId", jsonGetStr(item, "peer_id", "")).strip()
+    if peerText.len == 0:
+      continue
+    let peerId = PeerId.init(peerText).valueOr:
+      continue
+    var addrs: seq[MultiAddress] = @[]
+    for key in ["addrs", "multiaddrs", "addresses"]:
+      for raw in multiaddrsFromExtra(item, key):
+        let parsed = MultiAddress.init(raw)
+        if parsed.isOk():
+          addrs.add(parsed.get())
+    result.add(
+      LsmrAnchor(
+        peerId: peerId,
+        addrs: addrs,
+        operatorId: jsonGetStr(item, "operatorId", jsonGetStr(item, "operator_id", "")),
+        regionDigit: uint8(
+          min(
+            9'i64,
+            max(1'i64, jsonGetInt64(item, "regionDigit", jsonGetInt64(item, "region_digit", 5)))
+          )
+        ),
+        attestedPrefix:
+          parseLsmrPath(
+            if not item.getOrDefault("attestedPrefix").isNil:
+              item.getOrDefault("attestedPrefix")
+            else:
+              item.getOrDefault("attested_prefix")
+          ),
+        serveDepth: uint8(
+          min(255'i64, max(0'i64, jsonGetInt64(item, "serveDepth", jsonGetInt64(item, "serve_depth", 0))))
+        ),
+        directionMask: uint32(
+          max(0'i64, jsonGetInt64(item, "directionMask", jsonGetInt64(item, "direction_mask", 0x1ff)))
+        ),
+        canIssueRootCert:
+          jsonGetBool(
+            item,
+            "canIssueRootCert",
+            jsonGetBool(item, "can_issue_root_cert", false)
+          ),
+      )
+    )
+
+proc configuredLsmrConfig(cfg: NodeConfig): Option[LsmrConfig] =
+  let mode = configuredRoutingPlaneMode(cfg)
+  let anchors = configuredLsmrAnchors(cfg)
+  let hasExplicitLsmr =
+    mode != RoutingPlaneMode.legacyOnly or
+    anchors.len > 0 or
+    configuredLsmrPath(cfg).len > 0 or
+    configuredNearFieldBootstrapEnabled(cfg)
+  if not hasExplicitLsmr:
+    return none(LsmrConfig)
+  some(
+    LsmrConfig.init(
+      networkId = configuredLsmrNetworkId(cfg),
+      anchors = anchors,
+      localSuffix = configuredLsmrPath(cfg),
+      serveDepth = configuredLsmrServeDepth(cfg),
+      enableNearFieldBootstrap = configuredNearFieldBootstrapEnabled(cfg),
+      nearFieldProviders = configuredNearFieldProviders(cfg),
+    )
+  )
+
+proc routingStatusToJson(status: RoutingPlaneStatus): JsonNode =
+  %*{
+    "mode": $status.mode,
+    "primary": $status.primary,
+    "shadowMode": status.shadowMode,
+    "legacyCandidates": status.legacyCandidates,
+    "legacyTrusted": status.legacyTrusted,
+    "lsmrActiveCertificates": status.lsmrActiveCertificates,
+    "lsmrMigrations": status.lsmrMigrations,
+    "lsmrIsolations": status.lsmrIsolations,
+  }
+
+proc buildRoutingStatusPayload(node: NimNode): JsonNode {.gcsafe.} =
+  if node.isNil:
+    return routingStatusToJson(RoutingPlaneStatus())
+
+  let configuredMode = configuredRoutingPlaneMode(node.cfg)
+  let configuredPrimary = configuredPrimaryRoutingPlane(node.cfg)
+  var status = RoutingPlaneStatus(
+    mode: configuredMode,
+    primary: configuredPrimary,
+    shadowMode: configuredMode == RoutingPlaneMode.dualStack,
+  )
+
+  if not node.switchInstance.isNil and not node.switchInstance.peerStore.isNil:
+    let observed = routingPlaneStatus(node.switchInstance)
+    status.legacyCandidates = observed.legacyCandidates
+    status.legacyTrusted = observed.legacyTrusted
+    status.lsmrActiveCertificates = node.switchInstance.peerStore[ActiveLsmrBook].len
+    status.lsmrMigrations = node.switchInstance.peerStore[LsmrMigrationBook].len
+    status.lsmrIsolations = node.switchInstance.peerStore[LsmrIsolationBook].len
+    if observed.mode != RoutingPlaneMode.legacyOnly or
+        configuredMode == RoutingPlaneMode.legacyOnly:
+      status.mode = observed.mode
+    if observed.primary != PrimaryRoutingPlane.legacy or
+        configuredPrimary == PrimaryRoutingPlane.legacy:
+      status.primary = observed.primary
+    if observed.shadowMode:
+      status.shadowMode = true
+
+  routingStatusToJson(status)
+
 proc extractPeerIdFromMultiaddrStr(ma: string): Option[string] =
   const marker = "/p2p/"
   let idx = ma.rfind(marker)
@@ -2436,6 +2716,7 @@ proc freeNodeHandle(handle: pointer) =
     return
   let h = cast[NodeHandle](handle)
   h[].node = nil
+  deallocShared(h)
 
 # -------------------------------------------------------------
 # 配置与 Switch 构建
@@ -2706,27 +2987,32 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
         if derivedStr != ident.peerId:
           warn "identity peerId mismatch", provided = ident.peerId, derived = derivedStr
 
+  let routingMode = configuredRoutingPlaneMode(cfg)
+  let primaryPlane = configuredPrimaryRoutingPlane(cfg)
+  let lsmrConfigOpt = configuredLsmrConfig(cfg)
+  if routingMode != RoutingPlaneMode.legacyOnly and lsmrConfigOpt.isNone():
+    return err("LSMR routing requested without lsmrConfig")
+  if lsmrConfigOpt.isSome():
+    builder = builder.withRoutingPlanes(routingMode, primaryPlane)
+    builder = builder.withLsmr(lsmrConfigOpt.get())
+    debugLog(
+      "[nimlibp2p] buildSwitch enabled LSMR routing mode=" &
+      $routingMode & " primary=" & $primaryPlane &
+      " networkId=" & lsmrConfigOpt.get().networkId
+    )
+
   builder = builder.withTcpTransport()
   debugLog("[nimlibp2p] buildSwitch applied TCP transport")
   when defined(libp2p_msquic_experimental):
     var msquicBuilderCfg = MsQuicTransportBuilderConfig.init()
-    let prefRes = configuredQuicRuntimePreference(cfg.extra)
+    let prefRes = effectiveQuicRuntimePreference(cfg.extra)
     if prefRes.isErr:
       return err(prefRes.error)
-    if prefRes.get().isSome:
-      msquicBuilderCfg.config.setRuntimePreference(prefRes.get().get())
-      debugLog(
-        "[nimlibp2p] buildSwitch applied QUIC runtime preference=" &
-        quicRuntimePreferenceLabel(prefRes.get().get())
-      )
-    let explicitRuntimePath = configuredQuicRuntimeLibraryPath(cfg.extra)
-    if explicitRuntimePath.len > 0:
-      msquicBuilderCfg.config.loadOptions.explicitPath = explicitRuntimePath
-      msquicBuilderCfg.config.loadOptions.allowFallback = false
-      debugLog(
-        "[nimlibp2p] buildSwitch applied QUIC runtime library path=" &
-        explicitRuntimePath
-      )
+    msquicBuilderCfg.config.setRuntimePreference(prefRes.get())
+    debugLog(
+      "[nimlibp2p] buildSwitch applied QUIC runtime preference=" &
+      quicRuntimePreferenceLabel(prefRes.get())
+    )
     builder = builder.withMsQuicTransport(msquicBuilderCfg)
     debugLog("[nimlibp2p] buildSwitch applied MsQuic transport")
   builder = builder.withYamux()
@@ -2747,12 +3033,14 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
   if cfg.automations.circuitRelay:
     builder = builder.withCircuitRelay()
     debugLog("[nimlibp2p] buildSwitch enabled circuit relay")
-  if cfg.automations.rendezvous:
+  if cfg.automations.rendezvous and routingMode != RoutingPlaneMode.lsmrOnly:
     try:
       builder = builder.withRendezVous(RendezVous.new())
       debugLog("[nimlibp2p] buildSwitch configured rendezvous")
     except RendezVousError as exc:
       return err("rendezvous init failed: " & exc.msg)
+  elif cfg.automations.rendezvous:
+    debugLog("[nimlibp2p] buildSwitch skipped rendezvous because routingMode=lsmrOnly")
 
   when libp2pFetchEnabled:
     if cfg.automations.directStream:
@@ -3142,6 +3430,7 @@ proc runCommand(
           else: unavailableQuicRuntimeInfo()
         diagnostics["quicRuntime"] = quicRuntimeInfoToJson(runtimeInfo, n.cfg.extra)
         emitMsQuicStats(n, "diagnostics")
+      diagnostics["routingStatus"] = buildRoutingStatusPayload(n)
       command.stringResult = $diagnostics
       command.resultCode = NimResultOk
       debugLog("[nimlibp2p] cmdDiagnostics completed")
@@ -4308,20 +4597,16 @@ proc libp2p_node_free*(handle: pointer) {.exportc, cdecl, dynlib.} =
   if wasRunning:
     discard libp2p_node_stop(handle)
   waitShutdown(node)
+  if not node.threadJoined:
+    joinThread(node.thread)
+    node.threadJoined = true
   node.stateLock.acquire()
   node.running = false
   node.stateLock.release()
-  closeThreadSignal(node.signal, "node_free")
-  deinitCond(node.stateCond)
-  debugLog("[nimlibp2p] libp2p_node_free deinit stateLock ptr=" & lockAddr(node.stateLock))
-  deinitLock(node.stateLock)
-  debugLog("[nimlibp2p] libp2p_node_free deinit commandLock ptr=" & lockAddr(node.commandLock))
-  deinitLock(node.commandLock)
-  deinitLock(node.connectedPeersLock)
-  deinitLock(node.connectedPeersInfoLock)
-  deinitLock(node.feedItemsLock)
-  deinitLock(node.peerMultiaddrsLock)
-  GC_unref(node)
+  # Mirror the mobile_ffi teardown strategy: detach the public handle but keep
+  # the GC-managed node graph and its synchronization primitives alive for the
+  # remaining process lifetime. Eager close/deinit still races with lingering
+  # libp2p callbacks after stop() has returned.
   debugLog(
     "[nimlibp2p] libp2p_node_free completed handle=" & $handleAddr &
     " node=" & $nodeAddr
@@ -5067,6 +5352,10 @@ proc libp2p_get_diagnostics_json*(handle: pointer): cstring {.exportc, cdecl, dy
       allocCString("{}")
   destroyCommand(cmd)
   output
+
+proc libp2p_get_routing_status_json*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  allocCString($buildRoutingStatusPayload(node))
 
 proc libp2p_string_free*(value: cstring) {.exportc, cdecl, dynlib.} =
   if value != nil:

@@ -1,19 +1,20 @@
 {.used.}
 
-import std/[json, os, sequtils]
+import std/[json, options, os, sequtils]
 from std/times import epochTime
 
 import chronos
 import unittest2
 
 import ./helpers
-import ../libp2p/[builders, crypto/crypto, switch]
+import ../libp2p/[builders, crypto/crypto, lsmr, switch]
 import ../libp2p/nameresolving/nameresolver
 import ../libp2p/protocols/connectivity/autonatv2/[service, types]
 import ../libp2p/protocols/kademlia/[kademlia, keys]
 import ../libp2p/protocols/connectivity/relay/utils
 import ../libp2p/protocols/rendezvous/rendezvous
 import ../libp2p/services/hpservice
+import ../libp2p/services/lsmrservice
 import ../libp2p/services/wanbootstrapservice
 import ./kademlia/utils
 
@@ -48,6 +49,77 @@ proc hasKadKey(kad: KadDHT, key: Key): bool =
       if entry.nodeId == key:
         return true
   false
+
+proc makeSignedWitness(
+    anchorKey: PrivateKey,
+    subjectPeerId: PeerId,
+    networkId: string,
+    operatorId: string,
+    regionDigit: uint8,
+    rttMs: uint32,
+    attestedPrefix: LsmrPath = @[],
+): SignedLsmrWitness =
+  let anchorPeerId = PeerId.init(anchorKey).tryGet()
+  let targetPrefix =
+    if attestedPrefix.len > 0:
+      attestedPrefix
+    else:
+      @[regionDigit, latencyDigitForRtt(rttMs)]
+  let witness = LsmrWitness(
+    subjectPeerId: subjectPeerId,
+    anchorPeerId: anchorPeerId,
+    networkId: networkId,
+    regionDigit: regionDigit,
+    latencyDigit: targetPrefix[^1],
+    rttMs: rttMs,
+    operatorId: operatorId,
+    issuedAtMs: nowMillis(),
+    expiresAtMs: nowMillis() + 30 * 60 * 1000,
+    attestedPrefix: targetPrefix,
+    prefixDepth: uint8(targetPrefix.len),
+    directionMask: 0x1ff'u32,
+    epochId: 1'u64,
+    version: DefaultLsmrVersion,
+  )
+  SignedLsmrWitness.init(anchorKey, witness).tryGet()
+
+proc makeSignedCoordinateRecord(
+    peerKey: PrivateKey,
+    peerId: PeerId,
+    networkId: string,
+    attestedPrefix: LsmrPath,
+    witnesses: seq[SignedLsmrWitness],
+    confidence = 80'u8,
+): SignedLsmrCoordinateRecord =
+  var record = LsmrCoordinateRecord(
+    peerId: peerId,
+    networkId: networkId,
+    seqNo: uint64(nowMillis()),
+    attestedPrefix: attestedPrefix,
+    localSuffix: @[],
+    epochId: 1'u64,
+    issuedAtMs: nowMillis(),
+    expiresAtMs: nowMillis() + 30 * 60 * 1000,
+    confidence: confidence,
+    witnesses: witnesses,
+    parentDigest: computeExpectedParentDigest(networkId, attestedPrefix, 1'u64),
+    migrationDigest: computeStaticMigrationDigest(peerId, networkId, attestedPrefix, 1'u64),
+    coverageMask: expectedCoverageMask(attestedPrefix),
+    certifiedDepth: uint8(attestedPrefix.len),
+    recordDigest: "",
+    heTuParity:
+      computeHeTuParity(
+        1'u64,
+        attestedPrefix,
+        expectedCoverageMask(attestedPrefix),
+        computeExpectedParentDigest(networkId, attestedPrefix, 1'u64),
+        computeStaticMigrationDigest(peerId, networkId, attestedPrefix, 1'u64),
+        DefaultLsmrVersion,
+      ),
+    version: DefaultLsmrVersion,
+  )
+  record.recordDigest = computeRecordDigest(record)
+  SignedLsmrCoordinateRecord.init(peerKey, record).tryGet()
 
 suite "WAN bootstrap service":
   teardown:
@@ -111,6 +183,222 @@ suite "WAN bootstrap service":
     check selected[3].peerId == peerD
     check selected[3].selectionReason == "random_pool"
 
+  asyncTest "lsmr bias prefers nearer candidate within same trust tier":
+    let rng = newRng()
+    let networkId = "wan-bootstrap-lsmr-" & $nowMillis()
+    let anchorKeyNear = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorKeyFar = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeerNear = PeerId.init(anchorKeyNear).tryGet()
+    let anchorPeerFar = PeerId.init(anchorKeyFar).tryGet()
+
+    let sw = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          anchors = @[
+            LsmrAnchor(peerId: anchorPeerNear, operatorId: "op-near", regionDigit: 5'u8),
+            LsmrAnchor(peerId: anchorPeerFar, operatorId: "op-far", regionDigit: 8'u8),
+          ],
+          minWitnessQuorum = 1,
+          enableBootstrapBias = true,
+        )
+      )
+      .withWanBootstrapService(
+        WanBootstrapConfig.init(
+          networkId = networkId,
+          maxBootstrapCandidates = 2,
+          recentStableSlots = 2,
+          randomPoolCap = 2,
+        )
+      )
+      .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = getWanBootstrapService(sw)
+    check not svc.isNil
+    check not getLsmrService(sw).isNil
+
+    let localWitness =
+      makeSignedWitness(
+        anchorKeyNear, sw.peerInfo.peerId, networkId, "op-near", 5'u8, 5'u32, @[5'u8, 5'u8]
+      )
+    let localRecord =
+      makeSignedCoordinateRecord(
+        sw.peerInfo.privateKey, sw.peerInfo.peerId, networkId, @[5'u8, 5'u8], @[localWitness]
+      )
+    sw.peerInfo.metadata[LsmrCoordinateMetadataKey] = localRecord.encode().tryGet()
+    sw.peerStore[LsmrBook][sw.peerInfo.peerId] = localRecord
+
+    let peerNearKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let peerFarKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let peerNear = PeerId.init(peerNearKey).tryGet()
+    let peerFar = PeerId.init(peerFarKey).tryGet()
+
+    let nearRecord =
+      makeSignedCoordinateRecord(
+        peerNearKey,
+        peerNear,
+        networkId,
+        @[5'u8, 1'u8],
+        @[makeSignedWitness(anchorKeyNear, peerNear, networkId, "op-near", 5'u8, 10'u32, @[5'u8, 1'u8])],
+      )
+    let farRecord =
+      makeSignedCoordinateRecord(
+        peerFarKey,
+        peerFar,
+        networkId,
+        @[8'u8, 1'u8],
+        @[makeSignedWitness(anchorKeyFar, peerFar, networkId, "op-far", 8'u8, 10'u32, @[8'u8, 1'u8])],
+      )
+
+    sw.peerStore[LsmrBook][peerNear] = nearRecord
+    sw.peerStore[LsmrBook][peerFar] = farRecord
+    check svc.registerBootstrapHint(
+      peerNear,
+      @[MultiAddress.init("/ip4/10.0.1.1/tcp/4001").tryGet()],
+      source = "mdns",
+    )
+    check svc.registerBootstrapHint(
+      peerFar,
+      @[MultiAddress.init("/ip4/10.0.1.2/tcp/4001").tryGet()],
+      source = "mdns",
+    )
+    let ts = nowMillis() + 10_000
+    check svc.markBootstrapSeen(peerNear, ts)
+    check svc.markBootstrapSeen(peerFar, ts)
+
+    let selected = svc.selectBootstrapCandidates(2)
+    check selected.len == 2
+    check selected[0].peerId == peerNear
+    check selected[1].peerId == peerFar
+
+  asyncTest "near field refreshed local coordinate drives lsmr primary candidate selection":
+    let rng = newRng()
+    let networkId = "wan-bootstrap-near-field-" & $nowMillis()
+
+    let anchorKeyNear = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorKeyFar = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeerNear = PeerId.init(anchorKeyNear).tryGet()
+
+    let anchorNear = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(anchorKeyNear)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          serveWitness = true,
+          operatorId = "op-near",
+          regionDigit = 5'u8,
+          minWitnessQuorum = 1,
+        )
+      )
+      .build()
+
+    let clientLsmrConfig = LsmrConfig.init(
+      networkId = networkId,
+      minWitnessQuorum = 1,
+      enableBootstrapBias = true,
+      enableNearFieldBootstrap = true,
+      nearFieldProviders = @[NearFieldBootstrapProvider.nfbpBle],
+    )
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withLsmr(clientLsmrConfig)
+      .build()
+
+    await anchorNear.start()
+    await client.start()
+    discard await startLsmrService(anchorNear)
+    discard await startLsmrService(client)
+    defer:
+      await client.stop()
+      await anchorNear.stop()
+
+    let observation = NearFieldObservation(
+      provider: NearFieldBootstrapProvider.nfbpBle,
+      networkId: networkId,
+      peerId: anchorPeerNear,
+      addrs: anchorNear.peerInfo.addrs,
+      operatorId: "op-near",
+      regionDigit: 5'u8,
+      attestedPrefix: @[5'u8],
+      serveDepth: 1'u8,
+      directionMask: 0x1ff'u32,
+      canIssueRootCert: true,
+      rssi: -40'i32,
+      observedAtMs: nowMillis(),
+      ttlMs: 30 * 60 * 1000,
+    )
+    check observeNearFieldBootstrap(client, observation)
+    check await client.refreshCoordinateRecord()
+
+    let localRecord = activeCoordinateRecord(client, client.peerInfo.peerId)
+    check localRecord.isSome()
+    check localRecord.get().data.certifiedPrefix()[0] == 5'u8
+
+    var wanCfg = WanBootstrapConfig.init(
+      networkId = networkId,
+      maxBootstrapCandidates = 2,
+      recentStableSlots = 2,
+      randomPoolCap = 2,
+    )
+    wanCfg.routingMode = RoutingPlaneMode.dualStack
+    wanCfg.primaryPlane = PrimaryRoutingPlane.lsmr
+    wanCfg.lsmrConfig = some(clientLsmrConfig)
+
+    let svc = await startWanBootstrapService(client, wanCfg)
+    check not svc.isNil
+    check svc.config.primaryPlane == PrimaryRoutingPlane.lsmr
+
+    let peerNearKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let peerFarKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let peerNear = PeerId.init(peerNearKey).tryGet()
+    let peerFar = PeerId.init(peerFarKey).tryGet()
+
+    client.peerStore[ActiveLsmrBook][peerNear] =
+      makeSignedCoordinateRecord(
+        peerNearKey,
+        peerNear,
+        networkId,
+        @[5'u8, 1'u8],
+        @[makeSignedWitness(anchorKeyNear, peerNear, networkId, "op-near", 5'u8, 10'u32, @[5'u8, 1'u8])],
+      )
+    client.peerStore[ActiveLsmrBook][peerFar] =
+      makeSignedCoordinateRecord(
+        peerFarKey,
+        peerFar,
+        networkId,
+        @[8'u8, 1'u8],
+        @[makeSignedWitness(anchorKeyFar, peerFar, networkId, "op-far", 8'u8, 10'u32, @[8'u8, 1'u8])],
+      )
+
+    check svc.registerBootstrapHint(
+      peerNear,
+      @[MultiAddress.init("/ip4/10.0.2.1/tcp/4001").tryGet()],
+      source = "invite",
+    )
+    check svc.registerBootstrapHint(
+      peerFar,
+      @[MultiAddress.init("/ip4/10.0.2.2/tcp/4001").tryGet()],
+      source = "invite",
+    )
+    let seenAt = nowMillis() + 20_000
+    check svc.markBootstrapSeen(peerNear, seenAt)
+    check svc.markBootstrapSeen(peerFar, seenAt)
+
+    let selected = svc.selectBootstrapCandidates(2)
+    check selected.len == 2
+    check selected[0].peerId == peerNear
+    check selected[0].selectionReason == "lsmr_certified"
+    check selected[1].peerId == peerFar
+
+    let status = svc.routingPlaneStatus()
+    check status.mode == RoutingPlaneMode.dualStack
+    check status.primary == PrimaryRoutingPlane.lsmr
+    check status.shadowMode
+    check status.lsmrActiveCertificates >= 3
+    check selected[0].lsmrDistance < selected[1].lsmrDistance
+
   asyncTest "authoritative bootstrap peers suppress stale non-bootstrap candidates before first connection":
     let sw = makeMemorySwitch()
     await sw.start()
@@ -170,7 +458,8 @@ suite "WAN bootstrap service":
     check result.connectedCount == 1
     check result.attempts.len == 1
     check result.attempts[0].candidate.peerId == server.peerInfo.peerId
-    check client.isConnected(server.peerInfo.peerId)
+    checkUntilTimeout:
+      client.isConnected(server.peerInfo.peerId)
 
   asyncTest "joinViaBootstrap stops after first stable connection when stopAfterConnected is one":
     let primary = makeMemorySwitch()
@@ -205,7 +494,8 @@ suite "WAN bootstrap service":
     check result.attemptedCount == 1
     check result.attempts.len == 1
     check result.attempts[0].candidate.peerId == primary.peerInfo.peerId
-    check client.isConnected(primary.peerInfo.peerId)
+    checkUntilTimeout:
+      client.isConnected(primary.peerInfo.peerId)
     check not client.isConnected(secondary.peerInfo.peerId)
 
   asyncTest "joinViaBootstrap retries later candidate addrs when the first addr fails":
@@ -255,7 +545,7 @@ suite "WAN bootstrap service":
         check addrs.len >= 1
         check "Hints" in sources
         check stage.len >= 5 and stage[0 .. 4] == "local"
-        return rejected
+        return WanBootstrapTrust.rejected
     let svc = await startWanBootstrapService(
       client, WanBootstrapConfig.init(attestPeer = rejectAttester)
     )
@@ -297,9 +587,9 @@ suite "WAN bootstrap service":
           stage: string,
       ): Future[WanBootstrapTrust] {.async: (raises: []).} =
         check peerId == server.peerInfo.peerId
-        check currentTrust == quarantine
+        check currentTrust == WanBootstrapTrust.quarantine
         check stage.len >= 5 and stage[0 .. 4] == "local"
-        return trusted
+        return WanBootstrapTrust.trusted
     let svc = await startWanBootstrapService(
       client, WanBootstrapConfig.init(attestPeer = trustAttester)
     )
@@ -313,7 +603,7 @@ suite "WAN bootstrap service":
     let snapshot = svc.bootstrapStateSnapshot()
     check snapshot.metrics.attestTrusted == 1
     check snapshot.selectedCandidates.anyIt(
-      it.peerId == server.peerInfo.peerId and it.trust == trusted
+      it.peerId == server.peerInfo.peerId and it.trust == WanBootstrapTrust.trusted
     )
 
   asyncTest "journal persists and reloads bootstrap candidates":
@@ -583,6 +873,24 @@ suite "WAN bootstrap service":
     check publicCfg.fallbackDnsAddrs.len == 0
     check not mobileCfg.enableDnsaddrFallback
     check not publicCfg.enableDnsaddrFallback
+
+  test "dual stack role config preserves legacy primary by default":
+    let lsmrCfg =
+      LsmrConfig.init(
+        networkId = "dual-config",
+        localSuffix = @[1'u8, 8'u8],
+        serveDepth = 3,
+      )
+    let cfg = bootstrapDualStackRoleConfig(
+      WanBootstrapRole.publicNode,
+      lsmrCfg,
+      networkId = "dual-config",
+    )
+    check cfg.routingMode == RoutingPlaneMode.dualStack
+    check cfg.primaryPlane == PrimaryRoutingPlane.legacy
+    check cfg.lsmrConfig.isSome()
+    check cfg.legacyDiscoveryEnabled
+    check not cfg.legacyCompatibilityOnly
 
   asyncTest "legacy public bootstrap dnsaddrs are ignored when fallback is disabled":
     let sw = makeMemorySwitch()
@@ -925,3 +1233,104 @@ suite "WAN bootstrap service":
       $AutonatV2Codec.DialBack in sw.peerInfo.protocols
       RelayV2StopCodec in sw.peerInfo.protocols
     check RelayV2HopCodec notin sw.peerInfo.protocols
+
+  asyncTest "builder dual stack profile mounts lsmr without changing legacy primary":
+    let lsmrCfg =
+      LsmrConfig.init(
+        networkId = "builder-dual-" & $nowMillis(),
+        localSuffix = @[5'u8, 1'u8],
+        serveDepth = 3,
+      )
+    let cfg = bootstrapDualStackRoleConfig(
+      WanBootstrapRole.publicNode,
+      lsmrCfg,
+      networkId = lsmrCfg.networkId,
+    )
+    let sw =
+      newStandardSwitchBuilder(transport = TransportType.Memory)
+        .withWanBootstrapDualStackProfile(cfg, lsmrCfg)
+        .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = sw.getWanBootstrapService()
+    check svc != nil
+    check svc.config.routingMode == RoutingPlaneMode.dualStack
+    check svc.config.primaryPlane == PrimaryRoutingPlane.legacy
+    check svc.config.lsmrConfig.isSome()
+    check sw.services.anyIt(it of LsmrService)
+    check sw.services.anyIt(it of WanBootstrapService)
+
+  asyncTest "lsmr primary selection ignores legacy only candidates":
+    let rng = newRng()
+    let networkId = "wan-bootstrap-lsmr-primary-" & $nowMillis()
+    let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeer = PeerId.init(anchorKey).tryGet()
+    let sw = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          anchors = @[LsmrAnchor(peerId: anchorPeer, operatorId: "op-root", regionDigit: 5'u8)],
+          minWitnessQuorum = 1,
+        )
+      )
+      .withWanBootstrapService(
+        WanBootstrapConfig.init(
+          networkId = networkId,
+          routingMode = RoutingPlaneMode.dualStack,
+          primaryPlane = PrimaryRoutingPlane.lsmr,
+          lsmrConfig = some(
+            LsmrConfig.init(
+              networkId = networkId,
+              anchors = @[LsmrAnchor(peerId: anchorPeer, operatorId: "op-root", regionDigit: 5'u8)],
+              minWitnessQuorum = 1,
+            )
+          ),
+        )
+      )
+      .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = getWanBootstrapService(sw)
+    let localWitness =
+      makeSignedWitness(anchorKey, sw.peerInfo.peerId, networkId, "op-root", 5'u8, 6'u32, @[5'u8, 5'u8])
+    let localRecord =
+      makeSignedCoordinateRecord(
+        sw.peerInfo.privateKey, sw.peerInfo.peerId, networkId, @[5'u8, 5'u8], @[localWitness]
+      )
+    sw.peerInfo.metadata[LsmrCoordinateMetadataKey] = localRecord.encode().tryGet()
+    sw.peerStore[LsmrBook][sw.peerInfo.peerId] = localRecord
+    sw.peerStore[ActiveLsmrBook][sw.peerInfo.peerId] = localRecord
+
+    let trustedKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let trustedPeer = PeerId.init(trustedKey).tryGet()
+    let trustedRecord =
+      makeSignedCoordinateRecord(
+        trustedKey,
+        trustedPeer,
+        networkId,
+        @[5'u8, 1'u8],
+        @[makeSignedWitness(anchorKey, trustedPeer, networkId, "op-root", 5'u8, 9'u32, @[5'u8, 1'u8])],
+      )
+    sw.peerStore[LsmrBook][trustedPeer] = trustedRecord
+    sw.peerStore[ActiveLsmrBook][trustedPeer] = trustedRecord
+    check svc.registerBootstrapHint(
+      trustedPeer,
+      @[MultiAddress.init("/ip4/10.0.9.1/tcp/4001").tryGet()],
+      source = "mdns",
+    )
+
+    let legacyOnlyPeer = makeMemorySwitch().peerInfo.peerId
+    check svc.registerBootstrapHint(
+      legacyOnlyPeer,
+      @[MultiAddress.init("/ip4/10.0.9.2/tcp/4001").tryGet()],
+      source = "invite",
+    )
+
+    let selected = svc.selectBootstrapCandidates(2)
+    check selected.len == 1
+    check selected[0].peerId == trustedPeer
+    check selected[0].selectionReason == "lsmr_certified"

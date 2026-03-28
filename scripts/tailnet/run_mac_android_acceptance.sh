@@ -130,7 +130,7 @@ build_host_harness() {
     --nimcache:"$HOST_NIMCACHE"
   )
   if [[ "$HOST_ENABLE_QUIC" == "1" ]]; then
-    flags+=(--define:libp2p_msquic_experimental --define:libp2p_msquic_builtin)
+    flags+=(--define:libp2p_msquic_experimental --define:libp2p_msquic_builtin --define:libp2p_pure_crypto)
   fi
   (
     cd "$REPO_ROOT"

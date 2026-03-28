@@ -46,6 +46,8 @@ type
     bandwidthManager*: BandwidthManager
     memoryManager*: MemoryManager
     multistreamVersion*: MultistreamVersion
+    pendingReadReplay*: seq[byte]
+    pendingLpReplayDrop*: seq[byte]
     when defined(libp2p_agents_metrics):
       shortAgent*: string
 
@@ -56,6 +58,12 @@ method closeWrite*(s: Connection): Future[void] {.base, async: (raises: []).} =
   ## Subclasses should implement this for their specific transport
   ## Default implementation just closes the entire connection
   await s.close()
+
+method beginProtocolNegotiation*(s: Connection): Future[void] {.base, gcsafe, async: (raises: [CancelledError]).} =
+  discard
+
+method endProtocolNegotiation*(s: Connection) {.base, gcsafe.} =
+  discard
 
 func shortLog*(conn: Connection): string =
   try:
@@ -206,41 +214,118 @@ proc clearNegotiatedMuxer*(conn: Connection) =
 proc connectionReadLpAsync(
     s: Connection, maxSize: int
 ): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError]).} =
-  let length = await readVarint(LPStream(s))
   let maxLen = uint64(if maxSize < 0: int.high else: maxSize)
+  let readChunkSize =
+    if maxSize < 0:
+      16 * 1024
+    else:
+      max(maxSize + 10, 64)
+  var buffer: seq[byte] = @[]
+  if s.pendingReadReplay.len > 0:
+    swap(buffer, s.pendingReadReplay)
 
-  if length > maxLen:
-    raise (ref MaxSizeError)(msg: "Message exceeds maximum length")
+  while true:
+    if buffer.len > 0:
+      var consumed = 0
+      var length = 0'u64
+      let decodeRes = PB.getUVarint(buffer.toOpenArray(0, buffer.high), consumed, length)
+      if decodeRes.isOk():
+        if length > maxLen:
+          raise (ref MaxSizeError)(msg: "Message exceeds maximum length")
 
-  if length == 0'u64:
-    return @[]
+        if length == 0'u64:
+          if buffer.len > consumed:
+            s.pendingReadReplay = buffer[consumed ..< buffer.len]
+          else:
+            s.pendingReadReplay.setLen(0)
+          return @[]
 
-  if length > uint64(high(int)):
-    raise (ref MaxSizeError)(
-      msg: "Message exceeds host allocation capacity"
-    )
+        if length > uint64(high(int)):
+          raise (ref MaxSizeError)(
+            msg: "Message exceeds host allocation capacity"
+          )
 
-  let requested = int(length)
-  var permit: MemoryPermit = nil
-  if not s.memoryManager.isNil:
-    let res = s.memoryManager.reserve(s.peerId, s.protocol, requested)
-    if res.isErr:
-      raise (ref LPStreamLimitError)(
-        msg: "Memory limit reached while reading stream: " & res.error
-      )
-    permit = res.get()
+        let total = consumed + int(length)
+        if buffer.len >= total:
+          let requested = int(length)
+          var permit: MemoryPermit = nil
+          var payload: seq[byte]
+          if not s.memoryManager.isNil:
+            let res = s.memoryManager.reserve(s.peerId, s.protocol, requested)
+            if res.isErr:
+              raise (ref LPStreamLimitError)(
+                msg: "Memory limit reached while reading stream: " & res.error
+              )
+            permit = res.get()
 
-  try:
-    result = newSeqUninit[byte](requested)
-    await s.readExactly(addr result[0], result.len)
-  finally:
-    if not permit.isNil:
-      permit.release()
+          try:
+            payload = newSeqUninit[byte](requested)
+            copyMem(addr payload[0], unsafeAddr buffer[consumed], requested)
+          finally:
+            if not permit.isNil:
+              permit.release()
+
+          if buffer.len > total:
+            s.pendingReadReplay = buffer[total ..< buffer.len]
+          else:
+            s.pendingReadReplay.setLen(0)
+
+          if s.pendingLpReplayDrop.len > 0:
+            let shouldDrop = payload == s.pendingLpReplayDrop
+            s.pendingLpReplayDrop.setLen(0)
+            if shouldDrop:
+              buffer = @[]
+              if s.pendingReadReplay.len > 0:
+                swap(buffer, s.pendingReadReplay)
+              continue
+
+          return payload
+      elif decodeRes.error() != VarintError.Incomplete:
+        raise (ref LPStreamError)(msg: "Invalid length prefix")
+
+    var chunk = newSeqUninit[byte](readChunkSize)
+    let readCount = await LPStream(s).readOnce(addr chunk[0], chunk.len)
+    if readCount <= 0:
+      raise newLPStreamEOFError()
+    chunk.setLen(readCount)
+    buffer.add(chunk)
 
 method readLp*(
     s: Connection, maxSize: int
 ): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError], raw: true), public.} =
   connectionReadLpAsync(s, maxSize)
+
+proc suppressNextReplayLp*(
+    s: Connection, payload: seq[byte]
+) {.public, raises: [].} =
+  if s.isNil:
+    return
+  if payload.len == 0:
+    s.pendingLpReplayDrop.setLen(0)
+    return
+  s.pendingLpReplayDrop = payload
+
+proc takePendingReadReplay*(
+    s: Connection
+): seq[byte] {.public, raises: [].} =
+  if s.isNil or s.pendingReadReplay.len == 0:
+    return @[]
+  swap(result, s.pendingReadReplay)
+
+proc restorePendingReadReplay*(
+    s: Connection, payload: seq[byte]
+) {.public, raises: [].} =
+  if s.isNil:
+    return
+  if payload.len == 0:
+    s.pendingReadReplay.setLen(0)
+  elif s.pendingReadReplay.len == 0:
+    s.pendingReadReplay = payload
+  else:
+    var merged = newSeqOfCap[byte](payload.len + s.pendingReadReplay.len)
+    merged.add(payload)
+    merged.add(s.pendingReadReplay)
+    s.pendingReadReplay = merged
 
 proc connectionWriteLpAsync(
     s: Connection, payload: seq[byte]

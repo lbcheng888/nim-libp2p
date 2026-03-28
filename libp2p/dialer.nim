@@ -343,6 +343,14 @@ proc tryReusingConnection(self: Dialer, peerId: PeerId): Opt[Muxer] =
   trace "Reusing existing connection", muxer, direction = $muxer.connection.dir
   return Opt.some(muxer)
 
+proc knownPeerAddrs(self: Dialer, peerId: PeerId): seq[MultiAddress] =
+  if self.peerStore.isNil:
+    return @[]
+  let addrBook = self.peerStore[AddressBook]
+  if addrBook.isNil:
+    return @[]
+  addrBook.book.getOrDefault(peerId)
+
 proc internalConnect(
     self: Dialer,
     peerId: Opt[PeerId],
@@ -424,11 +432,17 @@ proc internalConnect(
             negotiated = muxed.connection.negotiatedMuxer
           proc finishOhosNativeQuicIdentify() {.async: (raises: []).} =
             try:
+              let previousPeerId = muxed.connection.peerId
               warn "internalConnect native QUIC ohos async identify begin",
                 peerId = muxed.connection.peerId,
                 protocol = muxed.connection.protocol,
                 negotiated = muxed.connection.negotiatedMuxer
               await self.peerStore.identify(muxed)
+              self.connManager.reindexMuxerPeerId(
+                muxed,
+                previousPeerId,
+                muxed.connection.peerId,
+              )
               warn "internalConnect native QUIC ohos async identify done",
                 peerId = muxed.connection.peerId,
                 protocol = muxed.connection.protocol,
@@ -458,11 +472,17 @@ proc internalConnect(
             negotiated = muxed.connection.negotiatedMuxer
           proc finishNativeQuicIdentify() {.async: (raises: []).} =
             try:
+              let previousPeerId = muxed.connection.peerId
               warn "internalConnect native QUIC identify begin",
                 peerId = muxed.connection.peerId,
                 protocol = muxed.connection.protocol,
                 negotiated = muxed.connection.negotiatedMuxer
               await self.peerStore.identify(muxed)
+              self.connManager.reindexMuxerPeerId(
+                muxed,
+                previousPeerId,
+                muxed.connection.peerId,
+              )
               warn "internalConnect native QUIC identify done",
                 peerId = muxed.connection.peerId,
                 protocol = muxed.connection.protocol,
@@ -492,11 +512,17 @@ proc internalConnect(
           negotiated = muxed.connection.negotiatedMuxer
         proc finishOutgoingIdentify() {.async: (raises: []).} =
           try:
+            let previousPeerId = muxed.connection.peerId
             warn "internalConnect async identify begin",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
               negotiated = muxed.connection.negotiatedMuxer
             await self.peerStore.identify(muxed)
+            self.connManager.reindexMuxerPeerId(
+              muxed,
+              previousPeerId,
+              muxed.connection.peerId,
+            )
             warn "internalConnect async identify done",
               peerId = muxed.connection.peerId,
               protocol = muxed.connection.protocol,
@@ -526,11 +552,17 @@ proc internalConnect(
         negotiated = muxed.connection.negotiatedMuxer
       proc finishOutgoingIdentify() {.async: (raises: []).} =
         try:
+          let previousPeerId = muxed.connection.peerId
           warn "internalConnect async identify begin",
             peerId = muxed.connection.peerId,
             protocol = muxed.connection.protocol,
             negotiated = muxed.connection.negotiatedMuxer
           await self.peerStore.identify(muxed)
+          self.connManager.reindexMuxerPeerId(
+            muxed,
+            previousPeerId,
+            muxed.connection.peerId,
+          )
           warn "internalConnect async identify done",
             peerId = muxed.connection.peerId,
             protocol = muxed.connection.protocol,
@@ -601,11 +633,15 @@ method negotiateStream*(
     self: Dialer, conn: Connection, protos: seq[string]
 ): Future[Connection] {.async: (raises: [CatchableError]).} =
   trace "Negotiating stream", conn, protos
-  let selected = await MultistreamSelect.select(conn, protos)
-  if not protos.contains(selected):
-    await conn.closeWithEOF()
-    raise newException(DialFailedError, "Unable to select sub-protocol: " & $protos)
-  return conn
+  await conn.beginProtocolNegotiation()
+  try:
+    let selected = await MultistreamSelect.select(conn, protos)
+    if not protos.contains(selected):
+      await conn.closeWithEOF()
+      raise newException(DialFailedError, "Unable to select sub-protocol: " & $protos)
+    return conn
+  finally:
+    conn.endProtocolNegotiation()
 
 method tryDial*(
     self: Dialer, peerId: PeerId, addrs: seq[MultiAddress]
@@ -648,8 +684,37 @@ method dial*(
     trace "Dial canceled", description = exc.msg
     raise exc
   except CatchableError as exc:
-    trace "Error dialing", description = exc.msg
-    raise newException(DialFailedError, "failed dial existing: " & exc.msg)
+    trace "Error dialing existing connection", description = exc.msg
+    let addrs = self.knownPeerAddrs(peerId)
+    if addrs.len == 0:
+      raise newException(DialFailedError, "failed dial existing: " & exc.msg, exc)
+
+    debug "Retrying stream dial on fresh connection",
+      peerId, addrs = addrs.len, protocolCount = protos.len
+    try:
+      await self.connManager.dropPeer(peerId)
+    except CancelledError as cancelExc:
+      raise cancelExc
+    except CatchableError as dropExc:
+      debug "Dropping stale peer before redial failed",
+        peerId, description = dropExc.msg
+
+    try:
+      return await self.dial(
+        peerId,
+        addrs,
+        protos,
+        forceDial = true,
+        reuseConnection = false,
+      )
+    except CancelledError as cancelExc:
+      raise cancelExc
+    except CatchableError as retryExc:
+      raise newException(
+        DialFailedError,
+        "failed dial existing: " & exc.msg & "; fresh redial failed: " & retryExc.msg,
+        retryExc,
+      )
 
 method dial*(
     self: Dialer,

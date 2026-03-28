@@ -1,4 +1,4 @@
-import std/[json, options, sets, strutils, tables]
+import std/[algorithm, json, options, sequtils, sets, strutils, tables]
 from std/times import epochTime
 import chronicles
 import chronos
@@ -57,6 +57,39 @@ proc closeConnSoon(conn: Connection) =
       discard
   asyncSpawn runner()
 
+proc closeConnLater(conn: Connection; delay: Duration) =
+  if conn.isNil:
+    return
+  proc runner() {.async.} =
+    try:
+      await sleepAsync(delay)
+      await conn.close()
+    except CatchableError:
+      discard
+  asyncSpawn runner()
+
+proc closeWriteAndCloseLater(
+    conn: Connection,
+    closeWriteDelay: Duration,
+    closeDelay: Duration
+) =
+  if conn.isNil:
+    return
+  proc runner() {.async.} =
+    try:
+      await sleepAsync(closeWriteDelay)
+      await conn.closeWrite()
+    except CatchableError:
+      discard
+    try:
+      let remaining = closeDelay - closeWriteDelay
+      if remaining > ZeroDuration:
+        await sleepAsync(remaining)
+      await conn.close()
+    except CatchableError:
+      discard
+  asyncSpawn runner()
+
 proc jsonGetStr(node: JsonNode, key: string, defaultVal = ""): string =
   if node.kind == JObject and node.hasKey(key) and node[key].kind == JString:
     return node[key].getStr()
@@ -96,7 +129,31 @@ when defined(libp2p_msquic_experimental):
     let prefix = addrText[0 ..< tcpIdx]
     some(prefix & "/udp/" & portPart & "/quic-v1" & suffix)
 
-proc orderDialAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
+proc directDialAddrPriority(addrText: string): int =
+  let lower = addrText.toLowerAscii()
+  let isTsnet = lower.contains("/tsnet")
+  let hasTcp = lower.contains("/tcp/")
+  let hasQuic = lower.contains("/quic")
+  let hasUdp = lower.contains("/udp/")
+
+  if isTsnet:
+    if hasTcp:
+      return 0
+    if hasQuic:
+      return 1
+    if hasUdp:
+      return 2
+    return 3
+
+  if hasTcp:
+    return 0
+  if hasQuic:
+    return 1
+  if hasUdp:
+    return 2
+  3
+
+proc orderDirectDialAddrs*(addrs: seq[MultiAddress]): seq[MultiAddress] =
   var expanded: seq[MultiAddress] = @[]
   var seen = initHashSet[string]()
   for ma in addrs:
@@ -108,27 +165,15 @@ proc orderDialAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
       seen.incl(text)
   if expanded.len <= 1:
     return expanded
-  var quic: seq[MultiAddress] = @[]
-  var udp: seq[MultiAddress] = @[]
-  var tcp: seq[MultiAddress] = @[]
-  var other: seq[MultiAddress] = @[]
-  for ma in expanded:
-    let text = $ma
-    if text.contains("/quic"):
-      quic.add(ma)
-    elif text.contains("/udp/"):
-      udp.add(ma)
-    elif text.contains("/tcp/"):
-      tcp.add(ma)
-    else:
-      other.add(ma)
-  quic & udp & tcp & other
-
-proc hasQuicAddr(addrs: seq[MultiAddress]): bool =
-  for ma in addrs:
-    if ($ma).contains("/quic"):
-      return true
-  false
+  var indexed: seq[(int, int, MultiAddress)] = @[]
+  for idx, ma in expanded:
+    indexed.add((directDialAddrPriority($ma), idx, ma))
+  indexed.sort(proc(a, b: (int, int, MultiAddress)): int =
+    result = system.cmp(a[0], b[0])
+    if result == 0:
+      result = system.cmp(a[1], b[1])
+  )
+  indexed.mapIt(it[2])
 
 proc buildAckPayload(
     svc: DirectMessageService,
@@ -173,14 +218,18 @@ proc handleIncoming(
   var ackRequested = false
   var messageId = ""
   var remotePeer = ""
+  var ackSent = false
   try:
     remotePeer = $conn.peerId
   except CatchableError:
     remotePeer = ""
 
   try:
+    debug "direct message readLp begin", peer = remotePeer, maxBytes = svc.maxMessageBytes
     let payload = await conn.readLp(svc.maxMessageBytes)
+    debug "direct message readLp done", peer = remotePeer, size = payload.len
     if payload.len == 0:
+      debug "direct message empty payload", peer = remotePeer
       return
 
     debug "direct message received", peer = remotePeer, size = payload.len
@@ -209,7 +258,10 @@ proc handleIncoming(
       if ackRequested and messageId.len > 0:
         let ackBytes = buildAckPayload(svc, messageId, false, exc.msg)
         try:
+          debug "direct message sending failure ack", peer = remotePeer, mid = messageId
           await conn.writeLp(ackBytes)
+          debug "direct message failure ack sent", peer = remotePeer, mid = messageId
+          ackSent = true
         except CatchableError as sendErr:
           warn "direct ack send failed", peer = remotePeer, err = sendErr.msg
       debug "direct message handler error", peer = remotePeer, err = exc.msg
@@ -219,6 +271,8 @@ proc handleIncoming(
       try:
         debug "direct message sending ack", peer = remotePeer, mid = messageId
         await conn.writeLp(ackBytes)
+        debug "direct message ack sent", peer = remotePeer, mid = messageId
+        ackSent = true
       except CatchableError as sendErr:
         warn "direct ack send failed", peer = remotePeer, err = sendErr.msg
     elif ackRequested:
@@ -231,13 +285,21 @@ proc handleIncoming(
     debug "direct message handler failed", peer = remotePeer, err = exc.msg
   finally:
     try:
+      debug "direct message handler closeWrite begin", peer = remotePeer
       await conn.closeWrite()
+      debug "direct message handler closeWrite done", peer = remotePeer
     except CatchableError:
       discard
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
+    if ackRequested and ackSent:
+      debug "direct message handler delayed close scheduled", peer = remotePeer, mid = messageId
+      closeConnLater(conn, 1.seconds)
+    else:
+      try:
+        debug "direct message handler close begin", peer = remotePeer
+        await conn.close()
+        debug "direct message handler close done", peer = remotePeer
+      except CatchableError:
+        discard
 
 proc newDirectMessageService*(
     switch: Switch,
@@ -286,29 +348,40 @@ proc send*(
   except CatchableError:
     storedAddrs = @[]
   let orderedAddrs =
-    if storedAddrs.len > 0: orderDialAddrs(storedAddrs) else: @[]
+    if storedAddrs.len > 0: orderDirectDialAddrs(storedAddrs) else: @[]
   let hasConn =
     (not svc.switch.connManager.isNil) and svc.switch.connManager.connCount(peer) > 0
   if hasConn:
-    if orderedAddrs.len > 0 and hasQuicAddr(orderedAddrs):
-      try:
-        conn = await svc.switch.dial(peer, orderedAddrs, @[svc.codec], forceDial = true)
-        debug "direct message quic-preferred dial succeeded", peer = $peer, codec = svc.codec
-      except CancelledError as exc:
-        raise exc
-      except CatchableError as exc:
-        dialErr = exc.msg
-        warn "direct message quic-preferred dial failed", peer = $peer, err = dialErr
-    if conn.isNil:
-      try:
-        conn = await svc.switch.dial(peer, @[svc.codec])
-        debug "direct message dialed peer", peer = $peer, codec = svc.codec
-      except CancelledError as exc:
-        raise exc
-      except CatchableError as exc:
-        dialErr = exc.msg
-        warn "direct message dial failed", peer = $peer, err = dialErr
-  else:
+    try:
+      debug "direct message live connection dial begin", peer = $peer, codec = svc.codec
+      conn = await svc.switch.dial(peer, @[svc.codec])
+      debug "direct message reused live connection", peer = $peer, codec = svc.codec
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      dialErr = exc.msg
+      warn "direct message live connection dial failed", peer = $peer, err = dialErr
+
+  if conn.isNil and orderedAddrs.len > 0:
+    try:
+      debug "direct message fresh dial begin",
+        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
+      conn = await svc.switch.dial(
+        peer,
+        orderedAddrs,
+        @[svc.codec],
+        forceDial = true,
+        reuseConnection = false,
+      )
+      debug "direct message fresh dial succeeded",
+        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      dialErr = exc.msg
+      warn "direct message fresh dial failed", peer = $peer, err = dialErr
+
+  if conn.isNil and dialErr.len == 0 and not hasConn:
     dialErr = "no existing connection"
 
   if conn.isNil:
@@ -319,13 +392,20 @@ proc send*(
     return (false, if dialErr.len > 0: dialErr else: "dial failed without fallback")
 
   try:
+    debug "direct message writeLp begin",
+      peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
     await conn.writeLp(payload)
-    try:
+    debug "direct message writeLp done",
+      peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+    if not ackRequested:
+      debug "direct message closeWrite begin", peer = $peer, mid = messageId
       await conn.closeWrite()
-    except CatchableError as closeErr:
-      warn "direct message closeWrite failed", peer = $peer, err = closeErr.msg
+      debug "direct message closeWrite done", peer = $peer, mid = messageId
+      debug "direct message delayed close scheduled", peer = $peer, mid = messageId
+      closeConnLater(conn, 1200.milliseconds)
     debug "direct message payload sent", peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
   except CatchableError as exc:
+    warn "direct message write path failed", peer = $peer, mid = messageId, err = exc.msg
     try:
       await conn.close()
     except CatchableError:
@@ -333,13 +413,16 @@ proc send*(
     return (false, exc.msg)
 
   if not ackRequested or messageId.len == 0:
-    closeConnSoon(conn)
     return (true, "")
 
   let ackFuture = conn.readLp(svc.maxAckBytes)
-  let completed =
+  let timeoutFuture = sleepAsync(timeout)
+  debug "direct message ack wait begin",
+    peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
+  let timedOut =
     try:
-      await withTimeout(ackFuture, timeout)
+      discard await race(ackFuture, timeoutFuture)
+      not ackFuture.finished()
     except CancelledError as exc:
       raise exc
     except CatchableError as exc:
@@ -349,8 +432,11 @@ proc send*(
       except CatchableError:
         discard
       return (false, exc.msg)
+    finally:
+      if not timeoutFuture.finished():
+        timeoutFuture.cancelSoon()
 
-  if not completed:
+  if timedOut:
     debug "direct message ack timeout", peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
     closeConnSoon(conn)
     return (false, "ack timeout")
@@ -363,6 +449,12 @@ proc send*(
     return (false, exc.msg)
 
   let ackResult = parseAckPayload(ackBytes)
+  try:
+    debug "direct message post-ack closeWrite begin", peer = $peer, mid = messageId
+    await conn.closeWrite()
+    debug "direct message post-ack closeWrite done", peer = $peer, mid = messageId
+  except CatchableError as closeErr:
+    warn "direct message post-ack closeWrite failed", peer = $peer, err = closeErr.msg
   closeConnSoon(conn)
 
   if not ackResult.ok or ackResult.mid != messageId:

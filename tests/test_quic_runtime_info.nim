@@ -1,6 +1,8 @@
-import std/unittest
+import std/[os, unittest]
 
 import "../libp2p/transports/quicruntime" as quicrt
+when defined(libp2p_msquic_experimental):
+  import "../libp2p/transports/msquicruntime" as msquicrt
 
 suite "QuicRuntime kind metadata":
   test "runtime kind labels only expose in-repo implementations":
@@ -16,3 +18,31 @@ suite "QuicRuntime kind metadata":
     check quicrt.isPureNimRuntime(builtin)
     check not quicrt.isPureNimRuntime(native)
     check not quicrt.isPureNimRuntime(unavailable)
+
+  test "builtin runtime bridge is self-hosted when compiled in":
+    when defined(libp2p_msquic_experimental) and defined(libp2p_msquic_builtin):
+      let bridgeRes = msquicrt.acquireMsQuicBridge()
+      check bridgeRes.success
+      check not bridgeRes.bridge.isNil
+      let info = quicrt.currentQuicRuntimeInfo()
+      check info.loaded
+      check info.kind == quicrt.qrkMsQuicBuiltin
+      check info.compileTimeBuiltin
+      msquicrt.releaseMsQuicBridge(bridgeRes.bridge)
+    else:
+      skip()
+
+  test "native runtime path is disabled in favor of builtin runtime":
+    when defined(libp2p_msquic_experimental) and defined(libp2p_msquic_builtin):
+      var cfg = quicrt.QuicRuntimeConfig()
+      cfg.useNativeRuntime()
+      let bridgeRes = msquicrt.acquireMsQuicBridge(cfg.loadOptions)
+      check bridgeRes.success
+      check not bridgeRes.bridge.isNil
+      let info = quicrt.currentQuicRuntimeInfo()
+      check info.loaded
+      check info.kind == quicrt.qrkMsQuicBuiltin
+      check info.compileTimeBuiltin
+      msquicrt.releaseMsQuicBridge(bridgeRes.bridge)
+    else:
+      skip()

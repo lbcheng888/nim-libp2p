@@ -32,6 +32,7 @@ var
   gZeroRttPreHandshakeObserved: bool
   gColdStartConnected: bool
   gColdStartResumed: bool
+  gCoalescedServerFlightObserved: bool
   gPeerSendAbortedObserved: bool
   gPeerSendAbortCode: uint64
 
@@ -81,6 +82,7 @@ suite "MsQuic builtin pure-Nim loopback":
     gZeroRttPreHandshakeObserved = false
     gColdStartConnected = false
     gColdStartResumed = false
+    gCoalescedServerFlightObserved = false
     gPeerSendAbortedObserved = false
     gPeerSendAbortCode = 0'u64
     clearBuiltinZeroRttReplayCacheForTest()
@@ -97,6 +99,8 @@ suite "MsQuic builtin pure-Nim loopback":
         gSessionTicketReceived = true
       elif event.note.contains("HANDSHAKE_DONE received."):
         gHandshakeDoneObserved = true
+      elif event.note.contains("Server flight sent (coalesced Initial+Handshake)."):
+        gCoalescedServerFlightObserved = true
       elif event.note.contains("Client Finished verify failed via Handshake packet."):
         gClientFinishedHandshakeVerifyFailed = true
       elif event.note.contains("RX 0-RTT pn="):
@@ -240,6 +244,7 @@ suite "MsQuic builtin pure-Nim loopback":
           " handshakeDone=" & $gHandshakeDoneObserved
         )
     check initialHandshakeReady
+    check gCoalescedServerFlightObserved
 
     var initialTicketAgeAdd = 0'u32
     check getConnectionResumptionTicketAgeAddForTest(clientConnection, initialTicketAgeAdd)

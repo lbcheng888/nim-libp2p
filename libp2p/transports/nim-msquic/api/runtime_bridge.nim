@@ -12,7 +12,8 @@ from ./api_impl import QuicApiTable, QUIC_STATUS, QUIC_STATUS_SUCCESS,
     QUIC_STREAM_START_FLAGS, QUIC_STREAM_SHUTDOWN_FLAGS, QUIC_SEND_FLAGS,
     QUIC_CONNECTION_SHUTDOWN_FLAGS, QUIC_UINT62, QuicConnectionEvent,
     QuicConnectionEventConnectedPayload, QUIC_CONNECTION_EVENT_CONNECTED,
-    registerConnectionEventHandler
+    registerConnectionEventHandler, getConnectionHandshakeComplete,
+    getConnectionCloseReason
 from ./param_catalog import QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED,
     QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED, QUIC_PARAM_STREAM_ID
 import ./event_model
@@ -727,6 +728,22 @@ proc getConnectionParam*(bridge: RuntimeBridge; connection: HQUIC;
     return QUIC_STATUS_INVALID_PARAMETER
   {.cast(gcsafe).}:
     bridge.api.GetParam(connection, paramId, addr bufferLength, buffer)
+
+proc connectionHandshakeComplete*(bridge: RuntimeBridge; connection: HQUIC): bool =
+  if bridge.isNil or connection.isNil:
+    return false
+  var value = false
+  if not getConnectionHandshakeComplete(connection, value):
+    return false
+  value
+
+proc connectionCloseReason*(bridge: RuntimeBridge; connection: HQUIC): string =
+  if bridge.isNil or connection.isNil:
+    return ""
+  var reason = ""
+  if not getConnectionCloseReason(connection, reason):
+    return ""
+  reason
 
 proc streamId*(bridge: RuntimeBridge; stream: HQUIC): Result[uint64, string] =
   if bridge.isNil or bridge.api.isNil or bridge.api.GetParam.isNil:

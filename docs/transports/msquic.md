@@ -1,62 +1,81 @@
 # MsQuic 传输栈运维备忘
 
-本文档说明如何在 `nim-libp2p` 中启用并验证 MsQuic 数据面，包括构建选项、运行时依赖、常见测试与运维提示。
+本文档说明如何在 `nim-libp2p` 中启用并验证 QUIC 数据面。当前产品路径已经固定为
+仓库内的 builtin MsQuic-compatible runtime；文档里的 “native MsQuic” 仅保留作
+显式验证、行为基线和性能对照。
 
 ## 1. 启用方式
 
 - 编译开关：`-d:libp2p_msquic_experimental`。  
-  未开启时仅编译 OpenSSL QUIC 驱动，MsQuic 代码保持占位状态。
+  未开启时不会启用当前 QUIC transport。
+- builtin runtime 开关：`-d:libp2p_msquic_builtin`。  
+  开启后产品和 FFI 默认值都会显式落到 `builtin_only`，选择仓库内的纯 Nim
+  MsQuic-compatible runtime，不依赖 `libmsquic.so` / `libmsquic.dylib`。
 - 禁用旧驱动：启用 MsQuic 时请移除 `-d:libp2p_quic_support`，避免编译遗留的 OpenSSL QUIC 代码路径。
 - 入口文件：`libp2p/transports/msquictransport.nim` 挂载 MsQuic-only 传输，`SwitchBuilder.withMsQuicTransport` / `newStandardSwitchBuilder` 默认走该实现。
 
 ## 2. 运行时依赖
 
-### 2.1 原生 MsQuic 库
+### 2.1 builtin 纯 Nim runtime
 
-- 推荐按平台安装微软官方 `msquic` 库，或设置环境变量 `NIM_MSQUIC_LIB` 指向自定义路径。  
-- 运行时会调用 `MsQuicOpenVersion`/`MsQuicClose` 获取 `QUIC_API_TABLE`，加载失败时会记录错误并回退。
-- 仓库内的构建脚本（`scripts/build_nim_android.sh`、`scripts/build_nim_ohos.sh`、`scripts/build_nim_libp2p.sh`、`nim-libp2p/examples/build_*.sh`、`nim-libp2p/tests/build_*_mobile_tests.sh` 等）会自动执行 `nim-libp2p/scripts/nim/bootstrap_msquic.sh env`。该脚本会：
-  - 检查 `NIM_MSQUIC_LIB` 是否已指向现有库；
-  - 在常见系统路径（`/usr/lib`、Homebrew 等）搜索 `libmsquic`；
-  - 若未找到且设置了 `MSQUIC_BOOTSTRAP_URL`，自动下载解压并设定 `NIM_MSQUIC_LIB`。
-  使用者也可以直接独立运行 `scripts/nim/bootstrap_msquic.sh env`，然后 `eval` 其输出以持久化环境变量。
+- 当前仓库里的 “builtin QUIC” 不是第二套独立 transport，而是编译进制品内的纯 Nim MsQuic-compatible runtime。
+- Android/OHOS 主构建脚本和移动端测试构建脚本默认都走这条路径；只要同时带上 `-d:libp2p_msquic_experimental -d:libp2p_msquic_builtin`，运行时就不需要外部 `libmsquic` 动态库。
+- 运行时会通过 builtin `MsQuicOpenVersion`/`MsQuicClose` 获取 `QUIC_API_TABLE`，`currentQuicRuntimeInfo()` 会显示 `kind=msquic_builtin`。
 
-### 2.2 纯 Nim builtin runtime（开发 / CI / 长期路线）
+### 2.2 原生 MsQuic 库
 
-- 默认 **不会** 自动切换到纯 Nim 版本，未找到原生库时会直接报错，确保线上/联调必走真实 MsQuic。  
-- 若需使用内置纯 Nim 实现（`api_impl.nim`）进行逻辑回归，或沿长期路线推进纯 Nim backend，请显式设置：
-  - `NIM_MSQUIC_USE_BUILTIN=1`
-- 该 runtime 属于当前仓库内唯一的纯 Nim QUIC backend；它不是单独的第二实现，而是
-  MsQuic-compatible builtin runtime。
-- builtin 是长期默认目标，但当前仍未切为默认。
-- native MsQuic 继续作为当前默认运行路径、行为基线、性能基线和显式回退路径存在。
-- 现阶段 builtin 仍不等价于原生 MsQuic 的真实数据面性能。
+- 原生库路径不再属于产品或 FFI 运行路径，主要用于显式对照、联调和性能基线。
+- `quicruntime.setRuntimePreference` 现在会强制 builtin-only；`mobile_ffi` /
+  `libnimlibp2p` 也会直接拒绝 `native_only` 和显式 `msquicLibraryPath`。
+- 如需显式加载平台原生 `msquic` 做对照，只能走专门的 native 验证入口，例如设置
+  `NIM_MSQUIC_LIB` 并运行 `scripts/nim/validate.sh` 的 `native` 模式。
 
 ## 3. 验证流程
 
-在纯 Nim fallback 环境下，默认执行以下编译检查：
+在 builtin runtime 环境下，默认先执行仓库级验证：
+
+```bash
+scripts/nim/validate.sh
+```
+
+该脚本默认以 builtin-only 方式编译并运行以下回归：
+
+- `tests/test_msquic_builder.nim`
+- `tests/test_quic_runtime_info.nim`
+- `tests/testmobile_ffi_ui_frame_snapshot.nim`
+- `tests/test_libnimlibp2p_quic_runtime.nim`
+
+如需显式验证 native runtime，可执行：
+
+```bash
+NIM_MSQUIC_VALIDATE_MODE=native scripts/nim/validate.sh
+```
+
+除此之外，常用的 builtin 编译检查包括：
 
 ```bash
 # 拨号生命周期（P4）
-nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_dial.nim
+nim check -d:threads -d:libp2p_msquic_experimental -d:libp2p_msquic_builtin tests/test_msquic_dial.nim
 
 # 流与 Datagram（P3）
-nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_stream.nim
+nim check -d:threads -d:libp2p_msquic_experimental -d:libp2p_msquic_builtin tests/test_msquic_stream.nim
 
 # 监听生命周期（P2）
-nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.nim
+nim check -d:threads -d:libp2p_msquic_experimental -d:libp2p_msquic_builtin tests/test_msquic_listener.nim
 ```
 
-若部署了原生 MsQuic，可将上面的 `nim check` 替换为 `nim c -r`，以执行实际事件流程。
+若需验证原生 MsQuic，可去掉 `-d:libp2p_msquic_builtin` 并配置 `NIM_MSQUIC_LIB`，再将上面的 `nim check` 替换为 `nim c -r`。
 
 ## 4. 运维提示
 
-1. **监控驱动切换**：拨号/监听失败时 `msquicdriver` 会自动落回 OpenSSL；可通过 `MsQuicDriverEnvVar` (`NIM_LIBP2P_QUIC_DRIVER`) 强制选择驱动并观察日志。
-2. **调试事件队列**：连接、流、监听分别暴露 `nextConnectionEvent`、`nextStreamEvent`、`nextListenerEvent`，在 Fallback 模式下便于模拟与测试。
-3. **Datagram 追踪**：`sendDatagram` 会触发 `ceParameterUpdated` 事件，可在日志中确认 MsQuic/回退模式是否正确执行。
-4. **驱动指标**：启用 `metrics` 编译开关后，`libp2p_quic_active_driver`、`libp2p_quic_driver_switch_total` 与 `libp2p_quic_msquic_failures_total` 会分别标识当前使用的驱动、切换原因以及 MsQuic 失败阶段。
+1. **监控 runtime 选择**：当前产品路径固定为 builtin-only；可通过
+   `quicRuntime.requestedPreference` 与 `currentQuicRuntimeInfo()` 确认是否命中
+   `builtin_only`。
+2. **调试事件队列**：连接、流、监听分别暴露 `nextConnectionEvent`、`nextStreamEvent`、`nextListenerEvent`，便于定位 runtime 初始化、accept、stream promote 等问题。
+3. **Datagram 追踪**：`sendDatagram` 会触发 `ceParameterUpdated` 事件，可在日志中确认 MsQuic datagram 路径是否正确执行。
+4. **驱动指标**：启用 `metrics` 编译开关后，`libp2p_quic_active_driver`、`libp2p_quic_driver_switch_total` 与 `libp2p_quic_msquic_failures_total` 会分别标识当前使用的 runtime、切换原因以及 MsQuic 失败阶段。
 
-如需将 MsQuic 纳入 CI，请在 Runner 上预先填充原生库或设定 `NIM_MSQUIC_LIB` 路径，并执行 `nim c -r ...` 以覆盖真实场景。
+如需将 MsQuic 纳入 CI，优先使用 builtin runtime；只有在专门覆盖 native 场景时才需要预先填充原生库或设定 `NIM_MSQUIC_LIB`。
 
 ## 5. OpenSSL → MsQuic 迁移任务矩阵
 
@@ -64,8 +83,8 @@ nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.ni
 
 | 编号 | 原子任务 | 状态 | 备注 |
 | --- | --- | --- | --- |
-| **A1** | 构建脚本默认启用 `-d:libp2p_msquic_experimental` 并下沉 MsQuic stub | ✅ | 所有主/示例/测试脚本均调用 `scripts/nim/bootstrap_msquic.sh env`，`scripts/build_nim_android.sh release` 已实机验证 |
-| **A2** | 清理 `libssl/libcrypto` 链接、引入 MsQuic-only runtime loader | ⏳ | 需要结合 C1/W1 设计新的 loader 注入点与平台证书配置 |
+| **A1** | 构建脚本默认启用 builtin MsQuic runtime | ✅ | Android/OHOS 主构建与移动端测试脚本默认启用 `-d:libp2p_msquic_experimental -d:libp2p_msquic_builtin` |
+| **A2** | 清理 `libssl/libcrypto` 链接、引入 MsQuic-only runtime loader | ✅ | 产品和 FFI 运行路径已强制 builtin-only，并拒绝原生库路径/回退；native loader 仅保留显式验证入口 |
 | **B1.a** | MsQuic read-path 将 `StreamEvent` payload 交给 driver | ✅ | `StreamEvent` 已携带 MsQuic 缓冲并在 driver 中入队 |
 | **B1.b** | 实现 `MsQuicStream`/`MsQuicConnection`（LPStream 接口、WebTransport/Datagram 集成） | ▶ | `msquicstream.nim`/`msquicconnection.nim` 初版就绪，待补 WebTransport/多路复用语义 |
 | **B1.c** | `SwitchBuilder` 中暴露 MsQuic-only 入口，默认替换 OpenSSL | ✅ | `withMsQuicTransport` + `newStandardSwitchBuilder` 默认挂载 MsQuic |
@@ -78,9 +97,11 @@ nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.ni
 | **D1** | DirectMessage/Feed/WebTransport 测试覆盖 MsQuic 连接 | ✅ | DirectMessage / Feed / WebTransport 三类集成测试已扩展至 MsQuic 路径 |
 | **D2** | Diagnostics（`NetworkEventService`、`msquicwrapper`）输出 MsQuic 指标 | ✅ | MsQuic 连接/会话统计通过 `MsQuicStats` 网络事件与 blueprint session JSON 暴露，移动端 Diagnostics 面板可直接消费 |
 | **E1** | Android/Harmony E2E 使用 MsQuic host 互通 | ✅ | 新增 `automated-tests/android-e2e-test/src/androidTest/java/com/example/unimaker/e2e/QuicDirectMessageSmokeTest.kt`，仪器化流程自动启动 MsQuic 节点、拨号 `quic_dm_host` 并完成 `PING/PONG` 往返，校验 `getNetworkDiagnostics()` 中的 MsQuic 摘要 |
-| **E2** | QUIC smoke/CI pipeline 移除 OpenSSL host，提供回滚文档 | ✅ | `run_quic_dm_smoke.sh` 默认 MsQuic-only 构建/运行，`QUIC_DM_SMOKE_USE_OPENSSL=1` 可按需回退 |
+| **E2** | QUIC smoke/CI pipeline 移除 OpenSSL host，提供回滚文档 | ✅ | 现行产品与验收构建默认走 builtin MsQuic runtime；native runtime 仅保留显式验证入口 |
 
-> 执行说明：每完成一个原子任务，更新本表并在同一 PR 中附带验证日志（例如 `quic_dm_smoke`、`./gradlew connectedDebugAndroidTest`）。当 B1 + C1 + D1 就绪后即可切换默认驱动为 MsQuic-only，并删除 OpenSSL 相关代码。
+> 执行说明：每完成一个原子任务，更新本表并在同一 PR 中附带验证日志（例如
+> `quic_dm_smoke`、`./gradlew connectedDebugAndroidTest`）。当前产品路径已经切到
+> builtin-only；后续重点不再是“切默认”，而是补协议完备性、长稳性和性能硬化。
 
 ## 6. 纯 Nim QUIC 路线图
 
@@ -113,9 +134,8 @@ nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.ni
   `Switch.msquicTransportStats()` 汇总多监听实例，`libnimlibp2p.nim` 在启动/握手/诊断命令时
   发布 `MsQuicStats` 网络事件（含会话、Datagram、certhash、拒绝原因等），`msquicwrapper.nim`
   额外提供 blueprint session JSON，NetworkEventService 可直接用于 UI 展示 MsQuic 健康状态。
-- QUIC smoke（E2）：`scripts/run_quic_dm_smoke.sh` 默认调用 `bootstrap_msquic` 并以 MsQuic-only
-  构建主机程序；如需临时回滚，可设置 `QUIC_DM_SMOKE_USE_OPENSSL=1` 恢复旧版 OpenSSL +
-  `libp2p_quic_support` 路径。
+- QUIC smoke（E2）：现行仓库内的 QUIC smoke 与 `/tsnet` 验收默认都编译为
+  `-d:libp2p_msquic_experimental -d:libp2p_msquic_builtin`；native runtime 仅保留为显式联调路径。
 - 协议覆盖测试（D1）：`generateNodes` 支持自定义 `TransportType`/监听地址，`testdirectdm.nim` 与 `testfeed_service.nim` 新增 MsQuic 版本的 DirectMessage/Feed 用例，`test_msquic_webtransport.nim` 验证 MsQuic WebTransport 握手与会话快照，确保核心应用协议均可在 MsQuic-only 环境运行。
 - 证书缓存（C2）：`MsQuicTransport.loadWebtransportCerthashHistory`、`Switch.restoreWebtransportCerthashHistory` 与 `SwitchBuilder.withMsQuicWebtransportCerthashHistory` 支持在节点重启时恢复历史 `/certhash` 指纹；`libnimlibp2p` JSON 配置新增 `msQuicCerthashHistory` 字段，启动阶段会自动写回广播地址并在拨号时复用提示。
 - 移动端诊断（E1）：Android 仪器化测试 `QuicDirectMessageSmokeTest` 负责启动 MsQuic 节点、拨号 `quic_dm_host` 并完成 `PING/PONG` 往返，同时通过 `NimNativeInterface.getNetworkDiagnostics()` 校验 MsQuic 摘要（certhash 历史、transport 数量、会话指标）；Harmony `Libp2pService` 同步解析统计数据以供 UI 展示。
@@ -189,9 +209,9 @@ nim check -d:threads -d:libp2p_msquic_experimental tests/test_msquic_listener.ni
 | Diagnostics/metrics | 已能区分 builtin/native runtime | 需要完整运行时指标与端到端诊断 | 需继续扩展 |
 | 性能 / 稳定性 | 适合逻辑回归与协议演进 | 需要接近原生 MsQuic 的 RTT/吞吐和长期 soak | 这是长期目标的主要缺口 |
 
-> 结论：builtin runtime 已经是仓库内的纯 Nim QUIC 主线，但距离完整生产 backend
-> 还差协议完备性、业务语义、性能硬化，以及达到“默认切换标准”这四块。具体阈值见
-> `docs/transports/nim_quic_roadmap.md`。
+> 结论：builtin runtime 已经是仓库内默认且唯一的产品 QUIC 路径，但距离“完整硬化的
+> 生产 backend”还差协议完备性、业务语义、性能硬化，以及达到“builtin 硬化标准”
+> 这四块。具体阈值见 `docs/transports/nim_quic_roadmap.md`。
 
 ## 6. 移动端互通排障笔记（2024-11）
 

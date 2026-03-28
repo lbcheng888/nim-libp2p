@@ -10,7 +10,7 @@
 {.push raises: [].}
 {.push public.}
 
-import std/sequtils
+import std/[sequtils, tables]
 import pkg/[chronos, chronicles, results]
 import peerid, multiaddress, multicodec, crypto/crypto, routing_record, errors, utility
 
@@ -39,6 +39,7 @@ type
     privateKey*: PrivateKey
     publicKey*: PublicKey
     signedPeerRecord*: SignedPeerRecord
+    metadata*: Table[string, seq[byte]]
 
 func shortLog*(p: PeerInfo): auto =
   (
@@ -114,7 +115,13 @@ proc new*(
         PeerInfoError, "invalid private key creating PeerInfo: " & e.msg, e
       )
 
-  let peerId = PeerId.init(key).tryGet()
+  let peerId =
+    try:
+      PeerId.init(key).tryGet()
+    except CatchableError as e:
+      raise newException(
+        PeerInfoError, "invalid private key creating peer id: " & e.msg, e
+      )
 
   let peerInfo = PeerInfo(
     peerId: peerId,
@@ -125,6 +132,7 @@ proc new*(
     listenAddrs: @listenAddrs,
     protocols: @protocols,
     addressMappers: addressMappers,
+    metadata: initTable[string, seq[byte]](),
   )
 
   return peerInfo

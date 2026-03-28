@@ -27,16 +27,13 @@ when defined(libp2p_msquic_experimental):
       check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
 
       cfg.preferBuiltinRuntime()
-      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpPrefer
+      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
 
       cfg.useNativeRuntime()
-      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpNever
+      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
 
       cfg.useAutoRuntime()
-      when defined(libp2p_msquic_builtin):
-        check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
-      else:
-        check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpAuto
+      check cfg.config.loadOptions.builtinPolicy == QuicRuntimeBuiltinPolicy.mbpOnly
 else:
   suite "MsQuic switch builder":
     test "experimental feature disabled":

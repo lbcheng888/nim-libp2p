@@ -15,6 +15,9 @@ when not defined(libp2p_msquic_experimental):
       alpns*: seq[string] = @["libp2p"]
       eventQueueLimit*: int = 0
       eventPollInterval*: Duration = 5.milliseconds
+      handshakeIdleTimeoutMs*: uint64 = 0'u64
+      idleTimeoutMs*: uint64 = 0'u64
+      keepAliveIntervalMs*: uint32 = 0'u32
       peerBidiStreamCount*: uint16 = 16'u16
       peerUnidiStreamCount*: uint16 = 16'u16
       appName*: string
@@ -149,6 +152,8 @@ when not defined(libp2p_msquic_experimental):
     ).init("msquic.pendingStream.disabled")
     fut.fail(newException(MsQuicEventQueueClosed, "MsQuic experimental runtime disabled"))
     fut
+  proc restorePendingStreamState*(state: MsQuicConnectionState;
+      streamState: MsQuicStreamState) = discard
 
   proc closeConnection*(handle: MsQuicTransportHandle; connection: pointer;
       state: MsQuicConnectionState = nil) = discard

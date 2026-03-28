@@ -17,6 +17,7 @@ import results, chronos, chronicles
 import
   ../protobuf/minprotobuf,
   ../bandwidthmanager,
+  ../lsmr,
   ../peerinfo,
   ../stream/connection,
   ../peerid,
@@ -144,7 +145,10 @@ proc collectBandwidthMetadata(manager: BandwidthManager): seq[(string, seq[byte]
   @[(BandwidthMetadataKey, encoded)]
 
 proc collectMetadata(p: Identify): seq[(string, seq[byte])] =
-  collectBandwidthMetadata(p.bandwidthManager)
+  if not p.isNil and not p.peerInfo.isNil:
+    for key, value in p.peerInfo.metadata.pairs:
+      result.add((key, value))
+  result.add(collectBandwidthMetadata(p.bandwidthManager))
 
 proc collectMetadata(p: IdentifyPush): seq[(string, seq[byte])] =
   collectBandwidthMetadata(p.bandwidthManager)
@@ -359,7 +363,10 @@ proc push*(
     p: IdentifyPush, peerInfo: PeerInfo, conn: Connection
 ) {.public, async: (raises: [CancelledError, LPStreamError]).} =
   ## Send new `peerInfo`s to a connection
-  let metadata = p.collectMetadata()
+  var metadata = p.collectMetadata()
+  if not peerInfo.isNil:
+    for key, value in peerInfo.metadata.pairs:
+      metadata.add((key, value))
   var pb = encodeMsg(peerInfo, conn.observedAddr, true, metadata)
   await conn.writeLp(pb.buffer)
 

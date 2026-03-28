@@ -22,6 +22,7 @@ when defined(libp2p_msquic_experimental):
   export msquicdrv.MsQuicTransportConfig
   export msquicdrv.MsQuicTransportHandle
   export msquicdrv.MsQuicConnectionState
+  export msquicdrv.MsQuicConnectionPathState
   export msquicdrv.MsQuicListenerState
   export msquicdrv.MsQuicStreamState
   export msquicdrv.MsQuicEventQueueClosed
@@ -48,13 +49,23 @@ when defined(libp2p_msquic_experimental):
   export msquicdrv.waitStreamStart
   export msquicdrv.readStream
   export msquicdrv.writeStream
+  export msquicdrv.writeStreamAndWait
+  export msquicdrv.beginSendFin
   export msquicdrv.streamId
   export msquicdrv.peekPendingStreamState
   export msquicdrv.popPendingStreamState
+  export msquicdrv.restorePendingStreamState
   export msquicdrv.awaitPendingStreamState
   export msquicdrv.takePendingConnection
   export msquicdrv.getConnectionRemoteAddress
   export msquicdrv.getConnectionLocalAddress
+  export msquicdrv.connectionHandshakeComplete
+  export msquicdrv.connectionCloseReason
+  export msquicdrv.activeConnectionPathId
+  export msquicdrv.knownConnectionPathCount
+  export msquicdrv.connectionPathState
+  export msquicdrv.triggerConnectionMigrationProbe
+  export msquicdrv.confirmConnectionValidatedPath
   export msquicdrv.isLocalInitiated
   export msquicdrv.handoffReadWaiters
   export msquicdrv.markStreamStartComplete
@@ -987,16 +998,12 @@ when defined(libp2p_msquic_experimental):
   proc setRuntimePreference*(
       options: var msffi.MsQuicLoadOptions, preference: QuicRuntimePreference
   ) {.inline, gcsafe.} =
-    case preference
-    of qrpAuto:
-      options.builtinPolicy =
-        if msffi.CompileTimeBuiltinMsQuic: msffi.mbpOnly else: msffi.mbpAuto
-    of qrpNativeOnly:
-      options.builtinPolicy = msffi.mbpNever
-    of qrpBuiltinPreferred:
-      options.builtinPolicy = msffi.mbpPrefer
-    of qrpBuiltinOnly:
-      options.builtinPolicy = msffi.mbpOnly
+    discard preference
+    ## Repository policy: QUIC runtime is always the in-repo builtin implementation.
+    ## Do not load libmsquic/libssl-backed native runtimes even if explicitly requested.
+    options.explicitPath = ""
+    options.allowFallback = false
+    options.builtinPolicy = msffi.mbpOnly
 
   proc setRuntimePreference*(
       cfg: var msquicdrv.MsQuicTransportConfig, preference: QuicRuntimePreference

@@ -13,10 +13,18 @@ switch("path", "vendor/NimYAML")
 switch("path", "vendor/jsonschema/src")
 switch("path", "nim-pebble")
 switch("passC", "-I" & thisDir())
-when defined(android) or defined(ohos):
-  switch("define", "chronicles_enabled=false")
-else:
-  switch("define", "chronicles_enabled=true")
+import strutils
+var hasExplicitChroniclesEnabled = false
+for param in 0 ..< system.paramCount():
+  let value = system.paramStr(param)
+  if "chronicles_enabled" in value:
+    hasExplicitChroniclesEnabled = true
+    break
+if not hasExplicitChroniclesEnabled:
+  when defined(android) or defined(ohos):
+    switch("define", "chronicles_enabled=false")
+  else:
+    switch("define", "chronicles_enabled=true")
 when not defined(chronicles_streams):
   switch("define", "chronicles_streams=defaultChroniclesStream[textlines]")
 

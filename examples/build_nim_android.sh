@@ -48,10 +48,6 @@ NIM_LIBP2P_DIR="$REPO_ROOT"
 NIM_UNIMAKER_DIR="$REPO_ROOT/examples/mobile_ffi"
 UNIMAKER_ANDROID_ROOT="${UNIMAKER_ANDROID_ROOT:-/Users/lbcheng/UniMaker/android}"
 
-MSQUIC_BOOTSTRAP="$NIM_LIBP2P_DIR/scripts/nim/bootstrap_msquic.sh"
-if [[ -x "$MSQUIC_BOOTSTRAP" ]]; then
-  eval "$("$MSQUIC_BOOTSTRAP" env || true)"
-fi
 OUT_DIR="${OUT_DIR:-$UNIMAKER_ANDROID_ROOT/core-bridge/src/main/jniLibs/$ABI_DIR}"
 mkdir -p "$OUT_DIR"
 
@@ -60,7 +56,11 @@ OUT_PATH="$OUT_DIR/$LIB_NAME"
 TSNET_BRIDGE_OUT="$OUT_DIR/libtsnetbridge.so"
 NIM_ANDROID_QUIC_BACKEND="${NIM_ANDROID_QUIC_BACKEND:-builtin}"
 NIM_ANDROID_PURE_CRYPTO="${NIM_ANDROID_PURE_CRYPTO:-1}"
-NIM_ANDROID_ENABLE_TSNET="${NIM_ANDROID_ENABLE_TSNET:-1}"
+NIM_ANDROID_ENABLE_SSL="${NIM_ANDROID_ENABLE_SSL:-0}"
+if [[ -n "${NIM_ANDROID_ENABLE_TSNET:-}" && -z "${NIM_ANDROID_ENABLE_LEGACY_TSNET_BRIDGE:-}" ]]; then
+  NIM_ANDROID_ENABLE_LEGACY_TSNET_BRIDGE="${NIM_ANDROID_ENABLE_TSNET}"
+fi
+NIM_ANDROID_ENABLE_LEGACY_TSNET_BRIDGE="${NIM_ANDROID_ENABLE_LEGACY_TSNET_BRIDGE:-0}"
 
 if [[ "${NIM_ANDROID_PURE_CRYPTO}" != "1" ]]; then
   echo "[nim-android] OpenSSL/libssl packaging has been removed; set NIM_ANDROID_PURE_CRYPTO=1" >&2
@@ -140,6 +140,11 @@ if [[ "${NIM_ANDROID_ENABLE_QUIC:-0}" == "1" ]]; then
 fi
 
 NIM_FLAGS+=("--define:libp2p_pure_crypto")
+if [[ "${NIM_ANDROID_ENABLE_SSL}" == "1" ]]; then
+  NIM_FLAGS+=("--define:ssl")
+  NIM_FLAGS+=("--passC:-includeglob.h")
+  echo "[nim-android] Enabling Nim stdlib ssl support"
+fi
 
 # Enable stacktrace/lineTrace only when显式开启，规避 Nim 2.3.x 交叉编译 SIGSEGV
 if [[ "${NIM_ANDROID_ENABLE_TRACES:-0}" == "1" ]]; then
@@ -172,12 +177,12 @@ echo "[nim-android] Building Nim libp2p -> $OUT_PATH"
   nim "${NIM_FLAGS[@]}" "$NIM_UNIMAKER_DIR/libnimlibp2p.nim"
 )
 
-if [[ "${NIM_ANDROID_ENABLE_TSNET}" == "1" ]]; then
+if [[ "${NIM_ANDROID_ENABLE_LEGACY_TSNET_BRIDGE}" == "1" ]]; then
   if ! command -v go >/dev/null 2>&1; then
     echo "[nim-android] go is required to build libtsnetbridge.so" >&2
     exit 1
   fi
-  echo "[nim-android] Building tsnet bridge -> $TSNET_BRIDGE_OUT"
+  echo "[nim-android] Building deprecated legacy tsnet bridge -> $TSNET_BRIDGE_OUT"
   (
     cd "$REPO_ROOT/go/tsnetbridge"
     CGO_ENABLED=1 \
@@ -190,6 +195,7 @@ if [[ "${NIM_ANDROID_ENABLE_TSNET}" == "1" ]]; then
   )
   rm -f "$OUT_DIR/libtsnetbridge.h"
 else
+  echo "[nim-android] Skipping deprecated legacy tsnet bridge packaging"
   rm -f "$TSNET_BRIDGE_OUT" "$OUT_DIR/libtsnetbridge.h"
 fi
 

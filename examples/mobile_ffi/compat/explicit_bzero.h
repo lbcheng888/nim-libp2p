@@ -3,6 +3,9 @@
 
 #include <stddef.h>
 #include <string.h>
+#if defined(__ANDROID__)
+#include <glob.h>
+#endif
 
 #if !defined(HAVE_EXPLICIT_BZERO)
 static inline void explicit_bzero(void *ptr, size_t len)

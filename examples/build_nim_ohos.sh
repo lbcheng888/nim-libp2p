@@ -19,11 +19,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NIM_LIBP2P_DIR="${REPO_ROOT}"
 NIM_UNIMAKER_DIR="${REPO_ROOT}/examples/mobile_ffi"
 
-MSQUIC_BOOTSTRAP="${NIM_LIBP2P_DIR}/scripts/nim/bootstrap_msquic.sh"
-if [[ -x "${MSQUIC_BOOTSTRAP}" ]]; then
-  eval "$("${MSQUIC_BOOTSTRAP}" env || true)"
-fi
-
 if [[ -n "${OHOS_PROJECT_DIR:-}" ]]; then
   :
 else
@@ -88,11 +83,21 @@ done
 
 LIB_NAME="libnimlibp2p.so"
 OUT_PATH="${OUT_DIR}/${LIB_NAME}"
-BRIDGE_SRC="${REPO_ROOT}/examples/hos/entry/src/main/cpp/nim_bridge.cpp"
+BRIDGE_SRC=""
+for candidate in \
+  "${OHOS_PROJECT_DIR}/entry/src/main/cpp/nim_bridge.cpp" \
+  "${REPO_ROOT}/examples/hos/entry/src/main/cpp/nim_bridge.cpp"; do
+  if [[ -f "${candidate}" ]]; then
+    BRIDGE_SRC="${candidate}"
+    break
+  fi
+done
+BRIDGE_INCLUDE_DIR=""
 BRIDGE_OBJ_DIR="${REPO_ROOT}/build/ohos-bridge"
 BRIDGE_OBJ="${BRIDGE_OBJ_DIR}/nim_bridge.o"
 NIM_OHOS_QUIC_BACKEND="${NIM_OHOS_QUIC_BACKEND:-builtin}"
 NIM_OHOS_PURE_CRYPTO="${NIM_OHOS_PURE_CRYPTO:-1}"
+NIM_OHOS_ENABLE_SSL="${NIM_OHOS_ENABLE_SSL:-0}"
 
 if [[ "${NIM_OHOS_PURE_CRYPTO}" != "1" ]]; then
   echo "[nim-ohos] OpenSSL/libssl packaging has been removed; set NIM_OHOS_PURE_CRYPTO=1" >&2
@@ -106,20 +111,26 @@ SYSROOT_FLAG="--sysroot=${SYSROOT_DIR}"
 TARGET_FLAG="--target=${TARGET_TRIPLE}"
 
 mkdir -p "${BRIDGE_OBJ_DIR}"
-echo "[nim-ohos] Building embedded N-API bridge object -> ${BRIDGE_OBJ}"
-"${CLANG_BIN}" \
-  ${TARGET_FLAG} \
-  ${SYSROOT_FLAG} \
-  -I"${REPO_ROOT}/examples/hos/entry/src/main/cpp" \
-  -I"${SYSROOT_DIR}/usr/include" \
-  -I"${SYSROOT_DIR}/usr/include/napi" \
-  -std=c++17 \
-  -DNAPI_VERSION=8 \
-  -DNIMBRIDGE_EMBEDDED=1 \
-  -fPIC \
-  -c \
-  -o "${BRIDGE_OBJ}" \
-  "${BRIDGE_SRC}"
+if [[ -n "${BRIDGE_SRC}" ]]; then
+  BRIDGE_INCLUDE_DIR="$(cd "$(dirname "${BRIDGE_SRC}")" && pwd)"
+  echo "[nim-ohos] Building embedded N-API bridge object -> ${BRIDGE_OBJ}"
+  "${CLANG_BIN}" \
+    ${TARGET_FLAG} \
+    ${SYSROOT_FLAG} \
+    -I"${BRIDGE_INCLUDE_DIR}" \
+    -I"${SYSROOT_DIR}/usr/include" \
+    -I"${SYSROOT_DIR}/usr/include/napi" \
+    -std=c++17 \
+    -DNAPI_VERSION=8 \
+    -DNIMBRIDGE_EMBEDDED=1 \
+    -fPIC \
+    -c \
+    -o "${BRIDGE_OBJ}" \
+    "${BRIDGE_SRC}"
+else
+  BRIDGE_OBJ=""
+  echo "[nim-ohos] nim_bridge.cpp not found; relying on project-provided Harmony N-API bridge"
+fi
 
 NIM_FLAGS=(
   "c"
@@ -150,7 +161,6 @@ NIM_FLAGS=(
   "--passL:-Wl,-export-dynamic"
   "--passL:-Wl,-soname,libnimlibp2p.so"
   "--passL:-lhilog_ndk.z"
-  "--passL:${BRIDGE_OBJ}"
   "--passL:-lace_napi.z"
   "--passL:-Wl,--start-group"
   "--passL:${LIBCXX_STATIC}"
@@ -160,6 +170,10 @@ NIM_FLAGS=(
   "--define:libp2p_autotls_support"
   "--out:${OUT_PATH}"
 )
+
+if [[ -n "${BRIDGE_OBJ}" ]]; then
+  NIM_FLAGS+=("--passL:${BRIDGE_OBJ}")
+fi
 
 echo "[nim-ohos] Pure builtin crypto packaging enabled"
 
@@ -178,6 +192,11 @@ case "${NIM_OHOS_QUIC_BACKEND}" in
 esac
 
 NIM_FLAGS+=("--define:libp2p_pure_crypto")
+if [[ "${NIM_OHOS_ENABLE_SSL}" == "1" ]]; then
+  NIM_FLAGS+=("--define:ssl")
+  NIM_FLAGS+=("--passC:-includeglob.h")
+  echo "[nim-ohos] Enabling Nim stdlib ssl support"
+fi
 
 # Allow enabling trace info explicitly to avoid Nim 2.3.x cross-compilation crashes by default
 if [[ "${NIM_OHOS_ENABLE_TRACES:-0}" == "1" ]]; then

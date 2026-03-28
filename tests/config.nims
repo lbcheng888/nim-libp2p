@@ -11,12 +11,12 @@ when defined(libp2p_test_metrics):
   switch("define", "libp2p_network_protocols_metrics")
   switch("define", "libp2p_mplex_metrics")
 
-# Only add chronicles param if the
-# user didn't specify any
+# Only add test logger defaults if the
+# user didn't specify any chronicles-related params.
 var hasChroniclesParam = false
 for param in 0 ..< system.paramCount():
   let value = system.paramStr(param)
-  if "chronicles" in value and "chronicles_enabled" notin value:
+  if "chronicles" in value:
     hasChroniclesParam = true
 
 if hasChroniclesParam:

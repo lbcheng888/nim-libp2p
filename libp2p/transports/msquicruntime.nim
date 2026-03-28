@@ -36,6 +36,10 @@ proc mergeOptions(options: MsQuicLoadOptions): MsQuicLoadOptions =
   result = options
   if result.requestedVersion == 0'u32:
     result.requestedVersion = msffi.DefaultMsQuicVersion
+  if result.builtinPolicy == msffi.mbpOnly:
+    result.explicitPath = ""
+    result.allowFallback = false
+    return
   if result.explicitPath.len == 0:
     let envPath = getEnv(msffi.DefaultMsQuicEnvVar)
     if envPath.len > 0:
