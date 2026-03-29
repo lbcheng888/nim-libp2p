@@ -6,7 +6,7 @@ Wants=network-online.target nim-tsnet-gateway.service
 [Service]
 Type=simple
 WorkingDirectory=/root/nim-libp2p
-ExecStart=/root/nim-libp2p/build/tsnet_product_node --label=remote-prod --rpc-host=127.0.0.1 --rpc-port=19111 --control-protocol=nim_quic --control-endpoint=quic://64.176.84.12:9444/nim-tsnet-control-quic/v1 --relay-endpoint=quic://64.176.84.12:9446/nim-tsnet-relay-quic/v1 --hostname=remote-prod --state-dir=/root/nim-libp2p/build/prod-remote/node/state --data-dir=/root/nim-libp2p/build/prod-remote/node/data --identity-path=/root/nim-libp2p/build/prod-remote/node/identity.json --listen-port=40111 --wait-timeout-sec=120 --quic-only=true
+ExecStart=/root/nim-libp2p/build/tsnet_product_node --label=remote-prod --rpc-host=127.0.0.1 --rpc-port=19111 --control-protocol=nim_quic --control-endpoint=quic://64.176.84.12:443/nim-tsnet-control-quic/v1 --relay-endpoint=quic://64.176.84.12:80/nim-tsnet-relay-quic/v1 --hostname=remote-prod --state-dir=/root/nim-libp2p/build/prod-remote/node/state --data-dir=/root/nim-libp2p/build/prod-remote/node/data --identity-path=/root/nim-libp2p/build/prod-remote/node/identity.json --listen-port=40111 --wait-timeout-sec=120 --quic-only=true
 Restart=always
 RestartSec=1
 

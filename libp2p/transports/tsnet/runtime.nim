@@ -1072,6 +1072,45 @@ proc stop*(runtime: TsnetInAppRuntime) =
   when defined(libp2p_msquic_experimental):
     qrelay.stopRelayListeners(runtime.runtimeId)
 
+proc unavailablePayloadError(): string
+
+proc reconcileProxyListeners*(
+    runtime: TsnetInAppRuntime
+): Result[void, string] =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  if not runtime.ready() or not runtime.session.supportsProxyRouting():
+    return err(unavailablePayloadError())
+  when defined(libp2p_msquic_experimental):
+    if not runtime.liveQuicRelayMode():
+      return ok()
+    let routes = proxyRouteSnapshots(runtime.runtimeId)
+    if routes.len == 0:
+      return ok()
+    qrelay.stopRelayListeners(runtime.runtimeId)
+    for route in routes:
+      let started =
+        case route.kind
+        of TsnetProxyKind.Tcp:
+          qrelay.startRelayListener(
+            runtime.runtimeId,
+            runtime.resolvedRelayDialUrl(),
+            route.advertised,
+            route.raw
+          )
+        of TsnetProxyKind.Quic:
+          qrelay.startUdpRelayListener(
+            runtime.runtimeId,
+            runtime.resolvedRelayDialUrl(),
+            route.advertised,
+            route.raw,
+            runtime.cfg.bridgeExtraJson
+          )
+      if started.isErr():
+        return err(started.error)
+    return ok()
+  ok()
+
 proc unavailablePayloadError(): string =
   TsnetMissingInAppProviderError
 
@@ -1094,6 +1133,7 @@ proc statusPayload*(runtime: TsnetInAppRuntime): Result[JsonNode, string] =
   when defined(libp2p_msquic_experimental):
     if runtime.liveQuicRelayMode():
       payload["udpDialStates"] = qrelay.udpDialStatesPayload(runtime.runtimeId)
+      payload["relayListeners"] = qrelay.relayListenerStatesPayload(runtime.runtimeId)
   ok(payload)
 
 proc requestString(node: JsonNode, key: string): string =

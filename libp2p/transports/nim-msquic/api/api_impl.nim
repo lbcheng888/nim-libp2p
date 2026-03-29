@@ -2853,6 +2853,19 @@ proc safeEmitConnectionDiagnostic(conn: ConnectionState; note: string) {.gcsafe,
   except Exception:
     discard
 
+proc safeEmitListenerDiagnostic(state: ListenerState; note: string) {.gcsafe, raises: [].} =
+  if state.isNil:
+    return
+  try:
+    {.cast(gcsafe).}:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: cast[pointer](state),
+        note: note
+      ))
+  except Exception:
+    discard
+
 proc emitListenerNewConnection(state: ListenerState; connection: HQUIC) =
   if state.isNil or state.callback.isNil or connection.isNil:
     return
@@ -5523,6 +5536,14 @@ proc listenerOnReceive(state: ListenerState; transp: DatagramTransport; remote: 
   if state.isNil:
     return
   try:
+    {.cast(gcsafe).}:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagRegistrationOpened,
+        handle: cast[pointer](state),
+        note: "listener datagram remote=" & $remote &
+          " local=" & $local &
+          " bytes=" & $data.len
+      ))
     for packetData in proto.splitCoalescedPackets(data):
       let packet = proto.decodePacket(packetData)
       if packet.isLongHeader and packet.longHeader.packetType == ptInitial:
@@ -5583,8 +5604,22 @@ proc listenerOnReceive(state: ListenerState; transp: DatagramTransport; remote: 
           let resetConn = state.findAcceptedConnectionByStatelessResetToken(packetData)
           if not resetConn.isNil:
             discard resetConn.handleStatelessReset(remote, state)
-  except Exception:
-    discard
+  except CatchableError as exc:
+    safeEmitListenerDiagnostic(
+      state,
+      "listener receive exception remote=" & $remote &
+        " local=" & $local &
+        " bytes=" & $data.len &
+        " err=" & exc.msg
+    )
+  except Exception as exc:
+    safeEmitListenerDiagnostic(
+      state,
+      "listener receive defect remote=" & $remote &
+        " local=" & $local &
+        " bytes=" & $data.len &
+        " err=" & exc.msg
+    )
 
 proc msquicListenerStart(listener: HQUIC; alpn: ptr QuicBuffer;
     alpnCount: uint32; address: pointer): QUIC_STATUS {.cdecl.} =

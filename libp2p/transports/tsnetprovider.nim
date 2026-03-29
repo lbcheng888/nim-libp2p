@@ -198,6 +198,18 @@ proc refreshControlMetadata*(provider: TsnetProvider): Result[void, string] {.gc
   provider.lastError = ""
   ok()
 
+proc reconcileProxyListeners*(provider: TsnetProvider): Result[void, string] {.gcsafe.} =
+  if provider.isNil:
+    return err("tsnet provider is nil")
+  if provider.kind != TsnetProviderKind.InAppReal or not tsnetproviderinapp.runtimePresent(provider.runtime):
+    return ok()
+  let repaired = tsnetproviderinapp.reconcileProxyListeners(provider.runtime)
+  if repaired.isErr():
+    provider.lastError = repaired.error
+    return err(repaired.error)
+  provider.lastError = ""
+  ok()
+
 proc stop*(provider: TsnetProvider) =
   if provider.isNil:
     return

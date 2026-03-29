@@ -11,6 +11,11 @@ type
     Tcp
     Quic
 
+  TsnetProxyRouteSnapshot* = object
+    advertised*: MultiAddress
+    raw*: MultiAddress
+    kind*: TsnetProxyKind
+
   TsnetProxyRegistration* = object
     ownerId*: int
     advertisedKey*: string
@@ -240,6 +245,27 @@ proc unregisterProxyRoutes*(ownerId: int) =
         registrations.add(registration)
         rebuiltDirectRoutes[registration.ownerId] = registrations
       proxyOwnerDirectRoutes = rebuiltDirectRoutes
+
+proc proxyRouteSnapshots*(ownerId: int): seq[TsnetProxyRouteSnapshot] {.gcsafe.} =
+  if ownerId <= 0:
+    return @[]
+  proxySafe:
+    withLock(proxyRegistryLock):
+      let registrations = proxyOwnerRegistrations.getOrDefault(ownerId)
+      for registration in registrations.items:
+        let advertised = parseKnownAddress(registration.advertisedKey)
+        let raw = parseKnownAddress(registration.rawKey)
+        let kind =
+          if "/udp/" in registration.advertisedKey.toLowerAscii() and
+              "/quic-v1" in registration.advertisedKey.toLowerAscii():
+            TsnetProxyKind.Quic
+          else:
+            TsnetProxyKind.Tcp
+        result.add(TsnetProxyRouteSnapshot(
+          advertised: advertised,
+          raw: raw,
+          kind: kind
+        ))
 
 proc lookupRawTarget*(
     family, ip: string,

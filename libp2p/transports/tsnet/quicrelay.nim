@@ -83,6 +83,13 @@ type
     attempts*: int
     updatedUnixMilli*: int64
 
+  TsnetRelayListenerDiagnostic* = object
+    route*: string
+    kind*: string
+    stage*: string
+    detail*: string
+    updatedUnixMilli*: int64
+
   TsnetQuicRelayListener = ref object
     connPtr: pointer
     connState: msquicdrv.MsQuicConnectionState
@@ -143,6 +150,8 @@ var relayOwnerTasks {.global.}: Table[int, seq[TsnetRelayTaskHandle]] = initTabl
 var relayReadyRoutes {.global.}: Table[int, HashSet[string]] = initTable[int, HashSet[string]]()
 var relayUdpDialStates {.global.}: Table[int, Table[string, TsnetUdpDialDiagnostic]] =
   initTable[int, Table[string, TsnetUdpDialDiagnostic]]()
+var relayListenerStates {.global.}: Table[int, Table[string, TsnetRelayListenerDiagnostic]] =
+  initTable[int, Table[string, TsnetRelayListenerDiagnostic]]()
 
 initLock(relayRegistryLock)
 
@@ -1768,6 +1777,43 @@ proc clearRelayReadyRoutes(ownerId: int) {.gcsafe, raises: [].} =
     withLock(relayRegistryLock):
       relayReadyRoutes.del(ownerId)
 
+proc markRelayListenerStage*(
+    ownerId: int,
+    route: string,
+    kind: string,
+    stage: string,
+    detail = ""
+) {.gcsafe, raises: [].} =
+  quicRelaySafe:
+    if ownerId <= 0 or route.len == 0 or stage.len == 0:
+      return
+    withLock(relayRegistryLock):
+      var states = relayListenerStates.getOrDefault(ownerId)
+      states[route] = TsnetRelayListenerDiagnostic(
+        route: route,
+        kind: normalizedRelayKind(kind, route),
+        stage: stage,
+        detail: detail,
+        updatedUnixMilli: currentUnixMilli()
+      )
+      relayListenerStates[ownerId] = states
+
+proc relayListenerStatesPayload*(ownerId: int): JsonNode {.gcsafe, raises: [].} =
+  result = newJArray()
+  quicRelaySafe:
+    if ownerId <= 0:
+      return
+    withLock(relayRegistryLock):
+      let states = relayListenerStates.getOrDefault(ownerId)
+      for route, state in states.pairs():
+        result.add(%*{
+          "route": route,
+          "kind": state.kind,
+          "stage": state.stage,
+          "detail": state.detail,
+          "updatedUnixMilli": state.updatedUnixMilli,
+        })
+
 proc markUdpDialProgress(
     ownerId: int,
     rawKey: string,
@@ -1868,6 +1914,7 @@ proc stopRelayListeners*(ownerId: int) =
     relayOwnerTasks.del(ownerId)
     relayReadyRoutes.del(ownerId)
     relayUdpDialStates.del(ownerId)
+    relayListenerStates.del(ownerId)
   for handle in handles:
     if not handle.server.isNil:
       try:
@@ -3466,17 +3513,21 @@ proc listenerLoop(
       await sleepAsync(startupDelay)
     while true:
       clearRelayReadyRoute(ownerId, route)
+      markRelayListenerStage(ownerId, route, "tcp", "connecting")
       let endpoint = quicRelayEndpoint(relayUrl).valueOr:
+        markRelayListenerStage(ownerId, route, "tcp", "failed", error)
         quicRelayTrace("listener endpoint parse failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
       let client = connectRelay(endpoint).valueOr:
+        markRelayListenerStage(ownerId, route, "tcp", "failed", error)
         quicRelayTrace("listener relay connect failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
       var regStream: MsQuicStream = nil
       block setup:
         regStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
+          markRelayListenerStage(ownerId, route, "tcp", "failed", error)
           quicRelayTrace("listener stream create failed routeId=" & $routeId & " err=" & error)
           break setup
         let hello = %*{
@@ -3498,6 +3549,13 @@ proc listenerLoop(
             "listener register ack"
           )
           if listenerAck.isNil or not listenerAck{"ok"}.getBool():
+            markRelayListenerStage(
+              ownerId,
+              route,
+              "tcp",
+              "failed",
+              if listenerAck.isNil: "register_ack_nil" else: jsonString(listenerAck, "error")
+            )
             quicRelayTrace(
               "listener registration rejected routeId=" & $routeId &
               " route=" & route &
@@ -3518,7 +3576,9 @@ proc listenerLoop(
         var acceptStream: MsQuicStream = nil
         while true:
           if acceptStream.isNil:
+            markRelayListenerStage(ownerId, route, "tcp", "registering")
             acceptStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
+              markRelayListenerStage(ownerId, route, "tcp", "failed", error)
               quicRelayTrace(
                 "listener accept stream create failed routeId=" & $routeId &
                 " route=" & route &
@@ -3581,6 +3641,7 @@ proc listenerLoop(
               break
             let awaitPayload = rpcPayload(awaitAck)
             if not awaitPayload{"published"}.getBool(false):
+              markRelayListenerStage(ownerId, route, "tcp", "failed", "route_not_published")
               quicRelayTrace(
                 "listener await missing published routeId=" & $routeId &
                 " route=" & route
@@ -3590,6 +3651,7 @@ proc listenerLoop(
               restart = true
               break
             markRelayRouteReady(ownerId, route)
+            markRelayListenerStage(ownerId, route, "tcp", "awaiting")
             quicRelayTrace(
               "listener published routeId=" & $routeId &
               " route=" & route
@@ -3619,6 +3681,7 @@ proc listenerLoop(
                 " route=" & route &
                 " err=" & exc.msg
               )
+              markRelayListenerStage(ownerId, route, "tcp", "dropped", exc.msg)
               await acceptStream.closeQuicStream()
               acceptStream = nil
               restart = true
@@ -3636,6 +3699,7 @@ proc listenerLoop(
             break
           if jsonString(incoming, "op") != "incoming":
             continue
+          markRelayListenerStage(ownerId, route, "tcp", "incoming")
           quicRelayTrace("listener incoming routeId=" & $routeId & " route=" & route)
           let sourceAdvertised = jsonString(incoming, "source")
           let bridgeSessionId = jsonString(incoming, "sessionId")
@@ -3655,6 +3719,7 @@ proc listenerLoop(
               " localTarget=" & $localTarget
             )
           except CatchableError:
+            markRelayListenerStage(ownerId, route, "tcp", "failed", "local_connect_failed")
             quicRelayTrace("listener local connect failed routeId=" & $routeId)
             restart = true
             break
@@ -3674,8 +3739,10 @@ proc listenerLoop(
               "candidates": [],
               "sessionId": bridgeSessionId
             })
+            markRelayListenerStage(ownerId, route, "tcp", "ready")
             quicRelayTrace("listener ready routeId=" & $routeId & " route=" & route)
           except CatchableError:
+            markRelayListenerStage(ownerId, route, "tcp", "dropped", "ready_write_failed")
             await localTransport.safeCloseTransport()
             await acceptStream.closeQuicStream()
             acceptStream = nil
@@ -3706,6 +3773,8 @@ proc listenerLoop(
               "listener bridge attach ack"
             )
             if attachAck.isNil or not attachAck{"ok"}.getBool():
+              markRelayListenerStage(ownerId, route, "tcp", "failed",
+                if attachAck.isNil: "bridge_attach_ack_nil" else: jsonString(attachAck, "error"))
               quicRelayTrace(
                 "listener bridge attach rejected routeId=" & $routeId &
                 " route=" & route &
@@ -3718,6 +3787,7 @@ proc listenerLoop(
               restart = true
               break
           except CatchableError as exc:
+            markRelayListenerStage(ownerId, route, "tcp", "failed", exc.msg)
             quicRelayTrace(
               "listener bridge attach failed routeId=" & $routeId &
               " route=" & route &
@@ -3730,11 +3800,13 @@ proc listenerLoop(
             restart = true
             break
           quicRelayTrace("listener bridge start routeId=" & $routeId & " route=" & route)
+          markRelayListenerStage(ownerId, route, "tcp", "bridge_attached")
           await bridgeLocalAndQuic(localTransport, bridgeStream)
           quicRelayTrace("listener bridge end routeId=" & $routeId & " route=" & route)
           continue
         if not restart:
           break
+        markRelayListenerStage(ownerId, route, "tcp", "restarting")
         if not acceptStream.isNil:
           await acceptStream.closeQuicStream()
       await regStream.closeQuicStream()
@@ -3744,6 +3816,7 @@ proc listenerLoop(
     discard
   finally:
     clearRelayReadyRoute(ownerId, route)
+    markRelayListenerStage(ownerId, route, "tcp", "stopped")
     quicRelayTrace("listener task stop routeId=" & $routeId)
 
 proc startRelayListener*(
@@ -3791,17 +3864,21 @@ proc udpListenerLoop(
       await sleepAsync(startupDelay)
     while true:
       clearRelayReadyRoute(ownerId, route)
+      markRelayListenerStage(ownerId, route, "udp", "connecting")
       let endpoint = quicRelayEndpoint(relayUrl).valueOr:
+        markRelayListenerStage(ownerId, route, "udp", "failed", error)
         quicRelayTrace("udp listener endpoint parse failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
       let client = connectRelay(endpoint).valueOr:
+        markRelayListenerStage(ownerId, route, "udp", "failed", error)
         quicRelayTrace("udp listener relay connect failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
       var regStream: MsQuicStream = nil
       block setup:
         regStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
+          markRelayListenerStage(ownerId, route, "udp", "failed", error)
           quicRelayTrace("udp listener stream create failed routeId=" & $routeId & " err=" & error)
           break setup
         quicRelayTrace("udp listener stream created routeId=" & $routeId & " route=" & route)
@@ -3826,6 +3903,13 @@ proc udpListenerLoop(
             "udp listener register ack"
           )
           if listenerAck.isNil or not listenerAck{"ok"}.getBool():
+            markRelayListenerStage(
+              ownerId,
+              route,
+              "udp",
+              "failed",
+              if listenerAck.isNil: "register_ack_nil" else: jsonString(listenerAck, "error")
+            )
             quicRelayTrace(
               "udp listener registration rejected routeId=" & $routeId &
               " route=" & route &
@@ -3846,7 +3930,9 @@ proc udpListenerLoop(
           regStream = nil
         while true:
           if acceptStream.isNil:
+            markRelayListenerStage(ownerId, route, "udp", "registering")
             acceptStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
+              markRelayListenerStage(ownerId, route, "udp", "failed", error)
               quicRelayTrace(
                 "udp listener accept stream create failed routeId=" & $routeId &
                 " route=" & route &
@@ -3921,6 +4007,7 @@ proc udpListenerLoop(
             )
             let awaitPayload = rpcPayload(awaitAck)
             if not awaitPayload{"published"}.getBool(false):
+              markRelayListenerStage(ownerId, route, "udp", "failed", "route_not_published")
               quicRelayTrace(
                 "udp listener accept stream await missing published routeId=" & $routeId &
                 " route=" & route
@@ -3930,6 +4017,7 @@ proc udpListenerLoop(
               restart = true
               break
             markRelayRouteReady(ownerId, route)
+            markRelayListenerStage(ownerId, route, "udp", "awaiting")
             quicRelayTrace(
               "udp listener published routeId=" & $routeId &
               " route=" & route
@@ -3998,6 +4086,7 @@ proc udpListenerLoop(
                 " route=" & route &
                 " err=" & exc.msg
               )
+              markRelayListenerStage(ownerId, route, "udp", "dropped", exc.msg)
               await controlStream.closeQuicStream()
               restart = true
               break
@@ -4023,6 +4112,7 @@ proc udpListenerLoop(
             if controlStream != acceptStream:
               await controlStream.closeQuicStream()
             continue
+          markRelayListenerStage(ownerId, route, "udp", "incoming")
           quicRelayTrace("udp listener incoming routeId=" & $routeId & " route=" & route)
           let sourceAdvertised = jsonString(incoming, "source")
           let bridgeSessionId = jsonString(incoming, "sessionId")
@@ -4106,8 +4196,10 @@ proc udpListenerLoop(
               "candidates": listenerCandidates,
               "sessionId": bridgeSessionId
             })
+            markRelayListenerStage(ownerId, route, "udp", "ready")
             quicRelayTrace("udp listener ready routeId=" & $routeId & " route=" & route)
           except CatchableError:
+            markRelayListenerStage(ownerId, route, "udp", "dropped", "ready_write_failed")
             await localUdp.closeDatagramTransport()
             await acceptStream.closeQuicStream()
             acceptStream = nil
@@ -4138,6 +4230,7 @@ proc udpListenerLoop(
               "udp listener bridge attach ack"
             )
             if not attachAck{"ok"}.getBool():
+              markRelayListenerStage(ownerId, route, "udp", "failed", jsonString(attachAck, "error"))
               quicRelayTrace(
                 "udp listener bridge attach rejected routeId=" & $routeId &
                 " route=" & route &
@@ -4154,7 +4247,9 @@ proc udpListenerLoop(
               " route=" & route &
               " sessionId=" & bridgeSessionId
             )
+            markRelayListenerStage(ownerId, route, "udp", "bridge_attached")
           except CatchableError as exc:
+            markRelayListenerStage(ownerId, route, "udp", "failed", exc.msg)
             quicRelayTrace(
               "udp listener bridge attach failed routeId=" & $routeId &
               " route=" & route &
@@ -4180,6 +4275,7 @@ proc udpListenerLoop(
           continue
         if not restart:
           break
+        markRelayListenerStage(ownerId, route, "udp", "restarting")
         if not acceptStream.isNil:
           await acceptStream.closeQuicStream()
       if not regStream.isNil:
@@ -4190,6 +4286,7 @@ proc udpListenerLoop(
     discard
   finally:
     clearRelayReadyRoute(ownerId, route)
+    markRelayListenerStage(ownerId, route, "udp", "stopped")
     quicRelayTrace("udp listener task stop routeId=" & $routeId)
 
 proc startUdpRelayListener*(

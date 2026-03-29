@@ -681,6 +681,7 @@ const
   RelayReservationRefreshSkewSec = 30'i64
   RelayReservationLoopMinSleepMs = 1_000
   RelayReservationLoopMaxSleepMs = 30_000
+  TailnetListenerRepairLoopMs = 1_000
 
 proc waitForBootstrapPeerConnectedWithinDeadlineAsync(
     node: NimNode,
@@ -1926,6 +1927,46 @@ proc collectRelayBackedProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} 
     result.add(canonical)
 
 proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].}
+
+proc tailnetListenerNeedsRepair(payload: JsonNode): bool {.gcsafe, raises: [].} =
+  proc boolField(node: JsonNode, key: string): bool {.gcsafe, raises: [].} =
+    if node.isNil or node.kind != JObject or not node.hasKey(key):
+      return false
+    let value = node.getOrDefault(key)
+    case value.kind
+    of JBool:
+      value.getBool()
+    of JInt, JFloat:
+      value.getInt() != 0
+    of JString:
+      value.getStr().toLowerAscii() in ["1", "true", "yes", "y"]
+    else:
+      false
+
+  proc strField(node: JsonNode, key: string): string {.gcsafe, raises: [].} =
+    if node.isNil or node.kind != JObject or not node.hasKey(key):
+      return ""
+    let value = node.getOrDefault(key)
+    if value.kind == JString:
+      return value.getStr()
+    ""
+
+  if payload.isNil or payload.kind != JObject:
+    return false
+  if not boolField(payload, "ok"):
+    return false
+  if not boolField(payload, "providerReady"):
+    return false
+  if boolField(payload, "proxyListenersReady"):
+    return false
+  let listeners = payload.getOrDefault("relayListeners")
+  if listeners.isNil or listeners.kind != JArray:
+    return false
+  for item in listeners.items:
+    let stage = strField(item, "stage").toLowerAscii()
+    if stage in ["failed", "dropped", "stopped"]:
+      return true
+  false
 
 proc isTsnetPublishAddr(addrText: string): bool {.gcsafe, raises: [].} =
   "/tsnet" in addrText.toLowerAscii()
@@ -3359,6 +3400,53 @@ proc spawnTailnetWarmAdvertisedPeerInfo(n: NimNode) {.gcsafe, raises: [].} =
         "[nimlibp2p] tailnet advertised peer sync failed err=" & exc.msg
       )
   asyncSpawn task()
+
+proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
+  if n.isNil or not n.started:
+    return
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    return
+  let before = buildTailnetStatusPayload(n)
+  if not tailnetListenerNeedsRepair(before):
+    return
+  let nowMs = nowMillis()
+  recordEvent(n, "system_status", $(%*{
+    "entity": "tailnet_listener",
+    "stage": "restarting",
+    "updatedAtMs": nowMs,
+    "tailnetPath": jsonGetStr(before, "tailnetPath", ""),
+    "proxyListenerExpected": jsonGetInt64(before, "proxyListenerExpected", 0),
+    "proxyListenerReady": jsonGetInt64(before, "proxyListenerReady", 0),
+    "relayListeners": before.getOrDefault("relayListeners"),
+  }))
+  let repaired = transport.reconcileProviderListeners()
+  if repaired.isErr():
+    recordEvent(n, "system_status", $(%*{
+      "entity": "tailnet_listener",
+      "stage": "failed",
+      "error": repaired.error,
+      "updatedAtMs": nowMillis(),
+      "relayListeners": before.getOrDefault("relayListeners"),
+    }))
+    return
+  mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+  publishTsnetLocalPeerInfo(n, transport)
+  discard await syncAdvertisedPeerInfo(
+    n,
+    reason = "tailnet_listener_reconcile",
+    reannounce = false,
+  )
+  let after = buildTailnetStatusPayload(n)
+  recordEvent(n, "system_status", $(%*{
+    "entity": "tailnet_listener",
+    "stage": (if jsonGetBool(after, "proxyListenersReady", false): "ready" else: "repair_started"),
+    "updatedAtMs": nowMillis(),
+    "tailnetPath": jsonGetStr(after, "tailnetPath", ""),
+    "proxyListenerExpected": jsonGetInt64(after, "proxyListenerExpected", 0),
+    "proxyListenerReady": jsonGetInt64(after, "proxyListenerReady", 0),
+    "relayListeners": after.getOrDefault("relayListeners"),
+  }))
 
 proc ensureTailnetControlRefreshLoop(n: NimNode) {.gcsafe, raises: [].}
 
@@ -8400,6 +8488,108 @@ proc connectMultiaddrDeferred(
   await sleepAsync(chronos.milliseconds(0))
   return await n.switchInstance.connect(ma, allowUnknownPeerId = true)
 
+type DirectMultiaddrConnectResult = object
+  ok: bool
+  err: string
+  peerConnected: bool
+
+proc connectMultiaddrExactAsync(
+    n: NimNode,
+    addrText: string,
+    timeoutMs: int,
+    allowLateDetach: bool
+): Future[DirectMultiaddrConnectResult] {.async.} =
+  result = DirectMultiaddrConnectResult(ok: false, err: "", peerConnected: false)
+  let ma = parseDialableMultiaddr(addrText).valueOr:
+    result.err = "invalid multiaddr: " & error
+    return
+  let lowerAddr = addrText.toLowerAscii()
+  let quicDial =
+    lowerAddr.contains("/quic-v1") or
+    lowerAddr.contains("/quic/")
+  let fullAddressRes = parseFullAddress(ma)
+  try:
+    if fullAddressRes.isOk():
+      let (peerId, _) = fullAddressRes.get()
+      if quicDial and peerCurrentlyConnected(n, peerId):
+        discard await disconnectPeerWithTimeout(
+          n,
+          peerId,
+          min(timeoutMs, 2_000),
+          "connectMultiaddrExactAsync_quic_stale",
+        )
+      let addrFut = connectMultiaddrDeferred(n, ma)
+      try:
+        let waitRes = await awaitFutureWithinDeadlineOrPeerConnected(
+          n,
+          addrFut,
+          peerId,
+          timeoutMs,
+        )
+        if waitRes.completed:
+          discard await addrFut
+          result.ok = true
+        elif waitRes.observedConnected:
+          result.ok = true
+          result.peerConnected = true
+          if not addrFut.finished():
+            asyncSpawn drainFutureDetached(
+              addrFut,
+              "connectMultiaddrExactAsync_observed_connected:" & addrText,
+            )
+        else:
+          result.err = "connect timeout"
+          if not addrFut.finished():
+            if allowLateDetach and quicDial:
+              asyncSpawn drainFutureDetached(
+                addrFut,
+                "connectMultiaddrExactAsync_timeout_detached:" & addrText,
+              )
+            else:
+              await cancelFutureAndDrain(
+                addrFut,
+                "connectMultiaddrExactAsync_timeout:" & addrText,
+              )
+          if quicDial and peerCurrentlyConnected(n, peerId):
+            discard await disconnectPeerWithTimeout(
+              n,
+              peerId,
+              min(timeoutMs, 750),
+              "connectMultiaddrExactAsync_quic_timeout_cleanup",
+            )
+        result.peerConnected = result.peerConnected or peerCurrentlyConnected(n, peerId)
+      except CatchableError as exc:
+        if not addrFut.finished():
+          await cancelFutureAndDrain(
+            addrFut,
+            "connectMultiaddrExactAsync_catch:" & addrText,
+          )
+        result.err = if exc.msg.len > 0: exc.msg else: $exc.name
+        result.peerConnected = peerCurrentlyConnected(n, peerId)
+    else:
+      let addrFut = connectMultiaddrDeferred(n, ma)
+      try:
+        let completed = await awaitFutureWithinDeadline(addrFut, timeoutMs)
+        if completed:
+          discard await addrFut
+          result.ok = true
+        else:
+          result.err = "connect timeout"
+          if not addrFut.finished():
+            await cancelFutureAndDrain(
+              addrFut,
+              "connectMultiaddrExactAsync_timeout:" & addrText,
+            )
+      except CatchableError as exc:
+        if not addrFut.finished():
+          await cancelFutureAndDrain(
+            addrFut,
+            "connectMultiaddrExactAsync_catch:" & addrText,
+          )
+        result.err = if exc.msg.len > 0: exc.msg else: $exc.name
+  except CatchableError as exc:
+    result.err = if exc.msg.len > 0: exc.msg else: $exc.name
+
 proc reserveOnRelayDeferred(
     client: RelayClient,
     peerId: PeerId,
@@ -11411,9 +11601,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           if quicDial:
             if tsnetDial:
               if requestedTimeoutMs > 0:
-                max(requestedTimeoutMs, 20_000)
+                max(requestedTimeoutMs, 250)
               else:
-                20_000
+                8_000
             elif requestedTimeoutMs > 0:
               max(requestedTimeoutMs, 250)
             else:
@@ -13458,6 +13648,8 @@ proc idleWakeLoop(n: NimNode) {.async.} =
   var lastPublicIpProbeKickMs = 0'i64
   var lastDrainLogMs = 0'i64
   var lastPendingHeartbeatMs = 0'i64
+  var lastTailnetListenerRepairMs = 0'i64
+  var tailnetListenerRepairTask: Future[void] = nil
   while not n.stopRequested.load(moAcquire):
     try:
       await sleepAsync(chronos.milliseconds(250))
@@ -13486,6 +13678,13 @@ proc idleWakeLoop(n: NimNode) {.async.} =
         let hostStatus = sanitizeHostNetworkStatus(n.hostNetworkStatus)
         if jsonGetBool(hostStatus, "isConnected", false) and shouldRefreshPublicIpProbe(n, hostStatus):
           asyncSpawn(refreshPublicIpProbeAsync(n, hostStatus))
+      if n.started and (tailnetListenerRepairTask.isNil or tailnetListenerRepairTask.finished()) and
+          (lastTailnetListenerRepairMs == 0 or nowMs - lastTailnetListenerRepairMs >= TailnetListenerRepairLoopMs):
+        let tailnet = buildTailnetStatusPayload(n)
+        if tailnetListenerNeedsRepair(tailnet):
+          lastTailnetListenerRepairMs = nowMs
+          tailnetListenerRepairTask = reconcileTailnetRelayListeners(n)
+          asyncSpawn(tailnetListenerRepairTask)
       processTailnetWarmCompletion(n)
     except CancelledError:
       debugLog("[nimlibp2p] idleWakeLoop cancelled node=" & $cast[int](n))
@@ -21298,14 +21497,12 @@ proc exactSeedConnectAttemptBudgetMs(maText: string): int {.gcsafe.} =
   let isTsnet = lowerAddr.contains("/tsnet")
   if lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/"):
     if isTsnet:
-      # Warm-up is explicit now, so exact-connect should expose real QUIC stalls
-      # promptly instead of burying them behind minute-scale per-address waits.
-      20_000
+      10_000
     else:
       20_000
   else:
     if isTsnet:
-      20_000
+      10_000
     else:
       6_000
 
@@ -21811,47 +22008,19 @@ proc runBootstrapSeedConnectExactAsync(
 
       var connectOk = false
       var err = ""
-      let connectCmd = makeCommand(cmdConnectMultiaddr)
-      connectCmd.multiaddr = addr
-      connectCmd.timeoutMs = timeoutMs
-      connectCmd.requestLimit = 1
-      if remainingAttempts == 1 and
-          (lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/")):
-        connectCmd.boolParam = true
       try:
-        let submitted = submitCommandNoWait(node, connectCmd)
-        if not submitted:
-          err =
-            if connectCmd.errorMsg.len > 0:
-              connectCmd.errorMsg
-            else:
-              "connect command submit failed"
-        else:
-          let completed = await awaitCommandCompletionAsync(
-            connectCmd,
-            timeoutMs + 3_000,
-          )
-          if completed:
-            connectOk = connectCmd.resultCode == NimResultOk
-            if not connectOk:
-              err =
-                if connectCmd.errorMsg.len > 0:
-                  connectCmd.errorMsg
-                else:
-                  "connect failed"
-          else:
-            err = "connect timeout"
+        let connectRes = await connectMultiaddrExactAsync(
+          node,
+          addr,
+          timeoutMs,
+          remainingAttempts == 1 and
+            (lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/")),
+        )
+        connectOk = connectRes.ok
+        peerConnected = peerConnected or connectRes.peerConnected
+        err = connectRes.err
       except CatchableError as exc:
         err = if exc.msg.len > 0: exc.msg else: $exc.name
-      finally:
-        if connectCmd.completed.load(moAcquire):
-          destroyCommand(connectCmd)
-        else:
-          asyncSpawn(drainCommandDetached(
-            connectCmd,
-            timeoutMs + 10_000,
-            "bootstrapSeedConnectExact_async:" & safePeerId & ":" & addr,
-          ))
 
       if peerRes.isOk():
         peerConnected = peerCurrentlyConnected(node, peerRes.get())

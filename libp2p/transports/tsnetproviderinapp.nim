@@ -88,6 +88,12 @@ proc refreshControlMetadata*(runtime: TsnetInAppRuntime): Result[void, string] {
   inAppSafe:
     result = tsruntime.refreshControlMetadata(runtime)
 
+proc reconcileProxyListeners*(runtime: TsnetInAppRuntime): Result[void, string] {.gcsafe.} =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  inAppSafe:
+    result = tsruntime.reconcileProxyListeners(runtime)
+
 proc statusPayload*(runtime: TsnetInAppRuntime): Result[JsonNode, string] =
   tsruntime.statusPayload(runtime)
 

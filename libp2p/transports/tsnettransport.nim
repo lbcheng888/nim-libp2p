@@ -338,6 +338,18 @@ proc refreshProviderControlMetadata*(self: TsnetTransport): Result[void, string]
       return err("tsnet transport is nil")
     result = self.provider.refreshControlMetadata()
 
+proc reconcileProviderListeners*(self: TsnetTransport): Result[void, string] {.gcsafe.} =
+  tsnetSafe:
+    if self.isNil:
+      return err("tsnet transport is nil")
+    if not self.providerUsesProxyRouting():
+      return ok()
+    let repaired = self.provider.reconcileProxyListeners()
+    if repaired.isErr():
+      return err(repaired.error)
+    self.providerListenersActivated = true
+    result = ok()
+
 proc publishedAddrs*(self: TsnetTransport): seq[MultiAddress] {.gcsafe.} =
   if self.isNil:
     return @[]
