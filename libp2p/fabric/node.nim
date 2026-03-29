@@ -1,4 +1,5 @@
 import std/[algorithm, deques, json, jsonutils, options, os, sequtils, sets, strutils, tables]
+from std/times import epochTime
 
 import chronos
 
@@ -20,10 +21,14 @@ import ./codec
 import ./types
 
 const
-  FabricWorkBatchLimit = 16
+  FabricWorkBatchLimit = 4
   FabricInboundDrainBatchLimit = FabricWorkBatchLimit
   FabricMaintenanceBatchLimit = FabricWorkBatchLimit
-  FabricOutboundSubmitBatchLimit = FabricWorkBatchLimit
+  FabricOutboundSubmitBatchLimit = 4
+  FabricInboundDrainYield = 0.seconds
+  FabricMaintenanceYield = 0.seconds
+  FabricSlowInboundSliceMs = 500'i64
+  FabricSlowMaintenanceSliceMs = 500'i64
 
 type
   InboundMessageKind = enum
@@ -92,8 +97,8 @@ type
     eventQueue: Deque[OutboundSubmit]
     attestationQueue: Deque[OutboundSubmit]
     otherQueue: Deque[OutboundSubmit]
-    runner: Future[void]
-    nextPriority: OutboundSubmitPriority
+    runners: array[OutboundSubmitPriority, Future[void]]
+    blockedOnReady: array[OutboundSubmitPriority, bool]
 
   DeliveryLedger = object
     remainingTargets: HashSet[string]
@@ -128,11 +133,20 @@ type
     latestCheckpointId*: string
     inbound*: Deque[InboundMessage]
     inboundScheduled*: bool
+    inboundPending: bool
+    inboundRunner: Future[void]
+    slowInboundSliceCount: int64
+    maxInboundSliceElapsedMs: int64
     connectedHandler*: ConnEventHandler
     syncingRoutingPeers*: HashSet[string]
     maintenanceScheduled*: bool
     maintenanceImmediateScheduled*: bool
     maintenanceGeneration*: uint64
+    maintenancePending: bool
+    maintenanceImmediatePending: bool
+    maintenanceRunner: Future[void]
+    slowMaintenanceSliceCount: int64
+    maxMaintenanceSliceElapsedMs: int64
     forwardedEvents*: Table[string, HashSet[string]]
     forwardedAttestations*: Table[string, HashSet[string]]
     forwardedEventCertificates*: Table[string, HashSet[string]]
@@ -158,7 +172,13 @@ type
     eventMaintenanceCursor: int
     attestationMaintenanceCursor: int
     eventCertificateMaintenanceCursor: int
+    checkpointCandidateMaintenanceCursor: int
+    checkpointVoteMaintenanceCursor: int
+    checkpointBundleMaintenanceCursor: int
+    avoProposalMaintenanceCursor: int
+    avoApprovalMaintenanceCursor: int
     lsmrOverlayDigest*: string
+    lsmrSubmitReadyDigest*: string
     outboundSessions*: Table[string, OutboundPeerSession]
 
 proc restoreFromStore(node: FabricNode)
@@ -167,17 +187,32 @@ proc knownPeerAnnouncements(node: FabricNode): seq[PeerAnnouncement]
 proc fetchLookupRaw(node: FabricNode, key: string): Option[seq[byte]] {.gcsafe, raises: [].}
 proc enqueueInbound(node: FabricNode, message: sink InboundMessage) {.gcsafe, raises: [].}
 proc scheduleInboundDrain(node: FabricNode) {.gcsafe, raises: [].}
-proc drainInbound(node: FabricNode)
+proc runInboundDrain(node: FabricNode): Future[void] {.async: (raises: []).}
+proc drainInbound(node: FabricNode): bool {.raises: [].}
 proc hasCheckpointForCandidate(node: FabricNode, candidateId: string): bool
 proc bootstrapRoutingSnapshot(node: FabricNode): Future[seq[PeerAnnouncement]] {.async: (raises: []).}
 proc syncRoutingSnapshotTask(node: FabricNode, peerIdText: string): Future[void] {.async: (raises: []).}
 proc ensureRoutingSnapshotSync(node: FabricNode, peerIdText: string)
-proc maintenanceStep(node: FabricNode)
+proc maintenanceLoop(node: FabricNode, initialDelayMs: int) {.async: (raises: []).}
+proc maintenanceStep(node: FabricNode): bool {.raises: [].}
 proc scheduleMaintenance(node: FabricNode, immediate = false) {.gcsafe, raises: [].}
 proc scheduleStateMaintenance(node: FabricNode) {.gcsafe, raises: [].}
+proc scheduleReadyOutboundSessions(node: FabricNode) {.gcsafe, raises: [].}
+proc eventHasRunnableLsmrDelivery(
+    node: FabricNode, event: FabricEvent, scopePrefixes: seq[LsmrPath]
+): bool
+proc attestationHasRunnableLsmrDelivery(
+    node: FabricNode, event: FabricEvent, att: EventAttestation
+): bool
+proc eventCertificateHasRunnableLsmrDelivery(
+    node: FabricNode, event: FabricEvent, cert: EventCertificate
+): bool
 proc logMaintenanceError(
     node: FabricNode, phase, itemKey: string, exc: ref Exception
 ) {.gcsafe, raises: [].}
+proc hasPending(
+    session: OutboundPeerSession, priority: OutboundSubmitPriority
+): bool {.gcsafe, raises: [].}
 proc enqueueOutbound(
     node: FabricNode,
     itemKey: string,
@@ -188,6 +223,33 @@ proc enqueueOutbound(
     onFailure: proc() {.closure, gcsafe, raises: [].},
 )
 proc usesLsmrPrimary(node: FabricNode): bool {.gcsafe, raises: [].}
+
+proc diagNowMs(): int64 {.gcsafe, raises: [].} =
+  int64(epochTime() * 1000)
+
+proc noteInboundSlice(node: FabricNode, elapsedMs: int64) {.gcsafe, raises: [].} =
+  if node.isNil or elapsedMs < 0:
+    return
+  if elapsedMs > node.maxInboundSliceElapsedMs:
+    node.maxInboundSliceElapsedMs = elapsedMs
+  if elapsedMs >= FabricSlowInboundSliceMs:
+    inc node.slowInboundSliceCount
+    echo "fabric-inbound slow-slice account=", node.identity.account,
+      " elapsedMs=", elapsedMs,
+      " inboundRemain=", node.inbound.len
+
+proc noteMaintenanceSlice(node: FabricNode, elapsedMs: int64) {.gcsafe, raises: [].} =
+  if node.isNil or elapsedMs < 0:
+    return
+  if elapsedMs > node.maxMaintenanceSliceElapsedMs:
+    node.maxMaintenanceSliceElapsedMs = elapsedMs
+  if elapsedMs >= FabricSlowMaintenanceSliceMs:
+    inc node.slowMaintenanceSliceCount
+    echo "fabric-maintenance slow-slice account=", node.identity.account,
+      " elapsedMs=", elapsedMs,
+      " pendingEvents=", node.pendingEvents.len,
+      " pendingAttestations=", node.pendingAttestations.len,
+      " pendingEventCerts=", node.pendingEventCertificates.len
 
 proc defaultIdentityPath*(dataDir: string): string =
   dataDir / "identity.json"
@@ -371,6 +433,27 @@ proc hasOutstandingDelivery(
   let ledger = ledgerBook.getOrDefault(itemKey, initDeliveryLedger())
   ledger.remainingTargets.len > 0 or ledger.inflightTargets.len > 0
 
+proc deliveredToPeer(
+    ledgerBook: Table[string, DeliveryLedger], itemKey, targetPeerId: string
+): bool {.gcsafe, raises: [].} =
+  if itemKey.len == 0 or targetPeerId.len == 0 or itemKey notin ledgerBook:
+    return false
+  let ledger = ledgerBook.getOrDefault(itemKey, initDeliveryLedger())
+  for targetKey in ledger.deliveredTargets:
+    if targetKey == targetPeerId or targetKey.startsWith(targetPeerId & "|"):
+      return true
+  false
+
+proc deliveryNeedsAttempt(
+    ledgerBook: Table[string, DeliveryLedger], itemKey, targetKey: string
+): bool {.gcsafe, raises: [].} =
+  if itemKey.len == 0 or targetKey.len == 0:
+    return false
+  if itemKey notin ledgerBook:
+    return true
+  let ledger = ledgerBook.getOrDefault(itemKey, initDeliveryLedger())
+  targetKey notin ledger.deliveredTargets and targetKey notin ledger.inflightTargets
+
 proc finalizeScopedPending(
     pendingBook: var HashSet[string],
     scopeBook: var Table[string, seq[LsmrPath]],
@@ -395,13 +478,30 @@ proc finalizeGlobalPending(
   if deferred:
     discard pendingBook.enqueuePending(key)
 
+proc submitLane(priority: OutboundSubmitPriority): FabricSubmitLane {.gcsafe, raises: [].} =
+  case priority
+  of ospEvent:
+    fslEvent
+  of ospAttestation:
+    fslAttestation
+  of ospOther:
+    fslOther
+
+proc lsmrSubmitRouteReady(
+    node: FabricNode, targetPeerId: string, priority: OutboundSubmitPriority
+): bool {.gcsafe, raises: [].} =
+  not node.isNil and not node.network.isNil and
+    node.network.submitPeerReady(targetPeerId, submitLane(priority))
+
 proc lsmrSubmitRouteReady(node: FabricNode, targetPeerId: string): bool {.gcsafe, raises: [].} =
   not node.isNil and not node.network.isNil and node.network.submitPeerReady(targetPeerId)
 
-proc ensureLsmrSubmitRoute(node: FabricNode, targetPeerId: string) {.gcsafe, raises: [].} =
+proc ensureLsmrSubmitRoute(
+    node: FabricNode, targetPeerId: string, priority: OutboundSubmitPriority
+) {.gcsafe, raises: [].} =
   if node.isNil or node.network.isNil or targetPeerId.len == 0:
     return
-  node.network.ensureSubmitPeerConnectivity(targetPeerId)
+  node.network.ensureSubmitPeerConnectivity(targetPeerId, submitLane(priority))
 
 proc attestationForKey(node: FabricNode, key: string): Option[EventAttestation] =
   let parts = key.split(":")
@@ -506,13 +606,32 @@ proc getOrCreateOutboundSession(node: FabricNode, targetPeerId: string): Outboun
       eventQueue: initDeque[OutboundSubmit](),
       attestationQueue: initDeque[OutboundSubmit](),
       otherQueue: initDeque[OutboundSubmit](),
-      nextPriority: ospEvent,
     )
     node.outboundSessions[targetPeerId] = result
 
 proc hasPending(session: OutboundPeerSession): bool {.gcsafe, raises: [].} =
   not session.isNil and
     (session.eventQueue.len > 0 or session.attestationQueue.len > 0 or session.otherQueue.len > 0)
+
+proc hasPending(
+    session: OutboundPeerSession, priority: OutboundSubmitPriority
+): bool {.gcsafe, raises: [].} =
+  if session.isNil:
+    return false
+  case priority
+  of ospEvent:
+    session.eventQueue.len > 0
+  of ospAttestation:
+    session.attestationQueue.len > 0
+  of ospOther:
+    session.otherQueue.len > 0
+
+proc hasRunning(
+    session: OutboundPeerSession, priority: OutboundSubmitPriority
+): bool {.gcsafe, raises: [].} =
+  not session.isNil and
+    not session.runners[priority].isNil and
+    not session.runners[priority].finished()
 
 proc popNext(session: OutboundPeerSession): OutboundSubmit {.gcsafe, raises: [].} =
   if session.isNil:
@@ -525,57 +644,50 @@ proc popNext(session: OutboundPeerSession): OutboundSubmit {.gcsafe, raises: [].
     return session.otherQueue.popFirst()
   nil
 
-proc popBatch(node: FabricNode, session: OutboundPeerSession): seq[OutboundSubmit] {.gcsafe, raises: [].} =
+proc popBatch(
+    node: FabricNode, session: OutboundPeerSession, priority: OutboundSubmitPriority
+): seq[OutboundSubmit] {.gcsafe, raises: [].} =
   if node.isNil or session.isNil:
     return @[]
-  if node.usesLsmrPrimary():
-    let start = ord(session.nextPriority)
-    for offset in 0 .. 2:
-      let priority = OutboundSubmitPriority((start + offset) mod 3)
-      case priority
-      of ospEvent:
-        if session.eventQueue.len == 0:
-          continue
-        while session.eventQueue.len > 0 and result.len < FabricOutboundSubmitBatchLimit:
-          result.add(session.eventQueue.popFirst())
-      of ospAttestation:
-        if session.attestationQueue.len == 0:
-          continue
-        while session.attestationQueue.len > 0 and result.len < FabricOutboundSubmitBatchLimit:
-          result.add(session.attestationQueue.popFirst())
-      of ospOther:
-        if session.otherQueue.len == 0:
-          continue
-        result.add(session.otherQueue.popFirst())
-        if result[0].submitKind == oskEventCertificate:
-          while session.otherQueue.len > 0 and
-              result.len < FabricOutboundSubmitBatchLimit and
-              session.otherQueue.peekFirst().submitKind == oskEventCertificate:
-            result.add(session.otherQueue.popFirst())
-      if result.len > 0:
-        session.nextPriority = OutboundSubmitPriority((ord(priority) + 1) mod 3)
-        return result
-    return @[]
-  if session.eventQueue.len > 0:
+  case priority
+  of ospEvent:
     while session.eventQueue.len > 0 and result.len < FabricOutboundSubmitBatchLimit:
       result.add(session.eventQueue.popFirst())
-    return result
-  if session.attestationQueue.len > 0:
+  of ospAttestation:
     while session.attestationQueue.len > 0 and result.len < FabricOutboundSubmitBatchLimit:
       result.add(session.attestationQueue.popFirst())
-    return result
-  if session.otherQueue.len == 0:
-    return @[]
-  result.add(session.otherQueue.popFirst())
-  if result[0].submitKind == oskEventCertificate:
-    while session.otherQueue.len > 0 and
-        result.len < FabricOutboundSubmitBatchLimit and
-        session.otherQueue.peekFirst().submitKind == oskEventCertificate:
-      result.add(session.otherQueue.popFirst())
+  of ospOther:
+    if session.otherQueue.len == 0:
+      return @[]
+    result.add(session.otherQueue.popFirst())
+    if result[0].submitKind == oskEventCertificate:
+      while session.otherQueue.len > 0 and
+          result.len < FabricOutboundSubmitBatchLimit and
+          session.otherQueue.peekFirst().submitKind == oskEventCertificate:
+        result.add(session.otherQueue.popFirst())
 
-proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.async: (raises: []).}
+proc pushBatchFront(
+    session: OutboundPeerSession, items: openArray[OutboundSubmit]
+) {.gcsafe, raises: [].} =
+  if session.isNil or items.len == 0:
+    return
+  for idx in countdown(items.high, 0):
+    let item = items[idx]
+    case item.priority
+    of ospEvent:
+      session.eventQueue.addFirst(item)
+    of ospAttestation:
+      session.attestationQueue.addFirst(item)
+    of ospOther:
+      session.otherQueue.addFirst(item)
 
-proc scheduleOutboundSession(node: FabricNode, targetPeerId: string) {.gcsafe, raises: [].} =
+proc runOutboundSession(
+    node: FabricNode, targetPeerId: string, priority: OutboundSubmitPriority
+): Future[void] {.async: (raises: []).}
+
+proc scheduleOutboundSession(
+    node: FabricNode, targetPeerId: string, priority: OutboundSubmitPriority
+) {.gcsafe, raises: [].} =
   if node.isNil or not node.running or targetPeerId.len == 0:
     return
 
@@ -584,31 +696,48 @@ proc scheduleOutboundSession(node: FabricNode, targetPeerId: string) {.gcsafe, r
     if node.isNil or not node.running:
       return
     let session = node.outboundSessions.getOrDefault(targetPeerId)
-    if session.isNil or not session.hasPending():
+    if session.isNil or not session.hasPending(priority):
       return
-    if not session.runner.isNil and not session.runner.finished():
+    if session.blockedOnReady[priority] and node.usesLsmrPrimary() and
+        (node.network.isNil or not node.network.submitPeerReady(targetPeerId, submitLane(priority))):
       return
-    session.runner = node.runOutboundSession(targetPeerId)
-    asyncSpawn session.runner
+    session.blockedOnReady[priority] = false
+    if session.hasRunning(priority):
+      return
+    session.runners[priority] = node.runOutboundSession(targetPeerId, priority)
+    asyncSpawn session.runners[priority]
 
   callSoon(launch, cast[pointer](node))
 
-proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.async: (raises: []).} =
+proc runOutboundSession(
+    node: FabricNode, targetPeerId: string, priority: OutboundSubmitPriority
+): Future[void] {.async: (raises: []).} =
   if node.isNil:
     return
   let session = node.getOrCreateOutboundSession(targetPeerId)
-  while node.running and session.hasPending():
-    let items = node.popBatch(session)
+  while node.running and session.hasPending(priority):
+    if node.usesLsmrPrimary() and
+        (node.network.isNil or not node.network.submitPeerReady(targetPeerId, submitLane(priority))):
+      session.blockedOnReady[priority] = true
+      node.ensureLsmrSubmitRoute(targetPeerId, priority)
+      when defined(fabric_submit_diag):
+        echo "submit-track sender=", node.identity.account,
+          " target=", targetPeerId,
+          " lane=", $ord(priority),
+          " blocked=not-ready"
+      break
+    session.blockedOnReady[priority] = false
+    let items = node.popBatch(session, priority)
     if items.len == 0:
       break
     let item = items[0]
     try:
-      var acceptedMap = initTable[string, bool]()
+      var acceptedItems: seq[bool] = @[]
       let accepted =
         case item.submitKind
         of oskProc:
           let ok = await item.submit()
-          acceptedMap[item.itemKey] = ok
+          acceptedItems = @[ok]
           ok
         of oskEvent:
           var batch: seq[tuple[itemKey: string, event: FabricEvent, scopePrefix: LsmrPath]] = @[]
@@ -618,8 +747,8 @@ proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.
               event: batchItem.event,
               scopePrefix: batchItem.scopePrefix,
             ))
-          acceptedMap = await node.network.submitEventBatch(item.targetPeerId, batch)
-          acceptedMap.len > 0
+          acceptedItems = await node.network.submitEventBatch(item.targetPeerId, batch)
+          acceptedItems.len == items.len
         of oskAttestation:
           var batch: seq[tuple[itemKey: string, attestation: EventAttestation, scopePrefix: LsmrPath]] = @[]
           for batchItem in items:
@@ -628,8 +757,8 @@ proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.
               attestation: batchItem.attestation,
               scopePrefix: batchItem.scopePrefix,
             ))
-          acceptedMap = await node.network.submitAttestationBatch(item.targetPeerId, batch)
-          acceptedMap.len > 0
+          acceptedItems = await node.network.submitAttestationBatch(item.targetPeerId, batch)
+          acceptedItems.len == items.len
         of oskEventCertificate:
           var batch: seq[tuple[itemKey: string, eventCertificate: EventCertificate, scopePrefix: LsmrPath]] = @[]
           for batchItem in items:
@@ -638,16 +767,33 @@ proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.
               eventCertificate: batchItem.eventCertificate,
               scopePrefix: batchItem.scopePrefix,
             ))
-          acceptedMap = await node.network.submitEventCertificateBatch(item.targetPeerId, batch)
-          acceptedMap.len > 0
+          acceptedItems = await node.network.submitEventCertificateBatch(item.targetPeerId, batch)
+          acceptedItems.len == items.len
+      if node.usesLsmrPrimary() and acceptedItems.len == 0 and
+          (node.network.isNil or not node.network.submitPeerReady(item.targetPeerId, submitLane(priority))):
+        session.pushBatchFront(items)
+        session.blockedOnReady[priority] = true
+        node.ensureLsmrSubmitRoute(item.targetPeerId, priority)
+        when defined(fabric_submit_diag):
+          echo "submit-track sender=", node.identity.account,
+            " item=", item.itemKey,
+            " target=", item.targetPeerId,
+            " lane=", $ord(priority),
+            " batchItems=", items.len,
+            " blocked=not-ready-requeue"
+        break
       when defined(fabric_submit_diag):
         echo "submit-track sender=", node.identity.account,
           " item=", item.itemKey,
           " target=", item.targetPeerId,
+          " lane=", $ord(priority),
           " batchItems=", items.len,
+          " acked=", acceptedItems.countIt(it),
+          "/",
+          items.len,
           " accepted=", accepted
-      for batchItem in items:
-        let batchAccepted = acceptedMap.getOrDefault(batchItem.itemKey, false)
+      for idx, batchItem in items:
+        let batchAccepted = idx < acceptedItems.len and acceptedItems[idx]
         if batchAccepted:
           if not batchItem.onSuccess.isNil:
             batchItem.onSuccess()
@@ -655,10 +801,24 @@ proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.
           if not batchItem.onFailure.isNil:
             batchItem.onFailure()
     except CatchableError:
+      if node.usesLsmrPrimary() and
+          (node.network.isNil or not node.network.submitPeerReady(item.targetPeerId, submitLane(priority))):
+        session.pushBatchFront(items)
+        session.blockedOnReady[priority] = true
+        node.ensureLsmrSubmitRoute(item.targetPeerId, priority)
+        when defined(fabric_submit_diag):
+          echo "submit-track sender=", node.identity.account,
+            " item=", item.itemKey,
+            " target=", item.targetPeerId,
+            " lane=", $ord(priority),
+            " batchItems=", items.len,
+            " blocked=exception-requeue"
+        break
       when defined(fabric_submit_diag):
         echo "submit-track sender=", node.identity.account,
           " item=", item.itemKey,
           " target=", item.targetPeerId,
+          " lane=", $ord(priority),
           " batchItems=", items.len,
           " accepted=false exception=true"
       for batchItem in items:
@@ -667,11 +827,18 @@ proc runOutboundSession(node: FabricNode, targetPeerId: string): Future[void] {.
   let current = node.outboundSessions.getOrDefault(targetPeerId)
   if current.isNil:
     return
-  if current.hasPending():
-    current.runner = nil
-    node.scheduleOutboundSession(targetPeerId)
+  current.runners[priority] = nil
+  if current.hasPending(priority):
+    if current.blockedOnReady[priority] and node.usesLsmrPrimary() and
+        (node.network.isNil or not node.network.submitPeerReady(targetPeerId, submitLane(priority))):
+      return
+    node.scheduleOutboundSession(targetPeerId, priority)
     return
-  node.outboundSessions.del(targetPeerId)
+  if not current.hasPending() and
+      current.runners[ospEvent].isNil and
+      current.runners[ospAttestation].isNil and
+      current.runners[ospOther].isNil:
+    node.outboundSessions.del(targetPeerId)
 
 proc enqueueOutbound(
     node: FabricNode,
@@ -702,7 +869,7 @@ proc enqueueOutbound(
     session.attestationQueue.addLast(item)
   of ospOther:
     session.otherQueue.addLast(item)
-  node.scheduleOutboundSession(targetPeerId)
+  node.scheduleOutboundSession(targetPeerId, priority)
 
 proc bufferDeferredAttestation(node: FabricNode, att: EventAttestation): bool =
   if node.isNil or att.eventId.len == 0:
@@ -727,6 +894,7 @@ proc bufferDeferredEventCertificate(node: FabricNode, cert: EventCertificate): b
 proc replayDeferredAttestations(node: FabricNode, eventId: string)
 proc replayDeferredEventCertificates(node: FabricNode, eventId: string)
 proc registerEventCertificate(node: FabricNode, cert: EventCertificate): bool
+proc activateDependentDeliveries(node: FabricNode, eventId: string)
 
 proc enqueueEventOutbound(
     node: FabricNode,
@@ -751,7 +919,7 @@ proc enqueueEventOutbound(
     onFailure: onFailure,
   )
   session.eventQueue.addLast(item)
-  node.scheduleOutboundSession(targetPeerId)
+  node.scheduleOutboundSession(targetPeerId, ospEvent)
 
 proc enqueueAttestationOutbound(
     node: FabricNode,
@@ -776,7 +944,7 @@ proc enqueueAttestationOutbound(
     onFailure: onFailure,
   )
   session.attestationQueue.addLast(item)
-  node.scheduleOutboundSession(targetPeerId)
+  node.scheduleOutboundSession(targetPeerId, ospAttestation)
 
 proc enqueueEventCertificateOutbound(
     node: FabricNode,
@@ -801,7 +969,7 @@ proc enqueueEventCertificateOutbound(
     onFailure: onFailure,
   )
   session.otherQueue.addLast(item)
-  node.scheduleOutboundSession(targetPeerId)
+  node.scheduleOutboundSession(targetPeerId, ospOther)
 
 template submitTracked(
     node: FabricNode,
@@ -1066,6 +1234,16 @@ proc scheduleStateMaintenance(node: FabricNode) {.gcsafe, raises: [].} =
     return
   node.scheduleMaintenance(immediate = node.usesLsmrPrimary())
 
+proc scheduleReadyOutboundSessions(node: FabricNode) {.gcsafe, raises: [].} =
+  if node.isNil or not node.running:
+    return
+  for targetPeerId, session in node.outboundSessions.mpairs:
+    if session.isNil:
+      continue
+    for priority in [ospEvent, ospAttestation, ospOther]:
+      if session.hasPending(priority):
+        node.scheduleOutboundSession(targetPeerId, priority)
+
 proc currentLsmrOverlayDigest(node: FabricNode): string =
   if node.isNil or node.network.isNil or node.network.switch.isNil or
       node.network.switch.peerStore.isNil:
@@ -1076,16 +1254,39 @@ proc currentLsmrOverlayDigest(node: FabricNode): string =
   entries.sort(system.cmp[string])
   entries.join("|")
 
+proc currentLsmrSubmitReadyDigest(node: FabricNode): string =
+  if node.isNil or not node.usesLsmrPrimary() or node.network.isNil or
+      node.network.switch.isNil:
+    return ""
+  var seen = initHashSet[string]()
+  var entries: seq[string] = @[]
+  for peerId in node.network.switch.connectedPeers(Direction.Out) &
+      node.network.switch.connectedPeers(Direction.In):
+    let peerIdText = $peerId
+    if peerIdText in seen:
+      continue
+    seen.incl(peerIdText)
+    entries.add(peerIdText & "=" &
+      (if node.lsmrSubmitRouteReady(peerIdText): "1" else: "0"))
+  entries.sort(system.cmp[string])
+  entries.join("|")
+
 proc refreshLsmrPending(node: FabricNode) =
   if node.isNil or not node.usesLsmrPrimary():
     return
-  let digest = node.currentLsmrOverlayDigest()
-  if digest == node.lsmrOverlayDigest:
+  let overlayDigest = node.currentLsmrOverlayDigest()
+  let submitReadyDigest = node.currentLsmrSubmitReadyDigest()
+  if overlayDigest == node.lsmrOverlayDigest and
+      submitReadyDigest == node.lsmrSubmitReadyDigest:
     return
-  node.lsmrOverlayDigest = digest
+  node.lsmrOverlayDigest = overlayDigest
+  node.lsmrSubmitReadyDigest = submitReadyDigest
   var eventsQueued = 0
+  var eventsPaused = 0
   var attestationsQueued = 0
+  var attestationsPaused = 0
   var certificatesQueued = 0
+  var certificatesPaused = 0
   var candidatesQueued = 0
   var votesQueued = 0
   var checkpointsQueued = 0
@@ -1101,8 +1302,16 @@ proc refreshLsmrPending(node: FabricNode) =
       continue
     if eventId notin node.pendingEvents and not node.eventDeliveries.hasOutstandingDelivery(eventId):
       continue
-    if node.pendingEvents.enqueuePending(eventId):
-      inc eventsQueued
+    if node.eventHasRunnableLsmrDelivery(
+        event,
+        node.pendingEventScopes.pendingScopePrefixes(eventId),
+    ):
+      if node.pendingEvents.enqueuePending(eventId):
+        inc eventsQueued
+    else:
+      if eventId in node.pendingEvents:
+        inc eventsPaused
+      node.pendingEvents.excl(eventId)
   for eventId, attestations in node.eventAttestations.pairs:
     if eventId notin node.events or eventId in node.isolatedEvents:
       continue
@@ -1113,8 +1322,13 @@ proc refreshLsmrPending(node: FabricNode) =
       if key notin node.pendingAttestations and
           not node.attestationDeliveries.hasOutstandingDelivery(key):
         continue
-      if node.pendingAttestations.enqueuePending(key):
-        inc attestationsQueued
+      if node.attestationHasRunnableLsmrDelivery(node.events[eventId], att):
+        if node.pendingAttestations.enqueuePending(key):
+          inc attestationsQueued
+      else:
+        if key in node.pendingAttestations:
+          inc attestationsPaused
+        node.pendingAttestations.excl(key)
   for eventId, event in node.events.pairs:
     if eventId notin node.eventCertificates or eventId in node.isolatedEvents:
       continue
@@ -1124,8 +1338,16 @@ proc refreshLsmrPending(node: FabricNode) =
     if eventId notin node.pendingEventCertificates and
         not node.eventCertificateDeliveries.hasOutstandingDelivery(eventId):
       continue
-    if node.pendingEventCertificates.enqueuePending(eventId):
-      inc certificatesQueued
+    if node.eventCertificateHasRunnableLsmrDelivery(
+        node.events[eventId],
+        node.eventCertificates[eventId],
+    ):
+      if node.pendingEventCertificates.enqueuePending(eventId):
+        inc certificatesQueued
+    else:
+      if eventId in node.pendingEventCertificates:
+        inc certificatesPaused
+      node.pendingEventCertificates.excl(eventId)
   for candidateId, candidate in node.checkpointCandidates.pairs:
     if node.hasCheckpointForCandidate(candidateId):
       continue
@@ -1151,13 +1373,58 @@ proc refreshLsmrPending(node: FabricNode) =
   when defined(fabric_lsmr_diag) or defined(fabric_submit_diag):
     echo "lsmr-overlay-refresh account=", node.identity.account,
       " events=", eventsQueued,
+      " pausedEvents=", eventsPaused,
       " attestations=", attestationsQueued,
+      " pausedAttestations=", attestationsPaused,
       " certs=", certificatesQueued,
+      " pausedCerts=", certificatesPaused,
       " candidates=", candidatesQueued,
       " votes=", votesQueued,
       " checkpoints=", checkpointsQueued,
       " proposals=", proposalsQueued,
-      " approvals=", approvalsQueued
+      " approvals=", approvalsQueued,
+      " readyPeers=", submitReadyDigest
+
+proc pruneLsmrPending(node: FabricNode) =
+  if node.isNil or not node.usesLsmrPrimary():
+    return
+  var pausedEvents = 0
+  var pausedAttestations = 0
+  var pausedCertificates = 0
+  for eventId in node.pendingEvents.toSeq():
+    if eventId notin node.events or eventId in node.isolatedEvents or
+        eventId in node.eventCertificates:
+      continue
+    if not node.eventHasRunnableLsmrDelivery(
+        node.events[eventId],
+        node.pendingEventScopes.pendingScopePrefixes(eventId),
+    ):
+      node.pendingEvents.excl(eventId)
+      inc pausedEvents
+  for key in node.pendingAttestations.toSeq():
+    let att = node.attestationForKey(key)
+    if att.isNone() or att.get().eventId notin node.events or
+        att.get().eventId in node.eventCertificates:
+      continue
+    if not node.attestationHasRunnableLsmrDelivery(node.events[att.get().eventId], att.get()):
+      node.pendingAttestations.excl(key)
+      inc pausedAttestations
+  for eventId in node.pendingEventCertificates.toSeq():
+    if eventId notin node.events or eventId notin node.eventCertificates or
+        eventId in node.isolatedEvents:
+      continue
+    if not node.eventCertificateHasRunnableLsmrDelivery(
+        node.events[eventId],
+        node.eventCertificates[eventId],
+    ):
+      node.pendingEventCertificates.excl(eventId)
+      inc pausedCertificates
+  when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+    if pausedEvents > 0 or pausedAttestations > 0 or pausedCertificates > 0:
+      echo "lsmr-pending-prune account=", node.identity.account,
+        " events=", pausedEvents,
+        " attestations=", pausedAttestations,
+        " certs=", pausedCertificates
 
 proc uniqueRoutingPeers(routes: openArray[RoutingPeer]): seq[RoutingPeer] =
   var seenPeerIds = initHashSet[string]()
@@ -1190,6 +1457,7 @@ proc installRouteAddrs(node: FabricNode, routes: openArray[RoutingPeer]) =
         addrs.add(parsed.get())
     if addrs.len > 0:
       node.network.switch.peerStore.setAddresses(peerId, addrs)
+      node.network.rememberSubmitPeerAddrs(peerId, addrs)
 
 proc eventWitnessRoutes(event: FabricEvent): seq[RoutingPeer] =
   if event.witnessRoutes.len > 0:
@@ -1754,6 +2022,16 @@ proc registerEvent(node: FabricNode, event: FabricEvent): bool =
     echo "register-stage done account=", node.identity.account, " event=", event.eventId
   true
 
+proc activateDependentDeliveries(node: FabricNode, eventId: string) =
+  if node.isNil or eventId.len == 0:
+    return
+  if eventId in node.eventCertificates:
+    discard node.pendingEventCertificates.enqueuePending(eventId)
+  else:
+    for att in node.eventAttestations.getOrDefault(eventId, @[]):
+      discard node.pendingAttestations.enqueuePending(att.attestationKey())
+  node.scheduleStateMaintenance()
+
 proc registerEventCertificate(node: FabricNode, cert: EventCertificate): bool =
   when defined(fabric_diag):
     echo "register-cert-start ", node.identity.account, " event=", cert.eventId
@@ -1787,6 +2065,7 @@ proc registerEventCertificate(node: FabricNode, cert: EventCertificate): bool =
   when defined(fabric_submit_diag):
     echo "cert-stage register account=", node.identity.account,
       " event=", cert.eventId,
+      " pendingEvents-before=", node.pendingEvents.len,
       " pendingAtts-before=", node.pendingAttestations.len,
       " lsmrPrimary=", node.usesLsmrPrimary()
   node.completeEventDelivery(cert.eventId)
@@ -1794,6 +2073,7 @@ proc registerEventCertificate(node: FabricNode, cert: EventCertificate): bool =
   when defined(fabric_submit_diag):
     echo "cert-stage register account=", node.identity.account,
       " event=", cert.eventId,
+      " pendingEvents-after=", node.pendingEvents.len,
       " pendingAtts-after=", node.pendingAttestations.len
   discard node.pendingEventCertificates.enqueuePending(cert.eventId)
   node.scheduleStateMaintenance()
@@ -2143,7 +2423,7 @@ template queueScopedEventSubmit(
       if acknowledgeDelivery(deliveryBook, itemKey, targetKey):
         pendingBook.excl(itemKey)
         clearPendingScopePrefixes(scopeBook, itemKey)
-        clearDeliveryState(deliveryBook, itemKey)
+      node.activateDependentDeliveries(itemKey)
     proc handleFailure() {.gcsafe, raises: [].} =
       clearForwarded(forwardedBook, itemKey, targetKey)
       failInflightDelivery(deliveryBook, itemKey, targetKey)
@@ -2172,7 +2452,6 @@ template queueScopedAttestationSubmit(
       if acknowledgeDelivery(deliveryBook, itemKey, targetKey):
         pendingBook.excl(itemKey)
         clearPendingScopePrefixes(scopeBook, itemKey)
-        clearDeliveryState(deliveryBook, itemKey)
     proc handleFailure() {.gcsafe, raises: [].} =
       clearForwarded(forwardedBook, itemKey, targetKey)
       failInflightDelivery(deliveryBook, itemKey, targetKey)
@@ -2208,7 +2487,6 @@ template queueScopedEventCertificateSubmit(
       if acknowledgeDelivery(deliveryBook, itemKey, targetKey):
         pendingBook.excl(itemKey)
         clearPendingScopePrefixes(scopeBook, itemKey)
-        clearDeliveryState(deliveryBook, itemKey)
     proc handleFailure() {.gcsafe, raises: [].} =
       clearForwarded(forwardedBook, itemKey, targetKey)
       failInflightDelivery(deliveryBook, itemKey, targetKey)
@@ -2398,6 +2676,63 @@ proc lsmrRelayRoutes(
       ):
         result.add((route: peerRoute, scope: targetPath))
 
+proc eventHasRunnableLsmrDelivery(
+    node: FabricNode, event: FabricEvent, scopePrefixes: seq[LsmrPath]
+): bool =
+  if node.isNil:
+    return false
+  if not node.usesLsmrPrimary():
+    return true
+  let routes = node.lsmrRelayRoutes(relayTargetPaths(node.allRoutingPaths(), scopePrefixes))
+  for route in routes:
+    if route.route.account == node.identity.account or route.route.peerId.len == 0:
+      continue
+    let targetKey = deliveryTargetKey(route.route.peerId, route.scope)
+    if not deliveryNeedsAttempt(node.eventDeliveries, event.eventId, targetKey):
+      continue
+    if node.lsmrSubmitRouteReady(route.route.peerId, ospEvent):
+      return true
+  false
+
+proc attestationHasRunnableLsmrDelivery(
+    node: FabricNode, event: FabricEvent, att: EventAttestation
+): bool =
+  if node.isNil:
+    return false
+  if not node.usesLsmrPrimary():
+    return true
+  let stateAtEra = node.replayState(event.clock.era)
+  let routes = uniqueRelayRoutesByPeer(node.lsmrRelayRoutes(node.validatorPaths(stateAtEra)))
+  for route in routes:
+    if route.route.account == node.identity.account or route.route.peerId.len == 0:
+      continue
+    let targetPeerId = route.route.peerId
+    let targetKey = deliveryTargetKey(targetPeerId)
+    if not deliveryNeedsAttempt(node.attestationDeliveries, att.attestationKey(), targetKey):
+      continue
+    if node.lsmrSubmitRouteReady(targetPeerId, ospAttestation):
+      return true
+  false
+
+proc eventCertificateHasRunnableLsmrDelivery(
+    node: FabricNode, event: FabricEvent, cert: EventCertificate
+): bool =
+  if node.isNil:
+    return false
+  if not node.usesLsmrPrimary():
+    return true
+  let routes = uniqueRelayRoutesByPeer(node.lsmrRelayRoutes(node.allRoutingPaths()))
+  for route in routes:
+    if route.route.account == node.identity.account or route.route.peerId.len == 0:
+      continue
+    let targetPeerId = route.route.peerId
+    let targetKey = deliveryTargetKey(targetPeerId)
+    if not deliveryNeedsAttempt(node.eventCertificateDeliveries, cert.eventId, targetKey):
+      continue
+    if node.lsmrSubmitRouteReady(targetPeerId, ospOther):
+      return true
+  false
+
 proc disseminateEvent(node: FabricNode, event: FabricEvent, scopePrefixes: seq[LsmrPath] = @[]) =
   let component = node.componentNodes()
   let scope = node.routeScope(event, component)
@@ -2423,14 +2758,14 @@ proc disseminateEvent(node: FabricNode, event: FabricEvent, scopePrefixes: seq[L
           let relayScope = route.scope
           let targetKey = deliveryTargetKey(targetPeerId, relayScope)
           registerDeliveryTarget(node.eventDeliveries, event.eventId, targetKey)
-          if not node.lsmrSubmitRouteReady(targetPeerId):
+          if not node.lsmrSubmitRouteReady(targetPeerId, ospEvent):
             when defined(fabric_submit_diag):
               echo "submit-defer account=", node.identity.account,
                 " item=", event.eventId,
                 " target=", targetPeerId,
                 " scope=", $relayScope,
                 " session={", node.network.submitPeerDiag(targetPeerId), "}"
-            node.ensureLsmrSubmitRoute(targetPeerId)
+            node.ensureLsmrSubmitRoute(targetPeerId, ospEvent)
             continue
           block:
             let submitTargetPeerId = targetPeerId
@@ -2448,6 +2783,8 @@ proc disseminateEvent(node: FabricNode, event: FabricEvent, scopePrefixes: seq[L
             )
         else:
           node.submitFuture(node.network.submitEvent(route.route.peerId, event))
+    if node.usesLsmrPrimary():
+      node.pendingEvents.excl(event.eventId)
 
 proc disseminateAttestation(
     node: FabricNode,
@@ -2480,14 +2817,14 @@ proc disseminateAttestation(
           let targetPeerId = route.route.peerId
           let targetKey = deliveryTargetKey(targetPeerId)
           registerDeliveryTarget(node.attestationDeliveries, att.attestationKey(), targetKey)
-          if not node.lsmrSubmitRouteReady(targetPeerId):
+          if not node.lsmrSubmitRouteReady(targetPeerId, ospAttestation):
             when defined(fabric_submit_diag):
               echo "submit-defer account=", node.identity.account,
                 " item=", att.attestationKey(),
                 " target=", targetPeerId,
                 " scope=@[]",
                 " session={", node.network.submitPeerDiag(targetPeerId), "}"
-            node.ensureLsmrSubmitRoute(targetPeerId)
+            node.ensureLsmrSubmitRoute(targetPeerId, ospAttestation)
             continue
           block:
             let submitTargetPeerId = targetPeerId
@@ -2504,6 +2841,8 @@ proc disseminateAttestation(
             )
         else:
           node.submitFuture(node.network.submitAttestation(route.route.peerId, att))
+    if node.usesLsmrPrimary():
+      node.pendingAttestations.excl(att.attestationKey())
 
 proc disseminateEventCertificate(
     node: FabricNode,
@@ -2535,14 +2874,14 @@ proc disseminateEventCertificate(
           let targetPeerId = route.route.peerId
           let targetKey = deliveryTargetKey(targetPeerId)
           registerDeliveryTarget(node.eventCertificateDeliveries, cert.eventId, targetKey)
-          if not node.lsmrSubmitRouteReady(targetPeerId):
+          if not node.lsmrSubmitRouteReady(targetPeerId, ospOther):
             when defined(fabric_submit_diag):
               echo "submit-defer account=", node.identity.account,
                 " item=", cert.eventId,
                 " target=", targetPeerId,
                 " scope=@[]",
                 " session={", node.network.submitPeerDiag(targetPeerId), "}"
-            node.ensureLsmrSubmitRoute(targetPeerId)
+            node.ensureLsmrSubmitRoute(targetPeerId, ospOther)
             continue
           block:
             let submitTargetPeerId = targetPeerId
@@ -2559,6 +2898,8 @@ proc disseminateEventCertificate(
             )
         else:
           node.submitFuture(node.network.submitEventCertificate(route.route.peerId, cert))
+    if node.usesLsmrPrimary():
+      node.pendingEventCertificates.excl(cert.eventId)
 
 proc disseminateCheckpointCandidate(node: FabricNode, candidate: CheckpointCandidate) =
   discard shareCandidate(node.componentNodes(), candidate)
@@ -2912,23 +3253,69 @@ proc flushTouchedLsmr(
         " scope=@[]"
     node.disseminateEventCertificate(node.events[eventId], node.eventCertificates[eventId])
 
+proc advanceLocalAcceptedEvent(
+    node: FabricNode,
+    eventId: string,
+) =
+  if node.isNil or eventId.len == 0 or eventId notin node.events or eventId in node.isolatedEvents:
+    return
+  var touchedAttestationKeys: seq[string] = @[]
+  var touchedEventCertificateIds: seq[string] = @[]
+  let touchedEvents = @[eventId]
+  let touchedEventScopes = initTable[string, seq[LsmrPath]]()
+  when defined(fabric_submit_diag):
+    echo "submit-stage local-advance account=", node.identity.account,
+      " event=", eventId
+  node.advanceTouchedInbound(
+    touchedEvents,
+    touchedAttestationKeys,
+    touchedEventCertificateIds,
+  )
+  node.flushTouchedLsmr(
+    touchedEvents,
+    touchedEventScopes,
+    touchedAttestationKeys,
+    touchedEventCertificateIds,
+  )
+
 proc scheduleInboundDrain(node: FabricNode) {.gcsafe, raises: [].} =
-  if node.isNil or node.inboundScheduled:
+  if node.isNil:
+    return
+  if not node.inboundRunner.isNil and not node.inboundRunner.finished():
+    node.inboundPending = true
     return
   node.inboundScheduled = true
-  proc drainCallback(udata: pointer) {.gcsafe, raises: [].} =
-    let node = cast[FabricNode](udata)
-    if node.isNil:
-      return
-    node.inboundScheduled = false
-    try:
-      {.cast(gcsafe).}:
-        node.drainInbound()
-    except Exception:
-      discard
-    if node.inbound.len > 0:
-      node.scheduleInboundDrain()
-  callSoon(drainCallback, cast[pointer](node))
+  node.inboundPending = false
+  node.inboundRunner = node.runInboundDrain()
+  asyncSpawn node.inboundRunner
+
+proc runInboundDrain(node: FabricNode): Future[void] {.async: (raises: []).} =
+  if node.isNil:
+    return
+  try:
+    while node.running:
+      let startedAtMs = diagNowMs()
+      let hasMore =
+        try:
+          {.cast(gcsafe).}:
+            node.drainInbound()
+        except Exception:
+          false
+      node.noteInboundSlice(diagNowMs() - startedAtMs)
+      if not hasMore and not node.inboundPending:
+        break
+      node.inboundPending = false
+      await sleepAsync(FabricInboundDrainYield)
+  except CancelledError:
+    discard
+  finally:
+    if not node.isNil:
+      node.inboundScheduled = false
+      node.inboundRunner = nil
+      let rerun = node.inboundPending or node.inbound.len > 0
+      node.inboundPending = false
+      if node.running and rerun:
+        node.scheduleInboundDrain()
 
 proc enqueueInbound(node: FabricNode, message: sink InboundMessage) {.gcsafe, raises: [].} =
   node.inbound.addLast(message)
@@ -2999,7 +3386,9 @@ proc fetchLookupRaw(node: FabricNode, key: string): Option[seq[byte]] {.gcsafe, 
     discard
   none(seq[byte])
 
-proc drainInbound(node: FabricNode) =
+proc drainInbound(node: FabricNode): bool {.raises: [].} =
+  if node.isNil or not node.running:
+    return false
   var changed = false
   var touchedEvents: seq[string] = @[]
   var touchedEventScopes = initTable[string, seq[LsmrPath]]()
@@ -3112,8 +3501,7 @@ proc drainInbound(node: FabricNode) =
           echo "converge-done ", node.identity.account
     except Exception:
       discard
-  if node.inbound.len > 0 and node.running:
-    node.scheduleInboundDrain()
+  node.inbound.len > 0
 
 proc bootstrapRoutingSnapshot(node: FabricNode): Future[seq[PeerAnnouncement]] {.async: (raises: []).} =
   if node.network.isNil:
@@ -3193,11 +3581,12 @@ proc connectedPeerIds(node: FabricNode): seq[string] =
     seen.incl(peerIdText)
     result.add(peerIdText)
 
-proc maintenanceStep(node: FabricNode) =
+proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
   if node.isNil or not node.running:
-    return
+    return false
   try:
-    node.drainInbound()
+    if node.drainInbound():
+      result = true
     node.refreshLsmrPending()
     var budgetExhausted = false
     when defined(fabric_submit_diag):
@@ -3280,7 +3669,15 @@ proc maintenanceStep(node: FabricNode) =
         node.disseminateEventCertificate(node.events[eventId], node.eventCertificates[eventId])
       except Exception as exc:
         node.logMaintenanceError("event-certificate", eventId, exc)
-    for candidateId in node.pendingCheckpointCandidates.sortedKeys():
+    node.pruneLsmrPending()
+    let checkpointCandidateKeys = node.pendingCheckpointCandidates.sortedKeys()
+    if checkpointCandidateKeys.len > FabricMaintenanceBatchLimit:
+      budgetExhausted = true
+    for candidateId in rotatePendingKeys(
+        checkpointCandidateKeys,
+        node.checkpointCandidateMaintenanceCursor,
+        FabricMaintenanceBatchLimit,
+    ):
       if candidateId notin node.checkpointCandidates or node.hasCheckpointForCandidate(candidateId):
         node.pendingCheckpointCandidates.excl(candidateId)
         continue
@@ -3288,7 +3685,14 @@ proc maintenanceStep(node: FabricNode) =
         node.disseminateCheckpointCandidate(node.checkpointCandidates[candidateId])
       except Exception as exc:
         node.logMaintenanceError("checkpoint-candidate", candidateId, exc)
-    for key in node.pendingCheckpointVotes.sortedKeys():
+    let checkpointVoteKeys = node.pendingCheckpointVotes.sortedKeys()
+    if checkpointVoteKeys.len > FabricMaintenanceBatchLimit:
+      budgetExhausted = true
+    for key in rotatePendingKeys(
+        checkpointVoteKeys,
+        node.checkpointVoteMaintenanceCursor,
+        FabricMaintenanceBatchLimit,
+    ):
       let vote = node.checkpointVoteForKey(key)
       if vote.isNone() or node.hasCheckpointForCandidate(vote.get().candidateId):
         node.pendingCheckpointVotes.excl(key)
@@ -3297,7 +3701,14 @@ proc maintenanceStep(node: FabricNode) =
         node.disseminateCheckpointVote(vote.get())
       except Exception as exc:
         node.logMaintenanceError("checkpoint-vote", key, exc)
-    for checkpointId in node.pendingCheckpointBundles.sortedKeys():
+    let checkpointBundleKeys = node.pendingCheckpointBundles.sortedKeys()
+    if checkpointBundleKeys.len > FabricMaintenanceBatchLimit:
+      budgetExhausted = true
+    for checkpointId in rotatePendingKeys(
+        checkpointBundleKeys,
+        node.checkpointBundleMaintenanceCursor,
+        FabricMaintenanceBatchLimit,
+    ):
       if checkpointId notin node.checkpoints or checkpointId notin node.checkpointSnapshots:
         node.pendingCheckpointBundles.excl(checkpointId)
         continue
@@ -3305,7 +3716,14 @@ proc maintenanceStep(node: FabricNode) =
         node.disseminateCheckpoint(node.checkpoints[checkpointId], node.checkpointSnapshots[checkpointId])
       except Exception as exc:
         node.logMaintenanceError("checkpoint-bundle", checkpointId, exc)
-    for proposalId in node.pendingAvoProposals.sortedKeys():
+    let avoProposalKeys = node.pendingAvoProposals.sortedKeys()
+    if avoProposalKeys.len > FabricMaintenanceBatchLimit:
+      budgetExhausted = true
+    for proposalId in rotatePendingKeys(
+        avoProposalKeys,
+        node.avoProposalMaintenanceCursor,
+        FabricMaintenanceBatchLimit,
+    ):
       if proposalId notin node.avoProposals:
         node.pendingAvoProposals.excl(proposalId)
         continue
@@ -3313,7 +3731,14 @@ proc maintenanceStep(node: FabricNode) =
         node.disseminateAvoProposal(node.avoProposals[proposalId])
       except Exception as exc:
         node.logMaintenanceError("avo-proposal", proposalId, exc)
-    for key in node.pendingAvoApprovals.sortedKeys():
+    let avoApprovalKeys = node.pendingAvoApprovals.sortedKeys()
+    if avoApprovalKeys.len > FabricMaintenanceBatchLimit:
+      budgetExhausted = true
+    for key in rotatePendingKeys(
+        avoApprovalKeys,
+        node.avoApprovalMaintenanceCursor,
+        FabricMaintenanceBatchLimit,
+    ):
       let parts = key.split(":")
       if parts.len != 2 or parts[0] notin node.avoProposals or
           parts[1] notin node.avoApprovals.getOrDefault(parts[0], @[]):
@@ -3329,9 +3754,10 @@ proc maintenanceStep(node: FabricNode) =
           " pendingEvents=", node.pendingEvents.len,
           " pendingAttestations=", node.pendingAttestations.len,
           " pendingEventCerts=", node.pendingEventCertificates.len
-      node.scheduleMaintenance(immediate = true)
+    result = result or budgetExhausted
   except Exception as exc:
     node.logMaintenanceError("maintenance-step", "", exc)
+    return false
 
 proc logMaintenanceError(
     node: FabricNode, phase, itemKey: string, exc: ref Exception
@@ -3343,55 +3769,58 @@ proc logMaintenanceError(
     " item=", itemKey,
     " err=", exc.msg
 
+proc maintenanceLoop(node: FabricNode, initialDelayMs: int) {.async: (raises: []).} =
+  if node.isNil:
+    return
+  try:
+    if initialDelayMs > 0:
+      await sleepAsync(initialDelayMs)
+    while node.running:
+      if not node.maintenancePending and not node.maintenanceImmediatePending:
+        break
+      node.maintenancePending = false
+      node.maintenanceImmediatePending = false
+      let startedAtMs = diagNowMs()
+      let needsContinue =
+        try:
+          {.cast(gcsafe).}:
+            node.maintenanceStep()
+        except Exception:
+          false
+      node.noteMaintenanceSlice(diagNowMs() - startedAtMs)
+      if needsContinue:
+        node.maintenanceImmediatePending = true
+      if not node.maintenancePending and not node.maintenanceImmediatePending:
+        break
+      await sleepAsync(FabricMaintenanceYield)
+  except CancelledError:
+    discard
+  finally:
+    if not node.isNil:
+      node.maintenanceScheduled = false
+      node.maintenanceImmediateScheduled = false
+      node.maintenanceRunner = nil
+      if node.running and (node.maintenancePending or node.maintenanceImmediatePending):
+        node.scheduleMaintenance(immediate = node.maintenanceImmediatePending)
+
 proc scheduleMaintenance(node: FabricNode, immediate = false) {.gcsafe, raises: [].} =
   if node.isNil or not node.running:
     return
-
-  proc runMaintenance(udata: pointer) {.gcsafe, raises: [].} =
-    let node = cast[FabricNode](udata)
-    if node.isNil or not node.running:
-      return
-    try:
-      {.cast(gcsafe).}:
-        node.maintenanceStep()
-    except Exception:
-      discard
-
   if immediate:
-    if node.maintenanceImmediateScheduled:
-      return
-    inc node.maintenanceGeneration
-    node.maintenanceImmediateScheduled = true
-    let expectedGeneration = node.maintenanceGeneration
-    proc immediateTick(udata: pointer) {.gcsafe, raises: [].} =
-      let node = cast[FabricNode](udata)
-      if node.isNil:
-        return
-      node.maintenanceImmediateScheduled = false
-      if not node.running or node.maintenanceGeneration != expectedGeneration:
-        return
-      runMaintenance(udata)
-    callSoon(immediateTick, cast[pointer](node))
-    return
-
-  if node.maintenanceScheduled:
+    node.maintenanceImmediatePending = true
+  node.maintenancePending = true
+  if not node.maintenanceRunner.isNil and not node.maintenanceRunner.finished():
     return
   node.maintenanceScheduled = true
-  let scheduledGeneration = node.maintenanceGeneration
-
-  proc maintenanceTick() {.async, gcsafe.} =
+  node.maintenanceImmediateScheduled = immediate
+  let initialDelayMs = if immediate: 0 else: 250
+  proc runner() {.async, gcsafe.} =
     try:
-      await sleepAsync(250)
+      await node.maintenanceLoop(initialDelayMs)
     except CancelledError:
       discard
-    if node.isNil:
-      return
-    node.maintenanceScheduled = false
-    if not node.running or node.maintenanceGeneration != scheduledGeneration:
-      return
-    runMaintenance(cast[pointer](node))
-
-  asyncSpawn maintenanceTick()
+  node.maintenanceRunner = runner()
+  asyncSpawn node.maintenanceRunner
 
 proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: LsmrPath = @[]): FabricNode =
   result = FabricNode(
@@ -3434,11 +3863,20 @@ proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: Lsmr
     latestCheckpointId: "",
     inbound: initDeque[InboundMessage](),
     inboundScheduled: false,
+    inboundPending: false,
+    inboundRunner: nil,
+    slowInboundSliceCount: 0,
+    maxInboundSliceElapsedMs: 0,
     connectedHandler: nil,
     syncingRoutingPeers: initHashSet[string](),
     maintenanceScheduled: false,
     maintenanceImmediateScheduled: false,
     maintenanceGeneration: 0'u64,
+    maintenancePending: false,
+    maintenanceImmediatePending: false,
+    maintenanceRunner: nil,
+    slowMaintenanceSliceCount: 0,
+    maxMaintenanceSliceElapsedMs: 0,
     forwardedEvents: initTable[string, HashSet[string]](),
     forwardedAttestations: initTable[string, HashSet[string]](),
     forwardedEventCertificates: initTable[string, HashSet[string]](),
@@ -3464,7 +3902,13 @@ proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: Lsmr
     eventMaintenanceCursor: 0,
     attestationMaintenanceCursor: 0,
     eventCertificateMaintenanceCursor: 0,
+    checkpointCandidateMaintenanceCursor: 0,
+    checkpointVoteMaintenanceCursor: 0,
+    checkpointBundleMaintenanceCursor: 0,
+    avoProposalMaintenanceCursor: 0,
+    avoApprovalMaintenanceCursor: 0,
     lsmrOverlayDigest: "",
+    lsmrSubmitReadyDigest: "",
     outboundSessions: initTable[string, OutboundPeerSession](),
   )
   result.routingPeers[identity.account] = RoutingPeer(
@@ -3574,23 +4018,20 @@ proc start*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
       node.network.switch.setTopologyChangedHook(proc() {.gcsafe, raises: [].} =
         if not node.isNil and node.running and node.usesLsmrPrimary():
           node.network.scheduleWarmSubmitConnections()
+          node.scheduleReadyOutboundSessions()
           node.scheduleMaintenance(immediate = true)
       )
       node.network.setSubmitReadyHook(proc() {.gcsafe, raises: [].} =
         if not node.isNil and node.running and node.usesLsmrPrimary():
+          node.scheduleReadyOutboundSessions()
           node.scheduleMaintenance(immediate = true)
       )
-      if node.usesLsmrPrimary():
-        node.network.scheduleWarmSubmitConnections()
       node.connectedHandler = proc(
           peerId: PeerId, event: ConnEvent
       ): Future[void] {.gcsafe, async: (raises: [CancelledError]).} =
         if event.kind != ConnEventKind.Connected:
           return
         if peerId == node.identity.peerId:
-          return
-        if node.usesLsmrPrimary():
-          node.network.ensureSubmitPeerConnectivity(peerIdString(peerId))
           return
         if not node.usesLsmrPrimary():
           try:
@@ -3610,6 +4051,13 @@ proc stop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
   node.running = false
   node.maintenanceScheduled = false
   node.maintenanceImmediateScheduled = false
+  node.inboundPending = false
+  node.maintenancePending = false
+  node.maintenanceImmediatePending = false
+  if not node.inboundRunner.isNil and not node.inboundRunner.finished():
+    node.inboundRunner.cancelSoon()
+  if not node.maintenanceRunner.isNil and not node.maintenanceRunner.finished():
+    node.maintenanceRunner.cancelSoon()
   if not node.connectedHandler.isNil and not node.network.isNil and not node.network.switch.isNil:
     node.network.switch.removeConnEventHandler(node.connectedHandler, ConnEventKind.Connected)
     node.connectedHandler = nil
@@ -3804,7 +4252,7 @@ proc submitTx*(node: FabricNode, tx: Tx): SubmitEventResult =
     if node.inbound.len > 0:
       node.scheduleInboundDrain()
   else:
-    node.drainInbound()
+    discard node.drainInbound()
   when defined(fabric_submit_diag):
     echo "submit-stage drained sender=", tx.sender, " nonce=", tx.nonce
   let event = node.buildEvent(tx)
@@ -3815,23 +4263,10 @@ proc submitTx*(node: FabricNode, tx: Tx): SubmitEventResult =
       " accepted=", result.accepted, " event=", result.eventId
   if result.accepted:
     if node.usesLsmrPrimary():
-      let touchedEvents = @[event.eventId]
-      var touchedAttestationKeys: seq[string] = @[]
-      var touchedEventCertificateIds: seq[string] = @[]
-      node.advanceTouchedInbound(
-        touchedEvents,
-        touchedAttestationKeys,
-        touchedEventCertificateIds,
-      )
-      node.flushTouchedLsmr(
-        touchedEvents,
-        initTable[string, seq[LsmrPath]](),
-        touchedAttestationKeys,
-        touchedEventCertificateIds,
-      )
-      node.scheduleMaintenance(immediate = true)
+      node.advanceLocalAcceptedEvent(event.eventId)
       when defined(fabric_submit_diag):
-        echo "submit-stage deferred-converge sender=", tx.sender, " nonce=", tx.nonce
+        echo "submit-stage converged sender=", tx.sender, " nonce=", tx.nonce,
+          " mode=local"
   else:
     node.converge()
     when defined(fabric_submit_diag):
@@ -3844,7 +4279,7 @@ proc submitTx*(node: FabricNode, tx: Tx): SubmitEventResult =
 proc fabricStatus*(node: FabricNode): FabricStatusSnapshot =
   when defined(fabric_diag):
     echo "status-start ", node.identity.account, " inbound=", len(node.inbound)
-  node.drainInbound()
+  discard node.drainInbound()
   when defined(fabric_diag):
     echo "status-drained ", node.identity.account, " inbound=", len(node.inbound)
   let frontier = frontierDigest(node.certifiedEvents())
@@ -3874,18 +4309,38 @@ proc fabricStatus*(node: FabricNode): FabricStatusSnapshot =
         @[],
   )
 
+proc slowInboundSlices*(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  if node.isNil:
+    return -1
+  node.slowInboundSliceCount
+
+proc maxInboundSliceMs*(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  if node.isNil:
+    return -1
+  node.maxInboundSliceElapsedMs
+
+proc slowMaintenanceSlices*(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  if node.isNil:
+    return -1
+  node.slowMaintenanceSliceCount
+
+proc maxMaintenanceSliceMs*(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  if node.isNil:
+    return -1
+  node.maxMaintenanceSliceElapsedMs
+
 proc getEvent*(node: FabricNode, eventId: string): Option[FabricEvent] =
-  node.drainInbound()
+  discard node.drainInbound()
   node.eventById(eventId)
 
 proc getEventCertificate*(node: FabricNode, eventId: string): Option[EventCertificate] =
-  node.drainInbound()
+  discard node.drainInbound()
   if node.eventCertificates.hasKey(eventId):
     return some(node.eventCertificates[eventId])
   none(EventCertificate)
 
 proc getCheckpoint*(node: FabricNode, checkpointId = ""): Option[CheckpointCertificate] =
-  node.drainInbound()
+  discard node.drainInbound()
   let targetId = if checkpointId.len > 0: checkpointId else: node.latestCheckpointId
   node.checkpointById(targetId)
 
@@ -3893,7 +4348,7 @@ proc snapshotState(node: FabricNode, checkpointId = ""): Option[ChainState] =
   node.checkpointState(checkpointId)
 
 proc publishTasks*(node: FabricNode, checkpointId = ""): seq[PublishTaskSnapshot] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isNone():
     return @[]
@@ -3902,14 +4357,14 @@ proc publishTasks*(node: FabricNode, checkpointId = ""): seq[PublishTaskSnapshot
   result.sort(proc(a, b: PublishTaskSnapshot): int = cmp(b.updatedAt, a.updatedAt))
 
 proc feedSnapshot*(node: FabricNode, limit = 50, checkpointId = ""): seq[SocialFeedItemSnapshot] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isSome():
     return state.get().socialFeedSnapshot(limit)
   @[]
 
 proc contentDetail*(node: FabricNode, contentId: string, checkpointId = ""): Option[SocialContentDetailSnapshot] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isNone():
     return none(SocialContentDetailSnapshot)
@@ -3918,35 +4373,35 @@ proc contentDetail*(node: FabricNode, contentId: string, checkpointId = ""): Opt
   some(state.get().socialContentDetailSnapshot(contentId))
 
 proc reportList*(node: FabricNode, contentId = "", checkpointId = ""): seq[ReportTicket] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isSome():
     return state.get().reportList(contentId)
   @[]
 
 proc creditBalance*(node: FabricNode, owner: string, checkpointId = ""): Option[CreditBalanceSnapshot] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isNone():
     return none(CreditBalanceSnapshot)
   some(state.get().creditBalanceSnapshot(owner))
 
 proc mintIntentStatus*(node: FabricNode, mintIntentId: string, checkpointId = ""): Option[MintIntentStatus] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isNone() or mintIntentId notin state.get().mintIntents:
     return none(MintIntentStatus)
   some(state.get().mintIntentStatusSnapshot(mintIntentId))
 
 proc resolveName*(node: FabricNode, name: string, nowTs: int64, checkpointId = ""): Option[NameRecordSnapshot] =
-  node.drainInbound()
+  discard node.drainInbound()
   let state = node.snapshotState(checkpointId)
   if state.isNone():
     return none(NameRecordSnapshot)
   state.get().resolveNameSnapshot(name, nowTs)
 
 proc queryProjection*(node: FabricNode, projection: string, checkpointId = ""): JsonNode =
-  node.drainInbound()
+  discard node.drainInbound()
   let snapshot = node.checkpointStateSnapshot(checkpointId)
   if snapshot.isNone():
     return newJNull()
@@ -3992,7 +4447,7 @@ proc getContractRoot*(kind: TxKind): tuple[contractRoot: string, entrypoint: str
   (contractRootFor(kind), entrypointFor(kind))
 
 proc listAvoProposals*(node: FabricNode): seq[AvoProposal] =
-  node.drainInbound()
+  discard node.drainInbound()
   for _, proposal in node.avoProposals.pairs:
     result.add(proposal)
   result.sort(proc(a, b: AvoProposal): int = cmp(a.createdAt, b.createdAt))
@@ -4007,7 +4462,7 @@ proc submitAvoProposal*(
     checkpointStartEra: uint64,
     checkpointEndEra: uint64,
 ): AvoProposal =
-  node.drainInbound()
+  discard node.drainInbound()
   result = AvoProposal(
     proposalId: "",
     bundle: AvoRuleBundle(
@@ -4027,7 +4482,7 @@ proc submitAvoProposal*(
   discard node.registerAvoProposal(result)
 
 proc approveAvoProposal*(node: FabricNode, proposalId: string): bool =
-  node.drainInbound()
+  discard node.drainInbound()
   if proposalId notin node.avoProposals:
     return false
   if node.identity.account in node.avoApprovals.getOrDefault(proposalId, @[]):

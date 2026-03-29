@@ -16,6 +16,9 @@ const
   FabricProbeAfterSubmitMs {.intdefine.} = -1
   MaxHealthyControlApplyMs = 1500'i64
   MaxHealthySubmitConnectMs = 2000'i64
+  MaxHealthySubmitAckMs = 2000'i64
+  MaxHealthyInboundSliceMs = 1000'i64
+  MaxHealthyMaintenanceSliceMs = 1000'i64
 
 proc makeGenesis(validators: seq[NodeIdentity], observer: NodeIdentity): GenesisSpec =
   var params = defaultChainParams()
@@ -136,9 +139,79 @@ proc submitWriteFailures(node: FabricNode): int64 {.gcsafe, raises: [].} =
     except CatchableError:
       return -1
 
+proc submitSlowAckCount(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      return node.network.submitSlowAcks()
+    except CatchableError:
+      return -1
+
+proc submitMaxAckMs(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      return node.network.submitMaxAckMs()
+    except CatchableError:
+      return -1
+
+proc inboundSlowSliceCount(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      return node.slowInboundSlices()
+    except CatchableError:
+      return -1
+
+proc inboundMaxSliceMs(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      return node.maxInboundSliceMs()
+    except CatchableError:
+      return -1
+
+proc maintenanceSlowSliceCount(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      return node.slowMaintenanceSlices()
+    except CatchableError:
+      return -1
+
+proc maintenanceMaxSliceMs(node: FabricNode): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      return node.maxMaintenanceSliceMs()
+    except CatchableError:
+      return -1
+
+proc submitReadySummary(node: FabricNode): string {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    try:
+      let stats = node.network.submitDesiredPeerStats()
+      return $stats.ready & "/" & $stats.total & " " & stats.detail
+    except CatchableError:
+      return "-1/-1"
+
 proc pendingBacklog(node: FabricNode): string {.gcsafe, raises: [].} =
   $(node.pendingEvents.toSeq().len) & "/" & $(node.pendingAttestations.toSeq().len) & "/" &
     $(node.pendingEventCertificates.toSeq().len)
+
+proc overlayPathology(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    for idx, node in nodes:
+      let slowApply = node.controlSlowApplyCount()
+      let maxApplyMs = node.controlMaxApplyMs()
+      let slowInbound = node.inboundSlowSliceCount()
+      let maxInboundMs = node.inboundMaxSliceMs()
+      let slowMaintenance = node.maintenanceSlowSliceCount()
+      let maxMaintenanceMs = node.maintenanceMaxSliceMs()
+      if maxApplyMs >= MaxHealthyControlApplyMs:
+        return "node=" & $idx & " slowControlApply=" & $slowApply &
+          " maxApplyMs=" & $maxApplyMs
+      if maxInboundMs >= MaxHealthyInboundSliceMs:
+        return "node=" & $idx & " slowInbound=" & $slowInbound &
+          " maxInboundMs=" & $maxInboundMs
+      if maxMaintenanceMs >= MaxHealthyMaintenanceSliceMs:
+        return "node=" & $idx & " slowMaintenance=" & $slowMaintenance &
+          " maxMaintenanceMs=" & $maxMaintenanceMs
+    ""
 
 proc networkPathology(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
   {.cast(gcsafe).}:
@@ -147,22 +220,37 @@ proc networkPathology(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
       let maxApplyMs = node.controlMaxApplyMs()
       let slowConnect = node.submitSlowConnectCount()
       let maxConnectMs = node.submitMaxConnectMs()
+      let slowAck = node.submitSlowAckCount()
+      let maxAckMs = node.submitMaxAckMs()
       let writeFailures = node.submitWriteFailures()
+      let slowInbound = node.inboundSlowSliceCount()
+      let maxInboundMs = node.inboundMaxSliceMs()
+      let slowMaintenance = node.maintenanceSlowSliceCount()
+      let maxMaintenanceMs = node.maintenanceMaxSliceMs()
       if writeFailures > 0:
         return "node=" & $idx & " submitWriteFailures=" & $writeFailures &
           " maxConnectMs=" & $maxConnectMs
       if maxConnectMs >= MaxHealthySubmitConnectMs:
         return "node=" & $idx & " slowSubmitConnect=" & $slowConnect &
           " maxConnectMs=" & $maxConnectMs
+      if maxAckMs >= MaxHealthySubmitAckMs:
+        return "node=" & $idx & " slowSubmitAck=" & $slowAck &
+          " maxAckMs=" & $maxAckMs
       if maxApplyMs >= MaxHealthyControlApplyMs:
         return "node=" & $idx & " slowControlApply=" & $slowApply &
           " maxApplyMs=" & $maxApplyMs
+      if maxInboundMs >= MaxHealthyInboundSliceMs:
+        return "node=" & $idx & " slowInbound=" & $slowInbound &
+          " maxInboundMs=" & $maxInboundMs
+      if maxMaintenanceMs >= MaxHealthyMaintenanceSliceMs:
+        return "node=" & $idx & " slowMaintenance=" & $slowMaintenance &
+          " maxMaintenanceMs=" & $maxMaintenanceMs
     ""
 
 proc progressFingerprint(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
   {.cast(gcsafe).}:
     for idx, node in nodes:
-      var snapshot = $idx & ":-1/-1/-1/-1/-1/0/-1/-1/-1/-1/-1"
+      var snapshot = $idx & ":-1/-1/-1/-1/-1/0/-1/-1/-1/-1/-1/-1/-1"
       try:
         let status = node.fabricStatus()
         let checkpoint = node.getCheckpoint()
@@ -177,7 +265,10 @@ proc progressFingerprint(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} 
           node.pendingBacklog() & "/" &
           $node.controlMaxApplyMs() & "/" &
           $node.submitMaxConnectMs() & "/" &
-          $node.submitWriteFailures()
+          $node.submitMaxAckMs() & "/" &
+          $node.submitWriteFailures() & "/" &
+          $node.maxInboundSliceMs() & "/" &
+          $node.maxMaintenanceSliceMs()
       except CatchableError:
         discard
       if result.len > 0:
@@ -208,7 +299,7 @@ proc awaitOverlayReady(
   var lastFingerprint = ""
   while true:
     let fingerprint = nodes.progressFingerprint()
-    let pathology = nodes.networkPathology()
+    let pathology = nodes.overlayPathology()
     if fingerprint != lastFingerprint:
       echo "OVERLAY-PROGRESS ", fingerprint
       lastFingerprint = fingerprint
@@ -231,6 +322,41 @@ proc awaitOverlayReady(
     if stallMs >= 0 and nowMs - lastProgressAtMs >= stallMs.int64:
       dumpNodeState(nodes)
       raise newException(ValueError, "overlay stalled fingerprint=" & fingerprint)
+    await sleepAsync(intervalMs)
+
+proc awaitSubmitReady(
+    nodes: seq[FabricNode], timeoutMs: int, stallMs = 3000, intervalMs = 100
+) {.async: (raises: [CancelledError, Exception]).} =
+  let startedAtMs = int64(epochTime() * 1000)
+  var lastProgressAtMs = startedAtMs
+  var lastFingerprint = ""
+  while true:
+    var fingerprintParts: seq[string] = @[]
+    var ready = true
+    for idx, node in nodes:
+      let summary = node.submitReadySummary()
+      fingerprintParts.add($idx & ":" & summary)
+      try:
+        let stats = node.network.submitDesiredPeerStats()
+        if stats.ready < stats.total:
+          ready = false
+      except CatchableError:
+        ready = false
+    let fingerprint = fingerprintParts.join(" | ")
+    if fingerprint != lastFingerprint:
+      echo "SUBMIT-READY-PROGRESS ", fingerprint
+      lastFingerprint = fingerprint
+      lastProgressAtMs = int64(epochTime() * 1000)
+    if ready:
+      echo "SUBMIT-READY ", fingerprint
+      return
+    let nowMs = int64(epochTime() * 1000)
+    if timeoutMs >= 0 and nowMs - startedAtMs >= timeoutMs.int64:
+      dumpNodeState(nodes)
+      raise newException(ValueError, "submit ready timed out fingerprint=" & fingerprint)
+    if stallMs >= 0 and nowMs - lastProgressAtMs >= stallMs.int64:
+      dumpNodeState(nodes)
+      raise newException(ValueError, "submit ready stalled fingerprint=" & fingerprint)
     await sleepAsync(intervalMs)
 
 proc awaitCheckpointConvergence(
@@ -350,6 +476,7 @@ proc dumpNodeState(nodes: seq[FabricNode]) {.gcsafe, raises: [].} =
       var slowConnect = int64(-1)
       var maxConnectMs = int64(-1)
       var writeFailures = int64(-1)
+      var submitReady = "-1/-1"
       try:
         let status = node.fabricStatus()
         let checkpoint = node.getCheckpoint()
@@ -367,6 +494,7 @@ proc dumpNodeState(nodes: seq[FabricNode]) {.gcsafe, raises: [].} =
         slowConnect = node.submitSlowConnectCount()
         maxConnectMs = node.submitMaxConnectMs()
         writeFailures = node.submitWriteFailures()
+        submitReady = node.submitReadySummary()
       except CatchableError:
         discard
       echo "FABRIC_LSMR node=", idx,
@@ -383,7 +511,8 @@ proc dumpNodeState(nodes: seq[FabricNode]) {.gcsafe, raises: [].} =
         " maxApplyMs=", maxApplyMs,
         " slowConnect=", slowConnect,
         " maxConnectMs=", maxConnectMs,
-        " writeFailures=", writeFailures
+        " writeFailures=", writeFailures,
+        " submitReady=", submitReady
       try:
         var activePrefixes: seq[string] = @[]
         if not node.network.isNil and not node.network.switch.isNil and
@@ -463,6 +592,18 @@ suite "Fabric lsmr only network":
       except CatchableError:
         dumpNodeState(nodes)
         raise
+
+      for node in nodes:
+        node.network.scheduleWarmSubmitConnections()
+
+      try:
+        waitFor awaitSubmitReady(nodes, timeoutMs = 10_000, stallMs = 3_000, intervalMs = 100)
+      except CatchableError:
+        dumpNodeState(nodes)
+        raise
+
+      for node in nodes:
+        node.network.resetSubmitMetrics()
 
       when defined(fabric_diag):
         for idx, node in nodes:

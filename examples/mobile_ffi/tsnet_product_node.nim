@@ -216,6 +216,42 @@ proc withPeerIdSuffix(listenAddrs: JsonNode; peerId: string): JsonNode {.gcsafe.
       maText.add("/p2p/" & peerId)
     result.add(%maText)
 
+proc synthesizedTsnetListenAddrs(
+    node: ProductNode;
+    peerId: string;
+    tailnetPayload: JsonNode
+): JsonNode {.gcsafe.} =
+  result = newJArray()
+  if node.isNil or peerId.len == 0 or node.opts.listenPort <= 0:
+    return
+  if tailnetPayload.kind != JObject or not boolField(tailnetPayload, "ok"):
+    return
+  if not boolField(tailnetPayload, "providerReady") or
+      not boolField(tailnetPayload, "proxyListenersReady"):
+    return
+  let ipRows = tailnetPayload.getOrDefault("tailnetIPs")
+  if ipRows.kind != JArray:
+    return
+  var seen = initHashSet[string]()
+  for item in ipRows.items:
+    if item.kind != JString:
+      continue
+    let ipText = item.getStr().strip()
+    if ipText.len == 0:
+      continue
+    let prefix =
+      if ':' in ipText:
+        "/ip6/"
+      else:
+        "/ip4/"
+    let addrText =
+      prefix & ipText & "/udp/" & $node.opts.listenPort &
+      "/quic-v1/tsnet/p2p/" & peerId
+    if addrText in seen:
+      continue
+    seen.incl(addrText)
+    result.add(%addrText)
+
 proc normalizeExactDialAddrs(peerId: string; listenAddrs: JsonNode): seq[string] {.gcsafe.} =
   if listenAddrs.kind != JArray:
     return @[]
@@ -466,11 +502,14 @@ proc stopNode(node: ProductNode) =
 proc localInfo(node: ProductNode): JsonNode {.raises: [].} =
   let startPayload = node.startStatus()
   let tailnetStartPayload = node.tailnetStartStatus()
+  let tailnetPayload = node.tailnetStatus()
   let peerId = safeCString(libp2p_get_local_peer_id(node.handle))
-  let listenAddrs = withPeerIdSuffix(
+  var listenAddrs = withPeerIdSuffix(
     safeJson(libp2p_get_listen_addresses(node.handle), "[]"),
     peerId
   )
+  if listenAddrs.kind != JArray or listenAddrs.len == 0:
+    listenAddrs = synthesizedTsnetListenAddrs(node, peerId, tailnetPayload)
   %*{
     "label": node.opts.label,
     "hostname": node.opts.hostname,

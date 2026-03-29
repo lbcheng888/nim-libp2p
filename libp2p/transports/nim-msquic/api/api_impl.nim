@@ -1,6 +1,9 @@
 ## MsQuic 最小 API 表实现，覆盖 `MsQuicOpenVersion` 所需的核心句柄/回调。
 
 import std/tables
+{.push warning[Deprecated]: off.}
+import std/collections/sharedtables
+{.pop.}
 import std/algorithm
 import std/sequtils
 import std/endians
@@ -2432,7 +2435,7 @@ proc algorithmNote(algorithm: CongestionAlgorithm): string {.inline.} =
     "congestion=BBR"
 
 var
-  gHandleRegistry = initTable[HQUIC, bool]()
+  gHandleRegistry: SharedTable[HQUIC, bool]
   gApiTableInstance: QuicApiTable
   gApiTableRefCount: int
   gNextConnectionId: uint32 = 1
@@ -2447,6 +2450,7 @@ type
 var gGlobalExecutionConfig: GlobalExecutionConfigState
 
 initLock(gApiStateLock)
+init(gHandleRegistry)
 
 template withApiStateLock(body: untyped): untyped =
   acquire(gApiStateLock)
@@ -2467,20 +2471,26 @@ proc storeHandle(state: QuicHandleState): HQUIC =
 proc fetchHandle(handle: HQUIC): QuicHandleState =
   if handle.isNil:
     return nil
+  var registered = false
   withApiStateLock:
-    if not gHandleRegistry.getOrDefault(handle, false):
-      return nil
-    let state = cast[QuicHandleState](handle)
-    GC_ref(state)
-    result = state
-    GC_unref(state)
+    gHandleRegistry.withValue(handle, value):
+      registered = value[]
+  if not registered:
+    return nil
+  let state = cast[QuicHandleState](handle)
+  GC_ref(state)
+  result = state
+  GC_unref(state)
 
 proc releaseHandle(handle: HQUIC) =
   if handle.isNil:
     return
   var releaseRoot = false
   withApiStateLock:
-    if gHandleRegistry.getOrDefault(handle, false):
+    var registered = false
+    gHandleRegistry.withValue(handle, value):
+      registered = value[]
+    if registered:
       gHandleRegistry.del(handle)
       releaseRoot = true
   if releaseRoot:
@@ -8158,7 +8168,12 @@ proc MsQuicClose*(table: pointer) {.exportc, cdecl.} =
     if gApiTableRefCount > 0:
       dec gApiTableRefCount
     if gApiTableRefCount == 0:
-      gHandleRegistry.clear()
+      # builtin QUIC 的全局句柄注册表和锁按进程生命周期常驻。
+      # Android 上初始化阶段会先探测 runtime，再立即 close；
+      # 这里如果 deinit+init 全局 SharedTable，会把底层锁结构拆掉，
+      # 随后的 reopen/close 在外部线程里会触发原生崩溃。
+      # 句柄本身在各自的 close 路径里已经逐个注销，这里只需要清缓存，
+      # 不应该销毁全局注册表容器。
       gBuiltinResumptionCache.clear()
       gBuiltinZeroRttReplayCache.clear()
       gGlobalExecutionConfig = GlobalExecutionConfigState()

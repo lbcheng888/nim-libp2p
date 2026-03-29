@@ -886,6 +886,7 @@ proc libp2p_bootstrap_seed_connect_exact*(
 proc jsonGetStr(node: JsonNode, key: string, defaultValue: string = ""): string
 proc nodeFromHandle(handle: pointer): NimNode
 proc activeTsnetTransport(n: NimNode): TsnetTransport {.gcsafe, raises: [].}
+proc wantsTsnetTransport(cfg: NodeConfig): bool {.gcsafe, raises: [].}
 proc updateTailnetStartStatus(
     n: NimNode,
     stage: string,
@@ -1809,6 +1810,8 @@ proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
 
 proc configuredRelayReservationAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
+    return @[]
+  if wantsTsnetTransport(node.cfg):
     return @[]
   var addrs = extraMultiaddrTexts(node.cfg.extra, ["relayMultiaddrs"])
   addrs.sort(proc(a, b: string): int =
@@ -3854,6 +3857,9 @@ proc wantsTsnetTransport(cfg: NodeConfig): bool {.gcsafe, raises: [].} =
     if addr.toLowerAscii().contains("/tsnet"):
       return true
   false
+
+proc legacyCircuitRelayEnabled(cfg: NodeConfig): bool {.gcsafe, raises: [].} =
+  cfg.automations.circuitRelay and not wantsTsnetTransport(cfg)
 
 proc defaultTsnetListenAddresses(): seq[string] {.gcsafe, raises: [].} =
   result = @["/ip4/0.0.0.0/tcp/0/tsnet"]
@@ -7334,7 +7340,7 @@ proc configuredWanBootstrapAuthoritativePeerIds(cfg: NodeConfig): seq[string] =
     result.add(peerId)
 
 proc configuredRelayBootstrapGate(cfg: NodeConfig): bool =
-  cfg.automations.circuitRelay and
+  legacyCircuitRelayEnabled(cfg) and
     configuredWanBootstrapAuthoritativePeerIds(cfg).len > 0 and
     extraMultiaddrTexts(cfg.extra, ["relayMultiaddrs"]).len > 0
 
@@ -8620,7 +8626,7 @@ proc hasConnectedAuthoritativeBootstrap(node: NimNode): bool {.gcsafe.} =
 proc relayBootstrapGateEnabled(node: NimNode): bool {.gcsafe, raises: [].} =
   if node.isNil or node.authoritativeBootstrapPeerIds.len == 0:
     return false
-  node.cfg.automations.circuitRelay and configuredRelayReservationAddrs(node).len > 0
+  legacyCircuitRelayEnabled(node.cfg) and configuredRelayReservationAddrs(node).len > 0
 
 proc relayBootstrapGateReady(node: NimNode): bool {.gcsafe, raises: [].} =
   if node.isNil or node.switchInstance.isNil:
@@ -9839,7 +9845,7 @@ proc startRelayReservationLoop(n: NimNode) =
   )
   if relayReservationTargets.len == 0:
     return
-  if not n.cfg.automations.circuitRelay:
+  if not legacyCircuitRelayEnabled(n.cfg):
     debugLog("[nimlibp2p] startRelayReservationLoop skipped: circuit relay disabled")
     return
   if not n.relayReservationLoop.isNil and not n.relayReservationLoop.finished():
@@ -10506,12 +10512,14 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
   if cfg.automations.autonat:
     builder = builder.withAutonat()
     debugLog("[nimlibp2p] buildSwitch enabled autonat")
-  if cfg.automations.circuitRelay:
+  if legacyCircuitRelayEnabled(cfg):
     if builder.hasCircuitRelay():
       debugLog("[nimlibp2p] buildSwitch keeping existing circuit relay from WAN bootstrap profile")
     else:
       builder = builder.withCircuitRelay()
       debugLog("[nimlibp2p] buildSwitch enabled circuit relay")
+  elif cfg.automations.circuitRelay:
+    debugLog("[nimlibp2p] buildSwitch skipped legacy circuit relay because tsnet transport is active")
   if cfg.automations.rendezvous and routingMode != RoutingPlaneMode.lsmrOnly:
     try:
       builder = builder.withRendezVous(RendezVous.new())

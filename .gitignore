@@ -137,3 +137,4 @@ examples/libnimlibp2p
 AGENTS.md
 examples/mobile_ffi/tsnet_product_node
 examples/tsnet_quic_gateway_service
+lessons.md

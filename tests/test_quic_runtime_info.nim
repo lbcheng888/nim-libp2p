@@ -46,3 +46,18 @@ suite "QuicRuntime kind metadata":
       msquicrt.releaseMsQuicBridge(bridgeRes.bridge)
     else:
       skip()
+
+  test "builtin runtime bridge can be reopened after full release":
+    when defined(libp2p_msquic_experimental) and defined(libp2p_msquic_builtin):
+      for _ in 0 ..< 3:
+        let first = msquicrt.acquireMsQuicBridge()
+        check first.success
+        check not first.bridge.isNil
+        msquicrt.releaseMsQuicBridge(first.bridge)
+
+        let second = msquicrt.acquireMsQuicBridge()
+        check second.success
+        check not second.bridge.isNil
+        msquicrt.releaseMsQuicBridge(second.bridge)
+    else:
+      skip()
