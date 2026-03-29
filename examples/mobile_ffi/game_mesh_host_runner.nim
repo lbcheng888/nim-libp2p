@@ -139,7 +139,7 @@ proc stringArray(values: seq[string]): JsonNode =
   for value in values:
     result.add(%value)
 
-proc hostHarnessDataDir(prefix: string): string =
+proc hostRunnerDataDir(prefix: string): string =
   let path = getTempDir() / "nim-libp2p-game-mesh-host" / (prefix & "-" & $nowMillis())
   createDir(path)
   path
@@ -154,10 +154,10 @@ proc testIdentity(): JsonNode =
     "privateKey": base64.encode(privateKey),
     "publicKey": base64.encode(publicKey),
     "peerId": peerId,
-    "source": "host_harness"
+    "source": "host_runner"
   }
 
-proc seededIdentity(seedText: string; source = "host_harness_seeded"): JsonNode =
+proc seededIdentity(seedText: string; source = "host_runner_seeded"): JsonNode =
   let normalized = seedText.strip()
   if normalized.len == 0:
     return testIdentity()
@@ -184,7 +184,7 @@ proc stableWanBootstrapIdentity(label, role, networkId: string): JsonNode =
   seededIdentity(
     "wan_bootstrap_host|" & label.strip() & "|" & role.strip().toLowerAscii() & "|" &
       networkId.strip(),
-    source = "host_harness_stable_wan_bootstrap"
+    source = "host_runner_stable_wan_bootstrap"
   )
 
 proc dualStackLoopbackListenAddrs(port: int): JsonNode =
@@ -380,7 +380,7 @@ proc initHostNode(
   )
 
 proc createNode*(label: string, transportMode = htmTcpExplicitSeed, listenPort = 0): HostNode =
-  let dataDir = hostHarnessDataDir(label)
+  let dataDir = hostRunnerDataDir(label)
   let config = %*{
     "identity": testIdentity(),
     "dataDir": dataDir,
@@ -397,7 +397,7 @@ proc createWanBootstrapNode*(
     enablePublicBootstrap = false,
     staticBootstrap: seq[string] = @[]
 ): HostNode =
-  let dataDir = hostHarnessDataDir(label)
+  let dataDir = hostRunnerDataDir(label)
   var config = %*{
     "identity": stableWanBootstrapIdentity(label, role, networkId),
     "dataDir": dataDir,
@@ -739,7 +739,7 @@ proc modeForApp(appId: string): string =
   if appId == "doudizhu": "p2p_bot_room" else: "p2p_room"
 
 proc matchSeedForApp(appId: string): string =
-  if appId == "doudizhu": "host-harness-ddz-seed" else: ""
+  if appId == "doudizhu": "host-runner-ddz-seed" else: ""
 
 proc waitForReady(appId, roomId: string, host, guest: HostNode): tuple[hostState, guestState: JsonNode] =
   let hostRef = host
@@ -1125,7 +1125,7 @@ proc runLocalGameMeshSuite*(
         outDir / appId
       else:
         ""
-    # The standalone host harness exits immediately after the final run, so
+    # The standalone host runner exits immediately after the final run, so
     # skipping teardown there avoids unrelated shutdown races masking game results.
     let cleanup =
       if apps.len == 1:

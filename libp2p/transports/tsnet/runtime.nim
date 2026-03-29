@@ -466,8 +466,53 @@ proc refreshBootstrapMaterial(runtime: TsnetInAppRuntime) =
     return
   discard runtime.ensureStateMaterial()
 
+proc bridgeExtraString(node: JsonNode, keys: openArray[string]): string =
+  if node.isNil or node.kind != JObject:
+    return ""
+  for key in keys:
+    if node.hasKey(key):
+      let value = node.getOrDefault(key)
+      if value.kind == JString:
+        let text = value.getStr().strip()
+        if text.len > 0:
+          return text
+  ""
+
+proc bridgeExtraStrings(node: JsonNode, keys: openArray[string]): seq[string] =
+  if node.isNil or node.kind != JObject:
+    return @[]
+  for key in keys:
+    if not node.hasKey(key):
+      continue
+    let value = node.getOrDefault(key)
+    if value.kind != JArray:
+      continue
+    for item in value.items():
+      if item.kind == JString:
+        let text = item.getStr().strip()
+        if text.len > 0 and text notin result:
+          result.add(text)
+    if result.len > 0:
+      return result
+
+proc bridgeLocalMetadata(runtime: TsnetInAppRuntime): tuple[peerId: string, listenAddrs: seq[string]] =
+  if runtime.isNil:
+    return ("", @[])
+  let raw = runtime.cfg.bridgeExtraJson.strip()
+  if raw.len == 0:
+    return ("", @[])
+  let payload = try:
+      parseJson(raw)
+    except CatchableError:
+      return ("", @[])
+  (
+    bridgeExtraString(payload, ["libp2pPeerId", "localPeerId", "peerId"]),
+    bridgeExtraStrings(payload, ["libp2pListenAddrs", "listenAddresses", "listenAddrs"])
+  )
+
 proc bootstrapInput(runtime: TsnetInAppRuntime): TsnetControlBootstrapInput =
   runtime.refreshBootstrapMaterial()
+  let metadata = runtime.bridgeLocalMetadata()
   TsnetControlBootstrapInput(
     controlUrl: runtime.baseControlUrl(),
     hostname: runtime.state.hostname,
@@ -480,7 +525,9 @@ proc bootstrapInput(runtime: TsnetInAppRuntime): TsnetControlBootstrapInput =
     nodePublicKey: runtime.state.nodePublicKey,
     wgKeyPresent: runtime.state.wgKey.strip().len > 0,
     discoPublicKey: runtime.state.discoPublicKey,
-    persistedNodeIdPresent: runtime.state.nodeId.strip().len > 0
+    persistedNodeIdPresent: runtime.state.nodeId.strip().len > 0,
+    libp2pPeerId: metadata.peerId,
+    libp2pListenAddrs: metadata.listenAddrs
   )
 
 proc buildControlProbePayload(
@@ -976,6 +1023,39 @@ proc reset*(runtime: TsnetInAppRuntime): Result[void, string] =
   trelay.stopRelayListeners(runtime.runtimeId)
   when defined(libp2p_msquic_experimental):
     qrelay.stopRelayListeners(runtime.runtimeId)
+  ok()
+
+proc refreshControlMetadata*(runtime: TsnetInAppRuntime): Result[void, string] =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  if not runtime.liveControlRequested():
+    return err("tsnet controlUrl is empty")
+  let bootstrap = runtime.probeControlServer().valueOr:
+    runtime.lastError = error
+    runtime.state.lastControlBootstrapError = error
+    discard runtime.persistState()
+    return err(error)
+  if bootstrap.stage != TsnetControlBootstrapStage.Mapped:
+    let errText =
+      if bootstrap.error.len > 0:
+        bootstrap.error
+      else:
+        "tsnet control metadata refresh did not reach mapped"
+    runtime.lastError = errText
+    runtime.state.lastControlBootstrapError = errText
+    discard runtime.persistState()
+    return err(errText)
+  let persisted = runtime.persistMappedRuntime(bootstrap)
+  if persisted.isErr():
+    let error = persisted.error
+    runtime.lastError = error
+    runtime.state.lastControlBootstrapError = error
+    discard runtime.persistState()
+    return err(error)
+  runtime.demoteRelayPath()
+  runtime.status = TsnetInAppRuntimeStatus.Running
+  runtime.lastError = ""
+  discard runtime.persistState()
   ok()
 
 proc stop*(runtime: TsnetInAppRuntime) =

@@ -2,7 +2,7 @@
 
 import chronos
 import chronos/osdefs
-import std/[json, locks, nativesockets, options, os, sequtils, sets, strutils, tables, uri]
+import std/[json, locks, nativesockets, options, os, posix, sequtils, sets, strutils, tables, uri]
 from std/times import epochTime
 
 import ../../multiaddress
@@ -41,8 +41,8 @@ const
   QuicRelayListenerReadyTimeout = 30.seconds
   QuicRelayAcceptAckTimeout = 10.seconds
   QuicRelayAcceptAwaitTimeout = 5.seconds
-  QuicRelayAcceptRefreshTimeout = 10.seconds
   QuicRelayIncomingWaitTimeout = 30.seconds
+  QuicRelayIncomingRevalidateInterval = 2.seconds
   QuicRelayReadinessPingAttempts = 3
   QuicRelayReadinessRetryDelay = 500.milliseconds
   QuicRelayRoutePublishAttempts = 10
@@ -55,6 +55,15 @@ const
   QuicRelayReadRetryDelay = 50.milliseconds
 
 type
+  Ifaddrs {.importc: "struct ifaddrs", header: "<ifaddrs.h>", bycopy.} = object
+    ifa_next: ptr Ifaddrs
+    ifa_name: cstring
+    ifa_flags: cuint
+    ifa_addr: ptr SockAddr
+    ifa_netmask: ptr SockAddr
+    ifa_dstaddr: ptr SockAddr
+    ifa_data: pointer
+
   TsnetQuicRelayEndpoint* = object
     url*: string
     host*: string
@@ -79,8 +88,15 @@ type
     connState: msquicdrv.MsQuicConnectionState
     candidates: seq[string]
     stream: MsQuicStream
-    reuseStream: bool
+    persistentControlStream: bool
+    awaiting: bool
+    readyFuture: Future[JsonNode]
     busy: bool
+
+  TsnetQuicRelayPendingBridge = ref object
+    route: string
+    kind: string
+    future: Future[MsQuicStream]
 
   TsnetQuicRelayGateway* = ref object
     handle*: msquicdrv.MsQuicTransportHandle
@@ -92,6 +108,8 @@ type
     listenersLock: Lock
     listenersLockInit: bool
     listeners: Table[string, TsnetQuicRelayListener]
+    pendingBridgeCounter: uint64
+    pendingBridges: Table[string, TsnetQuicRelayPendingBridge]
 
   TsnetQuicRelayClient = ref object
     endpoint: TsnetQuicRelayEndpoint
@@ -128,6 +146,9 @@ var relayUdpDialStates {.global.}: Table[int, Table[string, TsnetUdpDialDiagnost
 
 initLock(relayRegistryLock)
 
+proc c_getifaddrs(ifap: ptr ptr Ifaddrs): cint {.importc: "getifaddrs", header: "<ifaddrs.h>".}
+proc c_freeifaddrs(ifa: ptr Ifaddrs) {.importc: "freeifaddrs", header: "<ifaddrs.h>".}
+
 proc bytesToString(bytes: openArray[byte]): string =
   result = newString(bytes.len)
   for i, value in bytes:
@@ -158,6 +179,17 @@ proc defaultRelayPort(parsed: Uri): uint16 =
       discard
   NimTsnetQuicRelayDefaultPort
 
+proc normalizedRelayKind(kind, route: string): string {.gcsafe, raises: [].} =
+  let lowered = kind.strip().toLowerAscii()
+  if lowered == "udp":
+    return "udp"
+  if lowered == "tcp":
+    return "tcp"
+  let routeLower = route.toLowerAscii()
+  if "/udp/" in routeLower and "/quic-v1" in routeLower:
+    return "udp"
+  "tcp"
+
 proc bracketAuthorityHost(host: string): string =
   if host.contains(":") and not host.startsWith("["):
     "[" & host & "]"
@@ -185,6 +217,41 @@ proc detectAddressFamily(host: string): uint16 =
     except CatchableError:
       return 0'u16
   2'u16
+
+proc enumerateLocalInterfaceAddrs(): HashSet[string] =
+  result = initHashSet[string]()
+  var ifap: ptr Ifaddrs = nil
+  try:
+    if c_getifaddrs(addr ifap) == 0:
+      defer:
+        c_freeifaddrs(ifap)
+      var cursor = ifap
+      while cursor != nil:
+        let addrPtr = cursor.ifa_addr
+        if not addrPtr.isNil:
+          if cint(addrPtr.sa_family) == posix.AF_INET:
+            let sin = cast[ptr Sockaddr_in](addrPtr)
+            let raw = posix.inet_ntoa(sin.sin_addr)
+            if raw != nil:
+              result.incl($raw)
+          elif cint(addrPtr.sa_family) == posix.AF_INET6:
+            let sin6 = cast[ptr Sockaddr_in6](addrPtr)
+            var buffer: array[64, char]
+            when declared(inet_ntop):
+              if inet_ntop(
+                  posix.AF_INET6,
+                  addr sin6.sin6_addr,
+                  cast[ptr char](addr buffer[0]),
+                  buffer.len.cint
+              ) != nil:
+                var ip = $cast[cstring](addr buffer[0])
+                let zoneIdx = ip.find('%')
+                if zoneIdx >= 0:
+                  ip = ip[0 ..< zoneIdx]
+                result.incl(ip.toLowerAscii())
+        cursor = cursor.ifa_next
+  except CatchableError:
+    discard
 
 proc tlsServerName(host: string): Option[string] =
   if host.len == 0:
@@ -889,12 +956,133 @@ proc readJsonMessageWithTimeout(
   let timeoutFut = sleepAsync(timeout)
   let winner = await race(cast[FutureBase](readFut), cast[FutureBase](timeoutFut))
   if winner == cast[FutureBase](timeoutFut):
+    readFut.cancelSoon()
     raise newException(
       IOError,
       "nim_quic relay timed out waiting for " & label & " after " & $timeout
     )
-  timeoutFut.cancel()
+  timeoutFut.cancelSoon()
   await readFut
+
+proc relayRouteStatus(
+    client: TsnetQuicRelayClient,
+    route: string,
+    timeout: Duration = QuicRelayRpcTimeout
+): Future[Result[bool, string]] {.async: (raises: [CancelledError]).}
+
+proc ensureRelayRoutePublishedOnConnection(
+    client: TsnetQuicRelayClient,
+    route: string,
+    attempts = QuicRelayRoutePublishAttempts,
+    timeout: Duration = QuicRelayRpcTimeout
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).}
+
+proc clearRelayReadyRoute(ownerId: int, route: string) {.gcsafe, raises: [].}
+
+proc ensureRelayRoutePublished(
+    endpoint: TsnetQuicRelayEndpoint,
+    route: string,
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly,
+    attempts = QuicRelayRoutePublishAttempts,
+    timeout: Duration = QuicRelayRpcTimeout
+): Result[void, string] {.gcsafe, raises: [].}
+
+proc awaitPersistentIncomingWithRouteValidation(
+    client: TsnetQuicRelayClient,
+    stream: MsQuicStream,
+    ownerId: int,
+    routeId: int,
+    route: string,
+    interval: Duration = QuicRelayIncomingRevalidateInterval
+): Future[JsonNode] {.async: (raises: [CancelledError, CatchableError]).} =
+  if client.isNil:
+    raise newException(IOError, "nim_quic relay client is nil while awaiting incoming")
+  if stream.isNil:
+    raise newException(IOError, "nim_quic relay stream is nil while awaiting incoming")
+  if route.len == 0:
+    raise newException(IOError, "nim_quic relay route is empty while awaiting incoming")
+  try:
+    let incomingFut = readJsonMessage(stream)
+    let revalidateFut = proc(): Future[void] {.async: (raises: [CancelledError, CatchableError]).} =
+      while true:
+        await sleepAsync(interval)
+        if incomingFut.finished():
+          return
+        let published = await relayRouteStatus(client, route, QuicRelayRpcTimeout)
+        if published.isErr():
+          clearRelayReadyRoute(ownerId, route)
+          raise newException(
+            IOError,
+            "nim_quic relay route validation failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & published.error
+          )
+        if not published.get():
+          clearRelayReadyRoute(ownerId, route)
+          raise newException(
+            IOError,
+            "nim_quic relay route lost routeId=" & $routeId &
+              " route=" & route
+          )
+    let validationLoop = revalidateFut()
+    let winner = await race(
+      cast[FutureBase](incomingFut),
+      cast[FutureBase](validationLoop)
+    )
+    if winner == cast[FutureBase](incomingFut):
+      validationLoop.cancelSoon()
+      return await incomingFut
+    incomingFut.cancelSoon()
+    await validationLoop
+    raise newException(
+      IOError,
+      "nim_quic relay incoming validation loop exited without payload routeId=" &
+        $routeId & " route=" & route
+    )
+  except CatchableError as exc:
+    clearRelayReadyRoute(ownerId, route)
+    raise newException(
+      IOError,
+      "nim_quic relay incoming wait failed routeId=" & $routeId &
+        " route=" & route &
+        " err=" & exc.msg
+    )
+
+proc awaitJsonFutureWithTimeout(
+    fut: Future[JsonNode],
+    timeout: Duration,
+    label: string
+): Future[JsonNode] {.async: (raises: [CancelledError, CatchableError]).} =
+  if fut.isNil:
+    raise newException(IOError, "nim_quic relay future unavailable for " & label)
+  let timeoutFut = sleepAsync(timeout)
+  let winner = await race(cast[FutureBase](fut), cast[FutureBase](timeoutFut))
+  if winner == cast[FutureBase](timeoutFut):
+    fut.cancelSoon()
+    raise newException(
+      IOError,
+      "nim_quic relay timed out waiting for " & label & " after " & $timeout
+    )
+  timeoutFut.cancelSoon()
+  await fut
+
+proc awaitBridgeAttachWithTimeout(
+    fut: Future[MsQuicStream],
+    timeout: Duration,
+    label: string
+): Future[MsQuicStream] {.async: (raises: [CancelledError, CatchableError]).} =
+  if fut.isNil:
+    raise newException(IOError, "nim_quic relay bridge future unavailable for " & label)
+  let timeoutFut = sleepAsync(timeout)
+  let winner = await race(cast[FutureBase](fut), cast[FutureBase](timeoutFut))
+  if winner == cast[FutureBase](timeoutFut):
+    fut.cancelSoon()
+    raise newException(
+      IOError,
+      "nim_quic relay timed out waiting for " & label & " after " & $timeout
+    )
+  timeoutFut.cancelSoon()
+  await fut
 
 proc readBinaryFrame(
     stream: MsQuicStream
@@ -1075,6 +1263,38 @@ proc ensureRelayReady(
         " attempt=" & $(attempt + 1) &
         " err=" & lastError
       )
+  err(lastError)
+
+proc ensureRelayRoutePublishedOnConnection(
+    client: TsnetQuicRelayClient,
+    route: string,
+    attempts = QuicRelayRoutePublishAttempts,
+    timeout: Duration = QuicRelayRpcTimeout
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  if client.isNil:
+    return err("nim_quic relay client is nil")
+  if route.len == 0:
+    return err("nim_quic relay route is empty")
+  var lastError = ""
+  for attempt in 0 ..< max(1, attempts):
+    if attempt > 0:
+      await sleepAsync(QuicRelayRoutePublishRetryDelay)
+    let published = await relayRouteStatus(client, route, timeout)
+    if published.isOk():
+      if published.get():
+        quicRelayTrace(
+          "relay route published route=" & route &
+          " attempt=" & $(attempt + 1)
+        )
+        return ok()
+      lastError = "route_not_published"
+    else:
+      lastError = published.error
+    quicRelayTrace(
+      "relay route publication pending route=" & route &
+      " attempt=" & $(attempt + 1) &
+      " err=" & lastError
+    )
   err(lastError)
 
 proc ensureRelayRoutePublished(
@@ -1291,6 +1511,18 @@ proc udpBridgeSummary(state: TsnetUdpRelayBridge): string =
     " clientEgressBytes=" & $state.clientEgressBytes &
     " pendingFrames=" & $state.pendingFrames.len
 
+proc udpBridgeAcceptsSource*(
+    target: TransportAddress,
+    clientRemote: Option[TransportAddress],
+    remote: TransportAddress,
+    restrictSource: bool
+): tuple[accept: bool, learnClient: bool] {.gcsafe, raises: [].} =
+  if restrictSource:
+    return ($remote == $target, false)
+  if clientRemote.isNone():
+    return (true, true)
+  ($remote == $clientRemote.get(), false)
+
 proc writeUdpFrameLocked(
     state: TsnetUdpRelayBridge,
     payload: seq[byte]
@@ -1352,7 +1584,22 @@ proc bridgeUdpProxyToQuic(
   if transp.isNil or state.isNil:
     return
   try:
-    if restrictSource and $remote != $state.target:
+    let sourceDecision = udpBridgeAcceptsSource(
+      state.target,
+      state.clientRemote,
+      remote,
+      restrictSource
+    )
+    if not sourceDecision.accept:
+      quicRelayTrace(
+        "udp proxy ingress dropped owner=" & $state.ownerId &
+        " rawKey=" & state.rawKey &
+        " remote=" & $remote &
+        " target=" & $state.target &
+        " clientRemote=" &
+          (if state.clientRemote.isSome(): $state.clientRemote.get() else: "<none>") &
+        " restrictSource=" & $restrictSource
+      )
       return
     let message = transp.getMessage()
     if message.len == 0:
@@ -1368,7 +1615,7 @@ proc bridgeUdpProxyToQuic(
         " len=" & $message.len &
         " restrictSource=" & $restrictSource
       )
-    if not restrictSource and state.clientRemote.isNone():
+    if sourceDecision.learnClient:
       state.clientRemote = some(remote)
     await state.writeUdpFrameLocked(message)
   except CatchableError:
@@ -1482,6 +1729,17 @@ proc relayOwnerTaskCount(ownerId: int): int =
   withLock(relayRegistryLock):
     result = relayOwnerTasks.getOrDefault(ownerId).len
 
+proc relayRegisterTaskSafe(
+    ownerId: int,
+    server: StreamServer,
+    datagram: DatagramTransport,
+    task: Future[void]
+): TsnetRelayTaskHandle {.gcsafe, raises: [].} =
+  var handle: TsnetRelayTaskHandle
+  quicRelaySafe:
+    handle = relayRegisterTask(ownerId, server, datagram, task)
+  result = handle
+
 proc markRelayRouteReady(ownerId: int, route: string) {.gcsafe, raises: [].} =
   quicRelaySafe:
     if ownerId <= 0 or route.len == 0:
@@ -1490,6 +1748,18 @@ proc markRelayRouteReady(ownerId: int, route: string) {.gcsafe, raises: [].} =
       var routes = relayReadyRoutes.getOrDefault(ownerId)
       routes.incl(route)
       relayReadyRoutes[ownerId] = routes
+
+proc clearRelayReadyRoute(ownerId: int, route: string) {.gcsafe, raises: [].} =
+  quicRelaySafe:
+    if ownerId <= 0 or route.len == 0:
+      return
+    withLock(relayRegistryLock):
+      var routes = relayReadyRoutes.getOrDefault(ownerId)
+      routes.excl(route)
+      if routes.len == 0:
+        relayReadyRoutes.del(ownerId)
+      else:
+        relayReadyRoutes[ownerId] = routes
 
 proc clearRelayReadyRoutes(ownerId: int) {.gcsafe, raises: [].} =
   quicRelaySafe:
@@ -1616,7 +1886,8 @@ proc stopRelayListeners*(ownerId: int) =
 proc new*(_: type[TsnetQuicRelayGateway]): TsnetQuicRelayGateway =
   result = TsnetQuicRelayGateway(
     boundPort: NimTsnetQuicRelayDefaultPort,
-    listeners: initTable[string, TsnetQuicRelayListener]()
+    listeners: initTable[string, TsnetQuicRelayListener](),
+    pendingBridges: initTable[string, TsnetQuicRelayPendingBridge]()
   )
   initLock(result.listenersLock)
   result.listenersLockInit = true
@@ -1627,8 +1898,7 @@ proc storeListener(
     connPtr: pointer,
     connState: msquicdrv.MsQuicConnectionState,
     candidates: seq[string] = @[],
-    stream: MsQuicStream = nil,
-    reuseStream = false
+    stream: MsQuicStream = nil
 ) =
   if gateway.isNil:
     return
@@ -1639,7 +1909,9 @@ proc storeListener(
       connState: connState,
       candidates: candidates,
       stream: stream,
-      reuseStream: reuseStream
+      persistentControlStream: false,
+      awaiting: false,
+      readyFuture: nil
     )
   finally:
     release(gateway.listenersLock)
@@ -1653,32 +1925,216 @@ proc attachListenerStream(
 ): bool =
   if gateway.isNil or route.len == 0 or stream.isNil:
     return false
+  var staleReady: Future[JsonNode] = nil
   acquire(gateway.listenersLock)
   try:
     let listener = gateway.listeners.getOrDefault(route, nil)
     if listener.isNil:
       return false
+    staleReady = listener.readyFuture
     listener.connPtr = connPtr
     listener.connState = connState
     listener.stream = stream
+    listener.persistentControlStream = true
+    listener.awaiting = false
+    listener.readyFuture = nil
     listener.busy = false
+  finally:
+    release(gateway.listenersLock)
+  if not staleReady.isNil and not staleReady.finished():
+    staleReady.fail(
+      newException(
+        IOError,
+        "nim_quic relay listener control stream was replaced before ready"
+      )
+    )
+  true
+
+proc detachListenerStream(
+    gateway: TsnetQuicRelayGateway,
+    route: string,
+    stream: MsQuicStream,
+    err: string
+) =
+  if gateway.isNil or route.len == 0 or stream.isNil:
+    return
+  var staleReady: Future[JsonNode] = nil
+  var unpublishRoute = false
+  acquire(gateway.listenersLock)
+  try:
+    let listener = gateway.listeners.getOrDefault(route, nil)
+    if listener.isNil or listener.stream != stream:
+      return
+    quicRelayTrace(
+      "gateway listener stream detach route=" & route &
+      " persistent=" & $listener.persistentControlStream &
+      " awaiting=" & $listener.awaiting &
+      " busy=" & $listener.busy &
+      " err=" & (if err.len > 0: err else: "<empty>")
+    )
+    staleReady = listener.readyFuture
+    if listener.persistentControlStream:
+      unpublishRoute = true
+      gateway.listeners.del(route)
+    else:
+      listener.stream = nil
+      listener.persistentControlStream = false
+      listener.awaiting = false
+      listener.readyFuture = nil
+  finally:
+    release(gateway.listenersLock)
+  if not staleReady.isNil and not staleReady.finished():
+    staleReady.fail(
+      newException(
+        IOError,
+        if err.len > 0: err else: "nim_quic relay listener control stream detached"
+      )
+    )
+  if unpublishRoute:
+    quicRelayTrace("gateway listener unpublished route=" & route)
+
+proc markListenerAwaiting(
+    gateway: TsnetQuicRelayGateway,
+    route: string,
+    stream: MsQuicStream
+): bool =
+  if gateway.isNil or route.len == 0 or stream.isNil:
+    return false
+  acquire(gateway.listenersLock)
+  try:
+    let listener = gateway.listeners.getOrDefault(route, nil)
+    if listener.isNil or listener.stream != stream:
+      return false
+    listener.awaiting = true
     return true
   finally:
     release(gateway.listenersLock)
 
-proc consumeListenerStream(
+proc beginPersistentListenerIncoming(
     gateway: TsnetQuicRelayGateway,
     route: string
-): MsQuicStream =
+): Result[tuple[stream: MsQuicStream, readyFuture: Future[JsonNode]], string] =
   if gateway.isNil or route.len == 0:
-    return nil
+    return err("listener_not_ready")
   acquire(gateway.listenersLock)
   try:
     let listener = gateway.listeners.getOrDefault(route, nil)
     if listener.isNil:
-      return nil
-    result = listener.stream
-    listener.stream = nil
+      quicRelayTrace("gateway listener incoming begin route=" & route & " err=missing_listener")
+      return err("listener_not_ready")
+    if listener.stream.isNil:
+      quicRelayTrace("gateway listener incoming begin route=" & route & " err=missing_stream")
+      return err("listener_not_ready")
+    if not listener.persistentControlStream:
+      quicRelayTrace("gateway listener incoming begin route=" & route & " err=not_persistent")
+      return err("listener_not_ready")
+    if not listener.awaiting:
+      quicRelayTrace("gateway listener incoming begin route=" & route & " err=not_awaiting")
+      return err("listener_not_ready")
+    if not listener.readyFuture.isNil and not listener.readyFuture.finished():
+      quicRelayTrace("gateway listener incoming begin route=" & route & " err=busy")
+      return err("listener_busy")
+    listener.awaiting = false
+    listener.readyFuture = Future[JsonNode].init("tsnet.quicrelay.listener.ready")
+    quicRelayTrace("gateway listener incoming begin route=" & route & " ok=true")
+    return ok((listener.stream, listener.readyFuture))
+  finally:
+    release(gateway.listenersLock)
+
+proc completePersistentListenerReady(
+    gateway: TsnetQuicRelayGateway,
+    route: string,
+    stream: MsQuicStream,
+    payload: JsonNode
+): bool =
+  if gateway.isNil or route.len == 0 or stream.isNil:
+    return false
+  var readyFuture: Future[JsonNode] = nil
+  acquire(gateway.listenersLock)
+  try:
+    let listener = gateway.listeners.getOrDefault(route, nil)
+    if listener.isNil or listener.stream != stream:
+      return false
+    readyFuture = listener.readyFuture
+    listener.readyFuture = nil
+  finally:
+    release(gateway.listenersLock)
+  if readyFuture.isNil or readyFuture.finished():
+    return false
+  readyFuture.complete(payload)
+  true
+
+proc allocatePendingBridgeSession(
+    gateway: TsnetQuicRelayGateway,
+    route: string,
+    kind: string
+): tuple[sessionId: string, future: Future[MsQuicStream]] =
+  if gateway.isNil or route.len == 0:
+    return ("", nil)
+  acquire(gateway.listenersLock)
+  try:
+    inc gateway.pendingBridgeCounter
+    let sessionId =
+      route & "#bridge-" & $gateway.pendingBridgeCounter &
+      "-" & $currentUnixMilli()
+    let future = Future[MsQuicStream].init("tsnet.quicrelay.bridge.attach")
+    gateway.pendingBridges[sessionId] = TsnetQuicRelayPendingBridge(
+      route: route,
+      kind: kind,
+      future: future
+    )
+    (sessionId, future)
+  finally:
+    release(gateway.listenersLock)
+
+proc clearPendingBridgeSession(
+    gateway: TsnetQuicRelayGateway,
+    sessionId: string
+) =
+  if gateway.isNil or sessionId.len == 0:
+    return
+  acquire(gateway.listenersLock)
+  try:
+    let pending = gateway.pendingBridges.getOrDefault(sessionId, nil)
+    if not pending.isNil and not pending.future.isNil and not pending.future.finished():
+      pending.future.fail(
+        newException(
+          IOError,
+          "nim_quic relay pending bridge session cleared before attachment"
+        )
+      )
+    gateway.pendingBridges.del(sessionId)
+  finally:
+    release(gateway.listenersLock)
+
+proc attachPendingBridgeSession(
+    gateway: TsnetQuicRelayGateway,
+    sessionId: string,
+    route: string,
+    kind: string,
+    stream: MsQuicStream
+): string =
+  if gateway.isNil:
+    return "gateway_unavailable"
+  if sessionId.len == 0:
+    return "missing_bridge_session_id"
+  if stream.isNil:
+    return "bridge_stream_unavailable"
+  acquire(gateway.listenersLock)
+  try:
+    let pending = gateway.pendingBridges.getOrDefault(sessionId, nil)
+    if pending.isNil:
+      return "bridge_session_not_found"
+    if pending.route != route:
+      return "bridge_route_mismatch"
+    if pending.kind != kind:
+      return "bridge_kind_mismatch"
+    if pending.future.isNil:
+      return "bridge_session_future_unavailable"
+    if pending.future.finished():
+      return "bridge_session_already_attached"
+    pending.future.complete(stream)
+    ""
   finally:
     release(gateway.listenersLock)
 
@@ -1770,23 +2226,22 @@ proc serveRelayStream(
     stream: MsQuicStream
 ) {.async: (raises: []).} =
   var keepOpen = false
+  var pendingBridgeSessionId = ""
   try:
     let request = await readJsonMessage(stream)
     let mode = jsonString(request, "mode")
     let route = jsonString(request, "route")
     let candidates = jsonStrings(request, "candidates")
-    let kind = jsonString(request, "kind").toLowerAscii()
+    let kind = normalizedRelayKind(jsonString(request, "kind"), route)
     quicRelayTrace("gateway request mode=" & mode & " route=" & route)
     case mode
     of "listen":
-      let reuseStream = request{"reuseStream"}.getBool(false)
       gateway.storeListener(
         route,
         connPtr,
         connState,
         candidates,
-        nil,
-        reuseStream
+        nil
       )
       quicRelayTrace("gateway stored listener route=" & route)
       await writeJsonMessage(stream, rpcSuccess(%*{
@@ -1810,13 +2265,82 @@ proc serveRelayStream(
         "route": route
       }))
       quicRelayTrace("gateway accept ack sent route=" & route)
+      try:
+        while gateway.running:
+          let controlMsg = await readJsonMessage(stream)
+          if controlMsg.isNil or controlMsg.kind != JObject:
+            raise newException(
+              IOError,
+              "nim_quic relay accept stream received invalid control payload"
+            )
+          let op = jsonString(controlMsg, "op")
+          case op
+          of "await":
+            if not gateway.markListenerAwaiting(route, stream):
+              raise newException(
+                IOError,
+                "nim_quic relay accept stream lost attached listener route"
+              )
+            await writeJsonMessage(stream, rpcSuccess(%*{
+              "op": "await",
+              "route": route,
+              "published": true
+            }))
+            quicRelayTrace("gateway listener await registered route=" & route)
+          of "ready":
+            if gateway.completePersistentListenerReady(route, stream, controlMsg):
+              quicRelayTrace("gateway listener ready signaled route=" & route)
+            else:
+              quicRelayTrace("gateway listener ready ignored route=" & route)
+          else:
+            quicRelayTrace(
+              "gateway accept stream ignored route=" & route &
+              " op=" & op
+            )
+      finally:
+        gateway.detachListenerStream(
+          route,
+          stream,
+          "nim_quic relay accept stream closed before next control message"
+        )
+        await stream.closeQuicStream()
+      return
     of "route_status":
-      let published = not gateway.getListener(route).isNil
+      let listener = gateway.getListener(route)
+      let published =
+        if listener.isNil:
+          false
+        else:
+          listener.persistentControlStream and
+            (not listener.stream.isNil) and
+            listener.awaiting
       await writeJsonMessage(stream, rpcSuccess(%*{
         "mode": "route_status",
         "route": route,
         "published": published
       }))
+    of "bridge_attach":
+      let sessionId = jsonString(request, "sessionId")
+      let attachError = gateway.attachPendingBridgeSession(
+        sessionId,
+        route,
+        kind,
+        stream
+      )
+      if attachError.len > 0:
+        quicRelayTrace(
+          "gateway bridge attach rejected route=" & route &
+          " sessionId=" & sessionId &
+          " err=" & attachError
+        )
+        await writeJsonMessage(stream, rpcError(attachError))
+        return
+      keepOpen = true
+      pendingBridgeSessionId = sessionId
+      quicRelayTrace(
+        "gateway bridge attach accepted route=" & route &
+        " sessionId=" & sessionId
+      )
     of "ping":
       await writeJsonMessage(stream, rpcSuccess(%*{
         "mode": "ping"
@@ -1833,109 +2357,104 @@ proc serveRelayStream(
         return
       let source = jsonString(request, "source")
       quicRelayTrace("gateway dial matched route=" & route & " source=" & source)
-      let attachedStream = not listener.stream.isNil
-      let reuseStream = listener.reuseStream and attachedStream
-      let splitDialDataStream = kind.toLowerAscii() == "udp"
       var listenerControlStream: MsQuicStream = nil
+      var listenerDataStream: MsQuicStream = nil
+      var routeLockHeld = true
+      var bridgeAttachFuture: Future[MsQuicStream] = nil
+      var listenerReadyFuture: Future[JsonNode] = nil
       try:
-        if attachedStream:
-          listenerControlStream = gateway.consumeListenerStream(route)
-        if listenerControlStream.isNil:
-          listenerControlStream =
-            createBidiStream(gateway.handle, listener.connPtr, listener.connState).valueOr:
-              gateway.clearListenerRoutesForConnection(listener.connPtr)
-              quicRelayTrace("gateway listener stream create failed route=" & route & " err=" & error)
-              await writeJsonMessage(stream, rpcError("listener_not_ready"))
-              return
-        quicRelayTrace(
-          "gateway notifying listener route=" & route &
-          " reuseStream=" & $reuseStream &
-          " attachedStream=" & $attachedStream
-        )
-        if attachedStream and reuseStream:
-          let awaitMsg =
-            try:
-              await readJsonMessageWithTimeout(
-                listenerControlStream,
-                QuicRelayAcceptAwaitTimeout,
-                "gateway listener await"
-              )
-            except CatchableError as exc:
-              quicRelayTrace(
-                "gateway listener await failed route=" & route &
-                " err=" & exc.msg
-              )
-              await writeJsonMessage(stream, rpcError("listener_not_ready"))
-              await listenerControlStream.closeQuicStream()
-              return
-          if awaitMsg.isNil or awaitMsg.kind != JObject or
-              jsonString(awaitMsg, "op") != "await":
-            quicRelayTrace(
-              "gateway listener await rejected route=" & route &
-              " payload=" & (if awaitMsg.isNil: "<nil>" else: $awaitMsg)
-            )
-            await writeJsonMessage(stream, rpcError("listener_not_ready"))
-            await listenerControlStream.closeQuicStream()
-            return
-        await writeJsonMessage(listenerControlStream, %*{
-          "op": "incoming",
-          "route": route,
-          "source": source,
-          "candidates": candidates
-        })
-        let ready =
+        let bridgeSession = gateway.allocatePendingBridgeSession(route, kind)
+        pendingBridgeSessionId = bridgeSession.sessionId
+        bridgeAttachFuture = bridgeSession.future
+        if pendingBridgeSessionId.len == 0 or bridgeAttachFuture.isNil:
+          await writeJsonMessage(stream, rpcError("bridge_session_unavailable"))
+          return
+        let persistentIncoming = gateway.beginPersistentListenerIncoming(route).valueOr:
+          quicRelayTrace("gateway listener not awaiting route=" & route & " err=" & error)
+          await writeJsonMessage(stream, rpcError(error))
+          return
+        listenerControlStream = persistentIncoming.stream
+        listenerReadyFuture = persistentIncoming.readyFuture
+        quicRelayTrace("gateway notifying listener route=" & route & " controlStream=persistent")
+        var ready: JsonNode = nil
+        try:
+          quicRelayTrace("gateway listener incoming_write_begin route=" & route)
+          await writeJsonMessage(listenerControlStream, %*{
+            "op": "incoming",
+            "route": route,
+            "source": source,
+            "candidates": candidates,
+            "sessionId": pendingBridgeSessionId
+          })
+          quicRelayTrace("gateway listener incoming_write_done route=" & route)
+          quicRelayTrace("gateway listener ready_wait_begin route=" & route & " persistent=true")
+          ready = await awaitJsonFutureWithTimeout(
+            listenerReadyFuture,
+            QuicRelayListenerReadyTimeout,
+            "gateway listener ready"
+          )
+          quicRelayTrace("gateway listener ready_wait_done route=" & route)
+        except CatchableError as exc:
+          quicRelayTrace(
+            "gateway listener notify/ready failed route=" & route &
+            " err=" & exc.msg
+          )
           try:
-            await readJsonMessageWithTimeout(
-              listenerControlStream,
-              QuicRelayListenerReadyTimeout,
-              "gateway listener ready"
-            )
-          except CatchableError as exc:
-            quicRelayTrace(
-              "gateway listener ready wait failed route=" & route &
-              " err=" & exc.msg
-            )
             await writeJsonMessage(stream, rpcError("listener_not_ready"))
-            await listenerControlStream.closeQuicStream()
-            return
+          except CatchableError:
+            discard
+          gateway.detachListenerStream(route, listenerControlStream, exc.msg)
+          await listenerControlStream.closeQuicStream()
+          return
         if not ready{"ok"}.getBool():
           quicRelayTrace("gateway listener not ready route=" & route)
-          if not splitDialDataStream:
-            await writeJsonMessage(stream, rpcError("listener_not_ready"))
+          await writeJsonMessage(stream, rpcError("listener_not_ready"))
+          gateway.detachListenerStream(
+            route,
+            listenerControlStream,
+            "nim_quic relay listener rejected ready"
+          )
           await listenerControlStream.closeQuicStream()
           return
         let readyCandidates = jsonStrings(ready, "candidates")
         let listenerCandidates =
           if readyCandidates.len > 0: readyCandidates else: listener.candidates
         quicRelayTrace("gateway listener ready route=" & route)
+        listenerDataStream =
+          try:
+            await awaitBridgeAttachWithTimeout(
+              bridgeAttachFuture,
+              QuicRelayListenerReadyTimeout,
+              kind & " bridge attach"
+            )
+          except CatchableError as exc:
+            quicRelayTrace(
+              "gateway bridge attach wait failed route=" & route &
+              " sessionId=" & pendingBridgeSessionId &
+              " err=" & exc.msg
+            )
+            await writeJsonMessage(stream, rpcError("listener_not_ready"))
+            return
+        await writeJsonMessage(listenerDataStream, rpcSuccess(%*{
+          "mode": "bridge_attach",
+          "route": route,
+          "sessionId": pendingBridgeSessionId
+        }))
         await writeJsonMessage(stream, rpcSuccess(%*{
           "mode": "dial",
           "route": route,
-          "candidates": listenerCandidates
+          "candidates": listenerCandidates,
+          "sessionId": pendingBridgeSessionId
         }))
         quicRelayTrace("gateway bridging route=" & route)
-        if attachedStream or splitDialDataStream:
-          # For UDP, reuse the existing dial/incoming control streams as the
-          # bridged data streams after the JSON handshake completes. Prefer the
-          # listener's pre-attached accept stream whenever available so WAN
-          # live traffic does not depend on a server-initiated incoming stream.
-          await bridgeQuicStreams(listenerControlStream, stream)
-        else:
-          await listenerControlStream.closeQuicStream()
-          let listenerDataStream =
-            createBidiStream(gateway.handle, listener.connPtr, listener.connState).valueOr:
-              gateway.clearListenerRoutesForConnection(listener.connPtr)
-              quicRelayTrace("gateway listener data stream create failed route=" & route & " err=" & error)
-              await writeJsonMessage(stream, rpcError("listener_not_ready"))
-              return
-          await writeJsonMessage(listenerDataStream, %*{
-            "op": "bridge",
-            "kind": kind,
-            "route": route
-          })
-          await bridgeQuicStreams(listenerDataStream, stream)
-      finally:
         gateway.releaseListenerRoute(route)
+        routeLockHeld = false
+        await bridgeQuicStreams(listenerDataStream, stream)
+      finally:
+        if routeLockHeld:
+          gateway.releaseListenerRoute(route)
+        if pendingBridgeSessionId.len > 0:
+          gateway.clearPendingBridgeSession(pendingBridgeSessionId)
       keepOpen = true
     else:
       quicRelayTrace("gateway unsupported mode=" & mode)
@@ -2413,112 +2932,8 @@ proc probeDialCandidateExchange*(
     closeQuicRelayClient(listenerClient)
     return
   var listenerRegStream: MsQuicStream = nil
-  var listenerIncomingStream: MsQuicStream = nil
-  var dialerStream: MsQuicStream = nil
-  try:
-    listenerRegStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
-      result.error = error
-      return
-    await writeJsonMessage(listenerRegStream, %*{
-      "version": 1,
-      "mode": "listen",
-      "kind": "udp",
-      "route": route,
-      "candidates": listenerCandidates
-    })
-    let listenerAck = await readJsonMessageWithTimeout(
-      listenerRegStream,
-      QuicRelayRpcTimeout,
-      "listener register ack"
-    )
-    if not listenerAck{"ok"}.getBool():
-      result.error = jsonString(listenerAck, "error")
-      return
-    dialerStream = createBidiStream(dialerClient.handle, dialerClient.connPtr, dialerClient.connState).valueOr:
-      result.error = error
-      return
-    await writeJsonMessage(dialerStream, %*{
-      "version": 1,
-      "mode": "dial",
-      "kind": "udp",
-      "route": route,
-      "source": "/ip4/100.64.0.99/udp/4001/quic-v1/tsnet",
-      "candidates": dialerCandidates
-    })
-
-    await listenerRegStream.closeQuicStream()
-    listenerRegStream = nil
-    listenerIncomingStream =
-      try:
-        await awaitIncomingBidiStream(listenerClient.handle, listenerClient.connState)
-      except CatchableError as exc:
-        result.error = "listener incoming stream accept failed: " & exc.msg
-        return
-    let incoming = await readJsonMessageWithTimeout(
-      listenerIncomingStream,
-      QuicRelayRpcTimeout,
-      "listener incoming payload"
-    )
-    result.dialerCandidates = jsonStrings(incoming, "candidates")
-    await writeJsonMessage(listenerIncomingStream, %*{
-      "ok": true,
-      "op": "ready",
-      "candidates": listenerCandidates
-    })
-
-    let dialAck = await readJsonMessageWithTimeout(dialerStream, QuicRelayRpcTimeout, "dial ack")
-    if not dialAck{"ok"}.getBool():
-      result.error = jsonString(dialAck, "error")
-      return
-    result.listenerCandidates = jsonStrings(rpcPayload(dialAck), "candidates")
-    await dialerStream.closeQuicStream()
-    dialerStream = nil
-    await listenerIncomingStream.closeQuicStream()
-    listenerIncomingStream = nil
-    result.ok = result.listenerCandidates == listenerCandidates and
-      result.dialerCandidates == dialerCandidates
-  except CancelledError as exc:
-    result.error = exc.msg
-    raise exc
-  except CatchableError as exc:
-    result.error = exc.msg
-  finally:
-    if not dialerStream.isNil:
-      await noCancel dialerStream.closeQuicStream()
-    if not listenerIncomingStream.isNil:
-      await noCancel listenerIncomingStream.closeQuicStream()
-    if not listenerRegStream.isNil:
-      await noCancel listenerRegStream.closeQuicStream()
-    closeQuicRelayClient(dialerClient)
-    closeQuicRelayClient(listenerClient)
-
-proc probeAcceptStreamReuse*(
-    relayUrl: string,
-    route: string,
-    listenerCandidates: seq[string],
-    dialerCandidates: seq[string],
-    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly
-): Future[TsnetQuicRelayCandidateExchangeResult] {.async: (raises: [CancelledError]).} =
-  result = TsnetQuicRelayCandidateExchangeResult(
-    ok: false,
-    relayUrl: relayUrl,
-    route: route,
-    listenerCandidates: @[],
-    dialerCandidates: @[],
-    error: ""
-  )
-  let endpoint = quicRelayEndpoint(relayUrl).valueOr:
-    result.error = error
-    return
-  let listenerClient = connectRelay(endpoint, runtimePreference).valueOr:
-    result.error = error
-    return
-  let dialerClient = connectRelay(endpoint, runtimePreference).valueOr:
-    result.error = error
-    closeQuicRelayClient(listenerClient)
-    return
-  var listenerRegStream: MsQuicStream = nil
   var listenerAcceptStream: MsQuicStream = nil
+  var listenerDataStream: MsQuicStream = nil
   var dialerStream: MsQuicStream = nil
   try:
     listenerRegStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
@@ -2529,8 +2944,7 @@ proc probeAcceptStreamReuse*(
       "mode": "listen",
       "kind": "udp",
       "route": route,
-      "candidates": listenerCandidates,
-      "reuseStream": true
+      "candidates": listenerCandidates
     })
     let listenerAck = await readJsonMessageWithTimeout(
       listenerRegStream,
@@ -2564,6 +2978,165 @@ proc probeAcceptStreamReuse*(
       "op": "await",
       "route": route
     })
+    let awaitAck = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayAcceptAckTimeout,
+      "listener await ack"
+    )
+    if not awaitAck{"ok"}.getBool() or jsonString(rpcPayload(awaitAck), "op") != "await":
+      result.error = jsonString(awaitAck, "error")
+      return
+
+    dialerStream = createBidiStream(dialerClient.handle, dialerClient.connPtr, dialerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(dialerStream, %*{
+      "version": 1,
+      "mode": "dial",
+      "kind": "udp",
+      "route": route,
+      "source": "/ip4/100.64.0.99/udp/4001/quic-v1/tsnet",
+      "candidates": dialerCandidates
+    })
+    let incoming = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayRpcTimeout,
+      "listener incoming payload"
+    )
+    let sessionId = jsonString(incoming, "sessionId")
+    result.dialerCandidates = jsonStrings(incoming, "candidates")
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "ok": true,
+      "op": "ready",
+      "candidates": listenerCandidates,
+      "sessionId": sessionId
+    })
+
+    listenerDataStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerDataStream, %*{
+      "version": 1,
+      "mode": "bridge_attach",
+      "kind": "udp",
+      "route": route,
+      "sessionId": sessionId
+    })
+    let attachAck = await readJsonMessageWithTimeout(
+      listenerDataStream,
+      QuicRelayDialAckTimeout,
+      "listener bridge attach ack"
+    )
+    if not attachAck{"ok"}.getBool():
+      result.error = jsonString(attachAck, "error")
+      return
+
+    let dialAck = await readJsonMessageWithTimeout(dialerStream, QuicRelayRpcTimeout, "dial ack")
+    if not dialAck{"ok"}.getBool():
+      result.error = jsonString(dialAck, "error")
+      return
+    result.listenerCandidates = jsonStrings(rpcPayload(dialAck), "candidates")
+    await dialerStream.closeQuicStream()
+    dialerStream = nil
+    result.ok = result.listenerCandidates == listenerCandidates and
+      result.dialerCandidates == dialerCandidates
+  except CancelledError as exc:
+    result.error = exc.msg
+    raise exc
+  except CatchableError as exc:
+    result.error = exc.msg
+  finally:
+    if not dialerStream.isNil:
+      await noCancel dialerStream.closeQuicStream()
+    if not listenerDataStream.isNil:
+      await noCancel listenerDataStream.closeQuicStream()
+    if not listenerAcceptStream.isNil:
+      await noCancel listenerAcceptStream.closeQuicStream()
+    if not listenerRegStream.isNil:
+      await noCancel listenerRegStream.closeQuicStream()
+    closeQuicRelayClient(dialerClient)
+    closeQuicRelayClient(listenerClient)
+
+proc probeAcceptStreamReuse*(
+    relayUrl: string,
+    route: string,
+    listenerCandidates: seq[string],
+    dialerCandidates: seq[string],
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly
+): Future[TsnetQuicRelayCandidateExchangeResult] {.async: (raises: [CancelledError]).} =
+  result = TsnetQuicRelayCandidateExchangeResult(
+    ok: false,
+    relayUrl: relayUrl,
+    route: route,
+    listenerCandidates: @[],
+    dialerCandidates: @[],
+    error: ""
+  )
+  let endpoint = quicRelayEndpoint(relayUrl).valueOr:
+    result.error = error
+    return
+  let listenerClient = connectRelay(endpoint, runtimePreference).valueOr:
+    result.error = error
+    return
+  let dialerClient = connectRelay(endpoint, runtimePreference).valueOr:
+    result.error = error
+    closeQuicRelayClient(listenerClient)
+    return
+  var listenerRegStream: MsQuicStream = nil
+  var listenerAcceptStream: MsQuicStream = nil
+  var listenerDataStream: MsQuicStream = nil
+  var dialerStream: MsQuicStream = nil
+  try:
+    listenerRegStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerRegStream, %*{
+      "version": 1,
+      "mode": "listen",
+      "kind": "udp",
+      "route": route,
+      "candidates": listenerCandidates
+    })
+    let listenerAck = await readJsonMessageWithTimeout(
+      listenerRegStream,
+      QuicRelayRpcTimeout,
+      "listener register ack"
+    )
+    if not listenerAck{"ok"}.getBool():
+      result.error = jsonString(listenerAck, "error")
+      return
+    await listenerRegStream.closeQuicStream()
+    listenerRegStream = nil
+
+    listenerAcceptStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "version": 1,
+      "mode": "accept",
+      "kind": "udp",
+      "route": route
+    })
+    let acceptAck = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayAcceptAckTimeout,
+      "listener accept ack"
+    )
+    if not acceptAck{"ok"}.getBool():
+      result.error = jsonString(acceptAck, "error")
+      return
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "op": "await",
+      "route": route
+    })
+    let awaitAck = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayAcceptAckTimeout,
+      "listener await ack"
+    )
+    if not awaitAck{"ok"}.getBool() or jsonString(rpcPayload(awaitAck), "op") != "await":
+      result.error = jsonString(awaitAck, "error")
+      return
 
     dialerStream = createBidiStream(dialerClient.handle, dialerClient.connPtr, dialerClient.connState).valueOr:
       result.error = error
@@ -2581,17 +3154,276 @@ proc probeAcceptStreamReuse*(
       QuicRelayDialAckTimeout,
       "listener incoming payload"
     )
+    let sessionId = jsonString(incoming, "sessionId")
     result.dialerCandidates = jsonStrings(incoming, "candidates")
     await writeJsonMessage(listenerAcceptStream, %*{
       "ok": true,
       "op": "ready",
-      "candidates": listenerCandidates
+      "candidates": listenerCandidates,
+      "sessionId": sessionId
     })
+
+    listenerDataStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerDataStream, %*{
+      "version": 1,
+      "mode": "bridge_attach",
+      "kind": "udp",
+      "route": route,
+      "sessionId": sessionId
+    })
+    let attachAck = await readJsonMessageWithTimeout(
+      listenerDataStream,
+      QuicRelayDialAckTimeout,
+      "listener bridge attach ack"
+    )
+    if not attachAck{"ok"}.getBool():
+      result.error = jsonString(attachAck, "error")
+      return
 
     let dialAck = await readJsonMessageWithTimeout(
       dialerStream,
       QuicRelayDialAckTimeout,
       "dial ack"
+    )
+    if not dialAck{"ok"}.getBool():
+      result.error = jsonString(dialAck, "error")
+      return
+    result.listenerCandidates = jsonStrings(rpcPayload(dialAck), "candidates")
+    result.ok = result.listenerCandidates == listenerCandidates and
+      result.dialerCandidates == dialerCandidates
+
+    await dialerStream.closeQuicStream()
+    dialerStream = nil
+    await listenerDataStream.closeQuicStream()
+    listenerDataStream = nil
+
+    await sleepAsync(100.milliseconds)
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "op": "await",
+      "route": route
+    })
+    let secondAwaitAck = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayAcceptAckTimeout,
+      "listener second await ack"
+    )
+    if not secondAwaitAck{"ok"}.getBool() or
+        jsonString(rpcPayload(secondAwaitAck), "op") != "await":
+      result.error = jsonString(secondAwaitAck, "error")
+      return
+
+    dialerStream = createBidiStream(dialerClient.handle, dialerClient.connPtr, dialerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(dialerStream, %*{
+      "version": 1,
+      "mode": "dial",
+      "kind": "udp",
+      "route": route,
+      "source": "/ip4/100.64.0.98/udp/4002/quic-v1/tsnet",
+      "candidates": dialerCandidates
+    })
+    let secondIncoming = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayDialAckTimeout,
+      "listener second incoming payload"
+    )
+    let secondSessionId = jsonString(secondIncoming, "sessionId")
+    let secondDialerCandidates = jsonStrings(secondIncoming, "candidates")
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "ok": true,
+      "op": "ready",
+      "candidates": listenerCandidates,
+      "sessionId": secondSessionId
+    })
+
+    listenerDataStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerDataStream, %*{
+      "version": 1,
+      "mode": "bridge_attach",
+      "kind": "udp",
+      "route": route,
+      "sessionId": secondSessionId
+    })
+    let secondAttachAck = await readJsonMessageWithTimeout(
+      listenerDataStream,
+      QuicRelayDialAckTimeout,
+      "listener second bridge attach ack"
+    )
+    if not secondAttachAck{"ok"}.getBool():
+      result.error = jsonString(secondAttachAck, "error")
+      return
+
+    let secondDialAck = await readJsonMessageWithTimeout(
+      dialerStream,
+      QuicRelayDialAckTimeout,
+      "second dial ack"
+    )
+    if not secondDialAck{"ok"}.getBool():
+      result.error = jsonString(secondDialAck, "error")
+      return
+    let secondListenerCandidates = jsonStrings(rpcPayload(secondDialAck), "candidates")
+    result.ok = result.ok and
+      secondListenerCandidates == listenerCandidates and
+      secondDialerCandidates == dialerCandidates
+  except CancelledError as exc:
+    result.error = exc.msg
+    raise exc
+  except CatchableError as exc:
+    result.error = exc.msg
+  finally:
+    if not dialerStream.isNil:
+      await noCancel dialerStream.closeQuicStream()
+    if not listenerDataStream.isNil:
+      await noCancel listenerDataStream.closeQuicStream()
+    if not listenerAcceptStream.isNil:
+      await noCancel listenerAcceptStream.closeQuicStream()
+    if not listenerRegStream.isNil:
+      await noCancel listenerRegStream.closeQuicStream()
+    closeQuicRelayClient(dialerClient)
+    closeQuicRelayClient(listenerClient)
+
+proc probeAcceptStreamRouteStatusReuse*(
+    relayUrl: string,
+    route: string,
+    listenerCandidates: seq[string],
+    dialerCandidates: seq[string],
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly
+): Future[TsnetQuicRelayCandidateExchangeResult] {.async: (raises: [CancelledError]).} =
+  result = TsnetQuicRelayCandidateExchangeResult(
+    ok: false,
+    relayUrl: relayUrl,
+    route: route,
+    listenerCandidates: @[],
+    dialerCandidates: @[],
+    error: ""
+  )
+  let endpoint = quicRelayEndpoint(relayUrl).valueOr:
+    result.error = error
+    return
+  let listenerClient = connectRelay(endpoint, runtimePreference).valueOr:
+    result.error = error
+    return
+  let dialerClient = connectRelay(endpoint, runtimePreference).valueOr:
+    result.error = error
+    closeQuicRelayClient(listenerClient)
+    return
+  var listenerRegStream: MsQuicStream = nil
+  var listenerAcceptStream: MsQuicStream = nil
+  var listenerDataStream: MsQuicStream = nil
+  var dialerStream: MsQuicStream = nil
+  try:
+    listenerRegStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerRegStream, %*{
+      "version": 1,
+      "mode": "listen",
+      "kind": "udp",
+      "route": route,
+      "candidates": listenerCandidates
+    })
+    let listenerAck = await readJsonMessageWithTimeout(
+      listenerRegStream,
+      QuicRelayRpcTimeout,
+      "listener register ack"
+    )
+    if not listenerAck{"ok"}.getBool():
+      result.error = jsonString(listenerAck, "error")
+      return
+    await listenerRegStream.closeQuicStream()
+    listenerRegStream = nil
+
+    listenerAcceptStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "version": 1,
+      "mode": "accept",
+      "kind": "udp",
+      "route": route
+    })
+    let acceptAck = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayAcceptAckTimeout,
+      "listener accept ack"
+    )
+    if not acceptAck{"ok"}.getBool():
+      result.error = jsonString(acceptAck, "error")
+      return
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "op": "await",
+      "route": route
+    })
+    let awaitAck = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayAcceptAckTimeout,
+      "listener await ack"
+    )
+    if not awaitAck{"ok"}.getBool() or jsonString(rpcPayload(awaitAck), "op") != "await":
+      result.error = jsonString(awaitAck, "error")
+      return
+
+    let published = await relayRouteStatus(listenerClient, route, QuicRelayRpcTimeout)
+    if published.isErr():
+      result.error = published.error
+      return
+    if not published.get():
+      result.error = "route_not_published"
+      return
+
+    dialerStream = createBidiStream(dialerClient.handle, dialerClient.connPtr, dialerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(dialerStream, %*{
+      "version": 1,
+      "mode": "dial",
+      "kind": "udp",
+      "route": route,
+      "source": "/ip4/100.64.0.97/udp/4003/quic-v1/tsnet",
+      "candidates": dialerCandidates
+    })
+    let incoming = await readJsonMessageWithTimeout(
+      listenerAcceptStream,
+      QuicRelayDialAckTimeout,
+      "listener incoming payload after route_status"
+    )
+    let sessionId = jsonString(incoming, "sessionId")
+    result.dialerCandidates = jsonStrings(incoming, "candidates")
+    await writeJsonMessage(listenerAcceptStream, %*{
+      "ok": true,
+      "op": "ready",
+      "candidates": listenerCandidates,
+      "sessionId": sessionId
+    })
+
+    listenerDataStream = createBidiStream(listenerClient.handle, listenerClient.connPtr, listenerClient.connState).valueOr:
+      result.error = error
+      return
+    await writeJsonMessage(listenerDataStream, %*{
+      "version": 1,
+      "mode": "bridge_attach",
+      "kind": "udp",
+      "route": route,
+      "sessionId": sessionId
+    })
+    let attachAck = await readJsonMessageWithTimeout(
+      listenerDataStream,
+      QuicRelayDialAckTimeout,
+      "listener bridge attach ack after route_status"
+    )
+    if not attachAck{"ok"}.getBool():
+      result.error = jsonString(attachAck, "error")
+      return
+
+    let dialAck = await readJsonMessageWithTimeout(
+      dialerStream,
+      QuicRelayDialAckTimeout,
+      "dial ack after route_status"
     )
     if not dialAck{"ok"}.getBool():
       result.error = jsonString(dialAck, "error")
@@ -2607,6 +3439,8 @@ proc probeAcceptStreamReuse*(
   finally:
     if not dialerStream.isNil:
       await noCancel dialerStream.closeQuicStream()
+    if not listenerDataStream.isNil:
+      await noCancel listenerDataStream.closeQuicStream()
     if not listenerAcceptStream.isNil:
       await noCancel listenerAcceptStream.closeQuicStream()
     if not listenerRegStream.isNil:
@@ -2631,6 +3465,7 @@ proc listenerLoop(
       )
       await sleepAsync(startupDelay)
     while true:
+      clearRelayReadyRoute(ownerId, route)
       let endpoint = quicRelayEndpoint(relayUrl).valueOr:
         quicRelayTrace("listener endpoint parse failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
@@ -2657,80 +3492,153 @@ proc listenerLoop(
             " route=" & route &
             " mode=ack_first"
           )
-        except CatchableError:
-          break setup
-        let confirmed =
-          try:
-            await confirmRelayListenRegistration(regStream, endpoint, route)
-          except CatchableError as exc:
-            Result[void, string].err("nim_quic relay listen ack raised: " & exc.msg)
-        if confirmed.isOk():
-          quicRelayTrace(
-            "listener registration acked routeId=" & $routeId &
-            " route=" & route
+          let listenerAck = await readJsonMessageWithTimeout(
+            regStream,
+            QuicRelayRpcTimeout,
+            "listener register ack"
           )
-        else:
-          quicRelayTrace(
-            "listener registration ack failed routeId=" & $routeId &
-            " route=" & route &
-            " err=" & confirmed.error &
-            " fallback=route_status"
-          )
-        if confirmed.isErr():
-          let published = ensureRelayRoutePublished(endpoint, route)
-          if published.isErr():
+          if listenerAck.isNil or not listenerAck{"ok"}.getBool():
             quicRelayTrace(
-              "listener publication confirm failed routeId=" & $routeId &
+              "listener registration rejected routeId=" & $routeId &
               " route=" & route &
-              " err=" & published.error
+              " err=" & (if listenerAck.isNil: "<nil>" else: jsonString(listenerAck, "error"))
             )
             break setup
-        markRelayRouteReady(ownerId, route)
-        quicRelayTrace(
-          "listener published routeId=" & $routeId &
-          " route=" & route
-        )
+        except CatchableError as exc:
+          quicRelayTrace(
+            "listener registration failed routeId=" & $routeId &
+            " route=" & route &
+            " err=" & exc.msg
+          )
+          break setup
         await regStream.closeQuicStream()
         regStream = nil
 
         var restart = false
+        var acceptStream: MsQuicStream = nil
         while true:
-          let controlStream =
-            try:
-              await awaitIncomingBidiStream(client.handle, client.connState)
-            except CatchableError as exc:
+          if acceptStream.isNil:
+            acceptStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
               quicRelayTrace(
-                "listener incoming stream accept failed routeId=" & $routeId &
+                "listener accept stream create failed routeId=" & $routeId &
                 " route=" & route &
-                " err=" & exc.msg
+                " err=" & error
               )
               restart = true
               break
-          let incoming =
             try:
-              await readJsonMessage(controlStream)
+              await writeJsonMessage(acceptStream, %*{
+                "version": 1,
+                "mode": "accept",
+                "kind": "tcp",
+                "route": route
+              })
+              let acceptAck = await readJsonMessageWithTimeout(
+                acceptStream,
+                QuicRelayAcceptAckTimeout,
+                "listener accept ack"
+              )
+              if acceptAck.isNil or not acceptAck{"ok"}.getBool():
+                quicRelayTrace(
+                  "listener accept stream ack rejected routeId=" & $routeId &
+                  " route=" & route &
+                  " err=" & (if acceptAck.isNil: "<nil>" else: jsonString(acceptAck, "error"))
+                )
+                await acceptStream.closeQuicStream()
+                acceptStream = nil
+                restart = true
+                break
+            except CatchableError as exc:
+              quicRelayTrace(
+                "listener accept stream register failed routeId=" & $routeId &
+                " route=" & route &
+                " err=" & exc.msg
+              )
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
+              restart = true
+              break
+          try:
+            await writeJsonMessage(acceptStream, %*{
+              "op": "await",
+              "route": route
+            })
+            let awaitAck = await readJsonMessageWithTimeout(
+              acceptStream,
+              QuicRelayAcceptAckTimeout,
+              "listener await ack"
+            )
+            if awaitAck.isNil or not awaitAck{"ok"}.getBool() or
+                jsonString(rpcPayload(awaitAck), "op") != "await":
+              quicRelayTrace(
+                "listener await rejected routeId=" & $routeId &
+                " route=" & route &
+                " err=" & (if awaitAck.isNil: "<nil>" else: jsonString(awaitAck, "error"))
+              )
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
+              restart = true
+              break
+            let awaitPayload = rpcPayload(awaitAck)
+            if not awaitPayload{"published"}.getBool(false):
+              quicRelayTrace(
+                "listener await missing published routeId=" & $routeId &
+                " route=" & route
+              )
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
+              restart = true
+              break
+            markRelayRouteReady(ownerId, route)
+            quicRelayTrace(
+              "listener published routeId=" & $routeId &
+              " route=" & route
+            )
+          except CatchableError as exc:
+            quicRelayTrace(
+              "listener await failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & exc.msg
+            )
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
+            restart = true
+            break
+          let controlStream =
+            try:
+              await awaitPersistentIncomingWithRouteValidation(
+                client,
+                acceptStream,
+                ownerId,
+                routeId,
+                route
+              )
             except CatchableError as exc:
               quicRelayTrace(
                 "listener incoming payload failed routeId=" & $routeId &
                 " route=" & route &
                 " err=" & exc.msg
               )
-              await controlStream.closeQuicStream()
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
               restart = true
               break
+          let incoming =
+            controlStream
           quicRelayTrace(
             "listener incoming stream accepted routeId=" & $routeId &
             " route=" & route
           )
           if incoming.isNil or incoming.kind != JObject:
-            await controlStream.closeQuicStream()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
             restart = true
             break
           if jsonString(incoming, "op") != "incoming":
-            await controlStream.closeQuicStream()
             continue
           quicRelayTrace("listener incoming routeId=" & $routeId & " route=" & route)
           let sourceAdvertised = jsonString(incoming, "source")
+          let bridgeSessionId = jsonString(incoming, "sessionId")
           let rawTarget = rawSocketFromAddress(rawLocal).valueOr:
             discard
             restart = true
@@ -2760,67 +3668,82 @@ proc listenerLoop(
               except CatchableError:
                 discard
           try:
-            await writeJsonMessage(controlStream, %*{
+            await writeJsonMessage(acceptStream, %*{
               "ok": true,
               "op": "ready",
-              "candidates": []
+              "candidates": [],
+              "sessionId": bridgeSessionId
             })
             quicRelayTrace("listener ready routeId=" & $routeId & " route=" & route)
           except CatchableError:
             await localTransport.safeCloseTransport()
-            await controlStream.closeQuicStream()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
             restart = true
             break
-          controlStream.restoreCachedBytes(@[])
-          let bridgeStream =
-            try:
-              await awaitIncomingBidiStream(client.handle, client.connState)
-            except CatchableError as exc:
+          let bridgeStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
+            await localTransport.safeCloseTransport()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
+            quicRelayTrace(
+              "listener bridge stream create failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & error
+            )
+            restart = true
+            break
+          try:
+            await writeJsonMessage(bridgeStream, %*{
+              "version": 1,
+              "mode": "bridge_attach",
+              "kind": "tcp",
+              "route": route,
+              "sessionId": bridgeSessionId
+            })
+            let attachAck = await readJsonMessageWithTimeout(
+              bridgeStream,
+              QuicRelayDialAckTimeout,
+              "listener bridge attach ack"
+            )
+            if attachAck.isNil or not attachAck{"ok"}.getBool():
               quicRelayTrace(
-                "listener bridge stream accept failed routeId=" & $routeId &
+                "listener bridge attach rejected routeId=" & $routeId &
                 " route=" & route &
-                " err=" & exc.msg
-              )
-              await localTransport.safeCloseTransport()
-              restart = true
-              break
-          let bridgeOp =
-            try:
-              await readJsonMessage(bridgeStream)
-            except CatchableError as exc:
-              quicRelayTrace(
-                "listener bridge intro failed routeId=" & $routeId &
-                " route=" & route &
-                " err=" & exc.msg
+                " err=" & (if attachAck.isNil: "<nil>" else: jsonString(attachAck, "error"))
               )
               await localTransport.safeCloseTransport()
               await bridgeStream.closeQuicStream()
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
               restart = true
               break
-          if bridgeOp.isNil or bridgeOp.kind != JObject or jsonString(bridgeOp, "op") != "bridge":
+          except CatchableError as exc:
             quicRelayTrace(
-              "listener bridge intro rejected routeId=" & $routeId &
-              " route=" & route
+              "listener bridge attach failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & exc.msg
             )
             await localTransport.safeCloseTransport()
             await bridgeStream.closeQuicStream()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
             restart = true
             break
-          bridgeStream.restoreCachedBytes(@[])
-          await controlStream.finishQuicStream(QuicRelayGatewayResponseDrainDelay)
           quicRelayTrace("listener bridge start routeId=" & $routeId & " route=" & route)
           await bridgeLocalAndQuic(localTransport, bridgeStream)
           quicRelayTrace("listener bridge end routeId=" & $routeId & " route=" & route)
-          restart = true
-          break
+          continue
         if not restart:
           break
+        if not acceptStream.isNil:
+          await acceptStream.closeQuicStream()
       await regStream.closeQuicStream()
       closeQuicRelayClient(client)
       await sleepAsync(200.milliseconds)
   except CancelledError:
     discard
   finally:
+    clearRelayReadyRoute(ownerId, route)
     quicRelayTrace("listener task stop routeId=" & $routeId)
 
 proc startRelayListener*(
@@ -2867,6 +3790,7 @@ proc udpListenerLoop(
       )
       await sleepAsync(startupDelay)
     while true:
+      clearRelayReadyRoute(ownerId, route)
       let endpoint = quicRelayEndpoint(relayUrl).valueOr:
         quicRelayTrace("udp listener endpoint parse failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
@@ -2875,13 +3799,6 @@ proc udpListenerLoop(
         quicRelayTrace("udp listener relay connect failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
-      # On WAN we prefer a client-initiated accept stream. The listener keeps
-      # that bidi stream attached, explicitly sends `await`, and only then
-      # does the gateway answer with `incoming` on the same stream. This
-      # avoids the least stable path we have seen in practice: a delayed
-      # server-push onto a previously attached stream without a fresh
-      # request/response turn.
-      let preferReuseStream = not isLoopbackRelayHost(endpoint.host)
       var regStream: MsQuicStream = nil
       block setup:
         regStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
@@ -2893,8 +3810,7 @@ proc udpListenerLoop(
           "mode": "listen",
           "kind": "udp",
           "route": route,
-          "candidates": listenerCandidates,
-          "reuseStream": preferReuseStream
+          "candidates": listenerCandidates
         }
         try:
           await writeJsonMessage(regStream, hello)
@@ -2904,6 +3820,18 @@ proc udpListenerLoop(
             " route=" & route &
             " mode=ack_first"
           )
+          let listenerAck = await readJsonMessageWithTimeout(
+            regStream,
+            QuicRelayRpcTimeout,
+            "udp listener register ack"
+          )
+          if listenerAck.isNil or not listenerAck{"ok"}.getBool():
+            quicRelayTrace(
+              "udp listener registration rejected routeId=" & $routeId &
+              " route=" & route &
+              " err=" & (if listenerAck.isNil: "<nil>" else: jsonString(listenerAck, "error"))
+            )
+            break setup
         except CatchableError as exc:
           quicRelayTrace(
             "udp listener hello exchange failed routeId=" & $routeId &
@@ -2911,44 +3839,13 @@ proc udpListenerLoop(
             " err=" & exc.msg
           )
           break setup
-        let confirmed =
-          try:
-            await confirmRelayListenRegistration(regStream, endpoint, route)
-          except CatchableError as exc:
-            Result[void, string].err("nim_quic relay listen ack raised: " & exc.msg)
-        if confirmed.isOk():
-          quicRelayTrace(
-            "udp listener registration acked routeId=" & $routeId &
-            " route=" & route
-          )
-        else:
-          quicRelayTrace(
-            "udp listener registration ack failed routeId=" & $routeId &
-            " route=" & route &
-            " err=" & confirmed.error &
-            " fallback=route_status"
-          )
-        if confirmed.isErr():
-          let published = ensureRelayRoutePublished(endpoint, route)
-          if published.isErr():
-            quicRelayTrace(
-              "udp listener publication confirm failed routeId=" & $routeId &
-              " route=" & route &
-              " err=" & published.error
-            )
-            break setup
-        markRelayRouteReady(ownerId, route)
-        quicRelayTrace(
-          "udp listener published routeId=" & $routeId &
-          " route=" & route
-        )
         var restart = false
+        var acceptStream: MsQuicStream = nil
         if not regStream.isNil:
           await regStream.closeQuicStream()
           regStream = nil
         while true:
-          var acceptStream: MsQuicStream = nil
-          if preferReuseStream:
+          if acceptStream.isNil:
             acceptStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
               quicRelayTrace(
                 "udp listener accept stream create failed routeId=" & $routeId &
@@ -2980,18 +3877,11 @@ proc udpListenerLoop(
                   " err=" & jsonString(acceptAck, "error")
                 )
                 await acceptStream.closeQuicStream()
+                acceptStream = nil
                 restart = true
                 break
               quicRelayTrace(
                 "udp listener accept stream acked routeId=" & $routeId &
-                " route=" & route
-              )
-              await writeJsonMessage(acceptStream, %*{
-                "op": "await",
-                "route": route
-              })
-              quicRelayTrace(
-                "udp listener accept stream awaiting routeId=" & $routeId &
                 " route=" & route
               )
             except CatchableError as exc:
@@ -3001,8 +3891,59 @@ proc udpListenerLoop(
                 " err=" & exc.msg
               )
               await acceptStream.closeQuicStream()
+              acceptStream = nil
               restart = true
               break
+          try:
+            await writeJsonMessage(acceptStream, %*{
+              "op": "await",
+              "route": route
+            })
+            let awaitAck = await readJsonMessageWithTimeout(
+              acceptStream,
+              QuicRelayAcceptAckTimeout,
+              "udp listener await ack"
+            )
+            if awaitAck.isNil or not awaitAck{"ok"}.getBool() or
+                jsonString(rpcPayload(awaitAck), "op") != "await":
+              quicRelayTrace(
+                "udp listener accept stream await rejected routeId=" & $routeId &
+                " route=" & route &
+                " err=" & (if awaitAck.isNil: "<nil>" else: jsonString(awaitAck, "error"))
+              )
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
+              restart = true
+              break
+            quicRelayTrace(
+              "udp listener accept stream awaiting routeId=" & $routeId &
+              " route=" & route
+            )
+            let awaitPayload = rpcPayload(awaitAck)
+            if not awaitPayload{"published"}.getBool(false):
+              quicRelayTrace(
+                "udp listener accept stream await missing published routeId=" & $routeId &
+                " route=" & route
+              )
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
+              restart = true
+              break
+            markRelayRouteReady(ownerId, route)
+            quicRelayTrace(
+              "udp listener published routeId=" & $routeId &
+              " route=" & route
+            )
+          except CatchableError as exc:
+            quicRelayTrace(
+              "udp listener accept stream await failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & exc.msg
+            )
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
+            restart = true
+            break
           quicRelayTrace(
             "udp listener awaiting incoming stream routeId=" & $routeId &
             " route=" & route &
@@ -3026,16 +3967,24 @@ proc udpListenerLoop(
               break
           let incoming =
             try:
+              quicRelayTrace(
+                "udp listener incoming_payload_wait_begin routeId=" & $routeId &
+                " route=" & route &
+                " persistent=" & $(not acceptStream.isNil)
+              )
               if not acceptStream.isNil:
-                # This stream is a long-lived accept poll. On slower peers,
-                # especially Android, there can be a long warm-up gap between
-                # the listener attaching and the first dial arriving. Refresh
-                # the accept stream periodically so we don't sit forever on an
-                # idle attached stream that has silently gone stale.
-                await readJsonMessageWithTimeout(
+                # The attached accept stream is the canonical long-lived
+                # rendezvous channel for incoming relay notifications. While
+                # waiting on that stream, keep re-validating that the gateway
+                # still publishes this route; otherwise drop ready state and
+                # re-register instead of letting stale readiness survive until
+                # the next dial attempt.
+                await awaitPersistentIncomingWithRouteValidation(
+                  client,
                   controlStream,
-                  QuicRelayAcceptRefreshTimeout,
-                  "udp listener incoming reuse"
+                  ownerId,
+                  routeId,
+                  route
                 )
               else:
                 await readJsonMessageWithTimeout(
@@ -3044,14 +3993,6 @@ proc udpListenerLoop(
                   "udp listener incoming payload"
                 )
             except CatchableError as exc:
-              if not acceptStream.isNil and
-                  exc.msg.contains("timed out waiting for udp listener incoming reuse"):
-                quicRelayTrace(
-                  "udp listener accept stream refresh routeId=" & $routeId &
-                  " route=" & route
-                )
-                await controlStream.closeQuicStream()
-                continue
               quicRelayTrace(
                 "udp listener incoming payload failed routeId=" & $routeId &
                 " route=" & route &
@@ -3074,14 +4015,17 @@ proc udpListenerLoop(
               " route=" & route &
               " err=" & jsonString(incoming, "error")
             )
-            await controlStream.closeQuicStream()
+            if controlStream != acceptStream:
+              await controlStream.closeQuicStream()
             restart = true
             break
           if jsonString(incoming, "op") != "incoming":
-            await controlStream.closeQuicStream()
+            if controlStream != acceptStream:
+              await controlStream.closeQuicStream()
             continue
           quicRelayTrace("udp listener incoming routeId=" & $routeId & " route=" & route)
           let sourceAdvertised = jsonString(incoming, "source")
+          let bridgeSessionId = jsonString(incoming, "sessionId")
           let dialerCandidates = jsonStrings(incoming, "candidates")
           let rawTarget = rawSocketFromAddress(rawLocal).valueOr:
             restart = true
@@ -3159,23 +4103,85 @@ proc udpListenerLoop(
             await writeJsonMessage(controlStream, %*{
               "ok": true,
               "op": "ready",
-              "candidates": listenerCandidates
+              "candidates": listenerCandidates,
+              "sessionId": bridgeSessionId
             })
             quicRelayTrace("udp listener ready routeId=" & $routeId & " route=" & route)
           except CatchableError:
             await localUdp.closeDatagramTransport()
-            await controlStream.closeQuicStream()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
             restart = true
             break
-          state.stream = controlStream
+          let dataStream = createBidiStream(client.handle, client.connPtr, client.connState).valueOr:
+            await localUdp.closeDatagramTransport()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
+            quicRelayTrace(
+              "udp listener data stream create failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & error
+            )
+            restart = true
+            break
+          try:
+            await writeJsonMessage(dataStream, %*{
+              "version": 1,
+              "mode": "bridge_attach",
+              "kind": "udp",
+              "route": route,
+              "sessionId": bridgeSessionId
+            })
+            let attachAck = await readJsonMessageWithTimeout(
+              dataStream,
+              QuicRelayDialAckTimeout,
+              "udp listener bridge attach ack"
+            )
+            if not attachAck{"ok"}.getBool():
+              quicRelayTrace(
+                "udp listener bridge attach rejected routeId=" & $routeId &
+                " route=" & route &
+                " err=" & jsonString(attachAck, "error")
+              )
+              await localUdp.closeDatagramTransport()
+              await dataStream.closeQuicStream()
+              await acceptStream.closeQuicStream()
+              acceptStream = nil
+              restart = true
+              break
+            quicRelayTrace(
+              "udp listener bridge attached routeId=" & $routeId &
+              " route=" & route &
+              " sessionId=" & bridgeSessionId
+            )
+          except CatchableError as exc:
+            quicRelayTrace(
+              "udp listener bridge attach failed routeId=" & $routeId &
+              " route=" & route &
+              " err=" & exc.msg
+            )
+            await localUdp.closeDatagramTransport()
+            await dataStream.closeQuicStream()
+            await acceptStream.closeQuicStream()
+            acceptStream = nil
+            restart = true
+            break
 
-          quicRelayTrace("udp listener bridge start routeId=" & $routeId & " route=" & route)
-          await bridgeUdpAndQuic(localUdp, state, localTarget, false)
-          quicRelayTrace("udp listener bridge end routeId=" & $routeId & " route=" & route)
-          restart = true
-          break
+          state.stream = dataStream
+          await state.flushPendingUdpFrames()
+          let bridgeTask = bridgeUdpAndQuic(localUdp, state, localTarget, false)
+          let bridgeHandle = relayRegisterTaskSafe(ownerId, nil, localUdp, bridgeTask)
+          asyncSpawn bridgeTask
+          quicRelayTrace(
+            "udp listener bridge task scheduled routeId=" & $bridgeHandle.routeId &
+            " advertisedRoute=" & route &
+            " sessionId=" & bridgeSessionId
+          )
+          continue
         if not restart:
           break
+        if not acceptStream.isNil:
+          await acceptStream.closeQuicStream()
       if not regStream.isNil:
         await regStream.closeQuicStream()
       closeQuicRelayClient(client)
@@ -3183,6 +4189,7 @@ proc udpListenerLoop(
   except CancelledError:
     discard
   finally:
+    clearRelayReadyRoute(ownerId, route)
     quicRelayTrace("udp listener task stop routeId=" & $routeId)
 
 proc startUdpRelayListener*(

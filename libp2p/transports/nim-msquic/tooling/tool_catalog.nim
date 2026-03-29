@@ -17,9 +17,9 @@ const
       driver: "startTraceCollector",
       notes: "捕获 `DiagnosticsEvent` 并汇总 sample/interop 记录。"),
     ToolingComponent(
-      name: "nim-fuzz-harness",
+      name: "nim-fuzz-runner",
       category: tcDiagnostics,
-      sources: @["nim/tooling/fuzz_harness.nim"],
+      sources: @["nim/tooling/fuzz_runner.nim"],
       driver: "fuzzInitialFlight",
       notes: "覆盖初始握手 Crypto 帧的模糊测试入口。"),
     ToolingComponent(
@@ -31,4 +31,3 @@ const
 
 proc componentsByCategory*(category: ToolCategory): seq[ToolingComponent] =
   ToolComponents.filterIt(it.category == category)
-

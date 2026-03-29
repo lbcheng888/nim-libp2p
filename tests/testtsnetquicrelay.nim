@@ -1,7 +1,7 @@
 {.used.}
 
 when defined(libp2p_msquic_experimental):
-  import std/[json, nativesockets, os, sequtils, strutils, times]
+  import std/[json, nativesockets, options, os, sequtils, strutils, times]
   import chronos
   import unittest2
 
@@ -489,6 +489,71 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check exchange.ok
       check exchange.listenerCandidates == listenerCandidates
       check exchange.dialerCandidates == dialerCandidates
+
+    test "accept stream stays healthy while same connection route_status runs concurrently":
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        gateway.stop()
+
+      let listenerCandidates = @[
+        "/ip4/198.51.100.10/udp/4001/quic-v1"
+      ]
+      let dialerCandidates = @[
+        "/ip4/203.0.113.30/udp/4556/quic-v1"
+      ]
+      let exchange =
+        waitFor probeAcceptStreamRouteStatusReuse(
+          relayUrl,
+          "/ip4/100.64.0.20/udp/4001/quic-v1/tsnet",
+          listenerCandidates,
+          dialerCandidates
+        )
+      if not exchange.ok:
+        checkpoint("accept+route_status probe error: " & exchange.error)
+      check exchange.ok
+      check exchange.listenerCandidates == listenerCandidates
+      check exchange.dialerCandidates == dialerCandidates
+
+    test "udp bridge session binds exactly one client source":
+      let target = initTAddress("127.0.0.1", Port(40111))
+      let firstClient = initTAddress("127.0.0.1", Port(50199))
+      let secondClient = initTAddress("127.0.0.1", Port(50200))
+
+      let listenerDecision = udpBridgeAcceptsSource(
+        target,
+        none(TransportAddress),
+        target,
+        true
+      )
+      check listenerDecision.accept
+      check not listenerDecision.learnClient
+
+      let firstDialDecision = udpBridgeAcceptsSource(
+        target,
+        none(TransportAddress),
+        firstClient,
+        false
+      )
+      check firstDialDecision.accept
+      check firstDialDecision.learnClient
+
+      let repeatDialDecision = udpBridgeAcceptsSource(
+        target,
+        some(firstClient),
+        firstClient,
+        false
+      )
+      check repeatDialDecision.accept
+      check not repeatDialDecision.learnClient
+
+      let wrongDialDecision = udpBridgeAcceptsSource(
+        target,
+        some(firstClient),
+        secondClient,
+        false
+      )
+      check not wrongDialDecision.accept
+      check not wrongDialDecision.learnClient
 
     test "relay candidates include public and lan hints from bridgeExtraJson":
       let candidates = relayCandidatesForRaw(

@@ -2191,6 +2191,57 @@ suite "MsQuic ACK-driven loss recovery":
       check host.contains("10.0.2.211")
     )
 
+  test "flushStream segments oversized stream chunk into multiple packets":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard registration
+      discard api
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionHandshakeStateForTest(connection, true)
+      check setConnectionRemoteAddressForTest(connection, "10.0.2.213", 5213'u16)
+
+      var streamHandle: HQUIC
+      check api.StreamOpen(connection, QUIC_STREAM_OPEN_FLAGS(0), nil, nil, addr streamHandle) ==
+        QUIC_STATUS_SUCCESS
+      defer:
+        api.StreamClose(streamHandle)
+
+      var largePayload = newSeq[byte](4096)
+      for idx in 0 ..< largePayload.len:
+        largePayload[idx] = byte(idx mod 251)
+
+      check prependPendingStreamChunkForTest(streamHandle, 0'u64, largePayload, true)
+      check flushStreamForTest(streamHandle)
+
+      var sentCount = 0'u32
+      var pendingCount = 0'u32
+      check getConnectionSentPacketCountForTest(connection, sentCount)
+      check getStreamPendingChunkCountForTest(streamHandle, pendingCount)
+      check sentCount > 1'u32
+      check pendingCount == 0'u32
+
+      var reconstructed: seq[byte] = @[]
+      var expectedOffset = 0'u64
+      for idx in 0'u32 ..< sentCount:
+        var frameKind = sfkAck
+        var payload: seq[byte] = @[]
+        check getConnectionSentFrameKindAtForTest(connection, idx, frameKind)
+        check getConnectionSentFramePayloadAtForTest(connection, idx, payload)
+        check frameKind == sfkStream
+        var pos = 0
+        let frame = proto.parseStreamFrame(payload, pos)
+        check pos == payload.len
+        check frame.offset == expectedOffset
+        check frame.data.len > 0
+        if idx + 1'u32 < sentCount:
+          check not frame.fin
+        else:
+          check frame.fin
+        reconstructed.add(frame.data)
+        expectedOffset += uint64(frame.data.len)
+      check reconstructed == largePayload
+      check expectedOffset == uint64(largePayload.len)
+    )
+
   test "ACK flushes queued peer-started stream chunks":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard registration
@@ -2313,6 +2364,54 @@ suite "MsQuic ACK-driven loss recovery":
       check getConnectionSentPacketCountForTest(connection, count)
       check getConnectionProbeCountForEpoch(connection, packet_model.ceInitial, probeCount)
       check getConnectionLossFlightForTest(connection, packet_model.ceInitial, packets, bytes)
+      check count == 3'u32
+      check probeCount == 1'u16
+      check packets == 3'u32
+      check bytes > 1200'u64
+    )
+
+  test "pto timeout still sends 1-RTT probes when only exemption bytes remain":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      check setConnectionCongestionAlgorithmForTest(connection, caBbr)
+
+      let base = nowUs()
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
+      check setConnectionRemoteAddressForTest(connection, "10.0.2.222", 5222'u16)
+
+      var windowBytes = 0'u64
+      check getConnectionCongestionWindow(connection, windowBytes)
+      check windowBytes > 15'u64
+      check setConnectionCongestionBytesInFlightForTest(connection, uint32(windowBytes - 15'u64))
+
+      let streamPayload = proto.encodeStreamFrame(0'u64, @[0x51'u8, 0x52, 0x53], 0'u64, false)
+      check seedSentPacketForTest(
+        connection,
+        packet_model.ceOneRtt,
+        1'u64,
+        base - 500_000'u64,
+        1200'u16,
+        true,
+        sfkStream,
+        false,
+        streamPayload
+      )
+
+      var allowance = 0'u64
+      check getConnectionCongestionAllowanceForTest(connection, allowance)
+      check allowance == 15'u64
+
+      check runConnectionLossRecoveryTick(connection)
+
+      var count = 0'u32
+      var probeCount = 0'u16
+      var packets = 0'u32
+      var bytes = 0'u64
+      check getConnectionSentPacketCountForTest(connection, count)
+      check getConnectionProbeCountForEpoch(connection, packet_model.ceOneRtt, probeCount)
+      check getConnectionLossFlightForTest(connection, packet_model.ceOneRtt, packets, bytes)
       check count == 3'u32
       check probeCount == 1'u16
       check packets == 3'u32

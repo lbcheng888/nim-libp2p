@@ -306,15 +306,15 @@ proc isValidLsmrPath*(path: LsmrPath): bool =
 
 proc luoShuCoord(digit: uint8): tuple[x: int, y: int] =
   case digit
-  of 8'u8: (0, 0)
-  of 1'u8: (1, 0)
-  of 6'u8: (2, 0)
-  of 3'u8: (0, 1)
-  of 5'u8: (1, 1)
-  of 7'u8: (2, 1)
-  of 4'u8: (0, 2)
-  of 9'u8: (1, 2)
-  of 2'u8: (2, 2)
+  of 8'u8: (-1, -1)
+  of 1'u8: (0, -1)
+  of 6'u8: (1, -1)
+  of 3'u8: (-1, 0)
+  of 5'u8: (0, 0)
+  of 7'u8: (1, 0)
+  of 4'u8: (-1, 1)
+  of 9'u8: (0, 1)
+  of 2'u8: (1, 1)
   else:
     (-1, -1)
 

@@ -15,7 +15,7 @@ task build_ci, "Build library and auxiliary binaries for CI":
   exec("nim c --threads:on --path:src --hints:off --warnings:off src/pebble/interop/ab_driver")
   exec("nim c --run --threads:on --path:src --hints:off --warnings:off tests/test_main")
 
-task fuzz_entry, "Run fuzz harness entry point":
+task fuzz_entry, "Run fuzz runner entry point":
   exec("nim c -r --threads:on --path:src --hints:off --warnings:off tests/fuzz_entry")
 
 task docs_formats, "Generate interop format documentation":

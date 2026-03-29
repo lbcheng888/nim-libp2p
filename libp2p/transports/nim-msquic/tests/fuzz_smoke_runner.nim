@@ -2,7 +2,7 @@
 
 import std/unittest
 
-import ../tooling/fuzz_harness
+import ../tooling/fuzz_runner
 
 when isMainModule:
   suite "fuzz smoke runner":

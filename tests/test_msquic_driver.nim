@@ -1,4 +1,5 @@
-import std/[options, unittest]
+import std/[options, strutils, unittest]
+import results
 
 import chronos
 
@@ -164,6 +165,68 @@ when defined(libp2p_msquic_experimental):
 
                 discard msdriver.shutdownConnection(handle, connPtr)
                 msdriver.closeConnection(handle, connPtr, connState)
+
+    test "dial separates transport host from TLS server name":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (connPtr, stateOpt, dialErr) =
+            msdriver.dialConnection(
+              handle,
+              "100.64.185.9",
+              listener.port,
+              transportHost = LoopbackDialHost
+            )
+          if dialErr.len > 0 or stateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = stateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
+
+              let remoteRes = msdriver.getConnectionRemoteAddress(handle, connPtr)
+              check remoteRes.isOk()
+              if remoteRes.isOk():
+                let remote = remoteRes.get()
+                check ($remote).startsWith(LoopbackDialHost & ":")
+                check uint16(remote.port) == listener.port
+
+              let (connectedOpt, connectedErr) =
+                nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              check connectedErr.len == 0
+              check connectedOpt.isSome
+
+              let (serverConnectedOpt, serverConnectedErr) =
+                nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+              check serverConnectedErr.len == 0
+              check serverConnectedOpt.isSome
 else:
   suite "MsQuic experimental driver":
     test "experimental features disabled":

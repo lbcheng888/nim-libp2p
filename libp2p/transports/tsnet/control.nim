@@ -1,6 +1,6 @@
 {.push raises: [].}
 
-import std/[httpclient, json, net, strutils, times, uri]
+import std/[httpclient, json, net, sequtils, strutils, times, uri]
 
 import ../../utility
 import ./ts2021client
@@ -96,6 +96,8 @@ type
     wgKeyPresent*: bool
     discoPublicKey*: string
     persistedNodeIdPresent*: bool
+    libp2pPeerId*: string
+    libp2pListenAddrs*: seq[string]
 
   TsnetControlBootstrapStage* {.pure.} = enum
     ProbeFailed
@@ -317,6 +319,8 @@ proc toJson*(input: TsnetControlBootstrapInput): JsonNode =
     "wgKeyPresent": input.wgKeyPresent,
     "discoPublicKey": input.discoPublicKey,
     "persistedNodeIdPresent": input.persistedNodeIdPresent,
+    "libp2pPeerId": input.libp2pPeerId,
+    "libp2pListenAddrs": input.libp2pListenAddrs,
   }
 
 proc cloneJson(node: JsonNode): JsonNode =
@@ -494,6 +498,8 @@ proc buildRegisterRequestPayload*(
     nodePublicKey: string,
     machinePublicKey: string,
     hostname: string,
+    libp2pPeerId = "",
+    libp2pListenAddrs: seq[string] = @[],
     authKey = "",
     oldNodeKey = "",
     followup = "",
@@ -506,6 +512,8 @@ proc buildMapRequestPayload*(
     nodePublicKey: string,
     discoPublicKey: string,
     hostname: string,
+    libp2pPeerId = "",
+    libp2pListenAddrs: seq[string] = @[],
     stream = true,
     keepAlive = true,
     compress = "zstd",
@@ -586,6 +594,8 @@ proc buildRegisterBootstrapPayload*(
       nodePublicKey = plan.nodePublicKey,
       machinePublicKey = plan.machinePublicKey,
       hostname = plan.hostname,
+      libp2pPeerId = input.libp2pPeerId,
+      libp2pListenAddrs = input.libp2pListenAddrs,
       authKey = input.authKey
     )
   result["response"] = newJNull()
@@ -624,6 +634,8 @@ proc buildMapBootstrapPayload*(
       nodePublicKey = plan.nodePublicKey,
       discoPublicKey = plan.discoPublicKey,
       hostname = plan.hostname,
+      libp2pPeerId = input.libp2pPeerId,
+      libp2pListenAddrs = input.libp2pListenAddrs,
       stream = plan.stream,
       keepAlive = plan.keepAlive,
       compress = plan.compress
@@ -636,6 +648,8 @@ proc buildRegisterRequestPayload*(
     nodePublicKey: string,
     machinePublicKey: string,
     hostname: string,
+    libp2pPeerId = "",
+    libp2pListenAddrs: seq[string] = @[],
     authKey = "",
     oldNodeKey = "",
     followup = "",
@@ -655,16 +669,27 @@ proc buildRegisterRequestPayload*(
     result["Followup"] = %followup
   if ephemeral:
     result["Ephemeral"] = %true
-  result["Hostinfo"] = %*{
+  var hostinfo = %*{
     "Hostname": hostname,
     "BackendLogID": machinePublicKey,
   }
+  if libp2pPeerId.strip().len > 0:
+    hostinfo["PeerID"] = %libp2pPeerId.strip()
+  let normalizedListenAddrs =
+    libp2pListenAddrs
+      .mapIt(it.strip())
+      .filterIt(it.len > 0)
+  if normalizedListenAddrs.len > 0:
+    hostinfo["ListenAddrs"] = %normalizedListenAddrs
+  result["Hostinfo"] = hostinfo
 
 proc buildMapRequestPayload*(
     capabilityVersion: int,
     nodePublicKey: string,
     discoPublicKey: string,
     hostname: string,
+    libp2pPeerId = "",
+    libp2pListenAddrs: seq[string] = @[],
     stream = true,
     keepAlive = true,
     compress = "zstd",
@@ -678,9 +703,18 @@ proc buildMapRequestPayload*(
   result["DiscoKey"] = %discoPublicKey
   result["Stream"] = %stream
   result["OmitPeers"] = %omitPeers
-  result["Hostinfo"] = %*{
+  var hostinfo = %*{
     "Hostname": hostname
   }
+  if libp2pPeerId.strip().len > 0:
+    hostinfo["PeerID"] = %libp2pPeerId.strip()
+  let normalizedListenAddrs =
+    libp2pListenAddrs
+      .mapIt(it.strip())
+      .filterIt(it.len > 0)
+  if normalizedListenAddrs.len > 0:
+    hostinfo["ListenAddrs"] = %normalizedListenAddrs
+  result["Hostinfo"] = hostinfo
 
 proc parseRegisterResponse*(
     payload: JsonNode

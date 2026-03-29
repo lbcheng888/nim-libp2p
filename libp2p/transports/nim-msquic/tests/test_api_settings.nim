@@ -92,6 +92,54 @@ suite "MsQuic API settings":
     api.RegistrationClose(registration)
     MsQuicClose(apiPtr)
 
+  test "configuration and listener settings overlay are retained":
+    var apiPtr: pointer
+    check MsQuicOpenVersion(2, addr apiPtr) == QUIC_STATUS_SUCCESS
+    let api = cast[ptr QuicApiTable](apiPtr)
+
+    var registration: HQUIC
+    check api.RegistrationOpen(nil, addr registration) == QUIC_STATUS_SUCCESS
+
+    var alpn = "hq-29"
+    var alpnBuffer = QuicBuffer(
+      Length: uint32(alpn.len),
+      Buffer: cast[ptr uint8](alpn.cstring))
+
+    var configuration: HQUIC
+    check api.ConfigurationOpen(
+      registration,
+      addr alpnBuffer,
+      1,
+      nil,
+      0,
+      nil,
+      addr configuration) == QUIC_STATUS_SUCCESS
+
+    var cfgOverlay = overlayForProfile(profileLowLatency)
+    cfgOverlay.handshakeIdleTimeoutMs = 22_000
+    cfgOverlay.peerBidiStreamCount = 7
+    check applyConfigurationSettingsOverlay(configuration, cfgOverlay) == QUIC_STATUS_SUCCESS
+    var readCfgOverlay: QuicSettingsOverlay
+    check getConfigurationSettingsOverlay(configuration, readCfgOverlay)
+    check readCfgOverlay.handshakeIdleTimeoutMs == 22_000
+    check readCfgOverlay.peerBidiStreamCount == 7
+
+    var listener: HQUIC
+    check api.ListenerOpen(registration, nil, nil, addr listener) == QUIC_STATUS_SUCCESS
+    var listenerOverlay = overlayForProfile(profileMaxThroughput)
+    listenerOverlay.idleTimeoutMs = 88_000
+    listenerOverlay.keepAliveIntervalMs = 9_000
+    check applyListenerSettingsOverlay(listener, listenerOverlay) == QUIC_STATUS_SUCCESS
+    var readListenerOverlay: QuicSettingsOverlay
+    check getListenerSettingsOverlay(listener, readListenerOverlay)
+    check readListenerOverlay.idleTimeoutMs == 88_000
+    check readListenerOverlay.keepAliveIntervalMs == 9_000
+
+    api.ListenerClose(listener)
+    api.ConfigurationClose(configuration)
+    api.RegistrationClose(registration)
+    MsQuicClose(apiPtr)
+
   test "partition open validates configured processors and receive buffers are accepted":
     var apiPtr: pointer
     check MsQuicOpenVersion(2, addr apiPtr) == QUIC_STATUS_SUCCESS

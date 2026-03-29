@@ -5,6 +5,7 @@ import std/unittest
 import ../congestion/controller
 import ../congestion/common
 import ../congestion/bbr_model
+import ../congestion/cubic_model
 
 suite "Congestion controller strategy":
 
@@ -149,3 +150,14 @@ suite "Congestion controller strategy":
     let initialAllowance = controller.sendAllowance()
     controller.onPacketSent(1200, ackEliciting = false, appLimited = false)
     check controller.sendAllowance() == initialAllowance
+
+  test "PTO exemptions extend send allowance beyond residual cwnd":
+    var bbr = initCongestionController(caBbr, 1200'u32)
+    bbr.bbr.bytesInFlight = bbr.bbr.congestionWindow - 15'u32
+    bbr.grantExemptions(2'u8)
+    check bbr.sendAllowance() == 15'u64 + 2400'u64
+
+    var cubic = initCongestionController(caCubic, 1200'u32)
+    cubic.cubic.bytesInFlight = cubic.cubic.congestionWindow - 15'u32
+    cubic.grantExemptions(2'u8)
+    check cubic.sendAllowance() == 15'u64 + 2400'u64

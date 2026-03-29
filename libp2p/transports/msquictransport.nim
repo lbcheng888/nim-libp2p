@@ -3176,7 +3176,8 @@ method dial*(
           port,
           addressFamily = addressFamily,
           queueLimit = self.cfg.eventQueueLimit,
-          pollInterval = MsQuicDialEventTimeout
+          pollInterval = MsQuicDialEventTimeout,
+          transportHost = host
         )
       tmp
     connPtr = res.connection

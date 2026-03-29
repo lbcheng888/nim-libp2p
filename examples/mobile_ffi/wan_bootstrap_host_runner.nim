@@ -2,7 +2,7 @@
 
 import std/[json, os, parseopt, sequtils, sets, strutils]
 
-from ./game_mesh_host_harness import
+from ./game_mesh_host_runner import
   HostNode, HostTransportMode, htmTcpExplicitSeed, htmTcpPublicSeed, htmQuicExplicitSeed,
   htmQuicDualStackFixedPort, boolField, bootstrapStatus, createWanBootstrapNode,
   discoverySnapshot, intField, joinViaBootstrap, nowMillis, registerBootstrapHint,
@@ -132,7 +132,7 @@ proc bootstrapSummary(
     "generatedAtMs": nowMillis()
   }
 
-proc writeHarnessSummary(
+proc writeRunnerSummary(
     node: HostNode,
     label: string,
     role: string,
@@ -273,7 +273,7 @@ when isMainModule:
       preferIpv6 = true
     )
 
-    var summary = writeHarnessSummary(
+    var summary = writeRunnerSummary(
       node,
       label,
       role,
@@ -287,7 +287,7 @@ when isMainModule:
       sleep(serveMs)
       if expectPeerId.len > 0 and not learnedExpectedPeer:
         learnedExpectedPeer = containsPeer(node.bootstrapStatus(), expectPeerId)
-      summary = writeHarnessSummary(
+      summary = writeRunnerSummary(
         node,
         label,
         role,

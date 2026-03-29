@@ -9,6 +9,7 @@ import results
 import ./msquicruntime
 import "nim-msquic/api/runtime_bridge" as msruntime
 import "nim-msquic/api/api_impl" as msapi
+import "nim-msquic/api/settings_model" as mssettings
 import "nim-msquic/api/event_model" as msevents
 import "nim-msquic/api/tls_bridge" as mstls
 import "nim-msquic/tls/common" as mstlstypes
@@ -135,7 +136,9 @@ type
     externalHandler*: MsQuicConnectionHandler
     droppedEvents*: uint64
     pendingStreams: Table[pointer, MsQuicStreamState]
+    pendingStreamOrder: Deque[pointer]
     knownStreams: Table[pointer, MsQuicStreamState]
+    knownStreamsById: Table[uint64, MsQuicStreamState]
     pendingStreamWaiters: seq[Future[MsQuicStreamState]]
 
   MsQuicListenerState* = ref object
@@ -189,6 +192,8 @@ type
     startWaiters: seq[Future[void]]
     sendShutdownRequested: bool
     peerSendShutdown: bool
+    streamIdKnown: bool
+    streamIdCached: uint64
   MsQuicEventQueueClosed* = object of CatchableError
   MsTlsConfig = mstlstypes.TlsConfig
 
@@ -266,6 +271,8 @@ type
     note: MsQuicSharedText
 
 proc setConnectionLocalAddress*(handle: MsQuicTransportHandle; connection: pointer;
+    address: TransportAddress): string {.raises: [].}
+proc setConnectionRemoteAddress*(handle: MsQuicTransportHandle; connection: pointer;
     address: TransportAddress): string {.raises: [].}
 
 proc close(state: MsQuicStreamState) {.raises: [].}
@@ -754,13 +761,28 @@ proc handleIncomingConnectionEvent(state: MsQuicConnectionState;
       trace "MsQuic external handler raised", err = exc.msg
   enqueueConnectionEvent(state, forwarded)
 
+proc cacheStreamId(state: MsQuicStreamState) {.gcsafe, raises: [].} =
+  if state.isNil or state.streamIdKnown or state.handle.isNil or
+      state.handle.bridge.isNil or state.stream.isNil:
+    return
+  var idRes: Result[uint64, string]
+  {.cast(gcsafe).}:
+    idRes = state.handle.bridge.streamId(state.stream)
+  if idRes.isOk():
+    state.streamIdCached = idRes.get()
+    state.streamIdKnown = true
+
 proc storePendingStream(state: MsQuicConnectionState; stream: pointer;
-    streamState: MsQuicStreamState) =
+    streamState: MsQuicStreamState; prepend = false) =
   if state.isNil or stream.isNil or streamState.isNil:
     return
+  cacheStreamId(streamState)
   var waiter: Future[MsQuicStreamState] = nil
+  var queueHandle = false
   state.withStateLock:
     state.knownStreams[stream] = streamState
+    if streamState.streamIdKnown:
+      state.knownStreamsById[streamState.streamIdCached] = streamState
     var idx = 0
     while idx < state.pendingStreamWaiters.len:
       let candidate = state.pendingStreamWaiters[idx]
@@ -771,7 +793,13 @@ proc storePendingStream(state: MsQuicConnectionState; stream: pointer;
         state.pendingStreamWaiters.delete(idx)
         break
     if waiter.isNil:
+      queueHandle = not state.pendingStreams.hasKey(stream)
       state.pendingStreams[stream] = streamState
+      if queueHandle:
+        if prepend:
+          state.pendingStreamOrder.addFirst(stream)
+        else:
+          state.pendingStreamOrder.addLast(stream)
   when defined(libp2p_msquic_debug):
     warn "MsQuic pending stream stored",
       stream = cast[uint64](stream),
@@ -805,24 +833,44 @@ proc lookupKnownStream(
   state.withStateLock:
     result = state.knownStreams.getOrDefault(stream)
 
+proc lookupKnownStreamById*(
+    state: MsQuicConnectionState;
+    streamId: uint64
+): MsQuicStreamState {.gcsafe, raises: [].} =
+  if state.isNil:
+    return nil
+  state.withStateLock:
+    result = state.knownStreamsById.getOrDefault(streamId)
+
 proc unregisterKnownStream(
     state: MsQuicConnectionState;
     stream: pointer
 ) {.raises: [].} =
   if state.isNil or stream.isNil:
     return
+  var known: MsQuicStreamState = nil
   state.withStateLock:
+    known = state.knownStreams.getOrDefault(stream)
     state.knownStreams.del(stream)
+    state.pendingStreams.del(stream)
+    if not known.isNil and known.streamIdKnown:
+      let current = state.knownStreamsById.getOrDefault(known.streamIdCached)
+      if current == known:
+        state.knownStreamsById.del(known.streamIdCached)
 
 proc peekPendingStreamState*(state: MsQuicConnectionState): Option[MsQuicStreamState] =
   if state.isNil:
     return none(MsQuicStreamState)
   var result: Option[MsQuicStreamState]
   state.withStateLock:
-    for pending in state.pendingStreams.values:
-      if not pending.isNil:
-        result = some(pending)
-        break
+    while state.pendingStreamOrder.len > 0:
+      let streamPtr = state.pendingStreamOrder.peekFirst()
+      let pending = state.pendingStreams.getOrDefault(streamPtr)
+      if pending.isNil:
+        discard state.pendingStreamOrder.popFirst()
+        continue
+      result = some(pending)
+      break
   result
 
 proc popPendingStreamState*(state: MsQuicConnectionState): Option[MsQuicStreamState] =
@@ -830,7 +878,9 @@ proc popPendingStreamState*(state: MsQuicConnectionState): Option[MsQuicStreamSt
     return none(MsQuicStreamState)
   var result: Option[MsQuicStreamState]
   state.withStateLock:
-    for streamPtr, pending in state.pendingStreams.pairs:
+    while state.pendingStreamOrder.len > 0:
+      let streamPtr = state.pendingStreamOrder.popFirst()
+      let pending = state.pendingStreams.getOrDefault(streamPtr)
       if pending.isNil:
         continue
       result = some(pending)
@@ -845,7 +895,7 @@ proc restorePendingStreamState*(
   if state.isNil or streamState.isNil or streamState.stream.isNil:
     return
   streamState.connectionState = state
-  storePendingStream(state, cast[pointer](streamState.stream), streamState)
+  storePendingStream(state, cast[pointer](streamState.stream), streamState, prepend = true)
 
 proc isLocalInitiated*(state: MsQuicStreamState): bool {.inline.} =
   if state.isNil:
@@ -871,6 +921,11 @@ proc close(state: MsQuicConnectionState) =
     if state.pendingStreams.len > 0:
       pending = toSeq(state.pendingStreams.values)
       state.pendingStreams.clear()
+      state.pendingStreamOrder.clear()
+    else:
+      state.pendingStreamOrder.clear()
+    if state.knownStreamsById.len > 0:
+      state.knownStreamsById.clear()
     while state.queue.len > 0:
       var queuedEvent = state.queue.popFirst()
       release(queuedEvent)
@@ -924,7 +979,9 @@ proc newMsQuicConnectionState(handle: MsQuicTransportHandle;
     externalHandler: handler,
     droppedEvents: 0,
     pendingStreams: initTable[pointer, MsQuicStreamState](),
+    pendingStreamOrder: initDeque[pointer](),
     knownStreams: initTable[pointer, MsQuicStreamState](),
+    knownStreamsById: initTable[uint64, MsQuicStreamState](),
     pendingStreamWaiters: @[]
   )
   initLock(state.lock)
@@ -1005,12 +1062,15 @@ proc awaitPendingStreamState*(state: MsQuicConnectionState):
   state.withStateLock:
     if state.closed:
       shouldFail = true
-    elif state.pendingStreams.len > 0:
-      for streamPtr, pending in state.pendingStreams.pairs:
-        if not pending.isNil:
-          immediate = some(pending)
-          state.pendingStreams.del(streamPtr)
-          break
+    elif state.pendingStreamOrder.len > 0:
+      while state.pendingStreamOrder.len > 0:
+        let streamPtr = state.pendingStreamOrder.popFirst()
+        let pending = state.pendingStreams.getOrDefault(streamPtr)
+        if pending.isNil:
+          continue
+        immediate = some(pending)
+        state.pendingStreams.del(streamPtr)
+        break
     else:
       state.pendingStreamWaiters.add(fut)
   when defined(libp2p_msquic_debug):
@@ -1588,7 +1648,9 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     startComplete: not localInitiated,
     startWaiters: @[],
     sendShutdownRequested: false,
-    peerSendShutdown: false
+    peerSendShutdown: false,
+    streamIdKnown: false,
+    streamIdCached: 0'u64
   )
   initLock(state.lock)
   state.lockInit = true
@@ -2097,13 +2159,17 @@ proc readStream*(state: MsQuicStreamState): Future[seq[byte]] {.gcsafe.} =
     state.ensureStreamSignalLoop()
   fut
 
-proc writeStream*(state: MsQuicStreamState; data: seq[byte];
-    flags: uint32 = 0'u32; clientContext: pointer = nil): string {.gcsafe, raises: [].} =
+proc enqueueStreamWrite(
+    state: MsQuicStreamState;
+    data: seq[byte];
+    flags: uint32 = 0'u32;
+    clientContext: pointer = nil
+): tuple[error: string, waiter: Future[void]] {.gcsafe, raises: [].} =
   if state.isNil or state.closed:
-    return "MsQuic stream closed"
+    return ("MsQuic stream closed", nil)
   let handle = state.handle
   if handle.isNil or handle.bridge.isNil:
-    return "MsQuic transport handle unavailable"
+    return ("MsQuic transport handle unavailable", nil)
 
   var pending = MsQuicPendingSend(
     payload: data,
@@ -2145,7 +2211,7 @@ proc writeStream*(state: MsQuicStreamState; data: seq[byte];
         pending.waiter.fail(
           newException(CatchableError, "MsQuic StreamSend raised: " & exc.msg)
         )
-      return "MsQuic StreamSend raised: " & exc.msg
+      return ("MsQuic StreamSend raised: " & exc.msg, nil)
     except Exception as exc:
       state.withStateLock:
         for idx in 0 ..< state.pendingSends.len:
@@ -2156,7 +2222,7 @@ proc writeStream*(state: MsQuicStreamState; data: seq[byte];
         pending.waiter.fail(
           newException(CatchableError, "MsQuic StreamSend raised: " & exc.msg)
         )
-      return "MsQuic StreamSend raised: " & exc.msg
+      return ("MsQuic StreamSend raised: " & exc.msg, nil)
   when defined(ohos):
     warn "MsQuic StreamSend status", stream = cast[uint64](state.stream),
       status = status,
@@ -2176,29 +2242,27 @@ proc writeStream*(state: MsQuicStreamState; data: seq[byte];
       pending.waiter.fail(
         newException(CatchableError, fmt"MsQuic StreamSend failed: 0x{status:08x}")
       )
-    return fmt"MsQuic StreamSend failed: 0x{status:08x}"
-  ""
+    return (fmt"MsQuic StreamSend failed: 0x{status:08x}", nil)
+  ("", pending.waiter)
+
+proc writeStream*(state: MsQuicStreamState; data: seq[byte];
+    flags: uint32 = 0'u32; clientContext: pointer = nil): string {.gcsafe, raises: [].} =
+  enqueueStreamWrite(state, data, flags, clientContext).error
 
 proc writeStreamAndWait*(state: MsQuicStreamState; data: seq[byte];
     flags: uint32 = 0'u32; clientContext: pointer = nil): Future[string]
     {.async: (raises: [CancelledError]).} =
   if state.isNil or state.closed:
     return "MsQuic stream closed"
-  var waiter: Future[void] = nil
-  let err =
+  let (err, waiter) =
     try:
-      writeStream(state, data, flags, clientContext)
+      enqueueStreamWrite(state, data, flags, clientContext)
     except CatchableError as exc:
-      return "MsQuic StreamSend raised: " & exc.msg
+      ("MsQuic StreamSend raised: " & exc.msg, nil)
     except Exception as exc:
-      return "MsQuic StreamSend raised: " & exc.msg
+      ("MsQuic StreamSend raised: " & exc.msg, nil)
   if err.len > 0:
     return err
-  state.withStateLock:
-    if state.pendingSends.len > 0:
-      let pending = state.pendingSends[^1]
-      if not pending.isNil:
-        waiter = pending.waiter
   if waiter.isNil:
     return ""
   try:
@@ -2207,10 +2271,18 @@ proc writeStreamAndWait*(state: MsQuicStreamState; data: seq[byte];
     return exc.msg
   ""
 
-proc streamId*(state: MsQuicStreamState): Result[uint64, string] {.raises: [].} =
+proc streamId*(state: MsQuicStreamState): Result[uint64, string] {.gcsafe, raises: [].} =
   if state.isNil or state.handle.isNil or state.handle.bridge.isNil or state.stream.isNil:
     return err("MsQuic stream state unavailable")
-  state.handle.bridge.streamId(state.stream)
+  if state.streamIdKnown:
+    return ok(state.streamIdCached)
+  var idRes: Result[uint64, string]
+  {.cast(gcsafe).}:
+    idRes = state.handle.bridge.streamId(state.stream)
+  if idRes.isOk():
+    state.streamIdCached = idRes.get()
+    state.streamIdKnown = true
+  idRes
 
 proc releaseRegistration(handle: MsQuicTransportHandle) {.gcsafe, raises: [].} =
   if handle.bridge.isNil:
@@ -2317,6 +2389,25 @@ proc buildMsQuicSettings(cfg: MsQuicTransportConfig): MsQuicSettings =
   settings.peerUnidiStreamCount = unidi
   settings
 
+proc buildSettingsOverlay(cfg: MsQuicTransportConfig): mssettings.QuicSettingsOverlay =
+  result = mssettings.defaultQuicSettingsOverlay()
+  if cfg.handshakeIdleTimeoutMs > 0'u64:
+    result.handshakeIdleTimeoutMs = cfg.handshakeIdleTimeoutMs
+  if cfg.idleTimeoutMs > 0'u64:
+    result.idleTimeoutMs = cfg.idleTimeoutMs
+  if cfg.keepAliveIntervalMs > 0'u32:
+    result.keepAliveIntervalMs = cfg.keepAliveIntervalMs
+  result.peerBidiStreamCount =
+    if cfg.peerBidiStreamCount > 0'u16:
+      cfg.peerBidiStreamCount
+    else:
+      DefaultPeerBidiStreamCount
+  result.peerUnidiStreamCount =
+    if cfg.peerUnidiStreamCount > 0'u16:
+      cfg.peerUnidiStreamCount
+    else:
+      DefaultPeerUnidiStreamCount
+
 proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
     tuple[handle: MsQuicTransportHandle, error: string] {.raises: [].} =
   let bridgeRes = acquireMsQuicBridge(cfg.loadOptions)
@@ -2329,6 +2420,7 @@ proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
   var clientConfiguration: msapi.HQUIC = nil
   var alpnBuffers: seq[msapi.QuicBuffer]
   var settings = buildMsQuicSettings(cfg)
+  let overlay = buildSettingsOverlay(cfg)
 
   let alpns = resolvedAlpns(cfg)
   alpnBuffers = buildAlpnBuffers(alpns)
@@ -2363,6 +2455,12 @@ proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
       safeCloseRegistration(bridge, registration)
       releaseMsQuicBridge(bridge)
       return (nil, fmt"MsQuic configuration failed: 0x{cfgStatus:08x}")
+    let overlayStatus = msapi.applyConfigurationSettingsOverlay(configuration, overlay)
+    if overlayStatus != msapi.QUIC_STATUS_SUCCESS:
+      safeCloseConfiguration(bridge, configuration)
+      safeCloseRegistration(bridge, registration)
+      releaseMsQuicBridge(bridge)
+      return (nil, fmt"MsQuic configuration overlay failed: 0x{overlayStatus:08x}")
   except Exception as exc:
     safeCloseRegistration(bridge, registration)
     releaseMsQuicBridge(bridge)
@@ -2384,6 +2482,13 @@ proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
       safeCloseRegistration(bridge, registration)
       releaseMsQuicBridge(bridge)
       return (nil, fmt"MsQuic client configuration failed: 0x{cfgStatus:08x}")
+    let overlayStatus = msapi.applyConfigurationSettingsOverlay(clientConfiguration, overlay)
+    if overlayStatus != msapi.QUIC_STATUS_SUCCESS:
+      safeCloseConfiguration(bridge, clientConfiguration)
+      safeCloseConfiguration(bridge, configuration)
+      safeCloseRegistration(bridge, registration)
+      releaseMsQuicBridge(bridge)
+      return (nil, fmt"MsQuic client configuration overlay failed: 0x{overlayStatus:08x}")
   except Exception as exc:
     safeCloseConfiguration(bridge, configuration)
     safeCloseRegistration(bridge, registration)
@@ -2761,12 +2866,18 @@ proc attachIncomingConnectionAdopted*(handle: MsQuicTransportHandle; connection:
 proc dialConnection*(handle: MsQuicTransportHandle; serverName: string; port: uint16;
     handler: MsQuicConnectionHandler = nil; userContext: pointer = nil;
     addressFamily: uint16 = 0; queueLimit: int = 0;
-    pollInterval: Duration = DefaultEventPollInterval):
+    pollInterval: Duration = DefaultEventPollInterval;
+    transportHost: string = ""):
     tuple[connection: pointer, state: Option[MsQuicConnectionState], error: string] {.raises: [].} =
   if handle.isNil or handle.bridge.isNil or handle.closed:
     return (nil, none(MsQuicConnectionState), "MsQuic transport handle unavailable")
   if serverName.len == 0:
     return (nil, none(MsQuicConnectionState), "MsQuic dial requires non-empty serverName")
+  let dialHost =
+    if transportHost.len > 0: transportHost
+    else: serverName
+  if dialHost.len == 0:
+    return (nil, none(MsQuicConnectionState), "MsQuic dial requires non-empty transport host")
 
   let effectiveQueueLimit =
     if queueLimit > 0: queueLimit else: handle.config.eventQueueLimit
@@ -2841,6 +2952,28 @@ proc dialConnection*(handle: MsQuicTransportHandle; serverName: string; port: ui
       state.close()
       return (nil, none(MsQuicConnectionState), bindErr)
     trace "MsQuic dial local bind applied", bindHost = bindHost, bindPort = handle.config.clientBindPort
+
+  var remoteAddr = TransportAddress(family: AddressFamily.None)
+  try:
+    remoteAddr = initTAddress(dialHost, Port(port))
+  except CatchableError:
+    remoteAddr = TransportAddress(family: AddressFamily.None)
+  if remoteAddr.family == AddressFamily.None:
+    safeShutdownConnection(handle.bridge, connection, 0'u32, 0'u64)
+    safeCloseConnection(handle.bridge, connection)
+    state.close()
+    return (nil, none(MsQuicConnectionState), "MsQuic dial transport host invalid: " & dialHost)
+  let remoteErr =
+    setConnectionRemoteAddress(handle, cast[pointer](connection), remoteAddr)
+  if remoteErr.len > 0:
+    safeShutdownConnection(handle.bridge, connection, 0'u32, 0'u64)
+    safeCloseConnection(handle.bridge, connection)
+    state.close()
+    return (nil, none(MsQuicConnectionState), remoteErr)
+  trace "MsQuic dial remote target applied",
+    server = serverName,
+    transportHost = dialHost,
+    port = port
 
   let family = msapi.QUIC_ADDRESS_FAMILY(addressFamily)
   try:
@@ -3019,6 +3152,16 @@ proc startListener*(handle: MsQuicTransportHandle; listener: pointer;
     address: pointer = nil): string {.raises: [].} =
   if handle.isNil or handle.bridge.isNil or listener.isNil:
     return "MsQuic transport handle unavailable"
+  let overlayStatus =
+    try:
+      msapi.applyListenerSettingsOverlay(
+        cast[msapi.HQUIC](listener),
+        buildSettingsOverlay(handle.config)
+      )
+    except Exception as exc:
+      return "MsQuic listener overlay raised: " & exc.msg
+  if overlayStatus != msapi.QUIC_STATUS_SUCCESS:
+    return fmt"MsQuic listener overlay failed: 0x{overlayStatus:08x}"
   let status =
     try:
       msruntime.startListener(
@@ -3399,6 +3542,10 @@ proc enableConnectionDatagramSend*(
 proc setConnectionLocalAddress*(handle: MsQuicTransportHandle; connection: pointer;
     address: TransportAddress): string {.raises: [].} =
   setConnectionAddressParam(handle, connection, msparams.QUIC_PARAM_CONN_LOCAL_ADDRESS, address)
+
+proc setConnectionRemoteAddress*(handle: MsQuicTransportHandle; connection: pointer;
+    address: TransportAddress): string {.raises: [].} =
+  setConnectionAddressParam(handle, connection, msparams.QUIC_PARAM_CONN_REMOTE_ADDRESS, address)
 
 proc startStream*(handle: MsQuicTransportHandle; stream: pointer;
     flags: uint32 = 0'u32): string {.raises: [].} =

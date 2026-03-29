@@ -115,6 +115,134 @@ when defined(libp2p_msquic_experimental):
                             if clientRead2Ok:
                               check clientRead2.read() == reply2
 
+    test "same stream still receives later reply after another stream roundtrip":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (connPtr, connStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or connStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = connStateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
+
+              discard nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+
+              let (streamAPtr, streamAOpt, streamAErr) = msdriver.createStream(
+                handle,
+                connPtr,
+                connectionState = connState
+              )
+              check streamAErr.len == 0
+              check streamAOpt.isSome
+              if streamAErr.len == 0 and streamAOpt.isSome:
+                let clientStreamA = streamAOpt.get()
+                defer:
+                  msdriver.closeStream(handle, streamAPtr, clientStreamA)
+                check msdriver.startStream(handle, streamAPtr).len == 0
+                discard nextStreamEventOfKind(clientStreamA, quicrt.qseStartComplete)
+
+                let serverInboundAFut = msdriver.awaitPendingStreamState(serverState)
+                let requestA1 = @[byte 0x10, 0x11]
+                check (waitFor msdriver.writeStreamAndWait(clientStreamA, requestA1)) == ""
+                let serverInboundAOk = waitFor serverInboundAFut.withTimeout(3.seconds)
+                check serverInboundAOk
+                if serverInboundAOk:
+                  let serverInboundA = serverInboundAFut.read()
+                  check serverInboundA != nil
+                  if not serverInboundA.isNil:
+                    let serverReadA1 = msdriver.readStream(serverInboundA)
+                    let serverReadA1Ok = waitFor serverReadA1.withTimeout(3.seconds)
+                    check serverReadA1Ok
+                    if serverReadA1Ok:
+                      check serverReadA1.read() == requestA1
+
+                      let replyA1 = @[byte 0x20, 0x21]
+                      let clientReadA1 = msdriver.readStream(clientStreamA)
+                      waitFor sleepAsync(100.milliseconds)
+                      check (waitFor msdriver.writeStreamAndWait(serverInboundA, replyA1)) == ""
+                      let clientReadA1Ok = waitFor clientReadA1.withTimeout(3.seconds)
+                      check clientReadA1Ok
+                      if clientReadA1Ok:
+                        check clientReadA1.read() == replyA1
+
+                        let (streamBPtr, streamBOpt, streamBErr) = msdriver.createStream(
+                          handle,
+                          connPtr,
+                          connectionState = connState
+                        )
+                        check streamBErr.len == 0
+                        check streamBOpt.isSome
+                        if streamBErr.len == 0 and streamBOpt.isSome:
+                          let clientStreamB = streamBOpt.get()
+                          defer:
+                            msdriver.closeStream(handle, streamBPtr, clientStreamB)
+                          check msdriver.startStream(handle, streamBPtr).len == 0
+                          discard nextStreamEventOfKind(clientStreamB, quicrt.qseStartComplete)
+
+                          let serverInboundBFut = msdriver.awaitPendingStreamState(serverState)
+                          let requestB = @[byte 0x30, 0x31, 0x32]
+                          check (waitFor msdriver.writeStreamAndWait(clientStreamB, requestB)) == ""
+                          let serverInboundBOk = waitFor serverInboundBFut.withTimeout(3.seconds)
+                          check serverInboundBOk
+                          if serverInboundBOk:
+                            let serverInboundB = serverInboundBFut.read()
+                            check serverInboundB != nil
+                            if not serverInboundB.isNil:
+                              let serverReadB = msdriver.readStream(serverInboundB)
+                              let serverReadBOk = waitFor serverReadB.withTimeout(3.seconds)
+                              check serverReadBOk
+                              if serverReadBOk:
+                                check serverReadB.read() == requestB
+
+                                let replyB = @[byte 0x40, 0x41]
+                                let clientReadB = msdriver.readStream(clientStreamB)
+                                waitFor sleepAsync(100.milliseconds)
+                                check (waitFor msdriver.writeStreamAndWait(serverInboundB, replyB)) == ""
+                                let clientReadBOk = waitFor clientReadB.withTimeout(3.seconds)
+                                check clientReadBOk
+                                if clientReadBOk:
+                                  check clientReadB.read() == replyB
+
+                                  let replyA2 = @[byte 0x50, 0x51, 0x52]
+                                  let clientReadA2 = msdriver.readStream(clientStreamA)
+                                  waitFor sleepAsync(100.milliseconds)
+                                  check (waitFor msdriver.writeStreamAndWait(serverInboundA, replyA2)) == ""
+                                  let clientReadA2Ok = waitFor clientReadA2.withTimeout(3.seconds)
+                                  check clientReadA2Ok
+                                  if clientReadA2Ok:
+                                    check clientReadA2.read() == replyA2
+
 else:
   suite "MsQuic multi roundtrip":
     test "experimental features disabled":

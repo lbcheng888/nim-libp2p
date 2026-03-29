@@ -45,8 +45,18 @@ proc getJson[T](store: FabricStore, space: KeySpace, key: string): Option[T] =
   some(decodeObj[T](payload.get()))
 
 proc persistEvent*(store: FabricStore, event: FabricEvent) =
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "store-stage event begin id=", event.eventId,
+      " era=", $event.clock.era,
+      " tick=", $event.clock.tick,
+    )
   store.putJson(ksEvent, "event:" & keyHeight(event.clock.era) & ":" & event.eventId, event)
+  when defined(fabric_submit_diag):
+    stderr.writeLine("store-stage event ksEvent id=", event.eventId)
   store.putJson(ksTask, "event:" & event.eventId, event)
+  when defined(fabric_submit_diag):
+    stderr.writeLine("store-stage event ksTask id=", event.eventId)
 
 proc persistAttestation*(store: FabricStore, att: EventAttestation) =
   store.putJson(

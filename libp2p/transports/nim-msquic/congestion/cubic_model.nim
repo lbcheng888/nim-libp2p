@@ -145,12 +145,20 @@ proc canSend*(model: CubicModel): bool =
   model.bytesInFlight < model.congestionWindow or model.exemptions > 0
 
 proc sendAllowance*(model: CubicModel): uint64 =
-  if model.congestionWindow > model.bytesInFlight:
-    uint64(model.congestionWindow - model.bytesInFlight)
-  elif model.exemptions > 0:
-    uint64(model.datagramPayloadBytes) * uint64(model.exemptions)
-  else:
-    0
+  var allowance =
+    if model.congestionWindow > model.bytesInFlight:
+      uint64(model.congestionWindow - model.bytesInFlight)
+    else:
+      0'u64
+  if model.exemptions > 0:
+    # PTO probes are allowed to exceed cwnd by a bounded number of datagrams.
+    let exemptionAllowance =
+      uint64(model.datagramPayloadBytes) * uint64(model.exemptions)
+    if high(uint64) - allowance < exemptionAllowance:
+      allowance = high(uint64)
+    else:
+      allowance += exemptionAllowance
+  allowance
 
 proc onPacketSent*(
     model: var CubicModel,

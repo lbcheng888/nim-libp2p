@@ -502,7 +502,7 @@ suite "Game mesh core deterministic room init":
       guestPeer,
       conversationId,
       @["/ip4/192.168.3.4/tcp/4001/p2p/" & guestPeer],
-      "host-harness-ddz-seed",
+      "host-runner-ddz-seed",
       sendInvite = false
     )
     check created.ok

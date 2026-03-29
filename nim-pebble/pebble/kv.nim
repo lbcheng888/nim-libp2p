@@ -505,7 +505,15 @@ proc put*(kv: PebbleKV; space: KeySpace; id: string; value: string;
           opts: batch_types.WriteOptions = batch_types.defaultWriteOptions) =
   var batch = pebble_batch.newBatch(kv.memCfg)
   batch.put(toKey(space, id), value)
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "kv-stage put begin space=", $space,
+      " id=", id,
+      " bytes=", $value.len,
+    )
   discard kv.db.commit(batch, opts)
+  when defined(fabric_submit_diag):
+    stderr.writeLine("kv-stage put done space=", $space, " id=", id)
 
 proc putBytes*(kv: PebbleKV; space: KeySpace; id: string;
                value: openArray[byte];

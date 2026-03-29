@@ -6,7 +6,7 @@ from std/times import epochTime
 import unittest2
 
 type
-  HarnessProc = object
+  RunnerProc = object
     label: string
     summaryPath: string
     logPath: string
@@ -36,22 +36,22 @@ proc strField(node: JsonNode, key: string, defaultValue = ""): string =
     return node[key].getStr()
   defaultValue
 
-proc harnessSourcePath(): string =
-  currentSourcePath().parentDir() / ".." / "examples" / "mobile_ffi" / "wan_bootstrap_host_harness.nim"
+proc runnerSourcePath(): string =
+  currentSourcePath().parentDir() / ".." / "examples" / "mobile_ffi" / "wan_bootstrap_host_runner.nim"
 
-proc harnessBinaryPath(): string =
-  getTempDir() / "nim-libp2p-wan-bootstrap-host-test" / "wan_bootstrap_host_harness"
+proc runnerBinaryPath(): string =
+  getTempDir() / "nim-libp2p-wan-bootstrap-host-test" / "wan_bootstrap_host_runner"
 
-proc compileHarnessBinary() =
-  let sourcePath = harnessSourcePath()
-  let binaryPath = harnessBinaryPath()
+proc compileRunnerBinary() =
+  let sourcePath = runnerSourcePath()
+  let binaryPath = runnerBinaryPath()
   createDir(binaryPath.parentDir())
   let cmd = fmt"nim c --hints:off --warnings:off -o:{binaryPath.quoteShell} {sourcePath.quoteShell}"
   let res = execCmdEx(cmd, options = {poUsePath, poStdErrToStdOut})
   if res.exitCode != 0:
-    raise newException(IOError, "failed to compile harness:\n" & res.output)
+    raise newException(IOError, "failed to compile runner:\n" & res.output)
   if not fileExists(binaryPath):
-    raise newException(IOError, "compiled harness missing: " & binaryPath)
+    raise newException(IOError, "compiled runner missing: " & binaryPath)
 
 proc readTextIfExists(path: string): string =
   if fileExists(path):
@@ -65,10 +65,10 @@ proc tailText(raw: string, maxLines = 120): string =
     return raw
   lines[(lines.len - maxLines) ..< lines.len].join("\n")
 
-proc startHarness(
+proc startRunner(
     baseDir, networkId, label: string, extraArgs: seq[string]
-): HarnessProc =
-  let binaryPath = harnessBinaryPath()
+): RunnerProc =
+  let binaryPath = runnerBinaryPath()
   let summaryPath = baseDir / (label & ".summary.json")
   let logPath = baseDir / (label & ".log")
   if fileExists(summaryPath):
@@ -92,53 +92,53 @@ proc startHarness(
     workingDir = baseDir,
     options = {poUsePath},
   )
-  HarnessProc(
+  RunnerProc(
     label: label,
     summaryPath: summaryPath,
     logPath: logPath,
     process: process
   )
 
-proc stopHarness(harness: var HarnessProc) =
-  if harness.process == nil:
+proc stopRunner(runner: var RunnerProc) =
+  if runner.process == nil:
     return
-  let exitCode = peekExitCode(harness.process)
+  let exitCode = peekExitCode(runner.process)
   if exitCode == -1:
-    terminate(harness.process)
+    terminate(runner.process)
     sleep(300)
-    if peekExitCode(harness.process) == -1:
-      kill(harness.process)
-      discard waitForExit(harness.process)
-  close(harness.process)
-  harness.process = nil
+    if peekExitCode(runner.process) == -1:
+      kill(runner.process)
+      discard waitForExit(runner.process)
+  close(runner.process)
+  runner.process = nil
 
-proc waitForSummary(harness: HarnessProc, timeoutMs: int): JsonNode =
+proc waitForSummary(runner: RunnerProc, timeoutMs: int): JsonNode =
   let deadline = nowMillis() + int64(timeoutMs)
   while nowMillis() <= deadline:
-    if fileExists(harness.summaryPath):
+    if fileExists(runner.summaryPath):
       try:
-        return parseJson(readFile(harness.summaryPath))
+        return parseJson(readFile(runner.summaryPath))
       except CatchableError:
         discard
-    let exitCode = peekExitCode(harness.process)
-    if exitCode != -1 and not fileExists(harness.summaryPath):
-      let logTail = tailText(readTextIfExists(harness.logPath))
+    let exitCode = peekExitCode(runner.process)
+    if exitCode != -1 and not fileExists(runner.summaryPath):
+      let logTail = tailText(readTextIfExists(runner.logPath))
       raise newException(
         IOError,
-        "harness exited before summary: " & harness.label & " exit=" & $exitCode & "\n" & logTail
+        "runner exited before summary: " & runner.label & " exit=" & $exitCode & "\n" & logTail
       )
     sleep(150)
-  let logTail = tailText(readTextIfExists(harness.logPath))
-  raise newException(IOError, "timed out waiting for summary: " & harness.label & "\n" & logTail)
+  let logTail = tailText(readTextIfExists(runner.logPath))
+  raise newException(IOError, "timed out waiting for summary: " & runner.label & "\n" & logTail)
 
-proc waitForExit(harness: HarnessProc, timeoutMs: int): int =
+proc waitForExit(runner: RunnerProc, timeoutMs: int): int =
   let deadline = nowMillis() + int64(timeoutMs)
   while nowMillis() <= deadline:
-    let exitCode = peekExitCode(harness.process)
+    let exitCode = peekExitCode(runner.process)
     if exitCode != -1:
       return exitCode
     sleep(150)
-  raise newException(IOError, "timed out waiting for exit: " & harness.label)
+  raise newException(IOError, "timed out waiting for exit: " & runner.label)
 
 proc candidatePeerIds(status: JsonNode): seq[string] =
   if status.kind != JObject or not status.hasKey("selectedCandidates"):
@@ -178,20 +178,20 @@ proc attemptPeerId(joinResult: JsonNode, index: int): string =
 
 suite "Mobile FFI wan bootstrap host e2e":
   test "third node learns first peer from second snapshot without static fallback over real nodes":
-    compileHarnessBinary()
+    compileRunnerBinary()
 
     let networkId = "wan-host-e2e-" & $nowMillis()
     let baseDir = getTempDir() / ("wan-bootstrap-host-e2e-" & $nowMillis())
     createDir(baseDir)
 
-    var node1 = startHarness(
+    var node1 = startRunner(
       baseDir,
       networkId,
       "wan-node-1",
       @["--role=public", "--join=false", "--serve-ms=30000"]
     )
     defer:
-      stopHarness(node1)
+      stopRunner(node1)
 
     let node1Summary = waitForSummary(node1, 10_000)
     let node1PeerId = strField(node1Summary, "peerId")
@@ -200,7 +200,7 @@ suite "Mobile FFI wan bootstrap host e2e":
     check node1PeerId.len > 0
     check node1DialAddr.len > 0
 
-    var node2 = startHarness(
+    var node2 = startRunner(
       baseDir,
       networkId,
       "wan-node-2",
@@ -212,7 +212,7 @@ suite "Mobile FFI wan bootstrap host e2e":
       ]
     )
     defer:
-      stopHarness(node2)
+      stopRunner(node2)
 
     let node2Summary = waitForSummary(node2, 12_000)
     let node2Join = node2Summary{"joinResult"}
@@ -224,7 +224,7 @@ suite "Mobile FFI wan bootstrap host e2e":
     check node2PeerId.len > 0
     check node2DialAddr.len > 0
 
-    var node3 = startHarness(
+    var node3 = startRunner(
       baseDir,
       networkId,
       "wan-node-3",
@@ -237,7 +237,7 @@ suite "Mobile FFI wan bootstrap host e2e":
       ]
     )
     defer:
-      stopHarness(node3)
+      stopRunner(node3)
 
     let node3Summary = waitForSummary(node3, 15_000)
     let node3Exit = waitForExit(node3, 15_000)

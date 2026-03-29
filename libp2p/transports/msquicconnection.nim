@@ -100,8 +100,6 @@ proc completeWebtransportHandshake*(
 proc msquicConnError(msg: string; parent: ref Exception = nil): ref LPStreamError =
   (ref LPStreamError)(msg: msg, parent: parent)
 
-proc promotePendingPeerStream(conn: MsQuicConnection) {.gcsafe.}
-
 proc ensureStream(conn: MsQuicConnection) =
   if conn.isNil or conn.streamState.isNil or conn.streamHandle.isNil:
     raise newLPStreamConnDownError()
@@ -320,7 +318,9 @@ proc monitorConnection(conn: MsQuicConnection): Future[void] {.async.} =
         conn.sessionResumed = event.sessionResumed
         trace "MsQuic connection established", resumed = event.sessionResumed
       of msquicdrv.qcePeerStreamStarted:
-        conn.promotePendingPeerStream()
+        trace "MsQuic connection queued peer stream",
+          peerId = conn.peerId,
+          hasPrimary = not conn.streamState.isNil
       of msquicdrv.qceShutdownInitiated, msquicdrv.qceShutdownComplete:
         trace "MsQuic connection shutdown event", note = event.note
         break
@@ -353,6 +353,7 @@ proc newMsQuicConnection*(
     connHandle: pointer,
     connState: msquicdrv.MsQuicConnectionState,
     primaryStream: pointer = nil,
+    primaryStreamState: msquicdrv.MsQuicStreamState = nil,
     createPrimaryStream = true,
     observed: Opt[MultiAddress] = Opt.none(MultiAddress),
     local: Opt[MultiAddress] = Opt.none(MultiAddress),
@@ -365,7 +366,16 @@ proc newMsQuicConnection*(
   if createPrimaryStream:
     var streamStateOpt: Option[msquicdrv.MsQuicStreamState]
     var streamErr = ""
-    if not primaryStream.isNil:
+    if not primaryStreamState.isNil:
+      streamState = primaryStreamState
+      streamHandle =
+        if primaryStream.isNil:
+          cast[pointer](streamState.stream)
+        else:
+          primaryStream
+      if streamHandle.isNil or streamState.stream.isNil:
+        raise msquicConnError("MsQuic primary stream state unavailable")
+    elif not primaryStream.isNil:
       streamHandle = primaryStream
       try:
         msquicSafe:
@@ -397,15 +407,16 @@ proc newMsQuicConnection*(
         streamHandle = nil
         streamStateOpt = none(msquicdrv.MsQuicStreamState)
         streamErr = "MsQuic createStream raised: " & exc.msg
-    if streamErr.len > 0 or streamStateOpt.isNone or streamHandle.isNil:
-      raise msquicConnError("MsQuic stream unavailable: " & streamErr)
-    streamState = streamStateOpt.get()
+    if streamState.isNil:
+      if streamErr.len > 0 or streamStateOpt.isNone or streamHandle.isNil:
+        raise msquicConnError("MsQuic stream unavailable: " & streamErr)
+      streamState = streamStateOpt.get()
     when defined(libp2p_msquic_debug):
       let origin = if primaryStream.isNil: "local" else: "peer"
       warn "MsQuic connection stream selected",
         origin = origin,
         stream = cast[uint64](streamHandle)
-    if primaryStream.isNil:
+    if primaryStream.isNil and primaryStreamState.isNil:
       var startErr = ""
       try:
         msquicSafe:
@@ -620,65 +631,12 @@ proc transportHandle*(conn: MsQuicConnection): msquicdrv.MsQuicTransportHandle {
     return nil
   conn.handle
 
-proc promotePendingPeerStream(conn: MsQuicConnection) {.gcsafe.} =
-  if conn.isNil or conn.nativeMuxActive or conn.isWebtransport or
-      conn.connState.isNil or conn.streamState.isNil:
-    return
-  if not msquicdrv.isLocalInitiated(conn.streamState):
-    return
-
-  while true:
-    let pendingOpt = block:
-      var tmp: Option[msquicdrv.MsQuicStreamState]
-      msquicSafe:
-        tmp = msquicdrv.popPendingStreamState(conn.connState)
-      tmp
-    if pendingOpt.isNone:
-      return
-    let pending = pendingOpt.get()
-    if pending.isNil or pending.stream.isNil:
-      continue
-
-    let idRes = block:
-      var tmp: Result[uint64, string]
-      msquicSafe:
-        tmp = msquicdrv.streamId(pending)
-      tmp
-    if idRes.isOk and ((idRes.get() and 0x2'u64) != 0'u64):
-      try:
-        msquicSafe:
-          msquicdrv.closeStream(conn.handle, cast[pointer](pending.stream), pending)
-      except Exception as exc:
-        trace "MsQuic close unexpected unidirectional peer stream raised", err = exc.msg
-      continue
-
-    let previousState = conn.streamState
-    conn.streamHandle = cast[pointer](pending.stream)
-    conn.streamState = pending
-    conn.registerManagedStream(
-      conn.streamHandle,
-      conn.streamState,
-      role = "peer_promoted",
-      primary = true
-    )
-    conn.cached.setLen(0)
-    if not previousState.isNil:
-      msquicSafe:
-        msquicdrv.handoffReadWaiters(previousState, pending)
-    when defined(libp2p_msquic_debug):
-      warn "MsQuic connection promoted peer stream as primary",
-        stream = cast[uint64](conn.streamHandle),
-        activeStreamCount = conn.activeStreams.len
-    return
-
-
 method readOnce*(
     conn: MsQuicConnection, pbytes: pointer, nbytes: int
 ): Future[int] {.async: (raises: [CancelledError, LPStreamError]).} =
   if nbytes <= 0:
     return 0
   conn.ensureStream()
-  conn.promotePendingPeerStream()
   await msquicdrv.waitStreamStart(conn.streamState)
   if conn.cached.len == 0:
     var chunk: seq[byte]
@@ -750,7 +708,6 @@ method write*(
   if bytes.len == 0:
     return
   conn.ensureStream()
-  conn.promotePendingPeerStream()
   await msquicdrv.waitStreamStart(conn.streamState)
   if not conn.bandwidthManager.isNil and conn.peerId.len > 0:
     try:

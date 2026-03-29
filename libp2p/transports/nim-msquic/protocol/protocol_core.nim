@@ -428,7 +428,7 @@ type
     payloadLength*: uint64
     packetLength*: int
 
-proc parseUnprotectedHeader*(data: seq[byte]): UnprotectedHeader =
+proc parseUnprotectedHeader*(data: openArray[byte]): UnprotectedHeader =
   if data.len == 0: return
   
   var pos = 0
@@ -483,18 +483,21 @@ proc parseUnprotectedHeader*(data: seq[byte]): UnprotectedHeader =
   else:
     result.packetLength = data.len
 
-proc splitCoalescedPackets*(data: seq[byte]): seq[seq[byte]] =
+proc splitCoalescedPackets*(data: openArray[byte]): seq[seq[byte]] =
   if data.len == 0:
     return
   var pos = 0
   while pos < data.len:
-    let remaining = data[pos .. ^1]
-    let header = parseUnprotectedHeader(remaining)
+    let header = parseUnprotectedHeader(data.toOpenArray(pos, data.high))
+    let remainingLen = data.len - pos
     var packetLen = header.packetLength
-    if packetLen <= 0 or packetLen > remaining.len:
-      packetLen = remaining.len
-    result.add(remaining[0 ..< packetLen])
-    pos += packetLen
+    if packetLen <= 0 or packetLen > remainingLen:
+      packetLen = remainingLen
+    let nextPos = pos + packetLen
+    if nextPos <= pos or nextPos > data.len:
+      break
+    result.add(@(data.toOpenArray(pos, nextPos - 1)))
+    pos = nextPos
 
 proc parseCryptoFrame*(data: openArray[byte], pos: var int): CryptoFrame =
   # Assumes caller checked Type == 0x06

@@ -124,6 +124,9 @@ proc trackPending(writer: WalWriter; handle: TaskHandle) =
   writer.pending.add(handle)
 
 proc padBlock(writer: WalWriter) =
+  if writer.blockOffset >= blockSize:
+    writer.blockOffset = writer.blockOffset mod blockSize
+    return
   let remaining = blockSize - writer.blockOffset
   if remaining <= 0:
     return
@@ -202,6 +205,13 @@ proc writeChunk(writer: WalWriter;
                 chunkType: ChunkType;
                 payload: seq[byte];
                 metadata: WalRecordMetadata) =
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "wal-stage chunk begin type=", $chunkType,
+      " payload=", $payload.len,
+      " blockOffset=", $writer.blockOffset,
+      " segmentBytes=", $writer.segmentBytes,
+    )
   var header = newSeq[byte](headerSize(writer.cfg.format))
   let payloadLen = uint16(payload.len)
   var crc = extend(0'u32, fromByte(byte(chunkType.ord)))
@@ -235,6 +245,12 @@ proc writeChunk(writer: WalWriter;
   writer.blockOffset += header.len + payload.len
   writer.segmentBytes += int64(header.len + payload.len)
   writer.totalBytes += int64(header.len + payload.len)
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "wal-stage chunk done type=", $chunkType,
+      " blockOffset=", $writer.blockOffset,
+      " segmentBytes=", $writer.segmentBytes,
+    )
 
 proc rotateIfNeeded(writer: WalWriter; force = false) =
   if force or (writer.cfg.maxSegmentBytes > 0 and
@@ -300,8 +316,20 @@ proc append*(writer: WalWriter;
              options: WalAppendOptions = WalAppendOptions()): WalAppendResult =
   if writer.closed:
     raise newException(WalError, "wal writer already closed")
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "wal-stage append wait-lock bytes=", $payload.len,
+      " segment=", writer.segmentPath,
+      " pending=", $writer.pending.len,
+    )
   writer.mutex.acquire()
   defer: writer.mutex.release()
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "wal-stage append locked bytes=", $payload.len,
+      " blockOffset=", $writer.blockOffset,
+      " segmentBytes=", $writer.segmentBytes,
+    )
   if options.forceRotation:
     writer.rotateIfNeeded(true)
   var metadata = options.metadata
@@ -389,6 +417,13 @@ proc append*(writer: WalWriter;
   else:
     writer.maybeAutoSync(writtenBytes)
     result.syncHandle = nil
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "wal-stage append done bytes=", $writtenBytes,
+      " offset=", $result.offset,
+      " segmentBytes=", $writer.segmentBytes,
+      " pending=", $writer.pending.len,
+    )
 
 proc append*(writer: WalWriter;
              payload: string;

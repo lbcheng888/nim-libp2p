@@ -6,7 +6,7 @@ import ./test_catalog
 import ./ci_pipeline
 import ./sample_tool
 import ./trace_pipeline
-import ./fuzz_harness
+import ./fuzz_runner
 import ./interop_runner
 import ./tool_catalog
 import ./perf_ci_pipeline
@@ -18,7 +18,7 @@ export test_catalog
 export ci_pipeline
 export sample_tool
 export trace_pipeline
-export fuzz_harness
+export fuzz_runner
 export interop_runner
 export tool_catalog
 export perf_ci_pipeline

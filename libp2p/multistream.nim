@@ -11,6 +11,7 @@
 
 import std/[strutils, sequtils, tables]
 import chronos, chronicles, stew/byteutils
+from std/times import epochTime
 import varint
 import stream/connection, protocols/protocol, resourcemanager, protobuf/minprotobuf
 
@@ -368,6 +369,8 @@ proc performDialerHandshake(
 
   if attemptV2:
     trace "requesting multistream v2", conn
+    when defined(lsmr_diag):
+      echo "ms-diag t=", int64(epochTime() * 1000), " ms-handshake-v2-write-begin peer=", $conn.peerId
     await writeHandshakeWithTimeout(CodecV2 & "\n", "response2")
     when defined(ohos):
       warn "multistream dialer sent handshake v2", conn
@@ -375,7 +378,12 @@ proc performDialerHandshake(
       debug "multistream dialer sent v2", conn
     let response2 =
       try:
-        await readLpMessageWithin(conn, MsgSize, handshakeReadTimeout, "handshake response2")
+        when defined(lsmr_diag):
+          echo "ms-diag t=", int64(epochTime() * 1000), " ms-handshake-v2-read-begin peer=", $conn.peerId
+        let hr = await readLpMessageWithin(conn, MsgSize, handshakeReadTimeout, "handshake response2")
+        when defined(lsmr_diag):
+          echo "ms-diag t=", int64(epochTime() * 1000), " ms-handshake-v2-read-end peer=", $conn.peerId
+        hr
       except MultiStreamError as exc:
         when defined(ohos):
           warn "multistream dialer handshake response2 timeout", conn,
@@ -492,6 +500,8 @@ proc attemptProtocolSelectDialer(
 proc select*(
     m: MultistreamSelect | type MultistreamSelect, conn: Connection, proto: seq[string]
 ): Future[string] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
+  when defined(lsmr_diag):
+    echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-begin peer=", $conn.peerId, " hasprotos=", proto.len
   trace "initiating multistream negotiation", conn, candidates = proto
   ## select a remote protocol
   let manager =
@@ -524,7 +534,11 @@ proc select*(
     else:
       true
 
+  when defined(lsmr_diag):
+    echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-performDialerHandshake-begin peer=", $conn.peerId
   let negotiatedVersion = await performDialerHandshake(conn, attemptV2)
+  when defined(lsmr_diag):
+    echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-performDialerHandshake-end peer=", $conn.peerId, " ver=", $negotiatedVersion
 
   if proto.len() == 0:
     return (if negotiatedVersion == msv2: CodecV2 else: CodecV1)
@@ -577,6 +591,8 @@ proc select*(
       conn.protocol = firstProto
       manager.attachPermit(firstPermit, conn)
       firstPermit = nil
+      when defined(lsmr_diag):
+        echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-done-1 peer=", $conn.peerId
       return firstProto
 
     trace "first protocol rejected by remote",
@@ -764,6 +780,8 @@ proc processListenerHandshake(
   var pending: seq[byte] = @[]
   var version = msv1
 
+  when defined(lsmr_diag):
+    echo "ms-diag t=", int64(epochTime() * 1000), " ms-listener-next-read-begin peer=", $conn.peerId
   let nextMessage =
     await readLpMessageWithin(
       conn,
@@ -771,6 +789,8 @@ proc processListenerHandshake(
       protocolSelectReadTimeout(),
       "listener post-handshake",
     )
+  when defined(lsmr_diag):
+    echo "ms-diag t=", int64(epochTime() * 1000), " ms-listener-next-read-end peer=", $conn.peerId
   warn "multistream listener got post-handshake message", conn, bytes = nextMessage.len
   if nextMessage.len > 0:
     var nextStr = string.fromBytes(nextMessage)
@@ -850,6 +870,8 @@ proc handle*(
       else:
         await handleMultistreamV1Loop(conn, protos, matchers, @[], handshaked = true)
     else:
+      when defined(lsmr_diag):
+        echo "ms-diag t=", int64(epochTime() * 1000), " ms-listener-handle-begin peer=", $conn.peerId
       let first = await conn.readLp(MsgSize)
       if first.len > 0 and first[0] == byte('/'):
         let (version, pending) = await processListenerHandshake(conn, first)

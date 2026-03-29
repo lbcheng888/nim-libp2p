@@ -11,7 +11,7 @@
 
 {.push raises: [].}
 
-import std/[sequtils]
+import std/[sequtils, strutils]
 import chronos, chronicles
 import
   ./transport,
@@ -38,6 +38,7 @@ type
     flags: set[ServerFlags]
     clientFlags: set[SocketFlags]
     acceptFuts: seq[AcceptFuture]
+    dialTimeout: Duration
     connectionsTimeout: Duration
     stopping: bool
 
@@ -93,6 +94,7 @@ proc new*(
     T: typedesc[TcpTransport],
     flags: set[ServerFlags] = {},
     upgrade: Upgrade,
+    dialTimeout = 10.seconds,
     connectionsTimeout = 10.minutes,
 ): T {.public.} =
   let self = T(
@@ -102,6 +104,7 @@ proc new*(
         {SocketFlags.TcpNoDelay}
       else:
         default(set[SocketFlags]),
+    dialTimeout: dialTimeout,
     upgrader: upgrade,
     networkReachability: NetworkReachability.Unknown,
     connectionsTimeout: connectionsTimeout,
@@ -149,6 +152,8 @@ method start*(
           "Can init from local address"
         )
       )
+      when defined(fabric_lsmr_diag):
+        echo "tcp-listener start address=", $supported[^1]
 
     initialized = true
   finally:
@@ -163,6 +168,8 @@ method start*(
 
 method stop*(self: TcpTransport): Future[void] {.async: (raises: []).} =
   trace "Stopping TCP transport"
+  when defined(fabric_lsmr_diag):
+    echo "tcp-listener stop begin addrs=", self.addrs.mapIt($it).join(",")
   self.stopping = true
   defer:
     self.stopping = false
@@ -193,6 +200,8 @@ method stop*(self: TcpTransport): Future[void] {.async: (raises: []).} =
         len = self.clients[Direction.In].len + self.clients[Direction.Out].len
 
     trace "Transport stopped"
+    when defined(fabric_lsmr_diag):
+      echo "tcp-listener stop done"
     untrackCounter(TcpTransportTrackerName)
   else:
     # For legacy reasons, `stop` on a transpart that wasn't started is
@@ -256,17 +265,27 @@ method accept*(
       await finished
     except TransportTooManyError as exc:
       debug "Too many files opened", description = exc.msg
+      when defined(fabric_lsmr_diag):
+        echo "tcp-accept soft-error kind=too-many msg=", exc.msg
       return nil
     except TransportAbortedError as exc:
       debug "Connection aborted", description = exc.msg
+      when defined(fabric_lsmr_diag):
+        echo "tcp-accept soft-error kind=aborted msg=", exc.msg
       return nil
     except TransportUseClosedError as exc:
+      when defined(fabric_lsmr_diag):
+        echo "tcp-accept hard-error kind=closed msg=", exc.msg
       raise newTransportClosedError(exc)
     except TransportOsError as exc:
+      when defined(fabric_lsmr_diag):
+        echo "tcp-accept hard-error kind=os msg=", exc.msg
       raise (ref TcpTransportError)(
         msg: "TransportOs error in accept:" & exc.msg, parent: exc
       )
     except common.TransportError as exc: # Needed for chronos 4.0.0 support
+      when defined(fabric_lsmr_diag):
+        echo "tcp-accept hard-error kind=transport msg=", exc.msg
       raise (ref TcpTransportError)(
         msg: "TransportError in accept: " & exc.msg, parent: exc
       )
@@ -310,22 +329,50 @@ method dial*(
     raise (ref TcpTransportError)(msg: "Unsupported address: " & $address)
 
   trace "Dialing remote peer", address = $address
+  let dialFuture =
+    if self.networkReachability == NetworkReachability.NotReachable and
+        self.addrs.len > 0:
+      let local = initTAddress(self.addrs[0]).expect("self address is valid")
+      self.clientFlags.incl(SocketFlags.ReusePort)
+      connect(ta, flags = self.clientFlags, localAddress = local)
+    else:
+      connect(ta, flags = self.clientFlags)
+  when defined(fabric_lsmr_diag):
+    echo "tcp-stage connect-begin address=", $address,
+      " hostname=", hostname,
+      " timeoutMs=", self.dialTimeout.milliseconds
+  if self.dialTimeout > 0.seconds:
+    let connected =
+      try:
+        await withTimeout(dialFuture, self.dialTimeout)
+      except CancelledError as exc:
+        raise exc
+    if not connected:
+      when defined(fabric_lsmr_diag):
+        echo "tcp-stage connect-timeout address=", $address,
+          " hostname=", hostname
+      try:
+        await dialFuture.cancelAndWait()
+      except CancelledError:
+        discard
+      except CatchableError:
+        discard
+      raise (ref TcpTransportError)(msg: "TcpTransport dial timeout: " & $address)
   let transp =
     try:
-      await(
-        if self.networkReachability == NetworkReachability.NotReachable and
-            self.addrs.len > 0:
-          let local = initTAddress(self.addrs[0]).expect("self address is valid")
-          self.clientFlags.incl(SocketFlags.ReusePort)
-          connect(ta, flags = self.clientFlags, localAddress = local)
-        else:
-          connect(ta, flags = self.clientFlags)
-      )
+      await dialFuture
     except CancelledError as exc:
       raise exc
     except CatchableError as exc:
+      when defined(fabric_lsmr_diag):
+        echo "tcp-stage connect-exc address=", $address,
+          " hostname=", hostname,
+          " err=", exc.msg
       raise
         (ref TcpTransportError)(msg: "TcpTransport dial error: " & exc.msg, parent: exc)
+  when defined(fabric_lsmr_diag):
+    echo "tcp-stage connect-ok address=", $address,
+      " hostname=", hostname
 
   # If `stop` is called after `connect` but before `await` returns, we might
   # end up with a race condition where `stop` returns but not all connections

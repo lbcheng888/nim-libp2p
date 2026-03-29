@@ -5,7 +5,7 @@ from std/times import epochTime
 
 import unittest2
 
-const harnessPath = "/Users/lbcheng/nim-libp2p/examples/mobile_ffi/game_mesh_host_harness.nim"
+const runnerPath = "/Users/lbcheng/nim-libp2p/examples/mobile_ffi/game_mesh_host_runner.nim"
 
 proc nowMillis(): int64 =
   int64(epochTime() * 1000)
@@ -22,7 +22,7 @@ proc compileFlagsForTransport(transport: string): seq[string] =
   else:
     @[]
 
-proc runHarness(
+proc runRunner(
     appId: string,
     timeoutMs: int,
     transport = "tcp",
@@ -38,7 +38,7 @@ proc runHarness(
   ] & compileFlagsForTransport(transport) & @[
     "--nimcache:" & nimCacheDir,
     "-r",
-    harnessPath,
+    runnerPath,
     "--app:" & appId,
     "--transport:" & transport,
     "--timeout-ms:" & $timeoutMs,
@@ -56,7 +56,7 @@ proc runHarness(
     raise newException(IOError, "missing summary file for " & appId & "\n" & logText)
   let summary = parseJson(readFile(summaryPath))
   if exitCode != 0:
-    raise newException(IOError, "host harness failed for " & appId & "\n" & logText & "\nsummary=" & $summary)
+    raise newException(IOError, "host runner failed for " & appId & "\n" & logText & "\nsummary=" & $summary)
   summary
 
 proc summaryOk(summary: JsonNode): bool =
@@ -64,7 +64,7 @@ proc summaryOk(summary: JsonNode): bool =
 
 suite "Mobile FFI host game mesh e2e":
   test "xiangqi completes full localhost match over real nodes":
-    let summary = runHarness("chess", 30_000)
+    let summary = runRunner("chess", 30_000)
     check summaryOk(summary)
     check summary["host"]["finalState"]["phase"].getStr() == "FINISHED"
     check summary["guest"]["finalState"]["phase"].getStr() == "FINISHED"
@@ -74,7 +74,7 @@ suite "Mobile FFI host game mesh e2e":
     check summary["guest"]["replay"]["ok"].getBool()
 
   test "doudizhu completes localhost host+guest+bot match over real nodes":
-    let summary = runHarness("doudizhu", 45_000)
+    let summary = runRunner("doudizhu", 45_000)
     check summaryOk(summary)
     check summary["host"]["finalState"]["phase"].getStr() == "FINISHED"
     check summary["guest"]["finalState"]["phase"].getStr() == "FINISHED"
@@ -85,7 +85,7 @@ suite "Mobile FFI host game mesh e2e":
     check summary["host"]["finalState"]["auditValid"].getBool()
 
   test "xiangqi completes full localhost match over QUIC-only real nodes":
-    let summary = runHarness("chess", 30_000, transport = "quic")
+    let summary = runRunner("chess", 30_000, transport = "quic")
     check summaryOk(summary)
     check summary["transport"].getStr() == "quic_explicit_seed"
     check summary["host"]["finalState"]["phase"].getStr() == "FINISHED"
@@ -96,7 +96,7 @@ suite "Mobile FFI host game mesh e2e":
     check summary["guest"]["replay"]["ok"].getBool()
 
   test "doudizhu completes localhost host+guest+bot match over QUIC-only real nodes":
-    let summary = runHarness("doudizhu", 45_000, transport = "quic")
+    let summary = runRunner("doudizhu", 45_000, transport = "quic")
     check summaryOk(summary)
     check summary["transport"].getStr() == "quic_explicit_seed"
     check summary["host"]["finalState"]["phase"].getStr() == "FINISHED"
@@ -108,7 +108,7 @@ suite "Mobile FFI host game mesh e2e":
     check summary["host"]["finalState"]["auditValid"].getBool()
 
   test "xiangqi simulates LAN to mobile switch over dual-stack QUIC localhost nodes":
-    let summary = runHarness(
+    let summary = runRunner(
       "chess",
       45_000,
       transport = "quic-dual",
@@ -128,7 +128,7 @@ suite "Mobile FFI host game mesh e2e":
     check summary["guest"]["replay"]["ok"].getBool()
 
   test "doudizhu simulates LAN to mobile switch over dual-stack QUIC localhost nodes":
-    let summary = runHarness(
+    let summary = runRunner(
       "doudizhu",
       60_000,
       transport = "quic-dual",

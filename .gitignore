@@ -78,7 +78,7 @@ api_connection_id_frames_test
 tests/
 !tests/
 !tests/testmobile_ffi_relay_upgrade_observer.nim
-wan_bootstrap_host_harness
+wan_bootstrap_host_runner
 ipv6_bootstrap_node
 examples/dual_stack_bootstrap_node
 examples/quic_ping_client
@@ -132,7 +132,8 @@ examples/tsnet_quic_relay_gateway
 examples/tsnet_quic_control_gateway
 examples/tsnet_h3_control_gateway
 examples/rwadd
-examples/mobile_ffi/tsnet_acceptance_harness
 examples/mobile_ffi/inprocess_device_automation_runner
 examples/libnimlibp2p
 AGENTS.md
+examples/mobile_ffi/tsnet_product_node
+examples/tsnet_quic_gateway_service

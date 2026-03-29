@@ -1,0 +1,14 @@
+[Unit]
+Description=Nim tsnet QUIC gateway service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/nim-libp2p
+ExecStart=/root/nim-libp2p/build/tsnet_quic_gateway_service --listen-host=0.0.0.0 --control-listen-port=9444 --relay-listen-port=9446 --certificate-file=/root/nim-libp2p/build/nim-tsnet-quic.crt --private-key-file=/root/nim-libp2p/build/nim-tsnet-quic.key --open-network --public-host=64.176.84.12 --public-ipv4=64.176.84.12 --region-id=901 --region-code=sin --region-name=Open\x20QUIC\x20Network --derp-port=443 --verbose-diagnostics
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

@@ -5,6 +5,7 @@ import chronos
 import ./msquic_test_helpers
 import ../libp2p/transports/msquicdriver as msdriver
 import ../libp2p/transports/msquicconnection
+import ../libp2p/transports/msquicstream
 import ../libp2p/transports/quicruntime as quicrt
 import ../libp2p/stream/lpstream
 
@@ -63,8 +64,7 @@ when defined(libp2p_msquic_experimental):
                 handle,
                 clientConnPtr,
                 clientConnState,
-                nil,
-                true
+                createPrimaryStream = true
               )
               defer:
                 if not clientConn.isNil:
@@ -87,7 +87,8 @@ when defined(libp2p_msquic_experimental):
                 serverConnPtr,
                 serverConnState,
                 cast[pointer](serverInbound.stream),
-                true
+                primaryStreamState = serverInbound,
+                createPrimaryStream = true
               )
               defer:
                 if not serverConn.isNil:
@@ -132,6 +133,106 @@ when defined(libp2p_msquic_experimental):
               let clientPayload = clientConn.readLp(1024)
               check waitFor clientPayload.withTimeout(3.seconds)
               check bytesToString(clientPayload.read()) == "pong"
+
+    test "new inbound peer stream does not replace primary connection stream":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (clientConnPtr, clientConnStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or clientConnStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let clientConnState = clientConnStateOpt.get()
+            let (serverConnPtr, serverConnStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverConnStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverConnState = serverConnStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverConnState)
+                discard msdriver.shutdownConnection(handle, clientConnPtr)
+                msdriver.closeConnection(handle, clientConnPtr, clientConnState)
+
+              discard nextConnectionEventOfKind(clientConnState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverConnState, quicrt.qceConnected)
+
+              let clientConn = newMsQuicConnection(
+                handle,
+                clientConnPtr,
+                clientConnState,
+                createPrimaryStream = true
+              )
+              defer:
+                if not clientConn.isNil:
+                  waitFor clientConn.closeImpl()
+
+              check waitFor clientConn.writeLp("ping").withTimeout(3.seconds)
+              let serverInboundFut = msdriver.awaitPendingStreamState(serverConnState)
+              check waitFor serverInboundFut.withTimeout(3.seconds)
+              let serverInbound = serverInboundFut.read()
+              check serverInbound != nil
+
+              let serverConn = newMsQuicConnection(
+                handle,
+                serverConnPtr,
+                serverConnState,
+                cast[pointer](serverInbound.stream),
+                primaryStreamState = serverInbound,
+                createPrimaryStream = true
+              )
+              defer:
+                if not serverConn.isNil:
+                  waitFor serverConn.closeImpl()
+
+              let serverPing = serverConn.readLp(1024)
+              check waitFor serverPing.withTimeout(3.seconds)
+              check bytesToString(serverPing.read()) == "ping"
+
+              let reverseStream = serverConn.openMsQuicStream(false, Direction.Out)
+              defer:
+                if not reverseStream.isNil:
+                  waitFor reverseStream.closeImpl()
+              check waitFor reverseStream.writeLp("reverse-stream").withTimeout(3.seconds)
+
+              check waitFor serverConn.writeLp("pong").withTimeout(3.seconds)
+
+              let clientPrimaryPayload = clientConn.readLp(1024)
+              check waitFor clientPrimaryPayload.withTimeout(3.seconds)
+              check bytesToString(clientPrimaryPayload.read()) == "pong"
+
+              let clientPendingFut = msdriver.awaitPendingStreamState(clientConnState)
+              check waitFor clientPendingFut.withTimeout(3.seconds)
+              let clientReverseState = clientPendingFut.read()
+              check clientReverseState != nil
+
+              let clientReverse = newMsQuicStream(clientReverseState, handle, Direction.In)
+              defer:
+                if not clientReverse.isNil:
+                  waitFor clientReverse.closeImpl()
+              let clientReversePayload = clientReverse.readLp(1024)
+              check waitFor clientReversePayload.withTimeout(3.seconds)
+              check bytesToString(clientReversePayload.read()) == "reverse-stream"
 else:
   import ./helpers
   suite "MsQuic primary connection LP exchange":

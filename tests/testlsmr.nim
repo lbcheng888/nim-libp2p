@@ -154,6 +154,9 @@ suite "LSMR":
     let decoded = SignedLsmrCoordinateRecord.decode(encoded).tryGet()
     check decoded.data.attestedPrefix == @[5'u8, 1'u8]
     check decoded.data.witnesses.len == 1
+    check lsmrDigitDistance(5'u8, 5'u8) == 0
+    check lsmrDigitDistance(5'u8, 1'u8) == 1
+    check lsmrDigitDistance(5'u8, 8'u8) == 2
     check lsmrDistance(@[5'u8, 8'u8], @[5'u8, 2'u8]) == 4
 
   test "coordinate record rejects inconsistent he tu parity":
@@ -197,13 +200,15 @@ suite "LSMR":
     check coord.depth == 4'u8
     check coord.path == objectPathForDigest(digest, 4)
 
-  test "topology neighbor view groups same cell and directional peers":
+  test "topology neighbor view separates parent and directional peers":
     let rng = newRng()
     let networkId = "lsmr-neighbor-view"
     let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
 
     let localKey = PrivateKey.random(ECDSA, rng[]).tryGet()
     let localPeer = PeerId.init(localKey).tryGet()
+    let parentKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let parentPeer = PeerId.init(parentKey).tryGet()
     let sameKey = PrivateKey.random(ECDSA, rng[]).tryGet()
     let samePeer = PeerId.init(sameKey).tryGet()
     let eastKey = PrivateKey.random(ECDSA, rng[]).tryGet()
@@ -214,6 +219,14 @@ suite "LSMR":
     let sw = newStandardSwitchBuilder(transport = TransportType.Memory)
       .withPrivateKey(localKey)
       .build()
+    sw.peerStore[ActiveLsmrBook][parentPeer] =
+      makeSignedCoordinateRecord(
+        parentKey,
+        parentPeer,
+        networkId,
+        @[5'u8],
+        @[makeSignedWitness(anchorKey, parentPeer, networkId, "op-a", 5'u8, 7'u32, @[5'u8])],
+      )
     sw.peerStore[ActiveLsmrBook][localPeer] =
       makeSignedCoordinateRecord(
         localKey,
@@ -250,8 +263,9 @@ suite "LSMR":
     let view = sw.peerStore.topologyNeighborView(localPeer, depth = 2)
     check view.isSome()
     check samePeer in view.get().sameCellPeers
-    check eastPeer in view.get().parentPrefixPeers
-    check southPeer in view.get().parentPrefixPeers
+    check parentPeer in view.get().parentPrefixPeers
+    check eastPeer notin view.get().parentPrefixPeers
+    check southPeer notin view.get().parentPrefixPeers
     check view.get().directionalPeers.anyIt(it.directionDigit == 1'u8 and eastPeer in it.peers)
     check view.get().directionalPeers.anyIt(it.directionDigit == 9'u8 and southPeer in it.peers)
 
@@ -262,6 +276,8 @@ suite "LSMR":
 
     let localKey = PrivateKey.random(ECDSA, rng[]).tryGet()
     let localPeer = PeerId.init(localKey).tryGet()
+    let rootKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let rootPeer = PeerId.init(rootKey).tryGet()
     let eastKey = PrivateKey.random(ECDSA, rng[]).tryGet()
     let eastPeer = PeerId.init(eastKey).tryGet()
     let southKey = PrivateKey.random(ECDSA, rng[]).tryGet()
@@ -270,6 +286,14 @@ suite "LSMR":
     let sw = newStandardSwitchBuilder(transport = TransportType.Memory)
       .withPrivateKey(localKey)
       .build()
+    sw.peerStore[ActiveLsmrBook][rootPeer] =
+      makeSignedCoordinateRecord(
+        rootKey,
+        rootPeer,
+        networkId,
+        @[5'u8],
+        @[makeSignedWitness(anchorKey, rootPeer, networkId, "op-a", 5'u8, 7'u32, @[5'u8])],
+      )
     sw.peerStore[ActiveLsmrBook][localPeer] =
       makeSignedCoordinateRecord(
         localKey,
@@ -298,6 +322,10 @@ suite "LSMR":
     let nextHop = sw.peerStore.routeNextHop(localPeer, @[5'u8, 9'u8, 1'u8])
     check nextHop.isSome()
     check nextHop.get() == southPeer
+
+    let rootHop = sw.peerStore.routeNextHop(localPeer, @[5'u8])
+    check rootHop.isSome()
+    check rootHop.get() == rootPeer
 
   test "validated migration record allows non descendant coordinate update":
     let rng = newRng()
@@ -445,6 +473,309 @@ suite "LSMR":
     check client.peerStore[ActiveLsmrBook].contains(serverPeer)
     check client.peerStore[LsmrMigrationBook][subjectPeer].len == 1
     check client.peerStore[LsmrIsolationBook][subjectPeer].len == 1
+
+  asyncTest "coordinate sync promotes migrated coordinates after raw install":
+    let rng = newRng()
+    let networkId = "lsmr-sync-promote-" & $nowMillis()
+    let serverKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let serverPeer = PeerId.init(serverKey).tryGet()
+    let clientKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let committeeKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let committeePeer = PeerId.init(committeeKey).tryGet()
+    let subjectKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let subjectPeer = PeerId.init(subjectKey).tryGet()
+
+    let server = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(serverKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          minWitnessQuorum = 1,
+          serveWitness = true,
+          operatorId = "root",
+        )
+      )
+      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(clientKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          minWitnessQuorum = 1,
+          anchors = @[LsmrAnchor(peerId: serverPeer, addrs: server.peerInfo.addrs, operatorId: "root", regionDigit: 5'u8)],
+        )
+      )
+      .build()
+
+    await server.start()
+    await client.start()
+    discard await startLsmrService(server)
+    let clientSvc = await startLsmrService(client)
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let serverWitness =
+      makeSignedWitness(serverKey, serverPeer, networkId, "root", 5'u8, 5'u32, @[5'u8])
+    let serverRecord =
+      makeSignedCoordinateRecord(serverKey, serverPeer, networkId, @[5'u8], @[serverWitness])
+    server.peerStore[LsmrChainBook][serverPeer] = @[serverRecord]
+    server.peerStore[LsmrBook][serverPeer] = serverRecord
+    server.peerStore[ActiveLsmrBook][serverPeer] = serverRecord
+
+    let committeeWitness =
+      makeSignedWitness(serverKey, committeePeer, networkId, "root", 5'u8, 8'u32, @[5'u8, 5'u8])
+    let committeeRecord =
+      makeSignedCoordinateRecord(
+        committeeKey,
+        committeePeer,
+        networkId,
+        @[5'u8, 5'u8],
+        @[committeeWitness],
+      )
+    server.peerStore[LsmrChainBook][committeePeer] = @[committeeRecord]
+    server.peerStore[LsmrBook][committeePeer] = committeeRecord
+    server.peerStore[ActiveLsmrBook][committeePeer] = committeeRecord
+
+    let migrationWitness =
+      makeSignedWitness(committeeKey, subjectPeer, networkId, "committee", 5'u8, 9'u32, @[5'u8, 9'u8])
+    let migration =
+      makeSignedMigrationRecord(
+        subjectKey,
+        subjectPeer,
+        networkId,
+        @[5'u8, 1'u8],
+        @[5'u8, 9'u8],
+        "old-record",
+        @[migrationWitness],
+        epochId = 2'u64,
+      )
+    discard installMigrationRecord(server, migration)
+
+    var migratedData =
+      makeSignedCoordinateRecord(
+        subjectKey,
+        subjectPeer,
+        networkId,
+        @[5'u8, 9'u8],
+        @[migrationWitness],
+      ).data
+    migratedData.epochId = 2'u64
+    migratedData.parentDigest = computeExpectedParentDigest(networkId, @[5'u8, 9'u8], 2'u64)
+    migratedData.migrationDigest = migration.data.migrationDigest
+    migratedData.heTuParity =
+      computeHeTuParity(
+        2'u64,
+        @[5'u8, 9'u8],
+        expectedCoverageMask(@[5'u8, 9'u8]),
+        migratedData.parentDigest,
+        migratedData.migrationDigest,
+        DefaultLsmrVersion,
+      )
+    migratedData.recordDigest = computeRecordDigest(migratedData)
+    let migratedRecord = SignedLsmrCoordinateRecord.init(subjectKey, migratedData).tryGet()
+    server.peerStore[LsmrChainBook][subjectPeer] = @[migratedRecord]
+    server.peerStore[LsmrBook][subjectPeer] = migratedRecord
+    server.peerStore[ActiveLsmrBook][subjectPeer] = migratedRecord
+
+    await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+    check await clientSvc.syncCoordinatesFromPeer(serverPeer)
+    check client.peerStore[LsmrMigrationBook][subjectPeer].len == 1
+    check client.peerStore[ActiveLsmrBook].contains(committeePeer)
+    check client.peerStore[ActiveLsmrBook].contains(subjectPeer)
+    check client.peerStore[ActiveLsmrBook][subjectPeer].data.certifiedPrefix() == @[5'u8, 9'u8]
+
+  asyncTest "coordinate sync promotes same peer chain from root to deep":
+    let rng = newRng()
+    let networkId = "lsmr-sync-self-chain-" & $nowMillis()
+    let serverKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let serverPeer = PeerId.init(serverKey).tryGet()
+    let clientKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+
+    let server = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(serverKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          minWitnessQuorum = 1,
+          serveWitness = true,
+          operatorId = "root",
+        )
+      )
+      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(clientKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          minWitnessQuorum = 1,
+          anchors = @[LsmrAnchor(peerId: serverPeer, addrs: server.peerInfo.addrs, operatorId: "root", regionDigit: 5'u8)],
+        )
+      )
+      .build()
+
+    await server.start()
+    await client.start()
+    discard await startLsmrService(server)
+    let clientSvc = await startLsmrService(client)
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let rootWitness =
+      makeSignedWitness(serverKey, serverPeer, networkId, "root", 5'u8, 5'u32, @[5'u8])
+    let rootRecord =
+      makeSignedCoordinateRecord(serverKey, serverPeer, networkId, @[5'u8], @[rootWitness])
+    let deepWitness =
+      makeSignedWitness(serverKey, serverPeer, networkId, "root", 5'u8, 6'u32, @[5'u8, 1'u8])
+    let deepRecord =
+      makeSignedCoordinateRecord(serverKey, serverPeer, networkId, @[5'u8, 1'u8], @[deepWitness])
+
+    server.peerStore[LsmrChainBook][serverPeer] = @[rootRecord, deepRecord]
+    server.peerStore[LsmrBook][serverPeer] = deepRecord
+    server.peerStore[ActiveLsmrBook][serverPeer] = deepRecord
+
+    await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+    check await clientSvc.syncCoordinatesFromPeer(serverPeer)
+    await sleepAsync(100.milliseconds)
+    check client.peerStore[ActiveLsmrBook].contains(serverPeer)
+    check client.peerStore[ActiveLsmrBook][serverPeer].data.certifiedPrefix() == @[5'u8, 1'u8]
+
+  asyncTest "coordinate sync promotes foreign rooted chain with explicit root anchor":
+    let rng = newRng()
+    let networkId = "lsmr-sync-foreign-rooted-" & $nowMillis()
+    let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeer = PeerId.init(anchorKey).tryGet()
+    let subjectKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let subjectPeer = PeerId.init(subjectKey).tryGet()
+    let clientKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let clientConfig =
+      LsmrConfig.init(
+        networkId = networkId,
+        minWitnessQuorum = 1,
+        anchors = @[LsmrAnchor(
+          peerId: anchorPeer,
+          operatorId: "root-a",
+          regionDigit: 5'u8,
+          attestedPrefix: @[5'u8],
+          canIssueRootCert: true,
+        )],
+      )
+
+    let server = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(subjectKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          minWitnessQuorum = 1,
+          serveWitness = true,
+          operatorId = "subject-op",
+        )
+      )
+      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(clientKey)
+      .withLsmr(clientConfig)
+      .build()
+
+    await server.start()
+    await client.start()
+    discard await startLsmrService(server)
+    let clientSvc = await startLsmrService(client)
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let rootWitness =
+      makeSignedWitness(anchorKey, subjectPeer, networkId, "root-a", 5'u8, 5'u32, @[5'u8])
+    let rootRecord =
+      makeSignedCoordinateRecord(subjectKey, subjectPeer, networkId, @[5'u8], @[rootWitness])
+    let deepWitness =
+      makeSignedWitness(subjectKey, subjectPeer, networkId, "subject-op", 5'u8, 6'u32, @[5'u8, 1'u8])
+    let deepRecord =
+      makeSignedCoordinateRecord(subjectKey, subjectPeer, networkId, @[5'u8, 1'u8], @[deepWitness])
+
+    server.peerStore[LsmrChainBook][subjectPeer] = @[rootRecord, deepRecord]
+    server.peerStore[LsmrBook][subjectPeer] = deepRecord
+    server.peerStore[ActiveLsmrBook][subjectPeer] = deepRecord
+
+    await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+    check await clientSvc.syncCoordinatesFromPeer(subjectPeer)
+    await sleepAsync(100.milliseconds)
+
+    if not client.peerStore[ActiveLsmrBook].contains(subjectPeer):
+      client.peerStore[LsmrBook][subjectPeer] = rootRecord
+      let rootSnapshot = validateLsmrPeer(client, clientConfig, subjectPeer)
+      client.peerStore[LsmrBook][subjectPeer] = deepRecord
+      let deepSnapshot = validateLsmrPeer(client, clientConfig, subjectPeer)
+      checkpoint "root trust=" & $rootSnapshot.trust & " reason=" & rootSnapshot.reason &
+        " deep trust=" & $deepSnapshot.trust & " reason=" & deepSnapshot.reason
+    check client.peerStore[ActiveLsmrBook].contains(subjectPeer)
+    check client.peerStore[ActiveLsmrBook][subjectPeer].data.certifiedPrefix() == @[5'u8, 1'u8]
+
+  asyncTest "coordinate publish promotes foreign rooted chain with explicit root anchor":
+    let rng = newRng()
+    let networkId = "lsmr-publish-foreign-rooted-" & $nowMillis()
+    let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeer = PeerId.init(anchorKey).tryGet()
+    let subjectKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let subjectPeer = PeerId.init(subjectKey).tryGet()
+    let clientKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let clientConfig =
+      LsmrConfig.init(
+        networkId = networkId,
+        minWitnessQuorum = 1,
+        anchors = @[LsmrAnchor(
+          peerId: anchorPeer,
+          operatorId: "root-a",
+          regionDigit: 5'u8,
+          attestedPrefix: @[5'u8],
+          canIssueRootCert: true,
+        )],
+      )
+
+    let server = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(subjectKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          minWitnessQuorum = 1,
+          serveWitness = true,
+          operatorId = "subject-op",
+        )
+      )
+      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(clientKey)
+      .withLsmr(clientConfig)
+      .build()
+
+    await server.start()
+    await client.start()
+    let serverSvc = await startLsmrService(server)
+    discard await startLsmrService(client)
+    defer:
+      await client.stop()
+      await server.stop()
+
+    let rootWitness =
+      makeSignedWitness(anchorKey, subjectPeer, networkId, "root-a", 5'u8, 5'u32, @[5'u8])
+    let rootRecord =
+      makeSignedCoordinateRecord(subjectKey, subjectPeer, networkId, @[5'u8], @[rootWitness])
+    let deepWitness =
+      makeSignedWitness(subjectKey, subjectPeer, networkId, "subject-op", 5'u8, 6'u32, @[5'u8, 1'u8])
+    let deepRecord =
+      makeSignedCoordinateRecord(subjectKey, subjectPeer, networkId, @[5'u8, 1'u8], @[deepWitness])
+
+    server.peerStore[LsmrChainBook][subjectPeer] = @[rootRecord, deepRecord]
+    server.peerStore[LsmrBook][subjectPeer] = deepRecord
+    server.peerStore[ActiveLsmrBook][subjectPeer] = deepRecord
+
+    await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+    check await serverSvc.publishLocalStateToPeer(client.peerInfo.peerId)
+    await sleepAsync(100.milliseconds)
+    check client.peerStore[ActiveLsmrBook].contains(subjectPeer)
+    check client.peerStore[ActiveLsmrBook][subjectPeer].data.certifiedPrefix() == @[5'u8, 1'u8]
 
   asyncTest "near field observation seeds witness sources without static anchors":
     let rng = newRng()

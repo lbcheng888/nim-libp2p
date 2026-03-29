@@ -1,15 +1,15 @@
-import std/[json, options, os, parseopt, strutils]
+import std/[json, os, parseopt, strutils]
 import chronos
 
-import ../libp2p/transports/tsnet/[control, quiccontrol]
-when defined(libp2p_msquic_experimental):
-  import "../libp2p/transports/nim-msquic/api/diagnostics_model"
+import ../libp2p/transports/tsnet/[control, quiccontrol, quicrelay]
+import "../libp2p/transports/nim-msquic/api/diagnostics_model"
 import ../libp2p/utility
 
 type
   GatewayArgs = object
     listenHost: string
-    listenPort: int
+    controlListenPort: int
+    relayListenPort: int
     controlUrl: string
     certificateFile: string
     privateKeyFile: string
@@ -21,11 +21,13 @@ type
     regionCode: string
     regionName: string
     derpPort: int
+    verboseDiagnostics: bool
 
 proc parseArgs(): Result[GatewayArgs, string] =
   var args = GatewayArgs(
     listenHost: "0.0.0.0",
-    listenPort: int(NimTsnetQuicDefaultPort),
+    controlListenPort: int(NimTsnetQuicDefaultPort),
+    relayListenPort: int(NimTsnetQuicRelayDefaultPort),
     controlUrl: "",
     certificateFile: "",
     privateKeyFile: "",
@@ -36,7 +38,8 @@ proc parseArgs(): Result[GatewayArgs, string] =
     regionId: 901,
     regionCode: "sin",
     regionName: "Open QUIC Network",
-    derpPort: 443
+    derpPort: 443,
+    verboseDiagnostics: false
   )
   var parser = initOptParser(commandLineParams())
   while true:
@@ -48,13 +51,22 @@ proc parseArgs(): Result[GatewayArgs, string] =
       case parser.key
       of "listen-host":
         args.listenHost = parser.val.strip()
-      of "listen-port":
+      of "control-listen-port":
         try:
-          args.listenPort = max(1, parser.val.parseInt())
+          args.controlListenPort = max(1, parser.val.parseInt())
         except CatchableError:
-          return err("invalid --listen-port: " & parser.val)
+          return err("invalid --control-listen-port: " & parser.val)
+      of "relay-listen-port":
+        try:
+          args.relayListenPort = max(1, parser.val.parseInt())
+        except CatchableError:
+          return err("invalid --relay-listen-port: " & parser.val)
       of "control-url":
         args.controlUrl = parser.val.strip()
+      of "certificate-file":
+        args.certificateFile = parser.val.strip()
+      of "private-key-file":
+        args.privateKeyFile = parser.val.strip()
       of "open-network":
         args.openNetwork = true
       of "public-host":
@@ -77,10 +89,8 @@ proc parseArgs(): Result[GatewayArgs, string] =
           args.derpPort = max(1, parser.val.parseInt())
         except CatchableError:
           return err("invalid --derp-port: " & parser.val)
-      of "certificate-file":
-        args.certificateFile = parser.val.strip()
-      of "private-key-file":
-        args.privateKeyFile = parser.val.strip()
+      of "verbose-diagnostics":
+        args.verboseDiagnostics = true
       else:
         return err("unknown option: --" & parser.key)
     of cmdArgument:
@@ -93,20 +103,30 @@ proc parseArgs(): Result[GatewayArgs, string] =
     return err("missing --private-key-file")
   ok(args)
 
+proc installDiagnosticsHook() =
+  clearDiagnosticsHooks()
+  registerDiagnosticsHook(
+    proc(event: DiagnosticsEvent) {.gcsafe.} =
+      try:
+        stderr.writeLine(
+          "[nim-msquic] kind=" & $event.kind &
+          " handle=" & $cast[uint](event.handle) &
+          " note=" & event.note
+        )
+        flushFile(stderr)
+      except CatchableError:
+        discard
+  )
+
 proc main() =
   let args = parseArgs().valueOr:
     stderr.writeLine(error)
     quit(2)
-  when defined(libp2p_msquic_experimental):
-    if getEnv("NIM_TSNET_GATEWAY_DIAG").strip().toLowerAscii() in ["1", "true", "yes", "on"]:
-      clearDiagnosticsHooks()
-      registerDiagnosticsHook(proc(event: DiagnosticsEvent) {.gcsafe.} =
-        try:
-          stderr.writeLine("[gateway-diag] " & event.note)
-        except IOError:
-          discard
-      )
+
   chronos.setThreadDispatcher(newDispatcher())
+  if args.verboseDiagnostics:
+    installDiagnosticsHook()
+
   let certPem =
     try:
       readFile(args.certificateFile)
@@ -120,9 +140,9 @@ proc main() =
       stderr.writeLine("failed to read private key file: " & exc.msg)
       quit(2)
 
-  let gateway = TsnetQuicControlGateway.new(TsnetQuicControlGatewayConfig(
+  let controlGateway = TsnetQuicControlGateway.new(TsnetQuicControlGatewayConfig(
     listenHost: args.listenHost,
-    listenPort: uint16(args.listenPort),
+    listenPort: uint16(args.controlListenPort),
     controlUrl: args.controlUrl,
     upstreamTransport: if args.openNetwork: nil else: defaultControlTransport(),
     certificatePem: certPem,
@@ -136,28 +156,44 @@ proc main() =
     regionName: args.regionName,
     derpPort: args.derpPort
   ))
-  let started = gateway.start()
-  if started.isErr():
-    stderr.writeLine(started.error)
+  let controlStarted = controlGateway.start()
+  if controlStarted.isErr():
+    stderr.writeLine(controlStarted.error)
     quit(2)
+
+  let relayGateway = TsnetQuicRelayGateway.new()
+  let relayStarted = relayGateway.start(
+    listenHost = args.listenHost,
+    listenPort = uint16(args.relayListenPort),
+    certificatePem = certPem,
+    privateKeyPem = keyPem
+  )
+  if relayStarted.isErr():
+    controlGateway.stop()
+    stderr.writeLine(relayStarted.error)
+    quit(2)
+
   echo $(
     %*{
       "ok": true,
       "listenHost": args.listenHost,
-      "listenPort": gateway.boundPort(),
-      "controlUrl": args.controlUrl,
-      "openNetwork": args.openNetwork,
-      "protocol": "nim_quic",
-      "healthUrl": nimQuicHealthUrl(
-        "https://" & args.listenHost & ":" & $gateway.boundPort()
-      )
+      "control": {
+        "listenPort": controlGateway.boundPort(),
+        "protocol": "nim_quic",
+        "openNetwork": args.openNetwork
+      },
+      "relay": {
+        "listenPort": relayGateway.boundPort,
+        "protocol": "nim_quic_relay_async"
+      }
     }
   )
+
   while true:
     try:
       poll()
     except CatchableError as exc:
-      stderr.writeLine("nim_quic gateway poll error: " & exc.msg)
+      stderr.writeLine("nim_quic gateway service poll error: " & exc.msg)
       quit(1)
 
 main()

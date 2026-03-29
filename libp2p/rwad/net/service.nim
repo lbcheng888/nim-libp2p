@@ -1,4 +1,5 @@
 import std/[base64, options, strutils]
+from std/times import epochTime
 
 import chronos
 import chronicles
@@ -6,8 +7,8 @@ import chronicles
 import ../../builders
 import ../../lsmr
 import ../../multiaddress
-import ../../peerid
 import ../../peerstore
+import ../../services/lsmrservice
 import ../../switch
 import ../../protocols/fetch/fetch
 import ../../protocols/fetch/protobuf
@@ -151,6 +152,26 @@ proc appendUnique(target: var seq[string], value: string) =
       return
   target.add(value)
 
+proc appendUnique(target: var seq[MultiAddress], value: MultiAddress) =
+  for item in target:
+    if item == value:
+      return
+  target.add(value)
+
+proc stripPeerSuffix(address: string): string =
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = address.rfind(marker)
+    if idx >= 0:
+      return address[0 ..< idx]
+  address
+
+proc bootstrapAddrPeerText(address: string): string =
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = address.rfind(marker)
+    if idx >= 0:
+      return address[idx + marker.len .. ^1]
+  ""
+
 proc effectiveBootstrapAddrs(network: RwadNetwork): seq[string] =
   if network.isNil:
     return @[]
@@ -170,6 +191,56 @@ proc effectiveBootstrapAddrs(network: RwadNetwork): seq[string] =
   of RoutingPlaneMode.lsmrOnly:
     for raw in network.lsmrBootstrapAddrs:
       result.appendUnique(raw)
+
+proc importLsmrBootstrapHints(network: RwadNetwork) =
+  if network.isNil or network.switch.isNil:
+    return
+  let lsmrSvc = getLsmrService(network.switch)
+  if lsmrSvc.isNil:
+    return
+
+  type AnchorAddrs = tuple[anchor: LsmrAnchor, addrs: seq[MultiAddress]]
+  var grouped = initTable[string, AnchorAddrs]()
+  for raw in network.lsmrBootstrapAddrs:
+    let parsed = MultiAddress.init(raw)
+    if parsed.isErr():
+      continue
+    let rawBase = stripPeerSuffix(raw)
+    let rawPeerText = bootstrapAddrPeerText(raw)
+    for anchor in lsmrSvc.config.anchors:
+      var matched = false
+      if rawPeerText.len > 0 and rawPeerText == $anchor.peerId:
+        matched = true
+      else:
+        for configured in anchor.addrs:
+          if stripPeerSuffix($configured) == rawBase:
+            matched = true
+            break
+      if not matched:
+        continue
+      let key = $anchor.peerId
+      var entry = grouped.getOrDefault(key, (anchor: anchor, addrs: @[]))
+      entry.addrs.appendUnique(parsed.get())
+      grouped[key] = entry
+      break
+
+  let nowMs = int64(epochTime() * 1000)
+  let expiresAtMs = nowMs + (lsmrSvc.config.recordTtl.nanoseconds div 1_000_000)
+  for entry in grouped.values():
+    discard lsmrSvc.installNearFieldHandshake(NearFieldHandshakeRecord(
+      provider: NearFieldBootstrapProvider.nfbpBle,
+      networkId: lsmrSvc.config.networkId,
+      peerId: entry.anchor.peerId,
+      addrs: entry.addrs,
+      operatorId: entry.anchor.operatorId,
+      regionDigit: entry.anchor.regionDigit,
+      attestedPrefix: entry.anchor.attestedPrefix,
+      serveDepth: entry.anchor.serveDepth,
+      directionMask: entry.anchor.directionMask,
+      canIssueRootCert: entry.anchor.canIssueRootCert,
+      issuedAtMs: nowMs,
+      expiresAtMs: expiresAtMs,
+    ))
 
 proc routingPlaneStatus*(network: RwadNetwork): RoutingPlaneStatus =
   if network.isNil:
@@ -299,12 +370,37 @@ proc subscribeTopics(network: RwadNetwork) =
 proc start*(network: RwadNetwork) {.async.} =
   network.subscribeTopics()
   await network.switch.start()
+  if network.routingMode == RoutingPlaneMode.lsmrOnly:
+    network.importLsmrBootstrapHints()
+    return
   for raw in network.effectiveBootstrapAddrs():
     let parsed = MultiAddress.init(raw)
     if parsed.isErr():
       continue
     try:
-      discard await network.switch.connect(parsed.get(), allowUnknownPeerId = true)
+      let peerId = await network.switch.connect(parsed.get(), allowUnknownPeerId = true)
+      if not network.switch.isNil and not network.switch.peerStore.isNil:
+        network.switch.peerStore.addAddressWithTTL(peerId, parsed.get(), 30.minutes)
+      let lsmrSvc = getLsmrService(network.switch)
+      if not lsmrSvc.isNil:
+        let nowMs = int64(epochTime() * 1000)
+        for anchor in lsmrSvc.config.anchors:
+          if anchor.peerId == peerId:
+            discard lsmrSvc.installNearFieldHandshake(NearFieldHandshakeRecord(
+              provider: NearFieldBootstrapProvider.nfbpBle,
+              networkId: lsmrSvc.config.networkId,
+              peerId: anchor.peerId,
+              addrs: @[parsed.get()],
+              operatorId: anchor.operatorId,
+              regionDigit: anchor.regionDigit,
+              attestedPrefix: anchor.attestedPrefix,
+              serveDepth: anchor.serveDepth,
+              directionMask: anchor.directionMask,
+              canIssueRootCert: anchor.canIssueRootCert,
+              issuedAtMs: nowMs,
+              expiresAtMs: nowMs + (lsmrSvc.config.recordTtl.nanoseconds div 1_000_000),
+            ))
+            break
     except CatchableError:
       discard
 

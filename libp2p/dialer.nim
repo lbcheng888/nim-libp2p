@@ -8,6 +8,7 @@
 # those terms.
 
 import std/[algorithm, sequtils, strutils, tables]
+from std/times import epochTime
 
 import pkg/[chronos, chronicles, metrics, results]
 
@@ -37,6 +38,9 @@ logScope:
 declareCounter(libp2p_total_dial_attempts, "total attempted dials")
 declareCounter(libp2p_successful_dials, "dialed successful peers")
 declareCounter(libp2p_failed_dials, "failed dials")
+
+proc dialDiagNowMs(): int64 =
+  int64(epochTime() * 1000)
 
 type Dialer* = ref object of Dial
   localPeerId*: PeerId
@@ -157,16 +161,31 @@ method dialAndUpgrade*(
         trace "Dial blocked by connection gater",
           addrs, peerId = peerId.get(default(PeerId))
         continue
+      when defined(lsmr_diag):
+        echo "dialer dial-begin peer=", $peerId.get(default(PeerId)),
+          " addr=", $addrs,
+          " dir=", $dir,
+          " ts=", dialDiagNowMs()
       trace "Dialing address", addrs, peerId = peerId.get(default(PeerId)), hostname
       let dialed =
         try:
           libp2p_total_dial_attempts.inc()
           await transport.dial(hostname, addrs, peerId)
         except CancelledError as exc:
+          when defined(lsmr_diag):
+            echo "dialer dial-cancel peer=", $peerId.get(default(PeerId)),
+              " addr=", $addrs,
+              " err=", exc.msg,
+              " ts=", dialDiagNowMs()
           trace "Dialing canceled",
             description = exc.msg, peerId = peerId.get(default(PeerId))
           raise exc
         except CatchableError as exc:
+          when defined(lsmr_diag):
+            echo "dialer dial-fail peer=", $peerId.get(default(PeerId)),
+              " addr=", $addrs,
+              " err=", exc.msg,
+              " ts=", dialDiagNowMs()
           debug "Dialing failed",
             description = exc.msg, peerId = peerId.get(default(PeerId))
           libp2p_failed_dials.inc()
@@ -175,6 +194,10 @@ method dialAndUpgrade*(
           continue
 
       libp2p_successful_dials.inc()
+      when defined(lsmr_diag):
+        echo "dialer dial-ok peer=", $peerId.get(default(PeerId)),
+          " addr=", $addrs,
+          " ts=", dialDiagNowMs()
 
       let mux =
         try:
@@ -183,13 +206,28 @@ method dialAndUpgrade*(
           # The if below is more general and might handle other use cases in the future.
           if dialed.dir != dir:
             dialed.dir = dir
+          when defined(lsmr_diag):
+            echo "dialer upgrade-begin peer=", $peerId.get(default(PeerId)),
+              " addr=", $addrs,
+              " dir=", $dialed.dir,
+              " ts=", dialDiagNowMs()
           await transport.upgrade(dialed, peerId)
         except CancelledError as exc:
+          when defined(lsmr_diag):
+            echo "dialer upgrade-cancel peer=", $peerId.get(default(PeerId)),
+              " addr=", $addrs,
+              " err=", exc.msg,
+              " ts=", dialDiagNowMs()
           await dialed.close()
           raise exc
         except CatchableError as exc:
           # If we failed to establish the connection through one transport,
           # we won't succeeded through another - no use in trying again
+          when defined(lsmr_diag):
+            echo "dialer upgrade-fail peer=", $peerId.get(default(PeerId)),
+              " addr=", $addrs,
+              " err=", exc.msg,
+              " ts=", dialDiagNowMs()
           await dialed.close()
           debug "Connection upgrade failed",
             description = exc.msg, peerId = peerId.get(default(PeerId))
@@ -203,6 +241,10 @@ method dialAndUpgrade*(
           continue
 
       if mux.isNil:
+        when defined(lsmr_diag):
+          echo "dialer upgrade-nil peer=", $peerId.get(default(PeerId)),
+            " addr=", $addrs,
+            " ts=", dialDiagNowMs()
         debug "Dial upgrade returned nil, treating as failure",
           direction = $dialed.dir,
           address = $addrs
@@ -218,9 +260,14 @@ method dialAndUpgrade*(
         else:
           libp2p_failed_upgrades_incoming.inc()
         lastMsg = "upgrade returned nil for address=" & $addrs
-        continue
-      debug "Dial successful", peerId = mux.connection.peerId
-      return mux
+      else:
+        when defined(lsmr_diag):
+          echo "dialer upgrade-ok peer=", $peerId.get(default(PeerId)),
+            " addr=", $addrs,
+            " remote=", $mux.connection.peerId,
+            " ts=", dialDiagNowMs()
+        debug "Dial successful", peerId = mux.connection.peerId
+        return mux
   if not transportMatched:
     raise newException(DialFailedError, "no transport handles address: " & $addrs)
   if lastMsg.len == 0:
@@ -734,7 +781,10 @@ method dial*(
 
   proc cleanup() {.async: (raises: []).} =
     if not (isNil(stream)):
-      await stream.closeWithEOF()
+      # Dial failure means this stream may still have an in-flight read from
+      # negotiation or protocol setup. Abort it directly instead of attempting
+      # an EOF drain, which would start a second concurrent read.
+      await stream.close()
 
     if not (isNil(conn)):
       await conn.close()

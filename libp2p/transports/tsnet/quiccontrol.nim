@@ -1,6 +1,6 @@
 {.push raises: [].}
 
-import std/[json, nativesockets, options, os, sequtils, strutils, tables, times, uri]
+import std/[json, nativesockets, options, os, posix, sequtils, sets, strutils, tables, times, uri]
 import chronos
 import chronos/osdefs
 
@@ -27,7 +27,6 @@ const
   QuicControlRetryBackoff = chronos.milliseconds(250)
   QuicControlWriteDrainDelay = chronos.milliseconds(10)
   QuicGatewayResponseDrainDelay = chronos.seconds(1)
-  QuicControlMaxTrimmedPeers = 1
   QuicControlRequestTimeout = chronos.seconds(30)
   OpenNetworkRegionId = 901
   OpenNetworkRegionCode = "sin"
@@ -39,6 +38,15 @@ const
   OpenNetworkDisplayName = "Open Network"
 
 type
+  Ifaddrs {.importc: "struct ifaddrs", header: "<ifaddrs.h>", bycopy.} = object
+    ifa_next: ptr Ifaddrs
+    ifa_name: cstring
+    ifa_flags: cuint
+    ifa_addr: ptr SockAddr
+    ifa_netmask: ptr SockAddr
+    ifa_dstaddr: ptr SockAddr
+    ifa_data: pointer
+
   TsnetQuicControlEndpoint* = object
     url*: string
     host*: string
@@ -85,6 +93,8 @@ type
     machineKey: string
     discoKey: string
     hostname: string
+    libp2pPeerId: string
+    libp2pListenAddrs: seq[string]
     tailnetIpv4: string
     tailnetIpv6: string
     mapSessionHandle: string
@@ -97,6 +107,9 @@ type
     nodes: Table[string, TsnetQuicOpenNetworkNode]
 
 var quicClientCache {.threadvar.}: Table[string, TsnetQuicRpcClient]
+
+proc c_getifaddrs(ifap: ptr ptr Ifaddrs): cint {.importc: "getifaddrs", header: "<ifaddrs.h>".}
+proc c_freeifaddrs(ifa: ptr Ifaddrs) {.importc: "freeifaddrs", header: "<ifaddrs.h>".}
 
 proc nowUnixMilli(): int64 =
   getTime().toUnix().int64 * 1000
@@ -158,6 +171,41 @@ proc detectAddressFamily(host: string): uint16 =
     except CatchableError:
       return 0'u16
   2'u16
+
+proc enumerateLocalInterfaceAddrs(): HashSet[string] =
+  result = initHashSet[string]()
+  var ifap: ptr Ifaddrs = nil
+  try:
+    if c_getifaddrs(addr ifap) == 0:
+      defer:
+        c_freeifaddrs(ifap)
+      var cursor = ifap
+      while cursor != nil:
+        let addrPtr = cursor.ifa_addr
+        if not addrPtr.isNil:
+          if cint(addrPtr.sa_family) == posix.AF_INET:
+            let sin = cast[ptr Sockaddr_in](addrPtr)
+            let raw = posix.inet_ntoa(sin.sin_addr)
+            if raw != nil:
+              result.incl($raw)
+          elif cint(addrPtr.sa_family) == posix.AF_INET6:
+            let sin6 = cast[ptr Sockaddr_in6](addrPtr)
+            var buffer: array[64, char]
+            when declared(inet_ntop):
+              if inet_ntop(
+                  posix.AF_INET6,
+                  addr sin6.sin6_addr,
+                  cast[ptr char](addr buffer[0]),
+                  buffer.len.cint
+              ) != nil:
+                var ip = $cast[cstring](addr buffer[0])
+                let zoneIdx = ip.find('%')
+                if zoneIdx >= 0:
+                  ip = ip[0 ..< zoneIdx]
+                result.incl(ip.toLowerAscii())
+        cursor = cursor.ifa_next
+  except CatchableError:
+    discard
 
 proc decodeHexNibble(ch: char): int =
   case ch
@@ -427,15 +475,40 @@ proc copyArrayField(source: JsonNode, target: JsonNode, key: string) =
   if value.kind == JArray:
     target[key] = value
 
+proc jsonStringField(source: JsonNode, key: string): string =
+  if source.isNil or source.kind != JObject or not source.hasKey(key):
+    return ""
+  let value = source.getOrDefault(key)
+  if value.kind == JString:
+    return value.getStr().strip()
+  ""
+
+proc jsonStringArrayField(source: JsonNode, key: string): seq[string] =
+  if source.isNil or source.kind != JObject or not source.hasKey(key):
+    return @[]
+  let value = source.getOrDefault(key)
+  if value.kind != JArray:
+    return @[]
+  for item in value.items():
+    if item.kind != JString:
+      continue
+    let text = item.getStr().strip()
+    if text.len > 0:
+      result.add(text)
+
 proc trimHostinfo(hostinfo: JsonNode): JsonNode =
   result = newJObject()
   copyStringField(hostinfo, result, "Hostname")
+  copyStringField(hostinfo, result, "PeerID")
+  copyArrayField(hostinfo, result, "ListenAddrs")
 
 proc trimPeerNode(node: JsonNode): JsonNode =
   result = newJObject()
   copyStringField(node, result, "Name")
+  copyStringField(node, result, "PeerID")
   copyIntField(node, result, "HomeDERP")
   copyArrayField(node, result, "Addresses")
+  copyArrayField(node, result, "ListenAddrs")
   let hostinfo = trimHostinfo(
     if node.isNil or node.kind != JObject: newJNull()
     else: node.getOrDefault("Hostinfo")
@@ -524,13 +597,9 @@ proc trimMapPayload(payload: JsonNode): JsonNode =
     else: newJNull()
   if peers.kind == JArray:
     var trimmedPeers = newJArray()
-    var count = 0
     for peer in peers.items():
       if peer.kind == JObject:
         trimmedPeers.add(trimPeerNode(peer))
-        inc count
-        if count >= QuicControlMaxTrimmedPeers:
-          break
     result["Peers"] = trimmedPeers
     result["PeerCount"] = %peers.len
 
@@ -540,10 +609,17 @@ proc ensureOpenNode(
 ): TsnetQuicOpenNetworkNode =
   if gateway.openState.isNil:
     gateway.openState = initOpenNetworkState()
-  let nodeKey = requestNode{"NodeKey"}.getStr().strip()
-  let machineKey = requestNode{"Hostinfo", "BackendLogID"}.getStr().strip()
-  let discoKey = requestNode{"DiscoKey"}.getStr().strip()
-  let requestedHost = requestNode{"Hostinfo", "Hostname"}.getStr().strip()
+  let hostinfo =
+    if not requestNode.isNil and requestNode.kind == JObject and requestNode.hasKey("Hostinfo"):
+      requestNode.getOrDefault("Hostinfo")
+    else:
+      newJNull()
+  let nodeKey = jsonStringField(requestNode, "NodeKey")
+  let machineKey = jsonStringField(hostinfo, "BackendLogID")
+  let discoKey = jsonStringField(requestNode, "DiscoKey")
+  let requestedHost = jsonStringField(hostinfo, "Hostname")
+  let libp2pPeerId = jsonStringField(hostinfo, "PeerID")
+  let libp2pListenAddrs = jsonStringArrayField(hostinfo, "ListenAddrs")
   var existing = gateway.openState.nodes.getOrDefault(nodeKey, TsnetQuicOpenNetworkNode())
   if existing.nodeId.len == 0:
     let tailnet = deterministicNodeTailnet(nodeKey)
@@ -553,6 +629,8 @@ proc ensureOpenNode(
       machineKey: machineKey,
       discoKey: discoKey,
       hostname: if requestedHost.len > 0: requestedHost else: tailnet.nodeId,
+      libp2pPeerId: libp2pPeerId,
+      libp2pListenAddrs: libp2pListenAddrs,
       tailnetIpv4: tailnet.ipv4,
       tailnetIpv6: tailnet.ipv6,
       mapSessionHandle: "session-" & tailnet.nodeId,
@@ -566,6 +644,10 @@ proc ensureOpenNode(
       existing.machineKey = machineKey
     if discoKey.len > 0:
       existing.discoKey = discoKey
+    if libp2pPeerId.len > 0:
+      existing.libp2pPeerId = libp2pPeerId
+    if libp2pListenAddrs.len > 0:
+      existing.libp2pListenAddrs = libp2pListenAddrs
     existing.lastSeenUnixMilli = nowUnixMilli()
   gateway.openState.nodes[nodeKey] = existing
   existing
@@ -599,8 +681,14 @@ proc openNetworkRegisterResponse(
     "Node": {
       "StableID": node.nodeId,
       "Name": node.hostname,
+      "PeerID": node.libp2pPeerId,
+      "ListenAddrs": node.libp2pListenAddrs,
       "Addresses": [node.tailnetIpv4 & "/32", node.tailnetIpv6 & "/128"],
-      "Hostinfo": {"Hostname": node.hostname}
+      "Hostinfo": {
+        "Hostname": node.hostname,
+        "PeerID": node.libp2pPeerId,
+        "ListenAddrs": node.libp2pListenAddrs
+      }
     }
   }
 
@@ -638,9 +726,15 @@ proc openNetworkMapResponse(
     peers.add(%*{
       "StableID": candidate.nodeId,
       "Name": candidate.hostname,
+      "PeerID": candidate.libp2pPeerId,
+      "ListenAddrs": candidate.libp2pListenAddrs,
       "HomeDERP": gateway.cfg.openNetworkRegionId(),
       "Addresses": [candidate.tailnetIpv4 & "/32", candidate.tailnetIpv6 & "/128"],
-      "Hostinfo": {"Hostname": candidate.hostname}
+      "Hostinfo": {
+        "Hostname": candidate.hostname,
+        "PeerID": candidate.libp2pPeerId,
+        "ListenAddrs": candidate.libp2pListenAddrs
+      }
     })
   var updated = selfNode
   inc updated.seq
@@ -653,9 +747,15 @@ proc openNetworkMapResponse(
     "Node": {
       "StableID": updated.nodeId,
       "Name": updated.hostname,
+      "PeerID": updated.libp2pPeerId,
+      "ListenAddrs": updated.libp2pListenAddrs,
       "HomeDERP": gateway.cfg.openNetworkRegionId(),
       "Addresses": [updated.tailnetIpv4 & "/32", updated.tailnetIpv6 & "/128"],
-      "Hostinfo": {"Hostname": updated.hostname}
+      "Hostinfo": {
+        "Hostname": updated.hostname,
+        "PeerID": updated.libp2pPeerId,
+        "ListenAddrs": updated.libp2pListenAddrs
+      }
     },
     "DERPMap": gateway.openNetworkDerpMap(),
     "Peers": peers

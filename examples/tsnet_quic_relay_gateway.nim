@@ -2,6 +2,7 @@ import std/[json, os, parseopt, strutils]
 import chronos
 
 import ../libp2p/transports/tsnet/quicrelay
+import "../libp2p/transports/nim-msquic/api/diagnostics_model"
 import ../libp2p/utility
 
 type
@@ -10,13 +11,15 @@ type
     listenPort: int
     certificateFile: string
     privateKeyFile: string
+    verboseDiagnostics: bool
 
 proc parseArgs(): Result[GatewayArgs, string] =
   var args = GatewayArgs(
     listenHost: "0.0.0.0",
     listenPort: int(NimTsnetQuicRelayDefaultPort),
     certificateFile: "",
-    privateKeyFile: ""
+    privateKeyFile: "",
+    verboseDiagnostics: false
   )
   var parser = initOptParser(commandLineParams())
   while true:
@@ -37,6 +40,8 @@ proc parseArgs(): Result[GatewayArgs, string] =
         args.certificateFile = parser.val.strip()
       of "private-key-file":
         args.privateKeyFile = parser.val.strip()
+      of "verbose-diagnostics":
+        args.verboseDiagnostics = true
       else:
         return err("unknown option: --" & parser.key)
     of cmdArgument:
@@ -47,11 +52,28 @@ proc parseArgs(): Result[GatewayArgs, string] =
     return err("missing --private-key-file")
   ok(args)
 
+proc installDiagnosticsHook() =
+  clearDiagnosticsHooks()
+  registerDiagnosticsHook(
+    proc (event: DiagnosticsEvent) {.gcsafe.} =
+      try:
+        stderr.writeLine(
+          "[nim-msquic] kind=" & $event.kind &
+          " handle=" & $cast[uint](event.handle) &
+          " note=" & event.note
+        )
+        flushFile(stderr)
+      except CatchableError:
+        discard
+  )
+
 proc main() =
   let args = parseArgs().valueOr:
     stderr.writeLine(error)
     quit(2)
   chronos.setThreadDispatcher(newDispatcher())
+  if args.verboseDiagnostics:
+    installDiagnosticsHook()
   let certPem =
     try:
       readFile(args.certificateFile)

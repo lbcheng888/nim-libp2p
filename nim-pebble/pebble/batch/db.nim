@@ -144,12 +144,25 @@ proc commit*(db: DB; batch: BatchBase;
   let opCount = batch.len
   db.ensureOpen()
   acquire(db.lock)
+  when defined(fabric_submit_diag):
+    stderr.writeLine(
+      "pebble-stage commit begin ops=", $opCount,
+      " inflight=", $db.inflight,
+      " nextSeq=", $db.nextSeq,
+      " mem=", $db.mem.approxBytes,
+    )
   if db.cfg.maxConcurrentCommits > 0:
     let hasTimeout = options.timeoutMs > 0
     var deadline = 0.0
     if hasTimeout:
       deadline = epochTime() + (options.timeoutMs.float / 1000.0)
     while db.inflight >= db.cfg.maxConcurrentCommits:
+      when defined(fabric_submit_diag):
+        stderr.writeLine(
+          "pebble-stage commit wait inflight=", $db.inflight,
+          " limit=", $db.cfg.maxConcurrentCommits,
+          " mem=", $db.mem.approxBytes,
+        )
       let currentBytes = db.mem.approxBytes
       sendNudge(options.nudge, bpMemStall, batch, currentBytes)
       if hasTimeout:
@@ -171,6 +184,12 @@ proc commit*(db: DB; batch: BatchBase;
     let estimatedBytes = batch.estimatedBytes()
     var throttleDelay = db.mem.admitWrite(options.priority, estimatedBytes)
     while throttleDelay > 0:
+      when defined(fabric_submit_diag):
+        stderr.writeLine(
+          "pebble-stage commit throttle delay=", $throttleDelay,
+          " estimated=", $estimatedBytes,
+          " mem=", $db.mem.approxBytes,
+        )
       let currentBytes = db.mem.approxBytes
       sendNudge(options.nudge, bpMemStall, batch, currentBytes)
       release(db.lock)
@@ -197,6 +216,11 @@ proc commit*(db: DB; batch: BatchBase;
   var committed = false
   try:
     if walEnabled:
+      when defined(fabric_submit_diag):
+        stderr.writeLine(
+          "pebble-stage commit wal begin bytes=", $walPayload.len,
+          " sync=", $options.sync,
+        )
       var walError: ref CatchableError = nil
       var walResult: WalAppendResult
       release(db.lock)
@@ -216,7 +240,16 @@ proc commit*(db: DB; batch: BatchBase;
         exec.wait(walResult.syncHandle)
         acquire(db.lock)
         db.ensureOpen()
+      when defined(fabric_submit_diag):
+        stderr.writeLine("pebble-stage commit wal done")
+    when defined(fabric_submit_diag):
+      stderr.writeLine(
+        "pebble-stage commit mem begin entries=", $entries.len,
+        " mem=", $db.mem.approxBytes,
+      )
     db.mem.applyBatch(entries)
+    when defined(fabric_submit_diag):
+      stderr.writeLine("pebble-stage commit mem done mem=", $db.mem.approxBytes)
     if db.mem.needsFlush() or db.mem.readyForFlush():
       sendNudge(options.nudge, bpMemSoftLimit, batch, db.mem.approxBytes)
     committed = true
@@ -225,6 +258,12 @@ proc commit*(db: DB; batch: BatchBase;
     batch.markCommitted()
     result = lastSeq
   finally:
+    when defined(fabric_submit_diag):
+      stderr.writeLine(
+        "pebble-stage commit finally committed=", $committed,
+        " inflight-before-dec=", $db.inflight,
+        " nextSeq=", $db.nextSeq,
+      )
     dec db.inflight
     signal(db.cond)
     if not committed:

@@ -4,7 +4,7 @@ import std/[json, os, parseopt, sequtils, strutils]
 from std/times import epochTime
 
 const
-  harnessPath = "/Users/lbcheng/nim-libp2p/examples/mobile_ffi/game_mesh_host_harness.nim"
+  runnerPath = "/Users/lbcheng/nim-libp2p/examples/mobile_ffi/game_mesh_host_runner.nim"
 
 type
   AppSpec = object
@@ -21,9 +21,9 @@ proc suiteOutDir(baseDir: string): string =
   result = getCurrentDir() / "build" / "game-mesh-host" / ("suite-" & $nowMillis())
   createDir(result)
 
-proc runHarness(spec: AppSpec, baseOutDir: string): JsonNode =
+proc runRunner(spec: AppSpec, baseOutDir: string): JsonNode =
   proc compileFlags(): seq[string] =
-    if getEnv("HOST_HARNESS_TRANSPORT", "tcp").toLowerAscii() == "quic":
+    if getEnv("HOST_RUNNER_TRANSPORT", "tcp").toLowerAscii() == "quic":
       @["-d:libp2p_msquic_experimental", "-d:libp2p_msquic_builtin"]
     else:
       @[]
@@ -32,14 +32,14 @@ proc runHarness(spec: AppSpec, baseOutDir: string): JsonNode =
   let nimCacheDir = appOutDir / "nimcache"
   createDir(nimCacheDir)
   let logPath = appOutDir / (spec.appId & ".log")
-  let transport = getEnv("HOST_HARNESS_TRANSPORT", "tcp")
+  let transport = getEnv("HOST_RUNNER_TRANSPORT", "tcp")
   let cmd = (@[
     "nim",
     "c",
   ] & compileFlags() & @[
     "--nimcache:" & nimCacheDir,
     "-r",
-    harnessPath,
+    runnerPath,
     "--app:" & spec.appId,
     "--transport:" & transport,
     "--timeout-ms:" & $spec.timeoutMs,
@@ -86,7 +86,7 @@ when isMainModule:
     AppSpec(appId: "chess", timeoutMs: 30_000),
     AppSpec(appId: "doudizhu", timeoutMs: 45_000)
   ]
-  var transport = getEnv("HOST_HARNESS_TRANSPORT", "tcp").toLowerAscii()
+  var transport = getEnv("HOST_RUNNER_TRANSPORT", "tcp").toLowerAscii()
 
   var parser = initOptParser(commandLineParams())
   while true:
@@ -110,11 +110,11 @@ when isMainModule:
       discard
 
   let finalOutDir = suiteOutDir(outDir)
-  putEnv("HOST_HARNESS_TRANSPORT", transport)
+  putEnv("HOST_RUNNER_TRANSPORT", transport)
   var results = newJArray()
   var overallOk = true
   for spec in specs:
-    let summary = runHarness(spec, finalOutDir)
+    let summary = runRunner(spec, finalOutDir)
     results.add(summary)
     if not summaryOk(summary):
       overallOk = false

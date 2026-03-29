@@ -167,6 +167,7 @@ const
   PublicIpProbeRetryMs = 15_000'i64
   PublicIpProbeTimeoutMs = 2_500
   PublicIpProbeLoopKickMs = 2_000'i64
+  TailnetControlRefreshMs = 1_000
   PublicIpv4ProbeUrl = "http://4.ipw.cn"
   PublicIpv6ProbeUrl = "http://6.ipw.cn"
   MobileYamuxMaxChannels = 1024
@@ -473,6 +474,8 @@ type
     cmdMeasurePeerLatency,
     cmdRequestFileChunk,
     cmdWaitSecureChannel,
+    cmdWaitPeerIdentified,
+    cmdWaitPeerReady,
     cmdPollEvents
 
   Command = ref object
@@ -607,6 +610,7 @@ type
     keepAliveLoop: Future[void]
     relayReservationLoop: Future[void]
     relayReservationCycle: Future[int]
+    tailnetControlRefreshLoop: Future[void]
     telemetryLoop: Future[void]
     metricsLoop: Future[void]
     metricsTextfileLoop: Future[void]
@@ -1918,6 +1922,60 @@ proc collectRelayBackedProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} 
     seen.incl(canonical)
     result.add(canonical)
 
+proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].}
+
+proc isTsnetPublishAddr(addrText: string): bool {.gcsafe, raises: [].} =
+  "/tsnet" in addrText.toLowerAscii()
+
+proc tsnetPublicationReady(node: NimNode): bool {.gcsafe, raises: [].} =
+  proc fieldIsTrue(payload: JsonNode, key: string): bool {.gcsafe, raises: [].} =
+    if payload.isNil or payload.kind != JObject or not payload.hasKey(key):
+      return false
+    let value = payload.getOrDefault(key)
+    case value.kind
+    of JBool:
+      value.getBool()
+    of JInt, JFloat:
+      value.getInt() != 0
+    of JString:
+      value.getStr().toLowerAscii() in ["true", "1", "yes", "y"]
+    else:
+      false
+
+  if node.isNil:
+    return false
+  let transport =
+    if node.switchInstance.isNil:
+      nil
+    else:
+      node.switchInstance.tsnetTransport()
+  if transport.isNil:
+    return true
+  let tailnet = buildTailnetStatusPayload(node)
+  fieldIsTrue(tailnet, "ok") and
+    fieldIsTrue(tailnet, "providerReady") and
+    fieldIsTrue(tailnet, "proxyListenersReady")
+
+proc filterPublishableTsnetAddrs(
+    node: NimNode,
+    addrs: seq[MultiAddress]
+): seq[MultiAddress] {.gcsafe, raises: [].} =
+  if tsnetPublicationReady(node):
+    return addrs
+  for addr in addrs:
+    if not isTsnetPublishAddr($addr):
+      result.add(addr)
+
+proc filterPublishableTsnetAddrTexts(
+    node: NimNode,
+    addrs: seq[string]
+): seq[string] {.gcsafe, raises: [].} =
+  if tsnetPublicationReady(node):
+    return addrs
+  for addr in addrs:
+    if not isTsnetPublishAddr(addr):
+      result.add(addr)
+
 proc safeMultiaddrText(ma: MultiAddress): string {.gcsafe, raises: [].} =
   try:
     $ma
@@ -2038,6 +2096,8 @@ proc syncAdvertisedPeerInfo(
     nextAddrs = dedupeLocalMultiaddrs(nextListen)
   if nextListen.len == 0 and nextAddrs.len > 0:
     nextListen = dedupeLocalMultiaddrs(nextAddrs)
+  nextListen = filterPublishableTsnetAddrs(node, nextListen)
+  nextAddrs = filterPublishableTsnetAddrs(node, nextAddrs)
 
   let nextListenText = nextListen.mapIt($it)
   let nextAddrsText = nextAddrs.mapIt($it)
@@ -3266,14 +3326,51 @@ proc mergeTsnetListenAddrsIntoPeerInfo(
   node.switchInstance.peerInfo.listenAddrs = dedupeLocalMultiaddrs(nextListen)
   node.switchInstance.peerInfo.addrs = dedupeLocalMultiaddrs(nextAddrs)
 
-proc syncTailnetWarmAdvertisedPeerInfo(n: NimNode) {.async.} =
-  discard await syncAdvertisedPeerInfo(
+proc publishTsnetLocalPeerInfo(
+    node: NimNode,
+    transport: TsnetTransport
+) {.gcsafe, raises: [].} =
+  if node.isNil or transport.isNil or node.switchInstance.isNil or node.switchInstance.peerInfo.isNil:
+    return
+  let peerId = localPeerId(node).strip()
+  var listenAddrs: seq[string] = @[]
+  for addr in node.switchInstance.peerInfo.listenAddrs:
+    let text = safeMultiaddrText(addr)
+    if text.len > 0 and text notin listenAddrs:
+      listenAddrs.add(text)
+  transport.publishLocalPeerInfo(peerId, listenAddrs)
+
+proc syncTailnetWarmAdvertisedPeerInfo(n: NimNode): Future[bool] {.async.} =
+  return await syncAdvertisedPeerInfo(
     n,
     reason = "tailnet_warm",
     reannounce = false,
   )
 
+proc spawnTailnetWarmAdvertisedPeerInfo(n: NimNode) {.gcsafe, raises: [].} =
+  let task = proc(): Future[void] {.async.} =
+    try:
+      discard await syncTailnetWarmAdvertisedPeerInfo(n)
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] tailnet advertised peer sync failed err=" & exc.msg
+      )
+  asyncSpawn task()
+
+proc ensureTailnetControlRefreshLoop(n: NimNode) {.gcsafe, raises: [].}
+
 proc runTailnetWarmAsync(n: NimNode) {.async.}
+proc scheduleBackgroundTailnetWarm(
+    n: NimNode,
+    reason: string
+) {.gcsafe, raises: [].}
+
+proc scheduleTailnetWarmAfterStart(
+    n: NimNode,
+    reason: string
+) {.async.} =
+  await sleepAsync(chronos.milliseconds(0))
+  scheduleBackgroundTailnetWarm(n, reason)
 
 proc scheduleBackgroundTailnetWarm(
     n: NimNode,
@@ -3288,15 +3385,28 @@ proc scheduleBackgroundTailnetWarm(
   if readyPayload.isOk() and jsonGetBool(readyPayload.get(), "providerReady", false):
     updateTailnetStartStatus(n, "started", false)
     return
-  if not n.tailnetWarmTask.isNil and not n.tailnetWarmTask.finished():
+  n.tailnetStatusLock.acquire()
+  let alreadyQueued = n.tailnetInFlight
+  n.tailnetStatusLock.release()
+  if alreadyQueued:
     return
+  let cmd = makeCommand(cmdTailnetWarm)
   updateTailnetStartStatus(n, "queued", true)
-  n.tailnetWarmFinalizePending.store(false, moRelease)
-  n.tailnetWarmSucceeded.store(false, moRelease)
-  n.tailnetWarmThreadActive.store(false, moRelease)
-  n.tailnetWarmThreadJoined.store(true, moRelease)
-  n.tailnetWarmTask = runTailnetWarmAsync(n)
-  asyncSpawn n.tailnetWarmTask
+  let queued =
+    try:
+      submitCommandNoWait(n, cmd)
+    except Exception as exc:
+      let err = if exc.msg.len > 0: exc.msg else: $exc.name
+      updateTailnetStartStatus(n, "failed", false, err)
+      destroyCommand(cmd)
+      return
+  if not queued:
+    let err =
+      if cmd.errorMsg.len > 0: cmd.errorMsg
+      else: "tailnet_warm_auto_schedule_failed"
+    updateTailnetStartStatus(n, "failed", false, err)
+    destroyCommand(cmd)
+    return
   debugLog(
     "[nimlibp2p] tailnet warm auto-scheduled reason=" & reason
   )
@@ -3305,18 +3415,40 @@ proc runTailnetWarmAsync(n: NimNode) {.async.} =
   try:
     if n.isNil:
       return
+    debugLog("[nimlibp2p] tailnet warm async: begin")
     let transport = activeTsnetTransport(n)
     if transport.isNil:
       updateTailnetStartStatus(n, "failed", false, "tsnet transport unavailable")
       return
+    debugLog("[nimlibp2p] tailnet warm async: publish_local_peer_info_before_start")
+    publishTsnetLocalPeerInfo(n, transport)
+    debugLog("[nimlibp2p] tailnet warm async: warm_provider_begin")
     let warmRes = transport.warmProvider()
     if warmRes.isErr():
       updateTailnetStartStatus(n, "failed", false, warmRes.error)
       return
+    debugLog(
+      "[nimlibp2p] tailnet warm async: warm_provider_done kind=" &
+      $warmRes.get()
+    )
+    debugLog("[nimlibp2p] tailnet warm async: merge_listen_addrs_begin")
     mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+    debugLog("[nimlibp2p] tailnet warm async: publish_local_peer_info_after_merge")
+    publishTsnetLocalPeerInfo(n, transport)
     debugLog("[nimlibp2p] tailnet warm async: merged concrete tsnet listen addrs")
-    asyncSpawn syncTailnetWarmAdvertisedPeerInfo(n)
+    ensureTailnetControlRefreshLoop(n)
+    spawnTailnetWarmAdvertisedPeerInfo(n)
     updateTailnetStartStatus(n, "started", false)
+  except CatchableError as exc:
+    let errMsg = "tailnet warm async raised: " & exc.msg
+    debugLog("[nimlibp2p] " & errMsg)
+    if not n.isNil:
+      updateTailnetStartStatus(n, "failed", false, errMsg)
+  except Exception as exc:
+    let errMsg = "tailnet warm async fatal: " & exc.msg
+    debugLog("[nimlibp2p] " & errMsg)
+    if not n.isNil:
+      updateTailnetStartStatus(n, "failed", false, errMsg)
   finally:
     if not n.isNil:
       n.tailnetWarmTask = nil
@@ -3339,8 +3471,10 @@ proc processTailnetWarmCompletion(n: NimNode) {.gcsafe, raises: [].} =
     updateTailnetStartStatus(n, "failed", false, "tsnet transport unavailable")
     return
   mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+  publishTsnetLocalPeerInfo(n, transport)
   debugLog("[nimlibp2p] tailnet warm completion: merged concrete tsnet listen addrs")
-  asyncSpawn syncTailnetWarmAdvertisedPeerInfo(n)
+  ensureTailnetControlRefreshLoop(n)
+  spawnTailnetWarmAdvertisedPeerInfo(n)
   updateTailnetStartStatus(n, "started", false)
 
 proc scheduleHostNetworkStatusSideEffects(
@@ -4035,23 +4169,6 @@ proc activeTsnetTransport(n: NimNode): TsnetTransport {.gcsafe, raises: [].} =
 proc gossipAvailable(n: NimNode): bool {.gcsafe, raises: [].} =
   not n.isNil and not n.gossip.isNil and not n.gossip.PubSub.isNil
 
-proc libp2pPathLabel(n: NimNode): string {.gcsafe, raises: [].} =
-  if n.isNil or n.switchInstance.isNil or n.switchInstance.connManager.isNil:
-    return "NONE"
-  var hasRelay = false
-  for _, muxers in n.switchInstance.connManager.getConnections().pairs:
-    for mux in muxers:
-      if mux.isNil or mux.connection.isNil or mux.connection.closed:
-        continue
-      if isRelayed(mux.connection):
-        hasRelay = true
-      else:
-        return "DIRECT"
-  if hasRelay:
-    "RELAY"
-  else:
-    "NONE"
-
 proc emptyTailnetStatusPayload(
   n: NimNode,
   enabled = false,
@@ -4061,7 +4178,7 @@ proc emptyTailnetStatusPayload(
     "ok": error.len == 0 and enabled,
     "enabled": enabled,
     "running": (not n.isNil and n.started),
-    "libp2pPath": libp2pPathLabel(n),
+    "libp2pPath": "NONE",
     "tailnetIPs": newJArray(),
     "tailnetPath": "",
     "tailnetRelay": "",
@@ -4119,13 +4236,22 @@ proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
     result["ok"] = %true
   result["enabled"] = %true
   result["running"] = %(not n.isNil and n.started)
-  result["libp2pPath"] = %libp2pPathLabel(n)
   if not result.hasKey("tailnetIPs"):
     result["tailnetIPs"] = newJArray()
   if not result.hasKey("tailnetPeers"):
     result["tailnetPeers"] = newJArray()
   if not result.hasKey("tailnetPath"):
     result["tailnetPath"] = %""
+  let tailnetPathLabel = jsonGetStr(result, "tailnetPath", "").toLowerAscii()
+  result["libp2pPath"] = %(
+    case tailnetPathLabel
+    of "direct", "punched_direct":
+      "DIRECT"
+    of "relay":
+      "RELAY"
+    else:
+      "NONE"
+  )
   if not result.hasKey("tailnetRelay"):
     result["tailnetRelay"] = %""
   if not result.hasKey("tailnetDerpMapSummary"):
@@ -5021,6 +5147,32 @@ proc ensurePeerIdentified(
 
   await waitForPeerIdentifiedWithinDeadline(n, peer, identifyWaitMs)
 
+proc waitForSecureChannel(n: NimNode, peerId: string, timeoutMs: int): Future[bool] {.async.}
+
+proc waitForPeerReady(
+    n: NimNode,
+    peerIdText: string,
+    timeoutMs: int
+): Future[bool] {.async.} =
+  if n.isNil:
+    return false
+  let safePeerId = peerIdText.strip()
+  if safePeerId.len == 0:
+    return false
+  var peer: PeerId
+  if not peer.init(safePeerId):
+    return false
+  let totalBudgetMs = max(timeoutMs, 250)
+  let startedAtMs = nowMillis()
+  let secureOk = await waitForSecureChannel(n, safePeerId, totalBudgetMs)
+  if not secureOk:
+    return false
+  let elapsedMs = int(max(0'i64, nowMillis() - startedAtMs))
+  let remainingMs = max(totalBudgetMs - elapsedMs, 0)
+  if remainingMs == 0:
+    return peerCurrentlyIdentified(n, peer)
+  await ensurePeerIdentified(n, peer, remainingMs)
+
 
 proc updateStartupStatus(
     n: NimNode,
@@ -5054,6 +5206,16 @@ proc updateStartupStatus(
       " inFlight=" & $inFlight &
       (if errorMsg.len > 0: " error=" & errorMsg else: "")
     )
+    let payload = %*{
+      "entity": "startup",
+      "stage": stage,
+      "inFlight": inFlight,
+      "error": errorMsg,
+      "updatedAtMs": nowMs,
+      "started": (not n.isNil and n.started),
+      "attemptCount": (if n.isNil: 0 else: n.startupAttempts),
+    }
+    recordEvent(n, "system_status", $payload)
 
 proc buildStartupStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
   result = %*{
@@ -5119,6 +5281,15 @@ proc updateTailnetStartStatus(
       " inFlight=" & $inFlight &
       (if errorMsg.len > 0: " error=" & errorMsg else: "")
     )
+    let payload = %*{
+      "entity": "tailnet",
+      "stage": stage,
+      "inFlight": inFlight,
+      "error": errorMsg,
+      "updatedAtMs": nowMs,
+      "attemptCount": (if n.isNil: 0 else: n.tailnetAttempts),
+    }
+    recordEvent(n, "system_status", $payload)
 
 proc buildTailnetStartStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
   result = %*{
@@ -8529,6 +8700,13 @@ proc addBootstrapAddresses(peerId: string, values: seq[string], target: var seq[
     if normalized.len > 0 and normalized notin target:
       target.add(normalized)
 
+proc normalizePeerTargetAddresses(peerId: string, values: seq[string]): seq[string] {.gcsafe.} =
+  if values.len == 0:
+    return @[]
+  addBootstrapAddresses(peerId.strip(), values, result)
+  if result.len == 0 and peerId.len == 0:
+    result = preferStableAddrStrings(values)
+
 proc candidateLastSeen(n: NimNode, peerId: string): int64 =
   var ts = n.bootstrapLastSeen.getOrDefault(peerId, 0)
   ts = max(ts, n.mdnsLastSeen.getOrDefault(peerId, 0))
@@ -9275,6 +9453,27 @@ proc ensureKeepAliveLoop(n: NimNode) =
   let keepAliveFuture = loop()
   n.keepAliveLoop = keepAliveFuture
   asyncSpawn(keepAliveFuture)
+
+proc ensureTailnetControlRefreshLoop(n: NimNode) {.gcsafe, raises: [].} =
+  if n.isNil:
+    return
+  if not n.tailnetControlRefreshLoop.isNil and not n.tailnetControlRefreshLoop.finished:
+    return
+  let loop = proc(): Future[void] {.closure, async: (raises: [CancelledError]).} =
+    while n.running.load(moAcquire):
+      if n.started:
+        let transport = activeTsnetTransport(n)
+        if not transport.isNil:
+          let payloadRes = ffiTsnetSafe:
+            transport.tailnetStatusPayload()
+          if payloadRes.isOk() and jsonGetBool(payloadRes.get(), "providerReady", false):
+            mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+            publishTsnetLocalPeerInfo(n, transport)
+            spawnTailnetWarmAdvertisedPeerInfo(n)
+      await sleepAsync(chronos.milliseconds(TailnetControlRefreshMs))
+  let refreshFuture = loop()
+  n.tailnetControlRefreshLoop = refreshFuture
+  asyncSpawn(refreshFuture)
 
 proc boostConnectivity(n: NimNode): Future[void] {.async.}
 
@@ -10926,7 +11125,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
               n.telemetryLoop = telemetryLoop(n)
               asyncSpawn(n.telemetryLoop)
           asyncSpawn(logMemoryLoop(n))
-          scheduleBackgroundTailnetWarm(n, "cmdStart")
+          asyncSpawn(scheduleTailnetWarmAfterStart(n, "cmdStart"))
           debugLog(
             "[nimlibp2p] cmdStart: marking success node=" & $cast[int](n)
           )
@@ -10952,7 +11151,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
                 n.telemetryLoop = telemetryLoop(n)
                 asyncSpawn(n.telemetryLoop)
             asyncSpawn(logMemoryLoop(n))
-            scheduleBackgroundTailnetWarm(n, "cmdStart:advertise")
+            asyncSpawn(scheduleTailnetWarmAfterStart(n, "cmdStart:advertise"))
             updateStartupStatus(n, "started", false)
             command.resultCode = NimResultOk
             command.errorMsg = "WARN_DISCOVERY_ADVERTISE"
@@ -11007,6 +11206,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         if not n.relayReservationLoop.isNil:
           n.relayReservationLoop.cancel()
           n.relayReservationLoop = nil
+        if not n.tailnetControlRefreshLoop.isNil:
+          n.tailnetControlRefreshLoop.cancel()
+          n.tailnetControlRefreshLoop = nil
         if not n.relayReservationCycle.isNil:
           n.relayReservationCycle.cancelSoon()
           n.relayReservationCycle = nil
@@ -11533,6 +11735,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         let readyPayload = ffiTsnetSafe:
           transport.tailnetStatusPayload()
         if readyPayload.isOk() and jsonGetBool(readyPayload.get(), "providerReady", false):
+          ensureTailnetControlRefreshLoop(n)
           updateTailnetStartStatus(n, "started", false)
           command.resultCode = NimResultOk
         else:
@@ -12051,6 +12254,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.errorMsg = "local peer id unavailable"
           return
         if command.addresses.len > 0:
+          command.addresses = normalizePeerTargetAddresses(command.peerId, command.addresses)
           try:
             registerInitialPeerHints(
               n,
@@ -13107,6 +13311,27 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         let timeout = max(command.timeoutMs, 500)
         command.boolResult = await waitForSecureChannel(n, command.peerId, timeout)
         command.resultCode = NimResultOk
+    of cmdWaitPeerIdentified:
+      if command.peerId.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peer id"
+      else:
+        var peer: PeerId
+        if not peer.init(command.peerId):
+          command.resultCode = NimResultInvalidArgument
+          command.errorMsg = "invalid peer id"
+        else:
+          let timeout = max(command.timeoutMs, 250)
+          command.boolResult = await ensurePeerIdentified(n, peer, timeout)
+          command.resultCode = NimResultOk
+    of cmdWaitPeerReady:
+      if command.peerId.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peer id"
+      else:
+        let timeout = max(command.timeoutMs, 250)
+        command.boolResult = await waitForPeerReady(n, command.peerId, timeout)
+        command.resultCode = NimResultOk
     of cmdPollEvents:
       command.stringResult = pollEventLog(n, command.requestLimit)
       command.resultCode = NimResultOk
@@ -13606,6 +13831,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       keepAlivePeers: initHashSet[string](),
       keepAliveLoop: nil,
       relayReservationLoop: nil,
+      tailnetControlRefreshLoop: nil,
       relayReservationCycle: nil,
       telemetryLoop: nil,
       pingProtocol: nil,
@@ -14145,6 +14371,85 @@ proc libp2p_send_direct_text*(
   destroyCommand(cmd)
   ok
 
+proc libp2p_send_direct_text_with_addresses*(
+    handle: pointer,
+    peerId: cstring,
+    addressesJson: cstring,
+    messageId: cstring,
+    text: cstring,
+    replyTo: cstring,
+    requestAck: bool,
+    timeoutMs: cint
+): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil or text.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  proc parseAddressesJson(text: string): seq[string] =
+    if text.len == 0:
+      return @[]
+    try:
+      let parsed = parseJson(text)
+      if parsed.kind != JArray:
+        return @[]
+      for item in parsed.items:
+        if item.kind == JString:
+          let maText = item.getStr().strip()
+          if maText.len > 0:
+            result.add(maText)
+    except CatchableError:
+      discard
+  let cmd = makeCommand(cmdSendDirect)
+  cmd.peerId = $peerId
+  cmd.messageId = if messageId.isNil: "" else: $messageId
+  cmd.textPayload = $text
+  cmd.replyTo = if replyTo.isNil: "" else: $replyTo
+  let derivedOp = parseDirectEnvelopeOp(cmd.textPayload)
+  cmd.op = if derivedOp.len > 0: derivedOp else: "text"
+  cmd.ackRequested = requestAck
+  let requestedTimeout = int(timeoutMs)
+  let defaultTimeout = defaultDirectTimeoutMs(cmd.op)
+  cmd.timeoutMs = if requestedTimeout > 0: requestedTimeout else: defaultTimeout
+  if not addressesJson.isNil:
+    let parsed = parseAddressesJson($addressesJson)
+    if parsed.len > 0:
+      cmd.addresses = normalizePeerTargetAddresses($peerId, parsed)
+      cmd.source = "product_send_dm"
+      let connectStartedAtMs = nowMillis()
+      let exactPayloadRaw =
+        libp2p_bootstrap_seed_connect_exact(
+          handle,
+          peerId,
+          jsonEncodeStringSeq(cmd.addresses).cstring,
+          "product_send_dm_exact".cstring,
+          cint(cmd.addresses.len),
+          cint(max(250, min(cmd.timeoutMs, 10_000)))
+        )
+      let exactPayloadText =
+        if exactPayloadRaw.isNil:
+          ""
+        else:
+          let copied = $exactPayloadRaw
+          deallocShared(exactPayloadRaw)
+          copied
+      let exactPayload =
+        try:
+          parseJson(exactPayloadText)
+        except CatchableError:
+          newJObject()
+      if jsonGetBool(exactPayload, "ok", false) != true:
+        let err = jsonGetStr(exactPayload, "error", "bootstrap_seed_connect_exact_failed")
+        node.lastDirectError = err
+        destroyCommand(cmd)
+        return false
+      let elapsedMs = int(max(0'i64, nowMillis() - connectStartedAtMs))
+      cmd.timeoutMs = max(cmd.timeoutMs - elapsedMs, 1_000)
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk and (not requestAck or result.boolResult)
+  destroyCommand(cmd)
+  ok
+
 proc libp2p_send_chat_control*(
     handle: pointer,
     peerId: cstring,
@@ -14343,15 +14648,7 @@ proc libp2p_tailnet_status_json*(handle: pointer): cstring {.exportc, cdecl, dyn
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString($emptyTailnetStatusPayload(nil))
-  let cmd = makeCommand(cmdTailnetStatus)
-  let result = submitCommand(node, cmd)
-  let text =
-    if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      cloneOwnedString(result.stringResult)
-    else:
-      $emptyTailnetStatusPayload(node)
-  destroyCommand(cmd)
-  allocCString(text)
+  allocCString($buildTailnetStatusPayload(node))
 
 proc libp2p_tailnet_ping*(
     handle: pointer,
@@ -14385,6 +14682,18 @@ proc libp2p_tailnet_derp_map*(handle: pointer): cstring {.exportc, cdecl, dynlib
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{\"ok\":false,\"error\":\"node_unavailable\"}")
+  let tailnetStart = buildTailnetStartStatusPayload(node)
+  if jsonGetBool(tailnetStart, "inFlight", false):
+    let payload = %*{
+      "ok": true,
+      "deferred": true,
+      "providerStage": jsonGetStr(tailnetStart, "stage", "starting"),
+      "reason": "provider_start_inflight",
+      "omitDefaultRegions": false,
+      "regionCount": 0,
+      "regions": newJArray(),
+    }
+    return allocCString($payload)
   let cmd = makeCommand(cmdTailnetDerpMap)
   let result = submitCommand(node, cmd)
   let text =
@@ -14746,6 +15055,34 @@ proc libp2p_wait_secure_channel_ffi*(handle: pointer, peerId: cstring, timeoutMs
   if node.isNil:
     return false
   let cmd = makeCommand(cmdWaitSecureChannel)
+  cmd.peerId = $peerId
+  cmd.timeoutMs = int(timeoutMs)
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk and result.boolResult
+  destroyCommand(cmd)
+  ok
+
+proc libp2p_wait_peer_identified_ffi*(handle: pointer, peerId: cstring, timeoutMs: cint): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let cmd = makeCommand(cmdWaitPeerIdentified)
+  cmd.peerId = $peerId
+  cmd.timeoutMs = int(timeoutMs)
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk and result.boolResult
+  destroyCommand(cmd)
+  ok
+
+proc libp2p_wait_peer_ready_ffi*(handle: pointer, peerId: cstring, timeoutMs: cint): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let cmd = makeCommand(cmdWaitPeerReady)
   cmd.peerId = $peerId
   cmd.timeoutMs = int(timeoutMs)
   let result = submitCommand(node, cmd)
@@ -16102,7 +16439,7 @@ proc social_connect_peer_timeout*(handle: pointer, peerId: cstring, multiaddr: c
   var connected = false
   if dialAddr.len > 0:
     connected = libp2p_connect_multiaddr_timeout(handle, dialAddr.cstring, safeTimeoutMs.cint) == NimResultOk
-  if not connected:
+  if not connected and dialAddr.len == 0:
     connected = libp2p_connect_peer_timeout(handle, peer.cstring, safeTimeoutMs.cint) == NimResultOk
   var payload = newJObject()
   payload["peerId"] = %peer
@@ -20534,6 +20871,7 @@ proc libp2p_get_listen_addresses*(handle: pointer): cstring {.exportc, cdecl, dy
           addrs = runtimeAddrs.mapIt($it)
   except CatchableError:
     discard
+  addrs = filterPublishableTsnetAddrTexts(node, addrs)
   allocCString(jsonEncodeStringSeq(addrs))
 
 proc libp2p_get_dialable_addresses*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
@@ -20558,6 +20896,7 @@ proc libp2p_get_dialable_addresses*(handle: pointer): cstring {.exportc, cdecl, 
           addrs = filtered
   except CatchableError:
     discard
+  addrs = filterPublishableTsnetAddrTexts(node, addrs)
   let ordered = preferStableAddrStrings(addrs)
   allocCString(jsonEncodeStringSeq(ordered))
 
@@ -21343,10 +21682,12 @@ proc libp2p_bootstrap_seed_connect_exact*(
     attemptNode["bootstrapConnected"] = %bootstrapConnected
     attempts.add(attemptNode)
 
-    if peerConnected or bootstrapConnected:
+    if rc == NimResultOk or secureOk or peerConnected or bootstrapConnected:
       debugLog(
         "[nimlibp2p] bootstrapSeedConnectExact success peer=" & safePeerId &
         " addr=" & addr &
+        " connectOk=" & $(rc == NimResultOk) &
+        " secureOk=" & $secureOk &
         " peerConnected=" & $peerConnected &
         " identifiedOk=" & $identifiedOk &
         " bootstrapConnected=" & $bootstrapConnected
@@ -21615,14 +21956,14 @@ proc runBootstrapSeedConnectExactAsync(
       attemptNode["bootstrapConnected"] = %bootstrapConnected
       attempts.add(attemptNode)
 
-      if peerConnected or bootstrapConnected:
+      if connectOk or secureOk or peerConnected or bootstrapConnected:
         asyncSpawn(promoteConnectedBootstrapPeerDetached(
           node,
           safePeerId,
           selectedAddrs,
           effectiveSource,
         ))
-        let payload = bootstrapSeedConnectExactPayload(
+        let payload = parseJson(bootstrapSeedConnectExactPayload(
           node,
           safePeerId,
           effectiveSource,
@@ -21630,12 +21971,15 @@ proc runBootstrapSeedConnectExactAsync(
           attempts,
           true,
           "",
-        )
+        ))
+        payload["connectOk"] = %connectOk
+        payload["secureOk"] = %secureOk
+        payload["identifiedOk"] = %identifiedOk
         ffiNodeSafe:
           setBootstrapSeedConnectKickoffState(
             safePeerId,
             "done",
-            parseJson(payload),
+            payload,
           )
         return
 

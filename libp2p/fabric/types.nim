@@ -45,6 +45,7 @@ type
     account*: string
     peerId*: string
     path*: LsmrPath
+    addrs*: seq[string]
 
   PeerAnnouncement* = object
     account*: string

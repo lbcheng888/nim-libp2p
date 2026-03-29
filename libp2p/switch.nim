@@ -13,7 +13,8 @@
 
 {.push raises: [].}
 
-import std/[tables, options, sequtils, sets, oids, typetraits]
+import std/[tables, options, sequtils, sets, oids, typetraits, strutils]
+from std/times import epochTime
 
 import chronos, chronicles, metrics
 import utils/semaphore as lpSemaphore
@@ -1014,7 +1015,17 @@ proc upgrader(
     switch: Switch, trans: Transport, conn: Connection
 ) {.async: (raises: [CancelledError, UpgradeError]).} =
   try:
+    when defined(lsmr_diag):
+      echo "switch incoming-upgrade-begin self=", $switch.peerInfo.peerId,
+        " remote=", $conn.peerId,
+        " observed=", $conn.observedAddr,
+        " ts=", int64(epochTime() * 1000)
     let muxed = await trans.upgrade(conn, Opt.none(PeerId))
+    when defined(lsmr_diag):
+      echo "switch incoming-upgrade-ok self=", $switch.peerInfo.peerId,
+        " remote=", $muxed.connection.peerId,
+        " observed=", $muxed.connection.observedAddr,
+        " ts=", int64(epochTime() * 1000)
     if not switch.connectionGater.isNil:
       let secureConn = muxed.connection
       if not switch.connectionGater.allowSecured(
@@ -1066,8 +1077,18 @@ proc upgrader(
           description = exc.msg
     asyncSpawn finishIncomingIdentify()
   except CancelledError as e:
+    when defined(lsmr_diag):
+      echo "switch incoming-upgrade-cancel self=", $switch.peerInfo.peerId,
+        " remote=", $conn.peerId,
+        " err=", e.msg,
+        " ts=", int64(epochTime() * 1000)
     raise e
   except CatchableError as e:
+    when defined(lsmr_diag):
+      echo "switch incoming-upgrade-fail self=", $switch.peerInfo.peerId,
+        " remote=", $conn.peerId,
+        " err=", e.msg,
+        " ts=", int64(epochTime() * 1000)
     raise newException(UpgradeError, "catchable error upgrader: " & e.msg, e)
 
 proc upgradeMonitor(
@@ -1144,10 +1165,16 @@ proc accept(s: Switch, transport: Transport) {.async: (raises: []).} =
       asyncSpawn s.upgradeMonitor(transport, conn, upgrades)
     except CancelledError as exc:
       trace "releasing semaphore on cancellation"
+      when defined(fabric_lsmr_diag):
+        echo "switch-accept exit kind=cancelled peer=", $s.peerInfo.peerId
       upgrades.release() # always release the slot
       return
     except CatchableError as exc:
       error "Exception in accept loop, exiting", description = exc.msg
+      when defined(fabric_lsmr_diag):
+        echo "switch-accept exit kind=error peer=", $s.peerInfo.peerId,
+          " msg=", exc.msg,
+          " transport=", $cast[int](transport)
       upgrades.release() # always release the slot
       if not isNil(conn):
         await conn.close()
@@ -1158,6 +1185,8 @@ proc stop*(s: Switch) {.public, async: (raises: [CancelledError]).} =
   ## close every active connections
 
   trace "Stopping switch"
+  when defined(fabric_lsmr_diag):
+    echo "switch-stop begin peer=", $s.peerInfo.peerId
 
   s.started = false
 
@@ -1212,6 +1241,8 @@ proc stop*(s: Switch) {.public, async: (raises: [CancelledError]).} =
   await s.ms.stop()
 
   trace "Switch stopped"
+  when defined(fabric_lsmr_diag):
+    echo "switch-stop done peer=", $s.peerInfo.peerId
 
 template runServiceSetup(service: untyped, switchInst: Switch) =
   when compiles(await service.setup(switchInst)):
@@ -1238,6 +1269,8 @@ proc startAsyncImpl(s: Switch) {.async: (raises: [CancelledError, LPError]).} =
     return
 
   debug "starting switch for peer", peerInfo = s.peerInfo
+  when defined(fabric_lsmr_diag):
+    echo "switch-start begin peer=", $s.peerInfo.peerId
   var startFuts: seq[Future[void]]
   for t in s.transports:
     let addrs = s.peerInfo.listenAddrs.filterIt(t.handles(it))
@@ -1277,6 +1310,9 @@ proc startAsyncImpl(s: Switch) {.async: (raises: [CancelledError, LPError]).} =
       s.peerInfo.listenAddrs &= t.addrs
       warn "transport ready",
         transportAddr = cast[int](t), addrs = t.addrs.mapIt($it)
+      when defined(fabric_lsmr_diag):
+        echo "switch-start transport-ready peer=", $s.peerInfo.peerId,
+          " addrs=", t.addrs.mapIt($it).join(",")
 
   if s.services.len == 0:
     warn "no services to setup"
@@ -1287,6 +1323,9 @@ proc startAsyncImpl(s: Switch) {.async: (raises: [CancelledError, LPError]).} =
   await s.peerInfo.update()
   await s.ms.start()
   s.started = true
+  when defined(fabric_lsmr_diag):
+    echo "switch-start done peer=", $s.peerInfo.peerId,
+      " addrs=", s.peerInfo.addrs.mapIt($it).join(",")
 
   when defined(libp2p_msquic_experimental):
     if s.webtransportRotationInterval > chronos.ZeroDuration:

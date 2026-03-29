@@ -9,9 +9,11 @@ import ../tsnetprovidertypes
 
 type
   TsnetPeerSession* = object
+    peerId*: string
     hostName*: string
     dnsName*: string
     tailscaleIPs*: seq[string]
+    listenAddrs*: seq[string]
     online*: bool
     active*: bool
     curAddr*: string
@@ -123,6 +125,13 @@ proc jsonInt(node: JsonNode, key: string, defaultValue = 0): int =
   else:
     defaultValue
 
+proc distinctStrings(values: seq[string]): seq[string] =
+  result = @[]
+  for value in values:
+    if value.len == 0 or value in result:
+      continue
+    result.add(value)
+
 proc jsonInt64(node: JsonNode, key: string, defaultValue = 0'i64): int64 =
   let value = jsonField(node, key)
   case value.kind
@@ -143,9 +152,11 @@ proc jsonStrings(node: JsonNode, key: string): seq[string] =
 
 proc toJson*(peer: TsnetPeerSession): JsonNode =
   result = newJObject()
+  result["peerId"] = %peer.peerId
   result["hostName"] = %peer.hostName
   result["dnsName"] = %peer.dnsName
   result["tailscaleIPs"] = %peer.tailscaleIPs
+  result["listenAddrs"] = %peer.listenAddrs
   result["online"] = %peer.online
   result["active"] = %peer.active
   result["curAddr"] = %peer.curAddr
@@ -160,9 +171,11 @@ proc parsePeerSession*(node: JsonNode): Result[TsnetPeerSession, string] =
   if node.isNil or node.kind != JObject:
     return err("tsnet peer session must be a JSON object")
   ok(TsnetPeerSession(
+    peerId: jsonString(node, "peerId"),
     hostName: jsonString(node, "hostName"),
     dnsName: jsonString(node, "dnsName"),
     tailscaleIPs: jsonStrings(node, "tailscaleIPs"),
+    listenAddrs: jsonStrings(node, "listenAddrs"),
     online: jsonBool(node, "online"),
     active: jsonBool(node, "active"),
     curAddr: jsonString(node, "curAddr"),
@@ -523,12 +536,21 @@ proc parseControlDerpMap*(node: JsonNode): Result[TsnetDerpMapSnapshot, string] 
 proc parseControlPeer(node: JsonNode, derpMap: TsnetDerpMapSnapshot): TsnetPeerSession =
   let hostinfo = jsonField(node, "Hostinfo")
   let addresses = mapStringSeq(node, "Addresses").mapIt(trimCidr(it)).filterIt(it.len > 0)
+  let listenAddrs =
+    mapStringSeq(node, "ListenAddrs").filterIt(it.len > 0) &
+    mapStringSeq(hostinfo, "ListenAddrs").filterIt(it.len > 0)
   let homeDerpId = jsonInt(node, "HomeDERP")
   let regionCode = derpMap.mapRegionCodeById(homeDerpId)
+  let topLevelPeerId = jsonString(node, "PeerID")
+  let peerId =
+    if topLevelPeerId.len > 0: topLevelPeerId
+    else: jsonString(hostinfo, "PeerID")
   TsnetPeerSession(
+    peerId: peerId,
     hostName: jsonString(hostinfo, "Hostname"),
     dnsName: jsonString(node, "Name"),
     tailscaleIPs: addresses,
+    listenAddrs: distinctStrings(listenAddrs),
     online: true,
     active: true,
     curAddr: "",

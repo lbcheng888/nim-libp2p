@@ -58,6 +58,6 @@ const
     TestSuiteDescriptor(
       name: "fuzzing",
       kind: tsFuzz,
-      sources: @["src/fuzzing", "scripts/recvfuzz.ps1", "scripts/secnetperf.ps1", "nim/tooling/fuzz_harness.nim"],
+      sources: @["src/fuzzing", "scripts/recvfuzz.ps1", "scripts/secnetperf.ps1", "nim/tooling/fuzz_runner.nim"],
       driverScripts: @["scripts/recvfuzz.ps1"],
       notes: "覆盖数据包接收路径与安全场景的模糊测试。")]

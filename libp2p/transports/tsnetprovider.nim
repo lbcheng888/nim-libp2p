@@ -93,6 +93,13 @@ proc failure*(provider: TsnetProvider): string {.gcsafe.} =
     return ""
   provider.lastError
 
+proc updateBridgeExtraJson*(provider: TsnetProvider, bridgeExtraJson: string) {.gcsafe.} =
+  if provider.isNil:
+    return
+  provider.cfg.bridgeExtraJson = bridgeExtraJson
+  if tsnetproviderinapp.runtimePresent(provider.runtime):
+    provider.runtime.cfg.bridgeExtraJson = bridgeExtraJson
+
 proc jsonField(node: JsonNode, key: string): JsonNode {.gcsafe.} =
   if node.isNil or node.kind != JObject or not node.hasKey(key):
     return newJNull()
@@ -177,6 +184,19 @@ proc reset*(provider: TsnetProvider): Result[void, string] =
   if not legacy.bridgeActive(provider.bridge):
     return ok()
   legacy.resetLegacyBridge(provider.bridge)
+
+proc refreshControlMetadata*(provider: TsnetProvider): Result[void, string] {.gcsafe.} =
+  if provider.isNil:
+    return err("tsnet provider is nil")
+  if provider.kind != TsnetProviderKind.InAppReal or not tsnetproviderinapp.runtimePresent(provider.runtime):
+    return ok()
+  let refreshed = tsnetproviderinapp.refreshControlMetadata(provider.runtime)
+  if refreshed.isErr():
+    let error = refreshed.error
+    provider.lastError = error
+    return err(error)
+  provider.lastError = ""
+  ok()
 
 proc stop*(provider: TsnetProvider) =
   if provider.isNil:

@@ -7,6 +7,10 @@ import ./tsnet/runtime as tsruntime
 import ../multiaddress
 import ../utility
 
+template inAppSafe(body: untyped) =
+  {.cast(gcsafe).}:
+    body
+
 type
   TsnetInAppRuntime* = tsruntime.TsnetInAppRuntime
 
@@ -77,6 +81,12 @@ proc resetInAppRuntime*(runtime: TsnetInAppRuntime): Result[void, string] =
   if runtime.isNil:
     return err("tsnet in-app runtime is nil")
   tsruntime.reset(runtime)
+
+proc refreshControlMetadata*(runtime: TsnetInAppRuntime): Result[void, string] {.gcsafe.} =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  inAppSafe:
+    result = tsruntime.refreshControlMetadata(runtime)
 
 proc statusPayload*(runtime: TsnetInAppRuntime): Result[JsonNode, string] =
   tsruntime.statusPayload(runtime)

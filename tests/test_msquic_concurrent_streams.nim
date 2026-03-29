@@ -93,8 +93,7 @@ when defined(libp2p_msquic_experimental):
                 handle,
                 clientConnPtr,
                 clientConnState,
-                nil,
-                true
+                createPrimaryStream = true
               )
               defer:
                 if not clientConn.isNil:

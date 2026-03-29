@@ -142,6 +142,35 @@ proc providerConfig(cfg: TsnetTransportBuilderConfig): TsnetProviderConfig =
     bridgeExtraJson: cfg.bridgeExtraJson
   )
 
+proc mergeBridgeExtraJson(
+    current: string,
+    peerId: string,
+    listenAddrs: openArray[string]
+): string =
+  var payload =
+    if current.strip().len > 0:
+      try:
+        parseJson(current)
+      except CatchableError:
+        newJObject()
+    else:
+      newJObject()
+  if payload.kind != JObject:
+    payload = newJObject()
+  let normalizedPeerId = peerId.strip()
+  if normalizedPeerId.len > 0:
+    payload["libp2pPeerId"] = %normalizedPeerId
+    payload["localPeerId"] = %normalizedPeerId
+  var normalizedListenAddrs: seq[string] = @[]
+  for addr in listenAddrs:
+    let text = addr.strip()
+    if text.len > 0 and text notin normalizedListenAddrs:
+      normalizedListenAddrs.add(text)
+  if normalizedListenAddrs.len > 0:
+    payload["libp2pListenAddrs"] = %normalizedListenAddrs
+    payload["listenAddresses"] = %normalizedListenAddrs
+  $payload
+
 proc parseKnownAddress(text: string): MultiAddress {.gcsafe.} =
   MultiAddress.init(text).expect("tsnet transport constructed a valid multiaddr")
 
@@ -291,6 +320,23 @@ proc providerStartSafe(self: TsnetTransport): Result[TsnetProviderKind, string] 
 
 proc warmProvider*(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
   self.providerStartSafe()
+
+proc publishLocalPeerInfo*(
+    self: TsnetTransport,
+    peerId: string,
+    listenAddrs: openArray[string]
+) {.gcsafe.} =
+  if self.isNil:
+    return
+  let nextJson = mergeBridgeExtraJson(self.cfg.bridgeExtraJson, peerId, listenAddrs)
+  self.cfg.bridgeExtraJson = nextJson
+  self.provider.updateBridgeExtraJson(nextJson)
+
+proc refreshProviderControlMetadata*(self: TsnetTransport): Result[void, string] {.gcsafe.} =
+  tsnetSafe:
+    if self.isNil:
+      return err("tsnet transport is nil")
+    result = self.provider.refreshControlMetadata()
 
 proc publishedAddrs*(self: TsnetTransport): seq[MultiAddress] {.gcsafe.} =
   if self.isNil:
@@ -484,21 +530,42 @@ proc waitForProviderUdpDialReady(
 
 proc hasTsnetSuffix(address: MultiAddress): bool {.gcsafe.} =
   let text = $address
-  text.len > 6 and text.toLowerAscii().endsWith("/tsnet")
+  let lower = text.toLowerAscii()
+  if lower.len <= 6:
+    return false
+  if lower.endsWith("/tsnet"):
+    return true
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = lower.rfind(marker)
+    if idx >= 0 and idx > 6:
+      return lower[0 ..< idx].endsWith("/tsnet")
+  false
 
 proc stripTsnetSuffix(address: MultiAddress): Result[MultiAddress, string] {.gcsafe.} =
   let text = $address
-  if not text.toLowerAscii().endsWith("/tsnet"):
+  var baseText = text
+  let lower = text.toLowerAscii()
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = lower.rfind(marker)
+    if idx >= 0:
+      baseText = text[0 ..< idx]
+      break
+  if not baseText.toLowerAscii().endsWith("/tsnet"):
     return err("address is missing /tsnet: " & text)
-  if text.len <= 6:
+  if baseText.len <= 6:
     return err("invalid /tsnet address: " & text)
-  let rawText = text[0 ..< text.len - 6]
+  let rawText = baseText[0 ..< baseText.len - 6]
   MultiAddress.init(rawText)
 
 proc splitAddressParts(address: MultiAddress): seq[string] {.gcsafe.} =
   for part in ($address).split('/'):
     if part.len > 0:
       result.add(part)
+
+proc tsnetAddressBaseIndex(parts: seq[string]): int {.gcsafe.} =
+  if parts.len > 0 and parts[0].toLowerAscii() in ["awdl", "nan", "nearlink"]:
+    return 1
+  0
 
 proc portFromAddress(address: MultiAddress): int {.gcsafe.} =
   let parts = splitAddressParts(address)
@@ -514,14 +581,16 @@ proc portFromAddress(address: MultiAddress): int {.gcsafe.} =
 
 proc familyFromAddress(address: MultiAddress): string {.gcsafe.} =
   let parts = splitAddressParts(address)
-  if parts.len >= 2 and (parts[0] == "ip4" or parts[0] == "ip6"):
-    return parts[0]
+  let baseIdx = tsnetAddressBaseIndex(parts)
+  if parts.len >= baseIdx + 2 and (parts[baseIdx] == "ip4" or parts[baseIdx] == "ip6"):
+    return parts[baseIdx]
   ""
 
 proc hostFromAddress(address: MultiAddress): string {.gcsafe.} =
   let parts = splitAddressParts(address)
-  if parts.len >= 2 and (parts[0] == "ip4" or parts[0] == "ip6"):
-    return parts[1]
+  let baseIdx = tsnetAddressBaseIndex(parts)
+  if parts.len >= baseIdx + 2 and (parts[baseIdx] == "ip4" or parts[baseIdx] == "ip6"):
+    return parts[baseIdx + 1]
   ""
 
 proc quicDialHostname*(
@@ -574,14 +643,15 @@ proc parseTsnetAddress(
   let raw = stripTsnetSuffix(address).valueOr:
     return err(error)
   let parts = splitAddressParts(raw)
-  if parts.len < 4:
+  let baseIdx = tsnetAddressBaseIndex(parts)
+  if parts.len < baseIdx + 4:
     return err("unsupported /tsnet address: " & $address)
-  if parts[0] != "ip4" and parts[0] != "ip6":
+  if parts[baseIdx] != "ip4" and parts[baseIdx] != "ip6":
     return err("unsupported /tsnet address family: " & $address)
 
   var parsed = TsnetParsedAddress(
-    family: parts[0],
-    ip: parts[1].toLowerAscii(),
+    family: parts[baseIdx],
+    ip: parts[baseIdx + 1].toLowerAscii(),
     port: 0,
     explicitIP: true,
     raw: raw,
@@ -593,12 +663,12 @@ proc parseTsnetAddress(
   )
 
   try:
-    if parts.len == 4 and parts[2] == "tcp":
+    if parts.len == baseIdx + 4 and parts[baseIdx + 2] == "tcp":
       parsed.kind = TsnetPathKind.Tcp
-      parsed.port = parseInt(parts[3])
-    elif parts.len == 5 and parts[2] == "udp" and parts[4] == "quic-v1":
+      parsed.port = parseInt(parts[baseIdx + 3])
+    elif parts.len == baseIdx + 5 and parts[baseIdx + 2] == "udp" and parts[baseIdx + 4] == "quic-v1":
       parsed.kind = TsnetPathKind.Quic
-      parsed.port = parseInt(parts[3])
+      parsed.port = parseInt(parts[baseIdx + 3])
     else:
       return err("unsupported /tsnet address: " & $address)
   except ValueError as exc:

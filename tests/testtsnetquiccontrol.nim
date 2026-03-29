@@ -204,6 +204,8 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         capabilityVersion = 130,
         nodePublicKey = "nodekey:abcdef0123456789",
         machinePublicKey = "mkey:machine",
+        libp2pPeerId = "12D3KooWAndroidPeer",
+        libp2pListenAddrs = @["/ip4/100.64.160.122/udp/4001/quic-v1/tsnet/p2p/12D3KooWAndroidPeer"],
         hostname = "nim-open-runtime",
         authKey = ""
       )
@@ -216,12 +218,42 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         capabilityVersion = 130,
         nodePublicKey = "nodekey:abcdef0123456789",
         discoPublicKey = "discokey:wg",
+        libp2pPeerId = "12D3KooWAndroidPeer",
+        libp2pListenAddrs = @["/ip4/100.64.160.122/udp/4001/quic-v1/tsnet/p2p/12D3KooWAndroidPeer"],
         hostname = "nim-open-runtime"
       )
       let mapRes = mapPollQuic(controlUrl, mapReq)
       check mapRes.isOk()
       check mapRes.get()["DERPMap"]["Regions"]["901"]["RegionCode"].getStr() == "sin"
       check mapRes.get()["Node"]["Addresses"][0].getStr().startsWith("100.64.")
+      check mapRes.get()["Node"]["PeerID"].getStr() == "12D3KooWAndroidPeer"
+      check mapRes.get()["Node"]["ListenAddrs"][0].getStr().contains("/tsnet/p2p/12D3KooWAndroidPeer")
+
+      let registerReq2 = buildRegisterRequestPayload(
+        capabilityVersion = 130,
+        nodePublicKey = "nodekey:feedface01234567",
+        machinePublicKey = "mkey:machine-2",
+        libp2pPeerId = "12D3KooWMacPeer",
+        libp2pListenAddrs = @["/ip4/100.64.203.158/udp/4001/quic-v1/tsnet/p2p/12D3KooWMacPeer"],
+        hostname = "nim-open-runtime-2",
+        authKey = ""
+      )
+      let registerRes2 = registerNodeQuic(controlUrl, registerReq2)
+      check registerRes2.isOk()
+
+      let mapReq2 = buildMapRequestPayload(
+        capabilityVersion = 130,
+        nodePublicKey = "nodekey:feedface01234567",
+        discoPublicKey = "discokey:wg-2",
+        libp2pPeerId = "12D3KooWMacPeer",
+        libp2pListenAddrs = @["/ip4/100.64.203.158/udp/4001/quic-v1/tsnet/p2p/12D3KooWMacPeer"],
+        hostname = "nim-open-runtime-2"
+      )
+      let mapRes2 = mapPollQuic(controlUrl, mapReq2)
+      check mapRes2.isOk()
+      check mapRes2.get()["Peers"].len == 1
+      check mapRes2.get()["Peers"][0]["PeerID"].getStr() == "12D3KooWAndroidPeer"
+      check mapRes2.get()["Peers"][0]["ListenAddrs"][0].getStr().contains("/tsnet/p2p/12D3KooWAndroidPeer")
 
     test "runtime reaches running state over nim_quic without ssl":
       let (gateway, controlUrl) = startGateway()

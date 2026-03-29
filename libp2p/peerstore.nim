@@ -24,7 +24,7 @@ runnableExamples:
 {.push raises: [].}
 
 import
-  std/[algorithm, tables, sets, options, macros],
+  std/[algorithm, tables, sets, options, macros, sequtils, strutils],
   chronos,
   pkg/results,
   ../shim,
@@ -71,6 +71,7 @@ type
   ProtoVersionBook* {.public.} = ref object of PeerBook[string]
   SPRBook* {.public.} = ref object of PeerBook[Envelope]
   LsmrBook* {.public.} = ref object of PeerBook[SignedLsmrCoordinateRecord]
+  LsmrChainBook* {.public.} = ref object of SeqPeerBook[SignedLsmrCoordinateRecord]
   ActiveLsmrBook* {.public.} = ref object of PeerBook[SignedLsmrCoordinateRecord]
   LsmrMigrationBook* {.public.} = ref object of SeqPeerBook[SignedLsmrMigrationRecord]
   LsmrIsolationBook* {.public.} = ref object of SeqPeerBook[SignedLsmrIsolationEvidence]
@@ -199,6 +200,22 @@ proc `[]`*[T: BasePeerBook](p: PeerStore, typ: type[T]): T {.public.} =
       discard cast[T](p.books.getOrDefault(name)).del(pid)
     p.books[name] = result
 
+proc compareNeighborPeers(
+    peerStore: PeerStore,
+    aPeer, bPeer: PeerId,
+    targetPath: LsmrPath,
+): int =
+  if peerStore.isNil or not peerStore[ActiveLsmrBook].contains(aPeer) or
+      not peerStore[ActiveLsmrBook].contains(bPeer):
+    return cmp($aPeer, $bPeer)
+  compareCertifiedRecords(
+    aPeer,
+    bPeer,
+    peerStore[ActiveLsmrBook][aPeer],
+    peerStore[ActiveLsmrBook][bPeer],
+    targetPath,
+  )
+
 proc closestCertifiedPeers*(
     peerStore: PeerStore, targetPath: LsmrPath, limit = 0
 ): seq[PeerId] {.public.} =
@@ -236,16 +253,46 @@ proc bestCertifiedPeer(
   )
   Opt.some(ranked[0][0])
 
+proc bestNeighborPeer(
+    peerStore: PeerStore, peerIds: openArray[PeerId], targetPath: LsmrPath
+): Opt[PeerId] =
+  if peerStore.isNil or targetPath.len == 0:
+    return Opt.none(PeerId)
+  var peers: seq[PeerId] = @[]
+  for peerId in peerIds:
+    if peerStore[ActiveLsmrBook].contains(peerId):
+      peers.add(peerId)
+  if peers.len == 0:
+    return Opt.none(PeerId)
+  peers.sort(proc(a, b: PeerId): int = peerStore.compareNeighborPeers(a, b, targetPath))
+  Opt.some(peers[0])
+
+proc bestExactPrefixPeer(
+    peerStore: PeerStore, peerIds: openArray[PeerId], targetPath: LsmrPath
+): Opt[PeerId] =
+  if peerStore.isNil or targetPath.len == 0:
+    return Opt.none(PeerId)
+  var peers: seq[PeerId] = @[]
+  for peerId in peerIds:
+    if not peerStore[ActiveLsmrBook].contains(peerId):
+      continue
+    if peerStore[ActiveLsmrBook][peerId].data.certifiedPrefix() == targetPath:
+      peers.add(peerId)
+  if peers.len == 0:
+    return Opt.none(PeerId)
+  peers.sort(proc(a, b: PeerId): int = peerStore.compareNeighborPeers(a, b, targetPath))
+  Opt.some(peers[0])
+
 proc neighborsForPrefix*(
     peerStore: PeerStore, prefix: LsmrPath, depth: int
 ): seq[PeerId] {.public.} =
   if peerStore.isNil or prefix.len == 0 or depth <= 0:
     return @[]
   let required = min(prefix.len, depth)
-  for peerId in peerStore.closestCertifiedPeers(prefix):
-    let record = peerStore[ActiveLsmrBook][peerId]
+  for peerId, record in peerStore[ActiveLsmrBook].book.pairs:
     if commonPrefixLen(record.data.certifiedPrefix(), prefix) >= required:
       result.add(peerId)
+  result.sort(proc(a, b: PeerId): int = peerStore.compareNeighborPeers(a, b, prefix))
 
 proc topologyNeighborView*(
     peerStore: PeerStore,
@@ -269,22 +316,53 @@ proc routeNextHop*(
       continue
     let view = viewOpt.get()
     let shared = commonPrefixLen(view.selfPrefix, targetPath)
+    when defined(lsmr_diag):
+      echo "lsmr next-hop depth=", depth,
+        " local=", $localPeerId,
+        " target=", targetPath,
+        " selfPrefix=", view.selfPrefix,
+        " sameCell=", view.sameCellPeers.mapIt($it).join(","),
+        " parents=", view.parentPrefixPeers.mapIt($it).join(",")
 
     if shared == depth - 1 and targetPath.len >= depth:
       let targetDigit = targetPath[depth - 1]
       for bucket in view.directionalPeers:
         if bucket.directionDigit == targetDigit:
-          let nextHop = peerStore.bestCertifiedPeer(bucket.peers, targetPath)
+          when defined(lsmr_diag):
+            echo "lsmr next-hop bucket depth=", depth,
+              " local=", $localPeerId,
+              " target=", targetPath,
+              " digit=", targetDigit,
+              " peers=", bucket.peers.mapIt($it).join(",")
+          let nextHop = peerStore.bestNeighborPeer(bucket.peers, targetPath)
           if nextHop.isSome():
             return nextHop
 
     if shared >= depth:
-      let nextHop = peerStore.bestCertifiedPeer(view.sameCellPeers, targetPath)
+      let exactHop = peerStore.bestExactPrefixPeer(view.sameCellPeers, targetPath)
+      when defined(lsmr_diag):
+        echo "lsmr next-hop exact depth=", depth,
+          " local=", $localPeerId,
+          " target=", targetPath,
+          " next=", (if exactHop.isSome(): $exactHop.get() else: "none")
+      if exactHop.isSome():
+        return exactHop
+      let nextHop = peerStore.bestNeighborPeer(view.sameCellPeers, targetPath)
+      when defined(lsmr_diag):
+        echo "lsmr next-hop same depth=", depth,
+          " local=", $localPeerId,
+          " target=", targetPath,
+          " next=", (if nextHop.isSome(): $nextHop.get() else: "none")
       if nextHop.isSome():
         return nextHop
 
     if depth > 1:
-      let parentHop = peerStore.bestCertifiedPeer(view.parentPrefixPeers, targetPath)
+      let parentHop = peerStore.bestNeighborPeer(view.parentPrefixPeers, targetPath)
+      when defined(lsmr_diag):
+        echo "lsmr next-hop parent depth=", depth,
+          " local=", $localPeerId,
+          " target=", targetPath,
+          " next=", (if parentHop.isSome(): $parentHop.get() else: "none")
       if parentHop.isSome():
         return parentHop
 
@@ -324,20 +402,25 @@ proc topologyNeighborView*(
         return idx
     -1
 
-  for peerId in peerStore.closestCertifiedPeers(view.selfPrefix):
+  for peerId, record in peerStore[ActiveLsmrBook].book.pairs:
     if peerId == localPeerId:
       continue
-    let remotePrefix = peerStore[ActiveLsmrBook][peerId].data.certifiedPrefix()
-    if remotePrefix.len < targetDepth:
-      continue
+    let remotePrefix = record.data.certifiedPrefix()
 
     let shared = commonPrefixLen(remotePrefix, view.selfPrefix)
-    if shared >= targetDepth:
+    if remotePrefix.len >= targetDepth and shared >= targetDepth:
       view.sameCellPeers.add(peerId)
       continue
 
-    if targetDepth > 1 and shared >= targetDepth - 1:
+    if targetDepth > 1 and remotePrefix.len == targetDepth - 1 and
+        pathStartsWith(view.selfPrefix, remotePrefix):
       view.parentPrefixPeers.add(peerId)
+      continue
+
+    if remotePrefix.len < targetDepth:
+      continue
+
+    if targetDepth > 1 and shared >= targetDepth - 1:
       let directionDigit = remotePrefix[targetDepth - 1]
       if directionDigit == view.selfPrefix[targetDepth - 1]:
         continue
@@ -348,6 +431,23 @@ proc topologyNeighborView*(
         )
       elif view.directionalPeers[idx].peers.len < directionLimit:
         view.directionalPeers[idx].peers.add(peerId)
+
+  view.sameCellPeers.sort(
+    proc(a, b: PeerId): int = peerStore.compareNeighborPeers(a, b, view.selfPrefix)
+  )
+  view.parentPrefixPeers.sort(
+    proc(a, b: PeerId): int = peerStore.compareNeighborPeers(a, b, view.selfPrefix)
+  )
+  for idx in 0 ..< view.directionalPeers.len:
+    view.directionalPeers[idx].peers.sort(
+      proc(a, b: PeerId): int = peerStore.compareNeighborPeers(a, b, view.selfPrefix)
+    )
+    view.directionalPeers[idx].peers.setLen(
+      min(view.directionalPeers[idx].peers.len, directionLimit)
+    )
+  view.directionalPeers.sort(proc(a, b: TopologyNeighborBucket): int =
+    cmp(a.directionDigit, b.directionDigit)
+  )
 
   Opt.some(view)
 

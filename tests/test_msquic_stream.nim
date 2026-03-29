@@ -21,6 +21,10 @@ when defined(libp2p_msquic_experimental):
     copyMem(addr result[0], unsafeAddr data[0], data.len)
 
   suite "MsQuic stream & datagram":
+    proc waitStep[T](fut: Future[T]; label: string): T =
+      check waitFor fut.withTimeout(3.seconds), label
+      fut.read()
+
     test "stream receive events propagate":
       let (handle, initErr) = msdriver.initMsQuicTransport()
       if initErr.len > 0 or handle.isNil:
@@ -179,6 +183,137 @@ when defined(libp2p_msquic_experimental):
 
                 msdriver.closeStream(handle, streamPtr, streamState)
 
+    test "pending inbound stream queue preserves FIFO and sibling close independence":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (connPtr, connStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or connStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = connStateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
+
+              discard nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+
+              proc openStarted(): tuple[streamPtr: pointer, state: msdriver.MsQuicStreamState, id: uint64] =
+                let (streamPtr, streamStateOpt, streamErr) = msdriver.createStream(
+                  handle,
+                  connPtr,
+                  connectionState = connState
+                )
+                check streamErr.len == 0
+                check streamStateOpt.isSome
+                if streamErr.len > 0 or streamStateOpt.isNone:
+                  return (nil, nil, 0'u64)
+                let streamState = streamStateOpt.get()
+                check msdriver.startStream(handle, streamPtr).len == 0
+                let (startEventOpt, startEventErr) =
+                  nextStreamEventOfKind(streamState, quicrt.qseStartComplete)
+                check startEventErr.len == 0
+                check startEventOpt.isSome
+                let idRes = quicrt.streamId(streamState)
+                check idRes.isOk
+                (streamPtr, streamState, if idRes.isOk: idRes.get() else: 0'u64)
+
+              let openedA = openStarted()
+              let openedB = openStarted()
+              let openedC = openStarted()
+              var serverInboundA: msdriver.MsQuicStreamState = nil
+              var serverInboundB: msdriver.MsQuicStreamState = nil
+              var serverInboundC: msdriver.MsQuicStreamState = nil
+              defer:
+                if not openedA.state.isNil:
+                  msdriver.closeStream(handle, openedA.streamPtr, openedA.state)
+                if not openedB.state.isNil:
+                  msdriver.closeStream(handle, openedB.streamPtr, openedB.state)
+                if not openedC.state.isNil:
+                  msdriver.closeStream(handle, openedC.streamPtr, openedC.state)
+                if not serverInboundA.isNil:
+                  msdriver.closeStream(handle, cast[pointer](serverInboundA.stream), serverInboundA)
+                if not serverInboundB.isNil:
+                  msdriver.closeStream(handle, cast[pointer](serverInboundB.stream), serverInboundB)
+                if not serverInboundC.isNil:
+                  msdriver.closeStream(handle, cast[pointer](serverInboundC.stream), serverInboundC)
+
+              let inboundAFut = msdriver.awaitPendingStreamState(serverState)
+              let inboundBFut = msdriver.awaitPendingStreamState(serverState)
+              let inboundCFut = msdriver.awaitPendingStreamState(serverState)
+              check waitFor inboundAFut.withTimeout(3.seconds)
+              check waitFor inboundBFut.withTimeout(3.seconds)
+              check waitFor inboundCFut.withTimeout(3.seconds)
+              serverInboundA = inboundAFut.read()
+              serverInboundB = inboundBFut.read()
+              serverInboundC = inboundCFut.read()
+              check serverInboundA != nil
+              check serverInboundB != nil
+              check serverInboundC != nil
+
+              let inboundAId = quicrt.streamId(serverInboundA)
+              let inboundBId = quicrt.streamId(serverInboundB)
+              let inboundCId = quicrt.streamId(serverInboundC)
+              check inboundAId.isOk
+              check inboundBId.isOk
+              check inboundCId.isOk
+              check @[inboundAId.get(), inboundBId.get(), inboundCId.get()] ==
+                @[openedA.id, openedB.id, openedC.id]
+
+              let payloadA = @[byte 0x11, 0x12]
+              let payloadC = @[byte 0x31, 0x32, 0x33]
+              check waitFor msdriver.writeStreamAndWait(openedA.state, payloadA).withTimeout(3.seconds)
+              let serverReadA = msdriver.readStream(serverInboundA)
+              check waitFor serverReadA.withTimeout(3.seconds)
+              check serverReadA.read() == payloadA
+
+              msdriver.closeStream(handle, cast[pointer](serverInboundB.stream), serverInboundB)
+              serverInboundB = nil
+
+              let replyA = @[byte 0x21]
+              let replyC = @[byte 0x41, 0x42]
+              check waitFor msdriver.writeStreamAndWait(serverInboundA, replyA).withTimeout(3.seconds)
+              let clientReadA = msdriver.readStream(openedA.state)
+              check waitFor clientReadA.withTimeout(3.seconds)
+              check clientReadA.read() == replyA
+
+              check waitFor msdriver.writeStreamAndWait(openedC.state, payloadC).withTimeout(3.seconds)
+              let serverReadC = msdriver.readStream(serverInboundC)
+              check waitFor serverReadC.withTimeout(3.seconds)
+              check serverReadC.read() == payloadC
+              check waitFor msdriver.writeStreamAndWait(serverInboundC, replyC).withTimeout(3.seconds)
+              let clientReadC = msdriver.readStream(openedC.state)
+              check waitFor clientReadC.withTimeout(3.seconds)
+              check clientReadC.read() == replyC
+
     test "locally initiated bidi stream receives delayed server reply on same stream":
       let (handle, initErr) = msdriver.initMsQuicTransport()
       if initErr.len > 0 or handle.isNil:
@@ -258,6 +393,177 @@ when defined(libp2p_msquic_experimental):
                 discard waitFor msdriver.writeStreamAndWait(serverInbound, @[byte 0x41, 0x42, 0x43])
                 check waitFor clientRead.withTimeout(3.seconds)
                 check clientRead.read() == @[byte 0x41, 0x42, 0x43]
+
+    test "locally initiated bidi stream supports multi-turn request and reply on same stream":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (connPtr, connStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or connStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = connStateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
+
+              discard nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+
+              let (streamPtr, streamStateOpt, streamErr) = msdriver.createStream(
+                handle,
+                connPtr,
+                connectionState = connState
+              )
+              if streamErr.len > 0 or streamStateOpt.isNone:
+                echo "MsQuic stream unavailable: ", streamErr
+                skip()
+              else:
+                let clientStream = streamStateOpt.get()
+                defer:
+                  msdriver.closeStream(handle, streamPtr, clientStream)
+
+                check msdriver.startStream(handle, streamPtr).len == 0
+                let (startEventOpt, startEventErr) =
+                  nextStreamEventOfKind(clientStream, quicrt.qseStartComplete)
+                check startEventErr.len == 0
+                check startEventOpt.isSome
+
+                let serverInboundFut = msdriver.awaitPendingStreamState(serverState)
+                check waitFor serverInboundFut.withTimeout(3.seconds)
+                let serverInbound = serverInboundFut.read()
+                check serverInbound != nil
+
+                let request1 = @[byte 0x10, 0x20, 0x30]
+                check waitStep(msdriver.writeStreamAndWait(clientStream, request1), "client write request1") == ""
+
+                let serverRead1 = msdriver.readStream(serverInbound)
+                check waitStep(serverRead1, "server read request1") == request1
+
+                let clientRead1 = msdriver.readStream(clientStream)
+                waitFor sleepAsync(100.milliseconds)
+                check waitStep(msdriver.writeStreamAndWait(serverInbound, @[byte 0x41, 0x42]), "server write reply1") == ""
+                check waitStep(clientRead1, "client read reply1") == @[byte 0x41, 0x42]
+
+                let request2 = @[byte 0x31, 0x32, 0x33, 0x34]
+                check waitStep(msdriver.writeStreamAndWait(clientStream, request2), "client write request2") == ""
+
+                let serverRead2 = msdriver.readStream(serverInbound)
+                check waitStep(serverRead2, "server read request2") == request2
+
+                let clientRead2 = msdriver.readStream(clientStream)
+                waitFor sleepAsync(300.milliseconds)
+                check waitStep(msdriver.writeStreamAndWait(serverInbound, @[byte 0x51, 0x52, 0x53]), "server write reply2") == ""
+                check waitStep(clientRead2, "client read reply2") == @[byte 0x51, 0x52, 0x53]
+
+                let request3 = @[byte 0x61]
+                check waitStep(msdriver.writeStreamAndWait(clientStream, request3), "client write request3") == ""
+
+                let serverRead3 = msdriver.readStream(serverInbound)
+                check waitStep(serverRead3, "server read request3") == request3
+
+    test "same stream sequential server writes each wait for their own completion":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (connPtr, connStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or connStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = connStateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
+
+              discard nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+
+              let (streamPtr, streamStateOpt, streamErr) = msdriver.createStream(
+                handle,
+                connPtr,
+                connectionState = connState
+              )
+              if streamErr.len > 0 or streamStateOpt.isNone:
+                echo "MsQuic stream unavailable: ", streamErr
+                skip()
+              else:
+                let clientStream = streamStateOpt.get()
+                defer:
+                  msdriver.closeStream(handle, streamPtr, clientStream)
+
+                check msdriver.startStream(handle, streamPtr).len == 0
+                discard nextStreamEventOfKind(clientStream, quicrt.qseStartComplete)
+
+                let serverInboundFut = msdriver.awaitPendingStreamState(serverState)
+                check waitFor serverInboundFut.withTimeout(3.seconds)
+                let serverInbound = serverInboundFut.read()
+                check serverInbound != nil
+
+                let clientRead1 = msdriver.readStream(clientStream)
+                let clientRead2 = msdriver.readStream(clientStream)
+                let clientRead3 = msdriver.readStream(clientStream)
+
+                check waitStep(msdriver.writeStreamAndWait(serverInbound, @[byte 0x41]), "server write 1") == ""
+                check waitStep(msdriver.writeStreamAndWait(serverInbound, @[byte 0x42, 0x43]), "server write 2") == ""
+                check waitStep(msdriver.writeStreamAndWait(serverInbound, @[byte 0x44, 0x45, 0x46]), "server write 3") == ""
+
+                check waitStep(clientRead1, "client read 1") == @[byte 0x41]
+                check waitStep(clientRead2, "client read 2") == @[byte 0x42, 0x43]
+                check waitStep(clientRead3, "client read 3") == @[byte 0x44, 0x45, 0x46]
 
     test "same inbound stream second payload does not reappear as new pending stream":
       let (handle, initErr) = msdriver.initMsQuicTransport()
@@ -387,8 +693,7 @@ when defined(libp2p_msquic_experimental):
                 handle,
                 clientConnPtr,
                 clientConnState,
-                nil,
-                true
+                createPrimaryStream = true
               )
               defer:
                 if not clientConn.isNil:
@@ -404,7 +709,8 @@ when defined(libp2p_msquic_experimental):
                 serverConnPtr,
                 serverConnState,
                 cast[pointer](serverInbound.stream),
-                true
+                primaryStreamState = serverInbound,
+                createPrimaryStream = true
               )
               defer:
                 if not serverConn.isNil:
@@ -738,6 +1044,86 @@ when defined(libp2p_msquic_experimental):
                 check waitFor eofFuture.withTimeout(3.seconds)
                 expect LPStreamEOFError:
                   discard eofFuture.read()
+
+    test "large writeLp payload is segmented and reassembled end-to-end":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          let (connPtr, connStateOpt, dialErr) =
+            msdriver.dialConnection(handle, LoopbackDialHost, listener.port)
+          if dialErr.len > 0 or connStateOpt.isNone:
+            echo "MsQuic dial unavailable: ", dialErr
+            skip()
+          else:
+            let connState = connStateOpt.get()
+            let (serverConnPtr, serverStateOpt, acceptErr) =
+              acceptPendingConnection(listener.state)
+            if acceptErr.len > 0 or serverStateOpt.isNone:
+              echo "MsQuic accept unavailable: ", acceptErr
+              skip()
+            else:
+              let serverState = serverStateOpt.get()
+              defer:
+                discard msdriver.shutdownConnection(handle, serverConnPtr)
+                msdriver.closeConnection(handle, serverConnPtr, serverState)
+                discard msdriver.shutdownConnection(handle, connPtr)
+                msdriver.closeConnection(handle, connPtr, connState)
+
+              discard nextConnectionEventOfKind(connState, quicrt.qceConnected)
+              discard nextConnectionEventOfKind(serverState, quicrt.qceConnected)
+
+              let (streamPtr, streamStateOpt, streamErr) = msdriver.createStream(
+                handle,
+                connPtr,
+                connectionState = connState
+              )
+              if streamErr.len > 0 or streamStateOpt.isNone:
+                echo "MsQuic stream unavailable: ", streamErr
+                skip()
+              else:
+                let clientState = streamStateOpt.get()
+                defer:
+                  msdriver.closeStream(handle, streamPtr, clientState)
+
+                check msdriver.startStream(handle, streamPtr).len == 0
+                let (startEventOpt, startEventErr) =
+                  nextStreamEventOfKind(clientState, quicrt.qseStartComplete)
+                check startEventErr.len == 0
+                check startEventOpt.isSome
+
+                let serverInboundFut = msdriver.awaitPendingStreamState(serverState)
+                check waitFor serverInboundFut.withTimeout(3.seconds)
+                let serverInbound = serverInboundFut.read()
+                check serverInbound != nil
+
+                let clientStream = newMsQuicStream(clientState, handle, Direction.Out)
+                let serverStream = newMsQuicStream(serverInbound, handle, Direction.In)
+                var payload = newString(4096)
+                for idx in 0 ..< payload.len:
+                  payload[idx] = char(ord('a') + (idx mod 26))
+
+                let writeFuture = clientStream.writeLp(payload)
+                check waitFor writeFuture.withTimeout(3.seconds)
+
+                let readLpFuture = serverStream.readLp(payload.len + 64)
+                check waitFor readLpFuture.withTimeout(3.seconds)
+                check bytesToString(readLpFuture.read()) == payload
 
     test "datagram send surfaces connection event":
       let (handle, initErr) = msdriver.initMsQuicTransport()

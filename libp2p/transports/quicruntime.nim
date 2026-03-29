@@ -868,7 +868,8 @@ when defined(libp2p_msquic_experimental):
       userContext: pointer = nil,
       addressFamily: uint16 = 0,
       queueLimit: int = 0,
-      pollInterval: Duration = DefaultEventPollInterval
+      pollInterval: Duration = DefaultEventPollInterval,
+      transportHost: string = ""
   ): tuple[
       connection: pointer, state: Option[QuicRuntimeConnectionState], error: string
     ] {.raises: [].} =
@@ -881,7 +882,8 @@ when defined(libp2p_msquic_experimental):
       adapter.userContext,
       addressFamily,
       queueLimit,
-      pollInterval
+      pollInterval,
+      transportHost = transportHost
     )
     if adapter.context.isNil:
       return
