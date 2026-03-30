@@ -147,7 +147,9 @@ type
 var relayRegistryLock {.global.}: Lock
 var relayNextRouteId {.global.}: int
 var relayOwnerTasks {.global.}: Table[int, seq[TsnetRelayTaskHandle]] = initTable[int, seq[TsnetRelayTaskHandle]]()
-var relayReadyRoutes {.global.}: Table[int, HashSet[string]] = initTable[int, HashSet[string]]()
+var relayOwnerClients {.global.}: Table[int, Table[string, TsnetQuicRelayClient]] =
+  initTable[int, Table[string, TsnetQuicRelayClient]]()
+var relayReadyRoutes {.global.}: HashSet[string] = initHashSet[string]()
 var relayUdpDialStates {.global.}: Table[int, Table[string, TsnetUdpDialDiagnostic]] =
   initTable[int, Table[string, TsnetUdpDialDiagnostic]]()
 var relayListenerStates {.global.}: Table[int, Table[string, TsnetRelayListenerDiagnostic]] =
@@ -199,6 +201,15 @@ proc normalizedRelayKind(kind, route: string): string {.gcsafe, raises: [].} =
     return "udp"
   "tcp"
 
+proc relayReadyRouteKey(ownerId: int, route: string): string =
+  let normalizedRoute = route.strip()
+  if ownerId <= 0 or normalizedRoute.len == 0:
+    ""
+  else:
+    $ownerId & "|" & normalizedRoute
+
+proc closeOwnerRelayClients(ownerId: int) {.gcsafe, raises: [].}
+
 proc bracketAuthorityHost(host: string): string =
   if host.contains(":") and not host.startsWith("["):
     "[" & host & "]"
@@ -227,7 +238,7 @@ proc detectAddressFamily(host: string): uint16 =
       return 0'u16
   2'u16
 
-proc enumerateLocalInterfaceAddrs(): HashSet[string] =
+proc enumerateLocalInterfaceAddrs(): HashSet[string] {.gcsafe, raises: [].} =
   result = initHashSet[string]()
   var ifap: ptr Ifaddrs = nil
   try:
@@ -262,7 +273,7 @@ proc enumerateLocalInterfaceAddrs(): HashSet[string] =
   except CatchableError:
     discard
 
-proc tlsServerName(host: string): Option[string] =
+proc tlsServerName(host: string): Option[string] {.gcsafe, raises: [].} =
   if host.len == 0:
     return none(string)
   let suppressIpSni =
@@ -271,6 +282,8 @@ proc tlsServerName(host: string): Option[string] =
   if suppressIpSni and detectAddressFamily(host) != 0'u16:
     return none(string)
   some(host)
+
+proc isLoopbackRelayHost(host: string): bool {.gcsafe, raises: [].}
 
 proc parseRuntimePreference(raw: string): Option[qrt.QuicRuntimePreference] =
   case raw.strip().toLowerAscii()
@@ -288,7 +301,7 @@ proc relayRuntimePreference(
 ): qrt.QuicRuntimePreference =
   parseRuntimePreference(getEnv("NIM_TSNET_RELAY_QUIC_RUNTIME", "")).get(defaultPreference)
 
-proc resolveDialHost(host: string, port: uint16): Result[string, string] =
+proc resolveDialHost(host: string, port: uint16): Result[string, string] {.gcsafe, raises: [].} =
   if host.len == 0:
     return err("nim_quic relay host is empty")
   if detectAddressFamily(host) != 0'u16:
@@ -312,6 +325,9 @@ proc resolveDialHost(host: string, port: uint16): Result[string, string] =
     except CatchableError:
       discard
   err("failed to resolve nim_quic relay host " & host)
+
+proc resolveDialHostForTest*(host: string, port: uint16): Result[string, string] {.gcsafe, raises: [].} =
+  resolveDialHost(host, port)
 
 proc quicRelayTrace(message: string) =
   try:
@@ -451,7 +467,7 @@ proc parseDirectCandidate(text: string): Option[MultiAddress] =
     return
   some(parsed.get())
 
-proc isLoopbackRelayHost(host: string): bool =
+proc isLoopbackRelayHost(host: string): bool {.gcsafe, raises: [].} =
   let normalized = host.strip().toLowerAscii()
   normalized == "localhost" or
     normalized == "127.0.0.1" or
@@ -742,6 +758,19 @@ proc closeQuicRelayClient(client: TsnetQuicRelayClient) =
 
 proc relayHandshakeComplete(
     connState: msquicdrv.MsQuicConnectionState
+): bool {.gcsafe, raises: [].}
+
+proc relayClientUsable(client: TsnetQuicRelayClient): bool {.gcsafe, raises: [].} =
+  not client.isNil and
+    not client.handle.isNil and
+    not client.connPtr.isNil and
+    not client.connState.isNil and
+    not client.connState.closed and
+    (relayHandshakeComplete(client.connState) or
+      isLoopbackRelayHost(client.endpoint.host))
+
+proc relayHandshakeComplete(
+    connState: msquicdrv.MsQuicConnectionState
 ): bool {.gcsafe, raises: [].} =
   if connState.isNil:
     return false
@@ -956,6 +985,24 @@ proc writeJsonMessage(
   if encodedBytes.len > 0:
     await sleepAsync(QuicRelayWriteDrainDelay)
 
+proc writeJsonMessageWithTimeout(
+    stream: MsQuicStream,
+    payload: JsonNode,
+    timeout: Duration,
+    label: string
+) {.async: (raises: [CancelledError, CatchableError]).} =
+  let writeFut = writeJsonMessage(stream, payload)
+  let timeoutFut = sleepAsync(timeout)
+  let winner = await race(cast[FutureBase](writeFut), cast[FutureBase](timeoutFut))
+  if winner == cast[FutureBase](timeoutFut):
+    writeFut.cancelSoon()
+    raise newException(
+      IOError,
+      "nim_quic relay timed out writing " & label & " after " & $timeout
+    )
+  timeoutFut.cancelSoon()
+  await writeFut
+
 proc readJsonMessageWithTimeout(
     stream: MsQuicStream,
     timeout: Duration,
@@ -979,6 +1026,14 @@ proc relayRouteStatus(
     timeout: Duration = QuicRelayRpcTimeout
 ): Future[Result[bool, string]] {.async: (raises: [CancelledError]).}
 
+proc markRelayListenerStage*(
+    ownerId: int,
+    route: string,
+    kind: string,
+    stage: string,
+    detail = ""
+) {.gcsafe, raises: [].}
+
 proc ensureRelayRoutePublishedOnConnection(
     client: TsnetQuicRelayClient,
     route: string,
@@ -988,6 +1043,14 @@ proc ensureRelayRoutePublishedOnConnection(
 
 proc clearRelayReadyRoute(ownerId: int, route: string) {.gcsafe, raises: [].}
 
+proc relayListenerStage(ownerId: int, route: string): string {.gcsafe, raises: [].} =
+  quicRelaySafe:
+    if ownerId > 0 and route.len > 0:
+      withLock(relayRegistryLock):
+        let states = relayListenerStates.getOrDefault(ownerId)
+        if states.hasKey(route):
+          result = states.getOrDefault(route).stage
+
 proc ensureRelayRoutePublished(
     endpoint: TsnetQuicRelayEndpoint,
     route: string,
@@ -995,6 +1058,13 @@ proc ensureRelayRoutePublished(
     attempts = QuicRelayRoutePublishAttempts,
     timeout: Duration = QuicRelayRpcTimeout
 ): Result[void, string] {.gcsafe, raises: [].}
+
+proc probeRelayRoutePublished(
+    endpoint: TsnetQuicRelayEndpoint,
+    route: string,
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly,
+    timeout: Duration = QuicRelayRpcTimeout
+): Result[bool, string] {.gcsafe, raises: [].}
 
 proc awaitPersistentIncomingWithRouteValidation(
     client: TsnetQuicRelayClient,
@@ -1020,6 +1090,13 @@ proc awaitPersistentIncomingWithRouteValidation(
         let published = await relayRouteStatus(client, route, QuicRelayRpcTimeout)
         if published.isErr():
           clearRelayReadyRoute(ownerId, route)
+          markRelayListenerStage(
+            ownerId,
+            route,
+            normalizedRelayKind("", route),
+            "dropped",
+            published.error
+          )
           raise newException(
             IOError,
             "nim_quic relay route validation failed routeId=" & $routeId &
@@ -1028,6 +1105,13 @@ proc awaitPersistentIncomingWithRouteValidation(
           )
         if not published.get():
           clearRelayReadyRoute(ownerId, route)
+          markRelayListenerStage(
+            ownerId,
+            route,
+            normalizedRelayKind("", route),
+            "dropped",
+            "route_not_published"
+          )
           raise newException(
             IOError,
             "nim_quic relay route lost routeId=" & $routeId &
@@ -1356,6 +1440,23 @@ proc ensureRelayRoutePublished(
         " err=" & lastError
       )
   err(lastError)
+
+proc probeRelayRoutePublished(
+    endpoint: TsnetQuicRelayEndpoint,
+    route: string,
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly,
+    timeout: Duration = QuicRelayRpcTimeout
+): Result[bool, string] {.gcsafe, raises: [].} =
+  if route.len == 0:
+    return err("nim_quic relay route is empty")
+  let probeClient = connectRelay(endpoint, runtimePreference).valueOr:
+    return err("nim_quic relay route_status connect failed: " & error)
+  try:
+    waitFor relayRouteStatus(probeClient, route, timeout)
+  except CatchableError as exc:
+    err("nim_quic relay route_status raised: " & exc.msg)
+  finally:
+    closeQuicRelayClient(probeClient)
 
 proc confirmRelayListenRegistration(
     regStream: MsQuicStream,
@@ -1728,9 +1829,9 @@ proc relayRegisterTask(
       datagram: datagram,
       task: task
     )
-    var handles = relayOwnerTasks.getOrDefault(ownerId)
-    handles.add(result)
-    relayOwnerTasks[ownerId] = handles
+    var ownerTasks = relayOwnerTasks.getOrDefault(ownerId)
+    ownerTasks.add(result)
+    relayOwnerTasks[ownerId] = ownerTasks
 
 proc relayOwnerTaskCount(ownerId: int): int =
   if ownerId <= 0:
@@ -1751,31 +1852,32 @@ proc relayRegisterTaskSafe(
 
 proc markRelayRouteReady(ownerId: int, route: string) {.gcsafe, raises: [].} =
   quicRelaySafe:
-    if ownerId <= 0 or route.len == 0:
+    let key = relayReadyRouteKey(ownerId, route)
+    if key.len == 0:
       return
     withLock(relayRegistryLock):
-      var routes = relayReadyRoutes.getOrDefault(ownerId)
-      routes.incl(route)
-      relayReadyRoutes[ownerId] = routes
+      relayReadyRoutes.incl(key)
 
 proc clearRelayReadyRoute(ownerId: int, route: string) {.gcsafe, raises: [].} =
   quicRelaySafe:
-    if ownerId <= 0 or route.len == 0:
+    let key = relayReadyRouteKey(ownerId, route)
+    if key.len == 0:
       return
     withLock(relayRegistryLock):
-      var routes = relayReadyRoutes.getOrDefault(ownerId)
-      routes.excl(route)
-      if routes.len == 0:
-        relayReadyRoutes.del(ownerId)
-      else:
-        relayReadyRoutes[ownerId] = routes
+      relayReadyRoutes.excl(key)
 
 proc clearRelayReadyRoutes(ownerId: int) {.gcsafe, raises: [].} =
   quicRelaySafe:
     if ownerId <= 0:
       return
     withLock(relayRegistryLock):
-      relayReadyRoutes.del(ownerId)
+      let prefix = $ownerId & "|"
+      var staleKeys: seq[string] = @[]
+      for key in relayReadyRoutes.items:
+        if key.startsWith(prefix):
+          staleKeys.add(key)
+      for key in staleKeys:
+        relayReadyRoutes.excl(key)
 
 proc markRelayListenerStage*(
     ownerId: int,
@@ -1788,15 +1890,15 @@ proc markRelayListenerStage*(
     if ownerId <= 0 or route.len == 0 or stage.len == 0:
       return
     withLock(relayRegistryLock):
-      var states = relayListenerStates.getOrDefault(ownerId)
-      states[route] = TsnetRelayListenerDiagnostic(
+      var ownerStates = relayListenerStates.getOrDefault(ownerId)
+      ownerStates[route] = TsnetRelayListenerDiagnostic(
         route: route,
         kind: normalizedRelayKind(kind, route),
         stage: stage,
         detail: detail,
         updatedUnixMilli: currentUnixMilli()
       )
-      relayListenerStates[ownerId] = states
+      relayListenerStates[ownerId] = ownerStates
 
 proc relayListenerStatesPayload*(ownerId: int): JsonNode {.gcsafe, raises: [].} =
   result = newJArray()
@@ -1824,15 +1926,22 @@ proc markUdpDialProgress(
   quicRelaySafe:
     if ownerId <= 0 or rawKey.len == 0:
       return
+    quicRelayTrace(
+      "udp dial state update owner=" & $ownerId &
+      " rawKey=" & rawKey &
+      " phase=" & phase &
+      " detail=" & detail &
+      " attempts=" & $attempts
+    )
     withLock(relayRegistryLock):
-      var states = relayUdpDialStates.getOrDefault(ownerId)
-      states[rawKey] = TsnetUdpDialDiagnostic(
+      var ownerStates = relayUdpDialStates.getOrDefault(ownerId)
+      ownerStates[rawKey] = TsnetUdpDialDiagnostic(
         phase: phase,
         detail: detail,
         attempts: max(0, attempts),
         updatedUnixMilli: currentUnixMilli()
       )
-      relayUdpDialStates[ownerId] = states
+      relayUdpDialStates[ownerId] = ownerStates
 
 proc markUdpDialPending(ownerId: int, rawKey: string) {.gcsafe, raises: [].} =
   markUdpDialProgress(ownerId, rawKey, "pending")
@@ -1862,20 +1971,25 @@ proc udpDialState*(
       return
     withLock(relayRegistryLock):
       let states = relayUdpDialStates.getOrDefault(ownerId)
-      if not states.hasKey(rawKey):
-        return
-      result.known = true
-      let value = states.getOrDefault(rawKey)
-      result.phase = value.phase
-      result.detail = value.detail
-      result.attempts = value.attempts
-      result.updatedUnixMilli = value.updatedUnixMilli
-      if value.phase == "ready" or value.phase == "active":
-        result.ready = true
-      elif value.phase == "failed":
-        result.error =
-          if value.detail.len > 0: value.detail
-          else: "udp_dial_failed"
+      if states.hasKey(rawKey):
+        let value = states.getOrDefault(rawKey)
+        result.known = true
+        result.phase = value.phase
+        result.detail = value.detail
+        result.attempts = value.attempts
+        result.updatedUnixMilli = value.updatedUnixMilli
+        if value.phase == "ready" or value.phase == "active":
+          result.ready = true
+        elif value.phase == "failed":
+          result.error =
+            if value.detail.len > 0: value.detail
+            else: "udp_dial_failed"
+      else:
+        quicRelayTrace(
+          "udp dial state lookup miss owner=" & $ownerId &
+          " rawKey=" & rawKey &
+          " knownStates=" & $states.len
+        )
 
 proc udpDialStatesPayload*(ownerId: int): JsonNode {.gcsafe, raises: [].} =
   result = newJArray()
@@ -1896,14 +2010,73 @@ proc udpDialStatesPayload*(ownerId: int): JsonNode {.gcsafe, raises: [].} =
 
 proc udpRelayRouteReady*(ownerId: int, route: string): bool {.gcsafe, raises: [].} =
   quicRelaySafe:
-    if ownerId <= 0 or route.len == 0:
+    let key = relayReadyRouteKey(ownerId, route)
+    if key.len == 0:
       return false
     withLock(relayRegistryLock):
-      let routes = relayReadyRoutes.getOrDefault(ownerId)
-      result = route in routes
+      result = key in relayReadyRoutes
 
 proc relayRouteReady*(ownerId: int, route: string): bool {.gcsafe, raises: [].} =
   udpRelayRouteReady(ownerId, route)
+
+proc relayRouteReadyOrPublished*(
+    ownerId: int,
+    endpointUrl: string,
+    route: string,
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly
+): bool {.gcsafe, raises: [].} =
+  let hadLocalReady = relayRouteReady(ownerId, route)
+  let previousStage = relayListenerStage(ownerId, route).toLowerAscii()
+  if route.len == 0 or endpointUrl.strip().len == 0:
+    if hadLocalReady or previousStage.len > 0:
+      clearRelayReadyRoute(ownerId, route)
+      markRelayListenerStage(
+        ownerId,
+        route,
+        normalizedRelayKind("", route),
+        "dropped",
+        "route_status_unavailable"
+      )
+    return false
+  let endpointRes = quicRelayEndpoint(endpointUrl)
+  if endpointRes.isErr():
+    if hadLocalReady or previousStage.len > 0:
+      clearRelayReadyRoute(ownerId, route)
+      markRelayListenerStage(
+        ownerId,
+        route,
+        normalizedRelayKind("", route),
+        "dropped",
+        endpointRes.error
+      )
+    return false
+  let published = probeRelayRoutePublished(
+    endpointRes.get(),
+    route,
+    runtimePreference
+  )
+  quicRelayTrace(
+    "relay route ready check owner=" & $ownerId &
+    " route=" & route &
+    " hadLocalReady=" & $hadLocalReady &
+    " previousStage=" & previousStage &
+    " publishedOk=" & $published.isOk() &
+    " published=" & $(if published.isOk(): published.get() else: false) &
+    " err=" & (if published.isErr(): published.error else: "")
+  )
+  if published.isOk() and published.get():
+    markRelayRouteReady(ownerId, route)
+    return true
+  clearRelayReadyRoute(ownerId, route)
+  if hadLocalReady or previousStage.len > 0:
+    markRelayListenerStage(
+      ownerId,
+      route,
+      normalizedRelayKind("", route),
+      "dropped",
+      if published.isOk(): "route_not_published" else: published.error
+    )
+  false
 
 proc stopRelayListeners*(ownerId: int) =
   if ownerId <= 0:
@@ -1912,7 +2085,13 @@ proc stopRelayListeners*(ownerId: int) =
   withLock(relayRegistryLock):
     handles = relayOwnerTasks.getOrDefault(ownerId)
     relayOwnerTasks.del(ownerId)
-    relayReadyRoutes.del(ownerId)
+    let prefix = $ownerId & "|"
+    var staleKeys: seq[string] = @[]
+    for key in relayReadyRoutes.items:
+      if key.startsWith(prefix):
+        staleKeys.add(key)
+    for key in staleKeys:
+      relayReadyRoutes.excl(key)
     relayUdpDialStates.del(ownerId)
     relayListenerStates.del(ownerId)
   for handle in handles:
@@ -1929,6 +2108,7 @@ proc stopRelayListeners*(ownerId: int) =
         discard
     if not handle.task.isNil and not handle.task.finished():
       handle.task.cancelSoon()
+  closeOwnerRelayClients(ownerId)
 
 proc new*(_: type[TsnetQuicRelayGateway]): TsnetQuicRelayGateway =
   result = TsnetQuicRelayGateway(
@@ -2266,6 +2446,12 @@ proc clearListenerRoute(
   finally:
     release(gateway.listenersLock)
 
+proc dropListenerRouteForTests*(
+    gateway: TsnetQuicRelayGateway,
+    route: string
+) =
+  gateway.clearListenerRoute(route)
+
 proc serveRelayStream(
     gateway: TsnetQuicRelayGateway,
     connPtr: pointer,
@@ -2291,11 +2477,11 @@ proc serveRelayStream(
         nil
       )
       quicRelayTrace("gateway stored listener route=" & route)
-      await writeJsonMessage(stream, rpcSuccess(%*{
+      await writeJsonMessageWithTimeout(stream, rpcSuccess(%*{
           "mode": "listen",
           "route": route,
           "candidates": candidates
-      }))
+      }), QuicRelayRpcTimeout, "gateway listen ack")
     of "accept":
       if not gateway.attachListenerStream(route, connPtr, connState, stream):
         quicRelayTrace("gateway missing accept route=" & route)
@@ -2307,10 +2493,10 @@ proc serveRelayStream(
       # through `finally` and close the long-lived stream.
       keepOpen = true
       quicRelayTrace("gateway accept stream attached route=" & route)
-      await writeJsonMessage(stream, rpcSuccess(%*{
+      await writeJsonMessageWithTimeout(stream, rpcSuccess(%*{
         "mode": "accept",
         "route": route
-      }))
+      }), QuicRelayAcceptAckTimeout, "gateway accept ack")
       quicRelayTrace("gateway accept ack sent route=" & route)
       try:
         while gateway.running:
@@ -2328,11 +2514,11 @@ proc serveRelayStream(
                 IOError,
                 "nim_quic relay accept stream lost attached listener route"
               )
-            await writeJsonMessage(stream, rpcSuccess(%*{
+            await writeJsonMessageWithTimeout(stream, rpcSuccess(%*{
               "op": "await",
               "route": route,
               "published": true
-            }))
+            }), QuicRelayAcceptAckTimeout, "gateway await ack")
             quicRelayTrace("gateway listener await registered route=" & route)
           of "ready":
             if gateway.completePersistentListenerReady(route, stream, controlMsg):
@@ -2426,13 +2612,13 @@ proc serveRelayStream(
         var ready: JsonNode = nil
         try:
           quicRelayTrace("gateway listener incoming_write_begin route=" & route)
-          await writeJsonMessage(listenerControlStream, %*{
+          await writeJsonMessageWithTimeout(listenerControlStream, %*{
             "op": "incoming",
             "route": route,
             "source": source,
             "candidates": candidates,
             "sessionId": pendingBridgeSessionId
-          })
+          }, QuicRelayAcceptAckTimeout, "gateway incoming")
           quicRelayTrace("gateway listener incoming_write_done route=" & route)
           quicRelayTrace("gateway listener ready_wait_begin route=" & route & " persistent=true")
           ready = await awaitJsonFutureWithTimeout(
@@ -2482,17 +2668,17 @@ proc serveRelayStream(
             )
             await writeJsonMessage(stream, rpcError("listener_not_ready"))
             return
-        await writeJsonMessage(listenerDataStream, rpcSuccess(%*{
+        await writeJsonMessageWithTimeout(listenerDataStream, rpcSuccess(%*{
           "mode": "bridge_attach",
           "route": route,
           "sessionId": pendingBridgeSessionId
-        }))
-        await writeJsonMessage(stream, rpcSuccess(%*{
+        }), QuicRelayRpcTimeout, "gateway bridge attach ack")
+        await writeJsonMessageWithTimeout(stream, rpcSuccess(%*{
           "mode": "dial",
           "route": route,
           "candidates": listenerCandidates,
           "sessionId": pendingBridgeSessionId
-        }))
+        }), QuicRelayRpcTimeout, "gateway dial ack")
         quicRelayTrace("gateway bridging route=" & route)
         gateway.releaseListenerRoute(route)
         routeLockHeld = false
@@ -2800,27 +2986,64 @@ proc connectRelay(
         except CatchableError:
           discard
       continue
-    if isLoopbackRelayHost(endpoint.host):
-      return ok(client)
-    let pinged = ensureRelayReady(client, endpoint)
-    if pinged.isOk():
-      return ok(client)
-    let readyErr = pinged.error
-    failures.add(readyErr)
-    quicRelayTrace(
-      "relay readiness failed endpoint=" & endpoint.url &
-      " attempt=" & $(attempt + 1) &
-      " err=" & readyErr
-    )
-    closeQuicRelayClient(client)
-    if attempt + 1 < QuicRelayConnectAttempts:
-      try:
-        waitFor sleepAsync(QuicRelayConnectRetryBackoff)
-      except CatchableError:
-        discard
+    return ok(client)
   if failures.len == 0:
     return err("nim_quic relay connect failed")
   err(failures.join("; "))
+
+proc sharedRelayClient(
+    ownerId: int,
+    endpoint: TsnetQuicRelayEndpoint,
+    runtimePreference: qrt.QuicRuntimePreference = qrt.qrpBuiltinOnly,
+    allowWithoutConnected = true
+): Result[TsnetQuicRelayClient, string] {.gcsafe, raises: [].} =
+  if ownerId <= 0:
+    return connectRelay(endpoint, runtimePreference, allowWithoutConnected)
+  var cached: TsnetQuicRelayClient = nil
+  var stale: TsnetQuicRelayClient = nil
+  quicRelaySafe:
+    withLock(relayRegistryLock):
+      let ownerClients = relayOwnerClients.getOrDefault(ownerId)
+      if ownerClients.hasKey(endpoint.url):
+        cached = ownerClients.getOrDefault(endpoint.url)
+  if not relayClientUsable(cached):
+    stale = cached
+    cached = nil
+    quicRelaySafe:
+      withLock(relayRegistryLock):
+        if relayOwnerClients.hasKey(ownerId):
+          var perOwner = relayOwnerClients.getOrDefault(ownerId)
+          if perOwner.getOrDefault(endpoint.url) == stale:
+            perOwner.del(endpoint.url)
+            relayOwnerClients[ownerId] = perOwner
+          if perOwner.len == 0:
+            relayOwnerClients.del(ownerId)
+  if relayClientUsable(cached):
+    return ok(cached)
+  if not stale.isNil:
+    closeQuicRelayClient(stale)
+  let fresh = connectRelay(endpoint, runtimePreference, allowWithoutConnected).valueOr:
+    return err(error)
+  quicRelaySafe:
+    withLock(relayRegistryLock):
+      var ownerClients = relayOwnerClients.getOrDefault(ownerId)
+      ownerClients[endpoint.url] = fresh
+      relayOwnerClients[ownerId] = ownerClients
+  ok(fresh)
+
+proc closeOwnerRelayClients(ownerId: int) {.gcsafe, raises: [].} =
+  if ownerId <= 0:
+    return
+  var stale: seq[TsnetQuicRelayClient] = @[]
+  quicRelaySafe:
+    withLock(relayRegistryLock):
+      let ownerClients = relayOwnerClients.getOrDefault(ownerId)
+      if ownerClients.len > 0:
+        for client in ownerClients.values:
+          stale.add(client)
+        relayOwnerClients.del(ownerId)
+  for client in stale:
+    closeQuicRelayClient(client)
 
 proc keepRelayConnectionAlive(
     client: TsnetQuicRelayClient,
@@ -3519,7 +3742,7 @@ proc listenerLoop(
         quicRelayTrace("listener endpoint parse failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
-      let client = connectRelay(endpoint).valueOr:
+      let client = sharedRelayClient(ownerId, endpoint).valueOr:
         markRelayListenerStage(ownerId, route, "tcp", "failed", error)
         quicRelayTrace("listener relay connect failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
@@ -3537,7 +3760,12 @@ proc listenerLoop(
           "candidates": []
         }
         try:
-          await writeJsonMessage(regStream, hello)
+          await writeJsonMessageWithTimeout(
+            regStream,
+            hello,
+            QuicRelayRpcTimeout,
+            "listener register"
+          )
           quicRelayTrace(
             "listener registration sent routeId=" & $routeId &
             " route=" & route &
@@ -3587,12 +3815,12 @@ proc listenerLoop(
               restart = true
               break
             try:
-              await writeJsonMessage(acceptStream, %*{
+              await writeJsonMessageWithTimeout(acceptStream, %*{
                 "version": 1,
                 "mode": "accept",
                 "kind": "tcp",
                 "route": route
-              })
+              }, QuicRelayAcceptAckTimeout, "listener accept")
               let acceptAck = await readJsonMessageWithTimeout(
                 acceptStream,
                 QuicRelayAcceptAckTimeout,
@@ -3619,10 +3847,10 @@ proc listenerLoop(
               restart = true
               break
           try:
-            await writeJsonMessage(acceptStream, %*{
+            await writeJsonMessageWithTimeout(acceptStream, %*{
               "op": "await",
               "route": route
-            })
+            }, QuicRelayAcceptAckTimeout, "listener await")
             let awaitAck = await readJsonMessageWithTimeout(
               acceptStream,
               QuicRelayAcceptAckTimeout,
@@ -3668,6 +3896,11 @@ proc listenerLoop(
             break
           let controlStream =
             try:
+              # The attached accept stream is the authoritative long-lived
+              # rendezvous channel. After the gateway has acknowledged `await`,
+              # keep this stream single-purpose and wait only for `incoming`.
+              # Route publication validation must stay inside this wait path,
+              # not inside read-only status APIs.
               await awaitPersistentIncomingWithRouteValidation(
                 client,
                 acceptStream,
@@ -3733,12 +3966,12 @@ proc listenerLoop(
               except CatchableError:
                 discard
           try:
-            await writeJsonMessage(acceptStream, %*{
+            await writeJsonMessageWithTimeout(acceptStream, %*{
               "ok": true,
               "op": "ready",
               "candidates": [],
               "sessionId": bridgeSessionId
-            })
+            }, QuicRelayAcceptAckTimeout, "listener ready")
             markRelayListenerStage(ownerId, route, "tcp", "ready")
             quicRelayTrace("listener ready routeId=" & $routeId & " route=" & route)
           except CatchableError:
@@ -3806,11 +4039,11 @@ proc listenerLoop(
           continue
         if not restart:
           break
-        markRelayListenerStage(ownerId, route, "tcp", "restarting")
+        if relayListenerStage(ownerId, route).toLowerAscii() != "dropped":
+          markRelayListenerStage(ownerId, route, "tcp", "restarting")
         if not acceptStream.isNil:
           await acceptStream.closeQuicStream()
       await regStream.closeQuicStream()
-      closeQuicRelayClient(client)
       await sleepAsync(200.milliseconds)
   except CancelledError:
     discard
@@ -3870,7 +4103,7 @@ proc udpListenerLoop(
         quicRelayTrace("udp listener endpoint parse failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
         continue
-      let client = connectRelay(endpoint).valueOr:
+      let client = sharedRelayClient(ownerId, endpoint).valueOr:
         markRelayListenerStage(ownerId, route, "udp", "failed", error)
         quicRelayTrace("udp listener relay connect failed routeId=" & $routeId & " err=" & error)
         await sleepAsync(1.seconds)
@@ -3890,7 +4123,12 @@ proc udpListenerLoop(
           "candidates": listenerCandidates
         }
         try:
-          await writeJsonMessage(regStream, hello)
+          await writeJsonMessageWithTimeout(
+            regStream,
+            hello,
+            QuicRelayRpcTimeout,
+            "udp listener register"
+          )
           quicRelayTrace("udp listener hello sent routeId=" & $routeId & " route=" & route)
           quicRelayTrace(
             "udp listener registration sent routeId=" & $routeId &
@@ -3941,12 +4179,12 @@ proc udpListenerLoop(
               restart = true
               break
             try:
-              await writeJsonMessage(acceptStream, %*{
+              await writeJsonMessageWithTimeout(acceptStream, %*{
                 "version": 1,
                 "mode": "accept",
                 "kind": "udp",
                 "route": route
-              })
+              }, QuicRelayAcceptAckTimeout, "udp listener accept")
               quicRelayTrace(
                 "udp listener accept stream registered routeId=" & $routeId &
                 " route=" & route
@@ -3981,10 +4219,10 @@ proc udpListenerLoop(
               restart = true
               break
           try:
-            await writeJsonMessage(acceptStream, %*{
+            await writeJsonMessageWithTimeout(acceptStream, %*{
               "op": "await",
               "route": route
-            })
+            }, QuicRelayAcceptAckTimeout, "udp listener await")
             let awaitAck = await readJsonMessageWithTimeout(
               acceptStream,
               QuicRelayAcceptAckTimeout,
@@ -4058,22 +4296,29 @@ proc udpListenerLoop(
               quicRelayTrace(
                 "udp listener incoming_payload_wait_begin routeId=" & $routeId &
                 " route=" & route &
-                " persistent=" & $(not acceptStream.isNil)
+                " persistent=" & $(not acceptStream.isNil) &
+                (let sid = controlStream.streamId();
+                 if sid.isOk(): " streamId=" & $sid.get() else: "")
               )
               if not acceptStream.isNil:
-                # The attached accept stream is the canonical long-lived
-                # rendezvous channel for incoming relay notifications. While
-                # waiting on that stream, keep re-validating that the gateway
-                # still publishes this route; otherwise drop ready state and
-                # re-register instead of letting stale readiness survive until
-                # the next dial attempt.
-                await awaitPersistentIncomingWithRouteValidation(
+                # Once `await` is acknowledged, the attached accept stream is
+                # the only control lane for this listener. Keep route
+                # validation inside this long-lived wait path instead of
+                # re-probing from read-only status APIs.
+                let payload = await awaitPersistentIncomingWithRouteValidation(
                   client,
                   controlStream,
                   ownerId,
                   routeId,
                   route
                 )
+                quicRelayTrace(
+                  "udp listener incoming_payload_wait_done routeId=" & $routeId &
+                  " route=" & route &
+                  (let sid = controlStream.streamId();
+                   if sid.isOk(): " streamId=" & $sid.get() else: "")
+                )
+                payload
               else:
                 await readJsonMessageWithTimeout(
                   controlStream,
@@ -4190,12 +4435,12 @@ proc udpListenerLoop(
                 )
 
           try:
-            await writeJsonMessage(controlStream, %*{
+            await writeJsonMessageWithTimeout(controlStream, %*{
               "ok": true,
               "op": "ready",
               "candidates": listenerCandidates,
               "sessionId": bridgeSessionId
-            })
+            }, QuicRelayAcceptAckTimeout, "udp listener ready")
             markRelayListenerStage(ownerId, route, "udp", "ready")
             quicRelayTrace("udp listener ready routeId=" & $routeId & " route=" & route)
           except CatchableError:
@@ -4275,12 +4520,12 @@ proc udpListenerLoop(
           continue
         if not restart:
           break
-        markRelayListenerStage(ownerId, route, "udp", "restarting")
+        if relayListenerStage(ownerId, route).toLowerAscii() != "dropped":
+          markRelayListenerStage(ownerId, route, "udp", "restarting")
         if not acceptStream.isNil:
           await acceptStream.closeQuicStream()
       if not regStream.isNil:
         await regStream.closeQuicStream()
-      closeQuicRelayClient(client)
       await sleepAsync(200.milliseconds)
   except CancelledError:
     discard
@@ -4317,6 +4562,7 @@ proc startUdpRelayListener*(
   ok()
 
 proc dialRelayBridge(
+    ownerId: int,
     routeId: int,
     relayUrl: string,
     route: string,
@@ -4330,7 +4576,7 @@ proc dialRelayBridge(
       return
     let startedAt = Moment.now()
     while true:
-      let client = connectRelay(endpoint).valueOr:
+      let client = sharedRelayClient(ownerId, endpoint).valueOr:
         if Moment.now() >= startedAt + RelayDialRetryWindow:
           await localClient.safeCloseTransport()
           return
@@ -4345,13 +4591,13 @@ proc dialRelayBridge(
           retry = true
           break dialAttempt
         try:
-          await writeJsonMessage(stream, %*{
+          await writeJsonMessageWithTimeout(stream, %*{
             "version": 1,
             "mode": "dial",
             "route": route,
             "source": source,
             "candidates": []
-          })
+          }, QuicRelayRpcTimeout, "dial request")
           quicRelayTrace("dial request sent routeId=" & $routeId & " route=" & route)
           let dialAck = await readJsonMessageWithTimeout(
             stream,
@@ -4379,7 +4625,6 @@ proc dialRelayBridge(
           retry = Moment.now() < startedAt + RelayDialRetryWindow
       await stream.closeQuicStream()
       await dataStream.closeQuicStream()
-      closeQuicRelayClient(client)
       if not retry:
         await localClient.safeCloseTransport()
         return
@@ -4440,7 +4685,7 @@ proc openDialProxy*(
             buildAdvertisedSource(family, localTailnetIp, localPort)
           else:
             source
-        await dialRelayBridge(handle.routeId, relayUrl, route, adjustedSource, localClient)
+        await dialRelayBridge(ownerId, handle.routeId, relayUrl, route, adjustedSource, localClient)
       except CancelledError:
         discard
       finally:
@@ -4494,7 +4739,7 @@ proc dialUdpBridge(
         endpoint.url,
         attempt
       )
-      let client = connectRelay(endpoint).valueOr:
+      let client = sharedRelayClient(state.ownerId, endpoint).valueOr:
         quicRelayTrace("udp dial bridge connect failed routeId=" & $routeId & " err=" & error)
         lastError = "udp dial bridge connect failed: " & error
         markUdpDialProgress(state.ownerId, state.rawKey, "retrying", lastError, attempt)
@@ -4516,14 +4761,14 @@ proc dialUdpBridge(
           retry = true
           break dialAttempt
         try:
-          await writeJsonMessage(stream, %*{
+          await writeJsonMessageWithTimeout(stream, %*{
             "version": 1,
             "mode": "dial",
             "kind": "udp",
             "route": route,
             "source": source,
             "candidates": dialerCandidates
-          })
+          }, QuicRelayRpcTimeout, "udp dial request")
           markUdpDialProgress(state.ownerId, state.rawKey, "ack_wait", route, attempt)
           quicRelayTrace("udp dial bridge request sent routeId=" & $routeId & " route=" & route)
           let dialAck = await readJsonMessageWithTimeout(
@@ -4599,7 +4844,6 @@ proc dialUdpBridge(
           retry = Moment.now() < startedAt + RelayDialRetryWindow
       await stream.closeQuicStream()
       await dataStream.closeQuicStream()
-      closeQuicRelayClient(client)
       if not retry:
         markUdpDialFailed(state.ownerId, state.rawKey, lastError)
         await proxy.closeDatagramTransport()

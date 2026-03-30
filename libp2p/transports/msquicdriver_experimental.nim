@@ -1,4 +1,4 @@
-import std/[deques, locks, options, sequtils, strformat, strutils, tables]
+import std/[deques, locks, options, os, sequtils, strformat, strutils, tables]
 import stew/byteutils
 
 import chronos
@@ -20,6 +20,19 @@ export msquicruntime.MsQuicLoadOptions
 
 logScope:
   topics = "libp2p msquicdriver"
+
+proc relayStreamTraceEnabled(): bool {.gcsafe, raises: [].} =
+  getEnv("NIM_TSNET_RELAY_STREAM_TRACE", "").strip().toLowerAscii() in
+    ["1", "true", "yes", "on"]
+
+proc relayStreamTrace(message: string) {.gcsafe, raises: [].} =
+  if not relayStreamTraceEnabled():
+    return
+  try:
+    stderr.writeLine("[tsnet-msquicstream] " & message)
+    flushFile(stderr)
+  except CatchableError:
+    discard
 
 const
   DefaultEventQueueLimit* = 0
@@ -907,7 +920,7 @@ proc close(state: MsQuicConnectionState) =
     return
   let handle = state.handle
   var hadWaiters = false
-  var pending: seq[MsQuicStreamState]
+  var streams: seq[MsQuicStreamState]
   var streamWaiters: seq[Future[MsQuicStreamState]]
   var shouldRetain = false
   state.withStateLock:
@@ -918,12 +931,21 @@ proc close(state: MsQuicConnectionState) =
       state.retainedForLateCallbacks = true
       shouldRetain = true
     hadWaiters = state.waiters.len > 0
+    if state.knownStreams.len > 0:
+      for streamPtr, streamState in state.knownStreams.pairs:
+        if streamPtr.isNil or streamState.isNil:
+          continue
+        streams.add(streamState)
     if state.pendingStreams.len > 0:
-      pending = toSeq(state.pendingStreams.values)
-      state.pendingStreams.clear()
-      state.pendingStreamOrder.clear()
-    else:
-      state.pendingStreamOrder.clear()
+      for streamPtr, streamState in state.pendingStreams.pairs:
+        if streamPtr.isNil or streamState.isNil:
+          continue
+        if streamState notin streams:
+          streams.add(streamState)
+    state.pendingStreams.clear()
+    state.pendingStreamOrder.clear()
+    if state.knownStreams.len > 0:
+      state.knownStreams.clear()
     if state.knownStreamsById.len > 0:
       state.knownStreamsById.clear()
     while state.queue.len > 0:
@@ -946,7 +968,7 @@ proc close(state: MsQuicConnectionState) =
       if fut.isNil or fut.finished():
         continue
       fut.fail(err)
-  for streamState in pending:
+  for streamState in streams:
     if streamState.isNil:
       continue
     if not streamState.stream.isNil and not state.handle.isNil:
@@ -1286,6 +1308,15 @@ proc deliverStreamReads(state: MsQuicStreamState) =
       else:
         return
     if hasChunk and not fut.isNil:
+      relayStreamTrace(
+        "deliver read stream=" & $cast[uint64](state.stream) &
+        " bytes=" & $chunk.payload.len &
+        " receiveLen=" & $chunk.receiveLen &
+        " queued=" & $queuedLen &
+        " waiters=" & $waiterLen &
+        " closed=" & $state.closed &
+        " peerSendShutdown=" & $state.peerSendShutdown
+      )
       when defined(libp2p_msquic_debug):
         warn "MsQuic stream read waiter fulfilled",
           stream = cast[uint64](state.stream),
@@ -1491,6 +1522,14 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
       shouldNotify = state.readWaiters.len > 0
       queuedLen = state.readQueue.len
       waiterLen = state.readWaiters.len
+    relayStreamTrace(
+      "queue receive stream=" & $cast[uint64](state.stream) &
+      " bytes=" & $receiveLen &
+      " queued=" & $queuedLen &
+      " waiters=" & $waiterLen &
+      " closed=" & $state.closed &
+      " peerSendShutdown=" & $state.peerSendShutdown
+    )
     when defined(libp2p_msquic_debug):
       warn "MsQuic stream queued read",
         stream = cast[uint64](state.stream),
@@ -1540,6 +1579,11 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
         state.peerSendShutdown = true
         state.readQueue.addLast(MsQuicReadChunk(payload: @[], receiveLen: 0))
         shouldNotify = state.readWaiters.len > 0
+    relayStreamTrace(
+      "peer send shutdown stream=" & $cast[uint64](state.stream) &
+      " notify=" & $shouldNotify &
+      " closed=" & $state.closed
+    )
     if shouldNotify:
       triggerStreamDelivery(state)
 
@@ -2124,6 +2168,32 @@ proc readStream*(state: MsQuicStreamState): Future[seq[byte]] {.gcsafe.} =
       shouldArmSignalLoop = true
       queuedLen = state.readQueue.len
       waiterLen = state.readWaiters.len
+  if hasImmediate:
+    relayStreamTrace(
+      "read immediate stream=" & $cast[uint64](state.stream) &
+      " bytes=" & $immediateChunk.payload.len &
+      " receiveLen=" & $immediateChunk.receiveLen &
+      " queued=" & $queuedLen &
+      " waiters=" & $waiterLen &
+      " closed=" & $state.closed &
+      " peerSendShutdown=" & $state.peerSendShutdown
+    )
+  elif shouldFail:
+    relayStreamTrace(
+      "read fail stream=" & $cast[uint64](state.stream) &
+      " queued=" & $queuedLen &
+      " waiters=" & $waiterLen &
+      " closed=" & $state.closed &
+      " peerSendShutdown=" & $state.peerSendShutdown
+    )
+  else:
+    relayStreamTrace(
+      "read wait stream=" & $cast[uint64](state.stream) &
+      " queued=" & $queuedLen &
+      " waiters=" & $waiterLen &
+      " closed=" & $state.closed &
+      " peerSendShutdown=" & $state.peerSendShutdown
+    )
   if hasImmediate:
     let chunk = move(immediateChunk)
     when defined(ohos):

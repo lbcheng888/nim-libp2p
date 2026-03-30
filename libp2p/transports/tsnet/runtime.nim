@@ -143,6 +143,7 @@ proc rememberListenerRoute(routes: var seq[string], route: string) {.gcsafe.} =
 
 proc requestString(node: JsonNode, key: string): string
 proc liveQuicRelayMode(runtime: TsnetInAppRuntime): bool {.gcsafe.}
+proc resolvedRelayDialUrl(runtime: TsnetInAppRuntime): string {.gcsafe.}
 
 proc proxyListenerReadiness(runtime: TsnetInAppRuntime): tuple[expected, ready: int] {.gcsafe.} =
   if runtime.isNil:
@@ -158,6 +159,42 @@ proc proxyListenerReadiness(runtime: TsnetInAppRuntime): tuple[expected, ready: 
           inc result.ready
       return
   result.ready = runtime.tcpListenerRoutes.len + runtime.udpListenerRoutes.len
+
+proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
+  proc fieldString(node: JsonNode; key: string): string {.gcsafe.} =
+    if node.isNil or node.kind != JObject or not node.hasKey(key):
+      return ""
+    let value = node.getOrDefault(key)
+    if value.kind == JString:
+      return value.getStr()
+    ""
+
+  if runtime.isNil or runtime.status != TsnetInAppRuntimeStatus.Running:
+    return false
+  let readiness = runtime.proxyListenerReadiness()
+  if readiness.expected == 0 or readiness.ready >= readiness.expected:
+    return false
+  when defined(libp2p_msquic_experimental):
+    if runtime.liveQuicRelayMode():
+      let relayEndpoint = runtime.resolvedRelayDialUrl()
+      let listeners = qrelay.relayListenerStatesPayload(runtime.runtimeId)
+      if listeners.kind != JArray:
+        return false
+      for item in listeners.items:
+        if item.kind != JObject:
+          continue
+        let route = fieldString(item, "route")
+        let stage = fieldString(item, "stage").toLowerAscii()
+        if stage in ["failed", "dropped", "stopped"]:
+          return true
+        if route.len > 0 and stage in ["awaiting", "incoming", "ready"] and
+            not qrelay.relayRouteReadyOrPublished(
+              runtime.runtimeId,
+              relayEndpoint,
+              route
+            ):
+          return true
+  false
 
 proc resolvedControlDialUrl(runtime: TsnetInAppRuntime, protocol: string): string {.gcsafe.} =
   if runtime.isNil:
@@ -1289,7 +1326,7 @@ proc dialTcpProxy*(
   let localRoute = lookupRawTarget(family, ip, port, TsnetProxyKind.Tcp)
   if localRoute.isOk():
     return localRoute
-  let directRoute = lookupDirectTarget(family, ip, port, TsnetProxyKind.Tcp)
+  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Tcp)
   if directRoute.isOk():
     runtime.setTailnetPathState(directRoute.get().pathKind)
     return ok(directRoute.get().raw)
@@ -1320,7 +1357,7 @@ proc dialUdpProxy*(
   let localRoute = lookupRawTarget(family, ip, port, TsnetProxyKind.Quic)
   if localRoute.isOk():
     return localRoute
-  let directRoute = lookupDirectTarget(family, ip, port, TsnetProxyKind.Quic)
+  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Quic)
   if directRoute.isOk():
     runtime.setTailnetPathState(directRoute.get().pathKind)
     return ok(directRoute.get().raw)

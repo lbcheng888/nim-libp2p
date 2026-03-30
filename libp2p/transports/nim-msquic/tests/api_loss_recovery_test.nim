@@ -27,6 +27,53 @@ proc withConnection(body: proc(api: ptr QuicApiTable; registration: HQUIC; conne
     MsQuicClose(apiPtr)
 
 suite "MsQuic ACK-driven loss recovery":
+  test "handshake idle timeout closes dead connection and emits shutdown events":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs() - 5_000_000'u64
+      check setConnectionHandshakeStateForTest(connection, false)
+      check setConnectionTimeoutsForTest(connection, 1'u64, 30_000'u64)
+      check setConnectionPeerActivityForTest(connection, base, 0'u64)
+
+      var initiated = false
+      var completed = false
+      var note = ""
+      registerConnectionEventHandler(connection, proc (event: ConnectionEvent) {.closure, gcsafe.} =
+        if event.kind == ceShutdownInitiated:
+          initiated = true
+          note = event.note
+        elif event.kind == ceShutdownComplete:
+          completed = true
+          note = event.note
+      )
+
+      check runConnectionMaintenanceForTest(connection)
+
+      var closeReason = ""
+      check getConnectionCloseReason(connection, closeReason)
+      check initiated
+      check completed
+      check note == "handshake idle timeout"
+      check closeReason == "handshake idle timeout"
+    )
+
+  test "idle timeout closes established silent connection":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs() - 5_000_000'u64
+      check setConnectionHandshakeStateForTest(connection, true)
+      check setConnectionTimeoutsForTest(connection, 10_000'u64, 1'u64)
+      check setConnectionPeerActivityForTest(connection, base, base)
+
+      check runConnectionMaintenanceForTest(connection)
+
+      var closeReason = ""
+      check getConnectionCloseReason(connection, closeReason)
+      check closeReason == "idle timeout"
+    )
+
   test "packet threshold loss prunes older packets and schedules loss time":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard api
@@ -1662,6 +1709,41 @@ suite "MsQuic ACK-driven loss recovery":
       check host.contains("10.0.2.144")
     )
 
+  test "pto timeout falls back to ping when one-rtt control payload cannot fit":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+      let base = nowUs()
+      let oversizedPayload = newSeq[byte](1500)
+      let pingPayload = @[0x01'u8]
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
+      check seedSentPacketForTest(
+        connection,
+        packet_model.ceOneRtt,
+        1'u64,
+        base - 500_000'u64,
+        1200'u16,
+        frameKind = sfkHandshakeDone,
+        framePayload = oversizedPayload
+      )
+
+      check runConnectionLossRecoveryTick(connection)
+
+      var payloadLen = 0'u32
+      var payload: seq[byte] = @[]
+      var frameKind = sfkAck
+      var count = 0'u32
+      check getConnectionLastSentFramePayloadLenForTest(connection, payloadLen)
+      check getConnectionLastSentFrameKindForTest(connection, frameKind)
+      check getConnectionLastSentFramePayloadForTest(connection, payload)
+      check getConnectionSentPacketCountForTest(connection, count)
+      check count == 3'u32
+      check frameKind == sfkPing
+      check payloadLen == uint32(pingPayload.len)
+      check payload == pingPayload
+    )
+
   test "pto timeout reuses original remote for one-rtt path-challenge probes":
     withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
       discard api
@@ -2416,6 +2498,28 @@ suite "MsQuic ACK-driven loss recovery":
       check probeCount == 1'u16
       check packets == 3'u32
       check bytes > 1200'u64
+    )
+
+  test "pto timeout without a sendable 1-RTT probe re-arms timer in the future":
+    withConnection(proc(api: ptr QuicApiTable; registration: HQUIC; connection: HQUIC) =
+      discard api
+      discard registration
+
+      let base = nowUs()
+      check prepareConnectionPacketSendForTest(connection, packet_model.ceOneRtt)
+      check setConnectionRttStatsForTest(connection, 100_000'u64, 100_000'u64, 90_000'u64, 50_000'u64)
+      check setConnectionRemoteAddressForTest(connection, "10.0.2.223", 5223'u16)
+      check seedSentPacketForTest(connection, packet_model.ceOneRtt, 1'u64, base - 500_000'u64, 1200'u16)
+      check setConnectionHandshakeStateForTest(connection, false)
+
+      check runConnectionLossRecoveryTick(connection)
+
+      var timerUs = 0'u64
+      var probeCount = 0'u16
+      check getConnectionLossDetectionTimerForTest(connection, timerUs)
+      check getConnectionProbeCountForEpoch(connection, packet_model.ceOneRtt, probeCount)
+      check probeCount == 1'u16
+      check timerUs > nowUs()
     )
 
   test "actual epoch send paths consume congestion allowance":

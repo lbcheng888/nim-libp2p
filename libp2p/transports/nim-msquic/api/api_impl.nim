@@ -419,6 +419,7 @@ type
   ConnectionState = ref object of QuicHandleState
     registration: RegistrationState
     configuration: ConfigurationState
+    listenerOwner: ListenerState
     callback: QuicConnectionCallback
     callbackContext: pointer
     started: bool
@@ -489,9 +490,12 @@ type
     issuedLocalCids: seq[IssuedConnectionIdState]
     pendingAutoLocalCidAdvertisement: bool
     inLossDetectionTick: bool
+    deferredProbeDeadlineUs: array[CryptoEpoch, uint64]
     maintenanceSignal: ThreadSignalPtr
     maintenanceLoop: Future[void]
     maintenanceClosed: bool
+    createdAtUs: uint64
+    lastPeerActivityUs: uint64
 
 const
   DatagramReceiveNotes = ["receive=false", "receive=true"]
@@ -599,7 +603,7 @@ var gBuiltinTicketAgeAddSalt = 0'u32
 
 proc generateSingleConnectionId(): ConnectionId {.gcsafe.}
 proc cidBytes(cid: ConnectionId): seq[byte] {.gcsafe.}
-proc currentProbeTimeoutUs(conn: ConnectionState; epoch: CryptoEpoch = ceOneRtt): uint64 {.gcsafe.}
+proc currentProbeTimeoutUs(conn: ConnectionState; epoch: CryptoEpoch = ceOneRtt): uint64 {.gcsafe, raises: [].}
 proc updateLossDetectionTimer(conn: ConnectionState) {.gcsafe.}
 proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.}
 proc ensureConnectionMaintenanceLoop(conn: ConnectionState) {.gcsafe.}
@@ -611,6 +615,10 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
 proc currentBuiltinNewSessionTicketLifetimeSec(): uint32 {.gcsafe.}
 proc currentBuiltinNewSessionTicketMaxEarlyData(conn: ConnectionState): uint32 {.gcsafe.}
 proc flushPendingControlFrames(conn: ConnectionState) {.gcsafe.}
+proc closeOwnedDatagramTransport(transp: DatagramTransport) {.gcsafe, raises: [].}
+proc stopConnectionMaintenance(conn: ConnectionState) {.gcsafe, raises: [].}
+proc removeAcceptedConnection(state: ListenerState; conn: ConnectionState) {.gcsafe, raises: [].}
+proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe, raises: [].}
 proc sendOneRttPacket(conn: ConnectionState; payload: seq[byte];
     frameKind: SentFrameKind; ackEliciting: bool;
     stream: StreamState = nil; streamOffset = 0'u64;
@@ -620,6 +628,24 @@ proc sendOneRttPacket(conn: ConnectionState; payload: seq[byte];
 
 proc nowMicros(): uint64 =
   uint64(epochTime() * 1_000_000.0)
+
+proc effectiveTimeoutUs(timeoutMs: uint64): uint64 {.inline, gcsafe, raises: [].} =
+  timeoutMs * 1_000'u64
+
+proc peerActivityBaseUs(conn: ConnectionState): uint64 {.gcsafe, raises: [].} =
+  if conn.isNil:
+    return 0'u64
+  if conn.lastPeerActivityUs > 0'u64:
+    return conn.lastPeerActivityUs
+  conn.createdAtUs
+
+proc markPeerActivity(conn: ConnectionState; atUs: uint64 = 0'u64) {.gcsafe, raises: [].} =
+  if conn.isNil:
+    return
+  let effective =
+    if atUs > 0'u64: atUs
+    else: nowMicros()
+  conn.lastPeerActivityUs = effective
 
 template closeThreadSignal(signalVar: untyped) =
   if signalVar != nil:
@@ -1172,6 +1198,101 @@ proc newestAckElicitingSentPacket(conn: ConnectionState; epoch: CryptoEpoch;
       found = true
   found
 
+proc clearDeferredProbeDeadline(conn: ConnectionState; epoch: CryptoEpoch) {.gcsafe, inline.} =
+  if conn.isNil:
+    return
+  conn.deferredProbeDeadlineUs[epoch] = 0'u64
+
+proc clearConnectionRecoveryState(conn: ConnectionState) {.gcsafe.} =
+  if conn.isNil:
+    return
+  conn.sentPackets = @[]
+  conn.pendingDatagrams = @[]
+  conn.pendingControlFrames = @[]
+  conn.lossDetection = qloss.initLossDetectionModel()
+  conn.inLossDetectionTick = false
+  for epoch in CryptoEpoch:
+    conn.deferredProbeDeadlineUs[epoch] = 0'u64
+    if not conn.quicConn.isNil:
+      conn.quicConn.model.packetSpaces[epoch].lossTime = 0'u64
+  if not conn.quicConn.isNil:
+    conn.quicConn.model.timers.lossDetectionTimer = 0'u64
+
+proc closeConnectionDueToLocalTimeout(conn: ConnectionState; note: string) {.gcsafe, raises: [].} =
+  if conn.isNil:
+    return
+  if not conn.closeReason.isEmptyOrWhitespace():
+    if conn.closeReason == note:
+      return
+  conn.started = false
+  conn.handshakeComplete = false
+  conn.closeReason = note
+  conn.stopConnectionMaintenance()
+  conn.clearConnectionRecoveryState()
+  if not conn.listenerOwner.isNil:
+    conn.listenerOwner.removeAcceptedConnection(conn)
+  if conn.transportOwned and not conn.transport.isNil:
+    closeOwnedDatagramTransport(conn.transport)
+    conn.transport = nil
+    conn.transportOwned = false
+  var initiated = ConnectionEvent(
+    kind: ceShutdownInitiated,
+    errorCode: 0'u64,
+    note: note
+  )
+  emitConnectionEvent(conn, initiated)
+  var completed = ConnectionEvent(
+    kind: ceShutdownComplete,
+    errorCode: 0'u64,
+    note: note
+  )
+  emitConnectionEvent(conn, completed)
+  {.cast(gcsafe).}:
+    try:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: cast[pointer](conn),
+        note: note
+      ))
+    except Exception:
+      discard
+
+proc handshakeIdleDeadlineUs(conn: ConnectionState): uint64 {.gcsafe, raises: [].} =
+  if conn.isNil or conn.handshakeComplete:
+    return 0'u64
+  let timeoutUs = effectiveTimeoutUs(conn.settingsOverlay.handshakeIdleTimeoutMs)
+  if timeoutUs == 0'u64:
+    return 0'u64
+  let baseUs = conn.peerActivityBaseUs()
+  if baseUs == 0'u64:
+    return 0'u64
+  baseUs + timeoutUs
+
+proc idleDeadlineUs(conn: ConnectionState): uint64 {.gcsafe, raises: [].} =
+  if conn.isNil or not conn.handshakeComplete:
+    return 0'u64
+  let configuredUs = effectiveTimeoutUs(conn.settingsOverlay.idleTimeoutMs)
+  if configuredUs == 0'u64:
+    return 0'u64
+  let baseUs = conn.peerActivityBaseUs()
+  if baseUs == 0'u64:
+    return 0'u64
+  let minIdleUs = 3'u64 * conn.currentProbeTimeoutUs(ceOneRtt)
+  baseUs + max(configuredUs, minIdleUs)
+
+proc maybeHandleConnectionTimeout(conn: ConnectionState; nowUs: uint64): bool {.gcsafe, raises: [].} =
+  if conn.isNil:
+    return false
+  let handshakeDeadline = conn.handshakeIdleDeadlineUs()
+  if handshakeDeadline > 0'u64 and nowUs >= handshakeDeadline:
+    conn.closeConnectionDueToLocalTimeout("handshake idle timeout")
+    return true
+  let idleDeadline = conn.idleDeadlineUs()
+  if idleDeadline > 0'u64 and nowUs >= idleDeadline:
+    conn.closeConnectionDueToLocalTimeout("idle timeout")
+    return true
+  false
+
 proc selectLossDetectionSchedule(conn: ConnectionState; epoch: var CryptoEpoch;
     timerUs: var uint64; dueToLossTime: var bool): bool {.gcsafe.} =
   if conn.isNil or conn.quicConn.isNil:
@@ -1190,10 +1311,15 @@ proc selectLossDetectionSchedule(conn: ConnectionState; epoch: var CryptoEpoch;
     return true
   for candidate in CryptoEpoch:
     let latestSentUs = conn.latestAckElicitingSentTime(candidate)
-    if latestSentUs == 0'u64:
+    let deferredProbeUs = conn.deferredProbeDeadlineUs[candidate]
+    if latestSentUs == 0'u64 and deferredProbeUs == 0'u64:
       continue
     let ptoUs = conn.currentProbeTimeoutUs(candidate)
-    let candidateTimer = latestSentUs + ptoUs
+    var candidateTimer =
+      if latestSentUs == 0'u64: deferredProbeUs
+      else: latestSentUs + ptoUs
+    if deferredProbeUs > candidateTimer:
+      candidateTimer = deferredProbeUs
     if not found or candidateTimer < timerUs or (candidateTimer == timerUs and ord(candidate) < ord(epoch)):
       found = true
       epoch = candidate
@@ -1205,6 +1331,7 @@ proc recordSentPacket(conn: ConnectionState; meta: SentPacketMeta) {.gcsafe.} =
   if conn.isNil:
     return
   conn.sentPackets.add(meta)
+  conn.clearDeferredProbeDeadline(meta.epoch)
   let packet = qloss.PacketRecord(
     packetNumber: meta.packetNumber,
     encryptEpoch: meta.epoch,
@@ -1237,18 +1364,22 @@ proc connectionAckDeadlineUs(conn: ConnectionState): uint64 {.gcsafe.} =
     return 0'u64
   qack.ackDeadlineUs(conn.ackTracker, ceOneRtt)
 
-proc connectionMaintenanceDeadlineUs(conn: ConnectionState): uint64 {.gcsafe.} =
+proc connectionMaintenanceDeadlineUs(conn: ConnectionState): uint64 {.gcsafe, raises: [].} =
   if conn.isNil:
     return 0'u64
   let lossTimer =
     if conn.quicConn.isNil: 0'u64
     else: conn.quicConn.model.timers.lossDetectionTimer
   let ackDeadline = conn.connectionAckDeadlineUs()
-  if lossTimer == 0'u64:
-    return ackDeadline
-  if ackDeadline == 0'u64:
-    return lossTimer
-  min(lossTimer, ackDeadline)
+  let handshakeDeadline = conn.handshakeIdleDeadlineUs()
+  let idleDeadline = conn.idleDeadlineUs()
+  var earliest = 0'u64
+  for candidate in [lossTimer, ackDeadline, handshakeDeadline, idleDeadline]:
+    if candidate == 0'u64:
+      continue
+    if earliest == 0'u64 or candidate < earliest:
+      earliest = candidate
+  earliest
 
 proc connectionMaintenancePump(conn: ConnectionState): Future[void] {.async.} =
   try:
@@ -1331,7 +1462,7 @@ proc scheduleConnectionMaintenance(conn: ConnectionState) {.gcsafe.} =
       except Exception:
         discard
 
-proc stopConnectionMaintenance(conn: ConnectionState) {.gcsafe.} =
+proc stopConnectionMaintenance(conn: ConnectionState) {.gcsafe, raises: [].} =
   if conn.isNil:
     return
   conn.maintenanceClosed = true
@@ -1673,7 +1804,7 @@ proc findAcceptedConnectionByInitialTuple(state: ListenerState;
       return conn
   nil
 
-proc removeAcceptedConnection(state: ListenerState; conn: ConnectionState) {.gcsafe.} =
+proc removeAcceptedConnection(state: ListenerState; conn: ConnectionState) {.gcsafe, raises: [].} =
   if state.isNil or conn.isNil:
     return
   var staleKeys: seq[string] = @[]
@@ -1698,8 +1829,6 @@ proc registerAcceptedConnection(state: ListenerState; remoteKey: string;
   if remoteKey.len > 0:
     state.acceptedConnections[remoteKey] = conn
 
-proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe.}
-
 proc matchesStatelessResetToken(conn: ConnectionState; data: openArray[byte]): bool {.gcsafe.} =
   if conn.isNil or conn.quicConn.isNil or data.len < 16:
     return false
@@ -1721,8 +1850,13 @@ proc handleStatelessReset(conn: ConnectionState; remote: TransportAddress;
   conn.started = false
   conn.handshakeComplete = false
   conn.closeReason = "stateless reset"
-  if not owner.isNil:
-    owner.removeAcceptedConnection(conn)
+  conn.stopConnectionMaintenance()
+  conn.clearConnectionRecoveryState()
+  let effectiveOwner =
+    if not owner.isNil: owner
+    else: conn.listenerOwner
+  if not effectiveOwner.isNil:
+    effectiveOwner.removeAcceptedConnection(conn)
   var initiated = ConnectionEvent(
     kind: ceShutdownInitiated,
     errorCode: 0'u64,
@@ -1743,8 +1877,6 @@ proc handleStatelessReset(conn: ConnectionState; remote: TransportAddress;
     ))
   true
 
-proc closeOwnedDatagramTransport(transp: DatagramTransport) {.gcsafe, raises: [].}
-
 proc handleRemoteConnectionClose(conn: ConnectionState; errorCode: uint64;
     reasonPhrase: string; applicationClose: bool;
     owner: ListenerState = nil) {.gcsafe.} =
@@ -1760,8 +1892,13 @@ proc handleRemoteConnectionClose(conn: ConnectionState; errorCode: uint64;
   conn.started = false
   conn.handshakeComplete = false
   conn.closeReason = reasonPhrase
-  if not owner.isNil:
-    owner.removeAcceptedConnection(conn)
+  conn.stopConnectionMaintenance()
+  conn.clearConnectionRecoveryState()
+  let effectiveOwner =
+    if not owner.isNil: owner
+    else: conn.listenerOwner
+  if not effectiveOwner.isNil:
+    effectiveOwner.removeAcceptedConnection(conn)
   if conn.transportOwned and not conn.transport.isNil:
     closeOwnedDatagramTransport(conn.transport)
     conn.transport = nil
@@ -2071,7 +2208,7 @@ proc findNewestAckedAckElicitingPacket(conn: ConnectionState; ack: proto.AckFram
       found = true
   found
 
-proc currentProbeTimeoutUs(conn: ConnectionState; epoch: CryptoEpoch = ceOneRtt): uint64 {.gcsafe.} =
+proc currentProbeTimeoutUs(conn: ConnectionState; epoch: CryptoEpoch = ceOneRtt): uint64 {.gcsafe, raises: [].} =
   if conn.isNil:
     return MinProbeTimeoutUs
   let smoothedRtt =
@@ -2088,7 +2225,7 @@ proc currentProbeTimeoutUs(conn: ConnectionState; epoch: CryptoEpoch = ceOneRtt)
   let timeoutUs = qloss.computeProbeTimeout(conn.lossDetection, smoothedRtt, rttVariance, epoch) + ackDelayUs
   max(timeoutUs, MinProbeTimeoutUs)
 
-proc currentLossDelayUs(conn: ConnectionState): uint64 {.gcsafe.} =
+proc currentLossDelayUs(conn: ConnectionState): uint64 {.gcsafe, raises: [].} =
   if conn.isNil:
     return timeReorderThreshold(DefaultSmoothedRttUs)
   let observedRtt =
@@ -2098,14 +2235,14 @@ proc currentLossDelayUs(conn: ConnectionState): uint64 {.gcsafe.} =
     else: observedRtt
   max(timeReorderThreshold(latestOrSmoothed), 1'u64)
 
-proc persistentCongestionWindowUs(conn: ConnectionState; epoch: CryptoEpoch): uint64 {.gcsafe.} =
+proc persistentCongestionWindowUs(conn: ConnectionState; epoch: CryptoEpoch): uint64 {.gcsafe, raises: [].} =
   if conn.isNil:
     return MinProbeTimeoutUs * PersistentCongestionThreshold.uint64
   let ptoUs = conn.currentProbeTimeoutUs(epoch)
   max(ptoUs * PersistentCongestionThreshold.uint64, ptoUs)
 
 proc isPersistentCongestion(conn: ConnectionState; epoch: CryptoEpoch; earliestSentUs,
-    latestSentUs: uint64): bool {.gcsafe.} =
+    latestSentUs: uint64): bool {.gcsafe, raises: [].} =
   if conn.isNil or earliestSentUs == high(uint64) or latestSentUs < earliestSentUs:
     return false
   (latestSentUs - earliestSentUs) >= conn.persistentCongestionWindowUs(epoch)
@@ -2223,6 +2360,8 @@ proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
   defer:
     conn.inLossDetectionTick = false
   let nowUs = nowMicros()
+  if conn.maybeHandleConnectionTimeout(nowUs):
+    return
   discard conn.maybeSendExpiredOneRttAck(nowUs)
   if conn.sentPackets.len == 0:
     if not conn.quicConn.isNil:
@@ -2244,6 +2383,10 @@ proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
     qcc.onProbeTimeout(conn.congestionController)
     qcc.grantExemptions(conn.congestionController, 2'u8)
     let probeCountSent = conn.sendProbeForEpoch(selectedEpoch)
+    if probeCountSent == 0'u8:
+      conn.deferredProbeDeadlineUs[selectedEpoch] = nowUs + probeTimeoutUs
+    else:
+      conn.clearDeferredProbeDeadline(selectedEpoch)
     {.cast(gcsafe).}:
       emitDiagnostics(DiagnosticsEvent(
         kind: diagConnectionEvent,
@@ -2350,14 +2493,17 @@ proc listenerFromHandleFast(handle: HQUIC): ListenerState {.quicApiHot.} =
     return nil
   ListenerState(base)
 
-proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe.} =
+proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe, raises: [].} =
   event.connection = cast[HQUIC](state)
   if event.userContext.isNil:
     event.userContext = state.context
   if state.eventHandlers.len > 0:
     for handler in state.eventHandlers:
       if handler != nil:
-        handler(event)
+        try:
+          handler(event)
+        except Exception:
+          discard
   var diagNote = (if event.note.len > 0: event.note else: $event.kind)
   if event.errorCode != 0'u64:
     diagNote.add(" errorCode=" & $event.errorCode)
@@ -2372,11 +2518,14 @@ proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.g
   if event.appCloseInProgress:
     diagNote.add(" appCloseInProgress=true")
   {.cast(gcsafe).}:
-    emitDiagnostics(DiagnosticsEvent(
-      kind: diagConnectionEvent,
-      handle: cast[pointer](state),
-      paramId: event.paramId,
-      note: diagNote))
+    try:
+      emitDiagnostics(DiagnosticsEvent(
+        kind: diagConnectionEvent,
+        handle: cast[pointer](state),
+        paramId: event.paramId,
+        note: diagNote))
+    except Exception:
+      discard
 
 proc emitStreamEvent(state: StreamState; event: var StreamEvent) =
   event.stream = cast[HQUIC](state)
@@ -3557,6 +3706,7 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
     else:
       0'u16
   qloss.onAckReceived(conn.lossDetection, ackEvent)
+  conn.clearDeferredProbeDeadline(epoch)
   if preserveEpochProbeBackoff:
     conn.lossDetection.probeCountByEpoch[epoch] = savedEpochProbeCount
     conn.lossDetection.probeCount = 0'u16
@@ -3805,65 +3955,69 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
       probeMeta.clientContext
     else:
       nil
+  template probeTargetPtr(): untyped =
+    (if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
+      addr probeMeta.targetRemote
+    else:
+      nil)
+  proc sendProbePayload(payload: seq[byte]; frameKind: SentFrameKind): uint64 {.gcsafe.} =
+    case epoch
+    of ceInitial:
+      conn.sendInitialPacket(
+        payload,
+        frameKind,
+        true,
+        probeTargetPtr()
+      )
+    of ceHandshake:
+      conn.sendHandshakePacket(
+        payload,
+        frameKind,
+        true,
+        probeTargetPtr()
+      )
+    of ceZeroRtt:
+      conn.sendZeroRttPacket(
+        payload,
+        frameKind,
+        stream = probeStream,
+        streamOffset = probeStreamOffset,
+        streamPayload = probeStreamPayload,
+        streamFin = probeStreamFin,
+        clientContext = probeClientContext,
+        targetRemote = probeTargetPtr()
+      )
+    of ceOneRtt:
+      if not conn.handshakeComplete:
+        {.cast(gcsafe).}:
+          emitDiagnostics(DiagnosticsEvent(
+            kind: diagConnectionEvent,
+            handle: cast[pointer](conn),
+            note: "pto probe suppressed because ceOneRtt selected before handshake complete"
+          ))
+        return 0'u64
+      conn.sendOneRttPacket(
+        payload,
+        frameKind,
+        true,
+        stream = probeStream,
+        streamOffset = probeStreamOffset,
+        streamPayload = probeStreamPayload,
+        streamFin = probeStreamFin,
+        clientContext = probeClientContext,
+        targetRemote = probeTargetPtr()
+      )
   for _ in 0 ..< 2:
-    let packetNumber =
-      case epoch
-      of ceInitial:
-        conn.sendInitialPacket(
-          probePayload,
-          probeFrameKind,
-          true,
-          (if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
-            addr probeMeta.targetRemote
-          else:
-            nil)
-        )
-      of ceHandshake:
-        conn.sendHandshakePacket(
-          probePayload,
-          probeFrameKind,
-          true,
-          (if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
-            addr probeMeta.targetRemote
-          else:
-            nil)
-        )
-      of ceZeroRtt:
-        let probeTarget =
-          if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
-            addr probeMeta.targetRemote
-          else:
-            nil
-        conn.sendZeroRttPacket(
-          probePayload,
-          probeFrameKind,
-          stream = probeStream,
-          streamOffset = probeStreamOffset,
-          streamPayload = probeStreamPayload,
-          streamFin = probeStreamFin,
-          clientContext = probeClientContext,
-          targetRemote = probeTarget
-        )
-      of ceOneRtt:
-        if not conn.handshakeComplete:
-          0'u64
-        else:
-          let probeTarget =
-            if haveProbeMeta and probeMeta.targetRemote.family != AddressFamily.None:
-            addr probeMeta.targetRemote
-          else:
-            nil
-          conn.sendOneRttPacket(
-            probePayload,
-            probeFrameKind,
-            true,
-            stream = probeStream,
-            streamOffset = probeStreamOffset,
-            streamPayload = probeStreamPayload,
-            streamFin = probeStreamFin,
-            clientContext = probeClientContext,
-            targetRemote = probeTarget
-          )
+    var packetNumber = sendProbePayload(probePayload, probeFrameKind)
+    if packetNumber == 0'u64 and reuseOriginalFrame:
+      {.cast(gcsafe).}:
+        emitDiagnostics(DiagnosticsEvent(
+          kind: diagConnectionEvent,
+          handle: cast[pointer](conn),
+          note: "pto retransmit failed; falling back to ping epoch=" & $epoch &
+            " frameKind=" & $probeFrameKind
+        ))
+      packetNumber = sendProbePayload(genericProbePayload, sfkPing)
     if packetNumber == 0'u64:
       break
     inc result
@@ -4411,6 +4565,7 @@ proc parsePacketNumber(pnSlice: array[4, byte]): uint32 =
 
 proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress;
     clientCidSeq, serverCidSeq: seq[byte]): ConnectionState =
+  let createdAtUs = nowMicros()
   let conn = ConnectionState(kind: qhkConnection)
   conn.registration = state.registration
   if state.alpns.len > 0:
@@ -4421,6 +4576,7 @@ proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress
       credentialLoaded: true,
       settingsOverlay: state.settingsOverlay
     )
+  conn.listenerOwner = state
   conn.callback = nil
   conn.callbackContext = nil
   conn.context = nil
@@ -4484,6 +4640,8 @@ proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress
   conn.activeLocalCidSequence = 0'u64
   conn.advertisedPeerCids = @[]
   conn.issuedLocalCids = @[]
+  conn.createdAtUs = createdAtUs
+  conn.lastPeerActivityUs = createdAtUs
   conn.recordAdvertisedPeerCid(0'u64, conn.peerCid, default(array[16, uint8]))
   conn.recordIssuedLocalCid(0'u64, conn.localCid)
   conn.registerPathRemote(0'u8, remote)
@@ -4613,6 +4771,8 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
     packetNumber: uint64; plaintext: seq[byte]) =
   if conn.isNil:
     return
+  let nowUs = nowMicros()
+  conn.markPeerActivity(nowUs)
   proc maybeCompleteServerHandshakeFromOneRtt() =
     if conn.quicConn.isNil or conn.quicConn.role != crServer or conn.handshakeComplete:
       return
@@ -4625,7 +4785,6 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
   conn.maybeInitiatePathMigration(remote)
   let previousLargest = qack.largestPacketNumberAcked(conn.ackTracker, ceOneRtt)
   if qack.wasPacketReceived(conn.ackTracker, ceOneRtt, packetNumber):
-    let nowUs = nowMicros()
     {.cast(gcsafe).}:
       emitDiagnostics(DiagnosticsEvent(
         kind: diagConnectionEvent,
@@ -4638,7 +4797,6 @@ proc handleOneRttPayload(conn: ConnectionState; remote: TransportAddress;
       discard conn.sendAckFrame(packetNumber, ceOneRtt, unsafeAddr remote)
     return
   qack.trackIncomingPacket(conn.ackTracker, ceOneRtt, packetNumber)
-  let nowUs = nowMicros()
   let reordered =
     previousLargest > 0'u64 and
     (packetNumber < previousLargest or
@@ -4843,8 +5001,9 @@ proc handleZeroRttPayload(conn: ConnectionState; remote: TransportAddress;
     packetNumber: uint64; plaintext: seq[byte]) =
   if conn.isNil:
     return
+  let nowUs = nowMicros()
+  conn.markPeerActivity(nowUs)
   if qack.wasPacketReceived(conn.ackTracker, ceZeroRtt, packetNumber):
-    let nowUs = nowMicros()
     {.cast(gcsafe).}:
       emitDiagnostics(DiagnosticsEvent(
         kind: diagConnectionEvent,
@@ -4857,7 +5016,6 @@ proc handleZeroRttPayload(conn: ConnectionState; remote: TransportAddress;
       discard conn.maybeSendPendingOneRttAck(unsafeAddr remote)
     return
   qack.trackIncomingPacket(conn.ackTracker, ceZeroRtt, packetNumber)
-  let nowUs = nowMicros()
   var pos = 0
   var ackEliciting = false
   while pos < plaintext.len:
@@ -5095,6 +5253,7 @@ proc handleHandshakePacket(conn: ConnectionState; remote: TransportAddress; data
           " cipher=" & $ciphertext.len
       ))
     return
+  conn.markPeerActivity(nowUs)
   if conn.isClient:
     conn.peerAddressValidated = true
   if qack.wasPacketReceived(conn.ackTracker, ceHandshake, uint64(pnVal)):
@@ -5285,6 +5444,7 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
             if not byCid.isNil: byCid
             else: state.acceptedConnections.getOrDefault(remoteKey, nil)
       if not ackConn.isNil:
+        ackConn.markPeerActivity()
         ackConn.applyAckFrame(frame, ceInitial)
     elif frameType == 0x1C'u8 or frameType == 0x1D'u8:
       let frame = proto.parseConnectionCloseFrame(plaintext, pos)
@@ -5298,6 +5458,7 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
           if not byTuple.isNil: byTuple
           else: state.acceptedConnections.getOrDefault(remoteKey, nil)
       if not closeConn.isNil:
+        closeConn.markPeerActivity()
         closeConn.handleRemoteConnectionClose(
           frame.errorCode,
           frame.reasonPhrase,
@@ -5339,6 +5500,7 @@ proc handleInitialPacket(state: ListenerState; remote, local: TransportAddress; 
       conn.markConnectionPacketForAck(ceInitial, uint64(pnVal), nowMicros(), ackTypeAckImmediate)
       discard conn.sendAckFrame(uint64(pnVal), ceInitial, unsafeAddr remote)
     return
+  conn.markPeerActivity()
   qack.trackIncomingPacket(conn.ackTracker, ceInitial, uint64(pnVal))
   if ackEliciting:
     conn.markConnectionPacketForAck(
@@ -5760,6 +5922,8 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
   state.activeLocalCidSequence = 0'u64
   state.advertisedPeerCids = @[]
   state.issuedLocalCids = @[]
+  state.createdAtUs = nowMicros()
+  state.lastPeerActivityUs = 0'u64
   let raw = storeHandle(state)
   state.ensureConnectionMaintenanceLoop()
   state.scheduleConnectionMaintenance()
@@ -5996,6 +6160,7 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
                   )
 
                   if plaintext.len > 0:
+                    state.markPeerActivity()
                     {.cast(gcsafe).}:
                       emitDiagnostics(DiagnosticsEvent(
                         kind: diagConnectionEvent,
@@ -7754,6 +7919,31 @@ proc getConnectionCloseReason*(connection: HQUIC; reason: var string): bool {.ex
   if state.isNil:
     return false
   reason = state.closeReason
+  true
+
+proc setConnectionTimeoutsForTest*(connection: HQUIC;
+    handshakeIdleTimeoutMs: uint64; idleTimeoutMs: uint64): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  state.settingsOverlay.handshakeIdleTimeoutMs = handshakeIdleTimeoutMs
+  state.settingsOverlay.idleTimeoutMs = idleTimeoutMs
+  true
+
+proc setConnectionPeerActivityForTest*(connection: HQUIC;
+    createdAtUs: uint64; lastPeerActivityUs: uint64): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  state.createdAtUs = createdAtUs
+  state.lastPeerActivityUs = lastPeerActivityUs
+  true
+
+proc runConnectionMaintenanceForTest*(connection: HQUIC): bool =
+  let state = toConnection(connection)
+  if state.isNil:
+    return false
+  state.detectTimedOutLosses()
   true
 
 proc recomputeConnectionLossDetectionTimerForTest*(connection: HQUIC): bool =

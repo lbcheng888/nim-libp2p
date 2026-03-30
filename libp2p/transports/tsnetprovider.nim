@@ -88,6 +88,15 @@ proc requestedBackendLabel*(provider: TsnetProvider): string {.gcsafe.} =
 proc ready*(provider: TsnetProvider): bool {.gcsafe.} =
   not provider.isNil and provider.started
 
+proc listenerNeedsRepair*(provider: TsnetProvider): bool {.gcsafe.} =
+  if provider.isNil:
+    return false
+  case provider.kind
+  of TsnetProviderKind.InAppUnavailable, TsnetProviderKind.InAppReal:
+    tsnetproviderinapp.listenerNeedsRepair(provider.runtime)
+  else:
+    false
+
 proc failure*(provider: TsnetProvider): string {.gcsafe.} =
   if provider.isNil:
     return ""

@@ -525,14 +525,9 @@ proc select*(
     firstPermit = permitAttempt.permit
     firstUsed = true
 
-  let attemptV2 =
-    case conn.multistreamVersion
-    of msv1:
-      false
-    of msv2:
-      true
-    else:
-      true
+  ## Product path stays on multistream v1 until builtin QUIC proves
+  ## same-stream multi-flight handshakes stable across desktop and Android.
+  let attemptV2 = false
 
   when defined(lsmr_diag):
     echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-performDialerHandshake-begin peer=", $conn.peerId
@@ -730,12 +725,12 @@ proc handleMultistreamV1Loop(
         trace "handle: acknowledging duplicate handshake while handshaked", conn
         await conn.writeLp(CodecV1 & "\n")
     elif ms in protos or matchers.anyIt(it(ms)):
-      trace "found handler", conn, protocol = ms
+      warn "multistream v1 found handler", conn, protocol = ms
       await conn.writeLp(ms & "\n")
       conn.protocol = ms
       return ms
     else:
-      trace "no handlers", conn, protocol = ms
+      warn "multistream v1 no handlers", conn, protocol = ms
       await conn.writeLp(Na)
 
   ""
@@ -794,6 +789,8 @@ proc processListenerHandshake(
   warn "multistream listener got post-handshake message", conn, bytes = nextMessage.len
   if nextMessage.len > 0:
     var nextStr = string.fromBytes(nextMessage)
+    let preview = nextStr.replace("\n", "\\n").replace("\r", "\\r")
+    warn "multistream listener post-handshake content", conn, msg = preview
     when defined(libp2p_msquic_debug):
       debug "multistream listener got next", conn, msg = nextStr
     validateSuffix(nextStr)
@@ -884,7 +881,7 @@ proc handle*(
         await handleProtocolSelect(conn, protos, matchers, first)
 
   if negotiated.len > 0:
-    warn "multistream handle negotiated", conn, protocol = negotiated
+    warn "multistream handle negotiated", conn, protocol = negotiated, version = $conn.multistreamVersion
     return negotiated
 
   warn "multistream handle empty result", conn

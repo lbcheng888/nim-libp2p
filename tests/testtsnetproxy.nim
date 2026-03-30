@@ -90,6 +90,75 @@ proc mockMappedTransport(
   )
 
 suite "Tsnet proxy runtime":
+  test "invalid proxy registry rows are ignored during lookup":
+    unregisterProxyRoutes(7001)
+    unregisterProxyRoutes(7002)
+    let advertised = MultiAddress.init("/ip4/100.64.0.10/udp/4001/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/41002/quic-v1").tryGet()
+    check registerProxyRoute(7001, advertised, raw).isOk()
+    injectInvalidProxyRegistrationForTest(7002, "/ip4/127.0.0.1/udp/49999/quic-v1")
+
+    let looked = lookupRawTarget("ip4", "100.64.0.10", 4001, TsnetProxyKind.Quic)
+    check looked.isOk()
+    check looked.get() == raw
+
+    unregisterProxyRoutes(7001)
+    unregisterProxyRoutes(7002)
+
+  test "direct route snapshots ignore invalid resolved remote rows":
+    unregisterProxyRoutes(7003)
+    let advertised = MultiAddress.init("/ip4/100.64.0.12/udp/4002/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/203.0.113.12/udp/41012/quic-v1").tryGet()
+    check registerDirectRoute(7003, advertised, raw, TsnetPathDirect).isOk()
+    injectInvalidResolvedRemoteRegistrationForTest(7003, "/ip4/127.0.0.1/udp/49998/quic-v1")
+
+    let snapshots = directRouteSnapshots(7003)
+    check snapshots.len == 1
+    check snapshots[0].advertised == advertised
+    check snapshots[0].raw == raw
+    check normalizeTailnetPath(snapshots[0].pathKind) == TsnetPathDirect
+
+    unregisterProxyRoutes(7003)
+
+  test "status payload ignores invalid direct route rows":
+    let runtimeDir = tempRuntimeDir("invalid-direct-route-status")
+    let runtimeCfg = TsnetProviderConfig(
+      controlUrl: "http://headscale.local",
+      authKey: "tskey-invalid-direct-route-status",
+      hostname: "invalid-direct-route-status-node",
+      stateDir: runtimeDir,
+      wireguardPort: 41649,
+      bridgeLibraryPath: "",
+      logLevel: "",
+      enableDebug: false,
+      bridgeExtraJson: ""
+    )
+    let runtime = TsnetInAppRuntime.new(
+      runtimeCfg,
+      mockMappedTransport(
+        "invalid-direct-route-status-node",
+        11,
+        "100.64.0.21",
+        "fd7a:115c:a1e0::21",
+        "peer-node",
+        12,
+        "100.64.0.22"
+      )
+    )
+
+    check runtime.start().isOk()
+    check runtime.ready()
+    injectInvalidDirectRouteRegistrationForTest(
+      runtime.runtimeId,
+      "/ip4/203.0.113.21/udp/42021/quic-v1"
+    )
+
+    let statusPayload = runtime.statusPayload()
+    check statusPayload.isOk()
+    check directRouteSnapshots(runtime.runtimeId).len == 0
+
+    runtime.stop()
+
   test "mapped runtime exposes proxy-backed TCP and UDP routes with lifecycle cleanup":
     let serverDir = tempRuntimeDir("server")
     let clientDir = tempRuntimeDir("client")

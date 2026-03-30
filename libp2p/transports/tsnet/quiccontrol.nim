@@ -172,7 +172,7 @@ proc detectAddressFamily(host: string): uint16 =
       return 0'u16
   2'u16
 
-proc enumerateLocalInterfaceAddrs(): HashSet[string] =
+proc enumerateLocalInterfaceAddrs(): HashSet[string] {.gcsafe, raises: [].} =
   result = initHashSet[string]()
   var ifap: ptr Ifaddrs = nil
   try:
@@ -282,7 +282,7 @@ proc initOpenNetworkState(): TsnetQuicOpenNetworkState =
     nodes: initTable[string, TsnetQuicOpenNetworkNode]()
   )
 
-proc tlsServerName(host: string): Option[string] =
+proc tlsServerName(host: string): Option[string] {.gcsafe, raises: [].} =
   if host.len == 0:
     return none(string)
   let suppressIpSni =
@@ -292,7 +292,24 @@ proc tlsServerName(host: string): Option[string] =
     return none(string)
   some(host)
 
-proc isLoopbackControlHost(host: string): bool =
+proc isLoopbackControlHost(host: string): bool {.gcsafe, raises: [].}
+
+proc localLoopbackDialHost(host: string): Option[string] {.gcsafe, raises: [].} =
+  let normalized = host.strip().toLowerAscii()
+  if normalized.len == 0:
+    return none(string)
+  let family = detectAddressFamily(normalized)
+  if family == 0'u16 or isLoopbackControlHost(normalized):
+    return none(string)
+  let localAddrs = enumerateLocalInterfaceAddrs()
+  if normalized notin localAddrs:
+    return none(string)
+  if family == 23'u16:
+    some("::1")
+  else:
+    some("127.0.0.1")
+
+proc isLoopbackControlHost(host: string): bool {.gcsafe, raises: [].} =
   let lowered = host.strip().toLowerAscii()
   lowered in ["127.0.0.1", "::1", "localhost"]
 
@@ -344,9 +361,12 @@ proc quicClientDebug(message: string) =
   except IOError:
     discard
 
-proc resolveDialHost(host: string, port: uint16): Result[string, string] =
+proc resolveDialHost(host: string, port: uint16): Result[string, string] {.gcsafe, raises: [].} =
   if host.len == 0:
     return err("nim_quic control host is empty")
+  let literalOverride = localLoopbackDialHost(host)
+  if literalOverride.isSome():
+    return ok(literalOverride.get())
   if detectAddressFamily(host) != 0'u16:
     return ok(host)
   for domain in [AF_INET, AF_INET6, AF_UNSPEC]:
@@ -364,6 +384,9 @@ proc resolveDialHost(host: string, port: uint16): Result[string, string] =
         freeAddrInfo(addrInfo)
       let resolved = getAddrString(cast[ptr SockAddr](addrInfo.ai_addr))
       if resolved.len > 0:
+        let resolvedOverride = localLoopbackDialHost(resolved)
+        if resolvedOverride.isSome():
+          return ok(resolvedOverride.get())
         return ok(resolved)
     except CatchableError:
       discard

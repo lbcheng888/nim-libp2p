@@ -1,4 +1,4 @@
-import std/unittest
+import std/[times, unittest]
 
 import ../api/api_impl
 
@@ -95,6 +95,59 @@ suite "MsQuic listener accepted-connection storage":
       foundConn
     )
     check foundConn == secondConn
+
+    api.ListenerClose(listener)
+    api.RegistrationClose(registration)
+    MsQuicClose(apiPtr)
+
+  test "timed out accepted connection is removed from listener storage":
+    var apiPtr: pointer
+    check MsQuicOpenVersion(2, addr apiPtr) == QUIC_STATUS_SUCCESS
+    let api = cast[ptr QuicApiTable](apiPtr)
+
+    var registration: HQUIC
+    check api.RegistrationOpen(nil, addr registration) == QUIC_STATUS_SUCCESS
+
+    var listener: HQUIC
+    check api.ListenerOpen(registration, nil, nil, addr listener) == QUIC_STATUS_SUCCESS
+
+    let remoteHost = "10.0.2.77"
+    let remotePort = 4777'u16
+    let localHost = "127.0.0.1"
+    let localPort = 41077'u16
+    var clientCid = @[0x11'u8, 0x12, 0x13, 0x14]
+    var serverCid = @[0xC1'u8, 0xC2, 0xC3, 0xC4]
+
+    var conn: HQUIC
+    check createAcceptedConnectionForTest(
+      listener,
+      cstring(remoteHost),
+      remotePort,
+      cstring(localHost),
+      localPort,
+      addr clientCid[0],
+      uint32(clientCid.len),
+      addr serverCid[0],
+      uint32(serverCid.len),
+      conn
+    )
+
+    var uniqueCount = 0'u32
+    check getListenerAcceptedConnectionUniqueCountForTest(listener, uniqueCount)
+    check uniqueCount == 1'u32
+
+    let staleUs = uint64(epochTime() * 1_000_000.0) - 5_000_000'u64
+    check setConnectionHandshakeStateForTest(conn, false)
+    check setConnectionTimeoutsForTest(conn, 1'u64, 30_000'u64)
+    check setConnectionPeerActivityForTest(conn, staleUs, staleUs)
+    check runConnectionMaintenanceForTest(conn)
+
+    check getListenerAcceptedConnectionUniqueCountForTest(listener, uniqueCount)
+    check uniqueCount == 0'u32
+
+    var closeReason = ""
+    check getConnectionCloseReason(conn, closeReason)
+    check closeReason == "handshake idle timeout"
 
     api.ListenerClose(listener)
     api.RegistrationClose(registration)

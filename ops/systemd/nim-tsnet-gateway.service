@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/nim-libp2p
-ExecStart=/root/nim-libp2p/build/tsnet_quic_gateway_service --listen-host=0.0.0.0 --control-listen-port=443 --relay-listen-port=80 --certificate-file=/root/nim-libp2p/build/nim-tsnet-quic.crt --private-key-file=/root/nim-libp2p/build/nim-tsnet-quic.key --open-network --public-host=64.176.84.12 --public-ipv4=64.176.84.12 --public-ipv6=2001:19f0:4400:7c67:5400:6ff:fe04:54f8 --region-id=901 --region-code=sin --region-name=Open\x20QUIC\x20Network --derp-port=443 --verbose-diagnostics
+ExecStart=/root/nim-libp2p/build/tsnet_quic_gateway_service --listen-host=0.0.0.0 --control-listen-port=9444 --relay-listen-port=9446 --certificate-file=/root/nim-libp2p/build/nim-tsnet-quic.crt --private-key-file=/root/nim-libp2p/build/nim-tsnet-quic.key --open-network --public-host=64.176.84.12 --public-ipv4=64.176.84.12 --public-ipv6=2001:19f0:4400:7c67:5400:6ff:fe04:54f8 --region-id=901 --region-code=sin --region-name=Open\x20QUIC\x20Network --derp-port=9446 --verbose-diagnostics
 Restart=always
 RestartSec=1
 

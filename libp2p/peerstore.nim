@@ -87,6 +87,7 @@ type
     capacity*: int
     toClean*: seq[PeerId]
     addressExpirations: Table[PeerId, Table[MultiAddress, Moment]]
+    identifyLocks: Table[uint64, AsyncLock]
 
 const DefaultDiscoveredAddressTTL* = chronos.minutes(30)
 
@@ -97,6 +98,7 @@ proc new*(
     identify: identify,
     capacity: capacity,
     addressExpirations: initTable[PeerId, Table[MultiAddress, Moment]](),
+    identifyLocks: initTable[uint64, AsyncLock](),
   )
 
 #########################
@@ -614,7 +616,35 @@ proc cleanup*(peerStore: PeerStore, peerId: PeerId) =
     peerStore.del(peerStore.toClean[0])
     peerStore.toClean.delete(0)
 
-proc identify*(
+proc identifyTaskKey(muxer: Muxer): uint64 {.inline.} =
+  if muxer.isNil or muxer.connection.isNil:
+    return 0'u64
+  cast[uint64](muxer.connection)
+
+proc getOrCreateIdentifyLock(peerStore: PeerStore, muxer: Muxer): AsyncLock =
+  let taskKey = identifyTaskKey(muxer)
+  if taskKey == 0'u64:
+    return nil
+  result = peerStore.identifyLocks.getOrDefault(taskKey)
+  if result.isNil:
+    result = newAsyncLock()
+    peerStore.identifyLocks[taskKey] = result
+
+proc hasIdentifySnapshot(peerStore: PeerStore, peerId: PeerId): bool =
+  if peerStore.isNil or peerId.len == 0:
+    return false
+  try:
+    if peerStore[ProtoBook][peerId].len > 0:
+      return true
+    if peerStore[AgentBook][peerId].len > 0:
+      return true
+    if peerStore[ProtoVersionBook][peerId].len > 0:
+      return true
+  except CatchableError:
+    discard
+  false
+
+proc identifyImpl(
     peerStore: PeerStore, muxer: Muxer
 ) {.
     async: (
@@ -643,7 +673,15 @@ proc identify*(
     negotiated = stream.negotiatedMuxer
 
   try:
+    warn "peerStore.identify beginProtocolNegotiation begin",
+      peerId = muxer.connection.peerId,
+      streamPeerId = stream.peerId,
+      codec = peerStore.identify.codec()
     await stream.beginProtocolNegotiation()
+    warn "peerStore.identify beginProtocolNegotiation done",
+      peerId = muxer.connection.peerId,
+      streamPeerId = stream.peerId,
+      codec = peerStore.identify.codec()
     warn "peerStore.identify multistream select begin",
       peerId = muxer.connection.peerId,
       streamPeerId = stream.peerId,
@@ -681,6 +719,44 @@ proc identify*(
   finally:
     stream.endProtocolNegotiation()
     await stream.closeWithEOF()
+
+proc identify*(
+    peerStore: PeerStore, muxer: Muxer
+) {.
+    async: (
+      raises: [
+        CancelledError, IdentityNoMatchError, IdentityInvalidMsgError, MultiStreamError,
+        LPStreamError, MuxerError,
+      ]
+    )
+.} =
+  if peerStore.isNil or muxer.isNil or muxer.connection.isNil:
+    return
+  let identifyLock = getOrCreateIdentifyLock(peerStore, muxer)
+  let waitedForIdentify =
+    if identifyLock.isNil:
+      false
+    else:
+      identifyLock.locked()
+  if not identifyLock.isNil:
+    await identifyLock.acquire()
+  defer:
+    if not identifyLock.isNil:
+      try:
+        identifyLock.release()
+      except AsyncLockError as exc:
+        raiseAssert "identify lock must have been acquired above: " & exc.msg
+  if waitedForIdentify and
+      peerStore.hasIdentifySnapshot(muxer.connection.peerId):
+    warn "peerStore.identify skip duplicate after wait",
+      peerId = muxer.connection.peerId,
+      protocol = muxer.connection.protocol,
+      negotiated = muxer.connection.negotiatedMuxer
+    return
+  try:
+    await identifyImpl(peerStore, muxer)
+  except CancelledError as exc:
+    raise exc
 
 proc getMostObservedProtosAndPorts*(self: PeerStore): seq[MultiAddress] =
   return self.identify.observedAddrManager.getMostObservedProtosAndPorts()

@@ -56,6 +56,10 @@ proc runtimeCapabilities*(runtime: TsnetInAppRuntime): TsnetProviderCapabilities
     )
   tsruntime.capabilities(runtime)
 
+proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
+  inAppSafe:
+    result = tsruntime.listenerNeedsRepair(runtime)
+
 proc openInAppRuntime*(cfg: TsnetProviderConfig): Result[TsnetInAppRuntime, string] =
   let runtime = tsruntime.TsnetInAppRuntime.new(cfg)
   let started = tsruntime.start(runtime)

@@ -185,12 +185,16 @@ var messageIdLock: Lock
 var lastNodeIdentityLock: Lock
 var bootstrapSeedConnectKickoffState {.global.}: Table[string, string] = initTable[string, string]()
 var bootstrapSeedConnectKickoffStateLock {.global.}: Lock
+var sendWithAckKickoffState {.global.}: Table[string, string] = initTable[string, string]()
+var sendWithAckKickoffProgressStage {.global.}: Table[string, string] = initTable[string, string]()
+var sendWithAckKickoffStateLock {.global.}: Lock
 var lastNodeHandle: pointer = nil
 var lastNodePeerIdCache = ""
 
 initLock(messageIdLock)
 initLock(lastNodeIdentityLock)
 initLock(bootstrapSeedConnectKickoffStateLock)
+initLock(sendWithAckKickoffStateLock)
 
 proc bootstrapSeedConnectKickoffStateJson(
     peerId: string,
@@ -228,6 +232,119 @@ proc getBootstrapSeedConnectKickoffState(peerId: string): string =
     if bootstrapSeedConnectKickoffState.hasKey(safePeerId):
       return bootstrapSeedConnectKickoffState[safePeerId]
   bootstrapSeedConnectKickoffStateJson(safePeerId, "missing")
+
+proc sendWithAckKickoffStateJson(
+    requestKey: string,
+    status: string,
+    payload: JsonNode = newJNull(),
+    error: string = ""
+): string =
+  var obj = %*{
+    "status": status,
+    "requestKey": requestKey,
+    "error": error
+  }
+  if payload.kind != JNull:
+    obj["payload"] = payload
+  $obj
+
+proc setSendWithAckKickoffState(
+    requestKey: string,
+    status: string,
+    payload: JsonNode = newJNull(),
+    error: string = ""
+) =
+  let safeRequestKey = requestKey.strip()
+  if safeRequestKey.len == 0:
+    return
+  var stageText = ""
+  var peerText = ""
+  if payload.kind == JObject:
+    if payload.hasKey("stage") and payload["stage"].kind == JString:
+      stageText = payload["stage"].getStr("").strip()
+    if payload.hasKey("peerId") and payload["peerId"].kind == JString:
+      peerText = payload["peerId"].getStr("").strip()
+  withLock(sendWithAckKickoffStateLock):
+    if payload.kind == JObject and payload.hasKey("stage"):
+      let stage = payload["stage"].getStr("").strip()
+      if stage.len > 0:
+        sendWithAckKickoffProgressStage[safeRequestKey] = stage
+    sendWithAckKickoffState[safeRequestKey] =
+      sendWithAckKickoffStateJson(safeRequestKey, status, payload, error)
+  try:
+    stderr.writeLine(
+      "[nimlibp2p] sendWithAckKickoff state request=" &
+      safeRequestKey &
+      " status=" & status &
+      " stage=" & stageText &
+      " peer=" & peerText &
+      " err=" & error
+    )
+  except IOError:
+    discard
+
+proc getSendWithAckKickoffState(requestKey: string): string =
+  let safeRequestKey = requestKey.strip()
+  if safeRequestKey.len == 0:
+    return sendWithAckKickoffStateJson("", "missing", newJNull(), "missing_request_key")
+  withLock(sendWithAckKickoffStateLock):
+    if sendWithAckKickoffState.hasKey(safeRequestKey):
+      return sendWithAckKickoffState[safeRequestKey]
+  sendWithAckKickoffStateJson(safeRequestKey, "missing")
+
+proc mergeJsonObjectFields(target: var JsonNode, extra: JsonNode) =
+  if target.kind != JObject or extra.kind != JObject:
+    return
+  for key, value in extra:
+    target[key] = cloneJson(value)
+
+proc getSendWithAckKickoffPayloadSnapshot(requestKey: string): JsonNode =
+  let safeRequestKey = requestKey.strip()
+  if safeRequestKey.len == 0:
+    return newJNull()
+  var rawState = ""
+  withLock(sendWithAckKickoffStateLock):
+    rawState = sendWithAckKickoffState.getOrDefault(safeRequestKey, "")
+  if rawState.len == 0:
+    return newJNull()
+  try:
+    let node = parseJson(rawState)
+    if node.kind == JObject and node.hasKey("payload"):
+      return cloneJson(node["payload"])
+  except CatchableError:
+    discard
+  newJNull()
+
+proc updateSendWithAckKickoffProgress(
+    requestKey: string,
+    peerId: string,
+    stage: string,
+    addressCount: int = 0,
+    source: string = "",
+    ackRequested: bool = false,
+    messageId: string = "",
+    error: string = "",
+    detail: JsonNode = newJNull(),
+) =
+  let safeRequestKey = requestKey.strip()
+  if safeRequestKey.len == 0:
+    return
+  var payload = %*{
+    "ok": false,
+    "requestKey": safeRequestKey,
+    "peerId": peerId,
+    "stage": stage,
+    "addressCount": addressCount,
+    "source": source,
+    "ackRequested": ackRequested,
+  }
+  if messageId.len > 0:
+    payload["messageId"] = %messageId
+  if error.len > 0:
+    payload["error"] = %error
+  if detail.kind == JObject:
+    mergeJsonObjectFields(payload, detail)
+  setSendWithAckKickoffState(safeRequestKey, "running", payload, error)
 
 logScope:
   topics = "nimlibp2p ffi"
@@ -437,6 +554,7 @@ type
     cmdBootstrapSeedConnectExactKickoff,
     cmdUdpEchoProbe,
     cmdSendDirect,
+    cmdSendDirectKickoff,
     cmdSendChatAck,
     cmdGetLastDirectError,
     cmdInitializeConnEvents,
@@ -583,6 +701,7 @@ type
     tailnetAttempts: int
     tailnetWarmTask: Future[void]
     bootstrapSeedConnectTasks: Table[string, Future[void]]
+    sendDirectKickoffTasks: Table[string, Future[void]]
     tailnetWarmThread: Thread[pointer]
     tailnetWarmThreadActive: Atomic[bool]
     tailnetWarmThreadJoined: Atomic[bool]
@@ -611,6 +730,7 @@ type
     relayReservationLoop: Future[void]
     relayReservationCycle: Future[int]
     tailnetControlRefreshLoop: Future[void]
+    tailnetAdvertisedPeerSyncTask: Future[void]
     telemetryLoop: Future[void]
     metricsLoop: Future[void]
     metricsTextfileLoop: Future[void]
@@ -703,6 +823,19 @@ proc runBootstrapSeedConnectExactAsync(
     selectedAddrs: seq[string],
     effectiveSource: string,
     safeSecureTimeoutMs: int
+) {.async.}
+proc executeSendDirectCommand(
+    n: NimNode,
+    command: Command
+): Future[void] {.async.}
+proc runSendDirectKickoffAsync(
+    n: NimNode,
+    requestKey: string,
+    peerId: string,
+    jsonPayload: string,
+    timeoutMs: int,
+    addresses: seq[string],
+    source: string,
 ) {.async.}
 
 proc resetCommandFields(cmd: Command) =
@@ -799,6 +932,23 @@ proc parseDirectEnvelopeOp(payload: string): string =
   except CatchableError:
     return ""
 
+proc parseDirectEnvelopeAckRequested(
+    payload: string;
+    defaultValue = true
+): bool =
+  let trimmed = payload.strip()
+  if trimmed.len == 0 or trimmed[0] != '{':
+    return defaultValue
+  try:
+    let node = parseJson(trimmed)
+    if node.kind != JObject:
+      return defaultValue
+    if node.hasKey("ackRequested") and node["ackRequested"].kind == JBool:
+      return node["ackRequested"].getBool()
+  except CatchableError:
+    discard
+  defaultValue
+
 proc classifyDirectCommandOp(cmd: Command): string =
   if cmd.isNil:
     return ""
@@ -836,6 +986,8 @@ proc isHighPriorityCommand(cmd: Command): bool =
   of cmdSendDirect:
     let normalized = classifyDirectCommandOp(cmd).strip().toLowerAscii()
     return normalized.startsWith("game_") or normalized == "ack"
+  of cmdSendDirectKickoff:
+    return true
   else:
     return false
 
@@ -1768,6 +1920,8 @@ proc canonicalizeWanProviderAddr(
 proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
+  if wantsTsnetTransport(node.cfg):
+    return @[]
   let hostNetwork = currentHostNetworkStatus(node)
   let observedPublicIpv6 =
     if hostNetwork.kind == JObject and hostNetwork.hasKey("publicIpv6") and hostNetwork["publicIpv6"].kind == JString:
@@ -1914,6 +2068,8 @@ proc activeRelayReservationSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
 proc collectRelayBackedProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
+  if wantsTsnetTransport(node.cfg):
+    return @[]
   var localSeedAddrs = activeRelayReservationSeedAddrs(node)
   localSeedAddrs.add(prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node)))
   var seen = initHashSet[string]()
@@ -1964,7 +2120,7 @@ proc tailnetListenerNeedsRepair(payload: JsonNode): bool {.gcsafe, raises: [].} 
     return false
   for item in listeners.items:
     let stage = strField(item, "stage").toLowerAscii()
-    if stage in ["failed", "dropped", "stopped"]:
+    if stage in ["failed", "dropped", "stopped", "awaiting", "incoming", "ready"]:
       return true
   false
 
@@ -2104,38 +2260,41 @@ proc syncAdvertisedPeerInfo(
     nextListen = dedupeLocalMultiaddrs(peerInfo.addrs)
 
   var nextAddrs =
-    if peerInfo.addrs.len > 0:
+    if wantsTsnetTransport(node.cfg):
+      dedupeLocalMultiaddrs(nextListen)
+    elif peerInfo.addrs.len > 0:
       dedupeLocalMultiaddrs(peerInfo.addrs)
     else:
       dedupeLocalMultiaddrs(nextListen)
-  let directSeedAddrs = try:
-      collectWanProviderSeedAddrs(node)
-    except CatchableError as exc:
-      debugLog(
-        "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason &
-        " err=" & exc.msg
-      )
-      @[]
-    except Exception:
-      debugLog(
-        "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason
-      )
-      @[]
-  let relaySeedAddrs = try:
-      collectRelayBackedProviderSeedAddrs(node)
-    except CatchableError as exc:
-      debugLog(
-        "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason &
-        " err=" & exc.msg
-      )
-      @[]
-    except Exception:
-      debugLog(
-        "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason
-      )
-      @[]
-  appendParsedUniqueAddrs(nextAddrs, directSeedAddrs)
-  appendParsedUniqueAddrs(nextAddrs, relaySeedAddrs)
+  if not wantsTsnetTransport(node.cfg):
+    let directSeedAddrs = try:
+        collectWanProviderSeedAddrs(node)
+      except CatchableError as exc:
+        debugLog(
+          "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason &
+          " err=" & exc.msg
+        )
+        @[]
+      except Exception:
+        debugLog(
+          "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason
+        )
+        @[]
+    let relaySeedAddrs = try:
+        collectRelayBackedProviderSeedAddrs(node)
+      except CatchableError as exc:
+        debugLog(
+          "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason &
+          " err=" & exc.msg
+        )
+        @[]
+      except Exception:
+        debugLog(
+          "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason
+        )
+        @[]
+    appendParsedUniqueAddrs(nextAddrs, directSeedAddrs)
+    appendParsedUniqueAddrs(nextAddrs, relaySeedAddrs)
   if nextAddrs.len == 0:
     nextAddrs = dedupeLocalMultiaddrs(nextListen)
   if nextListen.len == 0 and nextAddrs.len > 0:
@@ -3336,11 +3495,28 @@ proc deferHostNetworkStatusSideEffects(
 proc mergeTsnetListenAddrsIntoPeerInfo(
     node: NimNode,
     transport: TsnetTransport
-) {.gcsafe, raises: [].} =
+) : bool {.gcsafe, raises: [].} =
   if node.isNil or transport.isNil or node.switchInstance.isNil or node.switchInstance.peerInfo.isNil:
-    return
-  var nextListen = dedupeLocalMultiaddrs(node.switchInstance.peerInfo.listenAddrs)
-  var nextAddrs = dedupeLocalMultiaddrs(node.switchInstance.peerInfo.addrs)
+    return false
+  let tsnetOnly = wantsTsnetTransport(node.cfg)
+  var nextListen =
+    if tsnetOnly:
+      dedupeLocalMultiaddrs(
+        node.switchInstance.peerInfo.listenAddrs.filterIt(
+          safeMultiaddrText(it).toLowerAscii().contains("/tsnet")
+        )
+      )
+    else:
+      dedupeLocalMultiaddrs(node.switchInstance.peerInfo.listenAddrs)
+  var nextAddrs =
+    if tsnetOnly:
+      dedupeLocalMultiaddrs(
+        node.switchInstance.peerInfo.addrs.filterIt(
+          safeMultiaddrText(it).toLowerAscii().contains("/tsnet")
+        )
+      )
+    else:
+      dedupeLocalMultiaddrs(node.switchInstance.peerInfo.addrs)
   let transportAddrs = try:
       transport.publishedAddrs()
     except CatchableError:
@@ -3367,8 +3543,13 @@ proc mergeTsnetListenAddrsIntoPeerInfo(
     if key notin addrsSeen:
       nextAddrs.add(addr)
       addrsSeen.incl(key)
-  node.switchInstance.peerInfo.listenAddrs = dedupeLocalMultiaddrs(nextListen)
-  node.switchInstance.peerInfo.addrs = dedupeLocalMultiaddrs(nextAddrs)
+  let mergedListen = dedupeLocalMultiaddrs(nextListen)
+  let mergedAddrs = dedupeLocalMultiaddrs(nextAddrs)
+  result =
+    mergedListen.mapIt($it) != node.switchInstance.peerInfo.listenAddrs.mapIt($it) or
+    mergedAddrs.mapIt($it) != node.switchInstance.peerInfo.addrs.mapIt($it)
+  node.switchInstance.peerInfo.listenAddrs = mergedListen
+  node.switchInstance.peerInfo.addrs = mergedAddrs
 
 proc publishTsnetLocalPeerInfo(
     node: NimNode,
@@ -3392,6 +3573,11 @@ proc syncTailnetWarmAdvertisedPeerInfo(n: NimNode): Future[bool] {.async.} =
   )
 
 proc spawnTailnetWarmAdvertisedPeerInfo(n: NimNode) {.gcsafe, raises: [].} =
+  if n.isNil:
+    return
+  if not n.tailnetAdvertisedPeerSyncTask.isNil and
+      not n.tailnetAdvertisedPeerSyncTask.finished():
+    return
   let task = proc(): Future[void] {.async.} =
     try:
       discard await syncTailnetWarmAdvertisedPeerInfo(n)
@@ -3399,7 +3585,12 @@ proc spawnTailnetWarmAdvertisedPeerInfo(n: NimNode) {.gcsafe, raises: [].} =
       debugLog(
         "[nimlibp2p] tailnet advertised peer sync failed err=" & exc.msg
       )
-  asyncSpawn task()
+    finally:
+      if not n.isNil:
+        n.tailnetAdvertisedPeerSyncTask = nil
+  let fut = task()
+  n.tailnetAdvertisedPeerSyncTask = fut
+  asyncSpawn fut
 
 proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
   if n.isNil or not n.started:
@@ -3420,7 +3611,7 @@ proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
     "proxyListenerReady": jsonGetInt64(before, "proxyListenerReady", 0),
     "relayListeners": before.getOrDefault("relayListeners"),
   }))
-  let repaired = transport.reconcileProviderListeners()
+  let repaired = reconcileProviderListeners(transport)
   if repaired.isErr():
     recordEvent(n, "system_status", $(%*{
       "entity": "tailnet_listener",
@@ -3430,7 +3621,7 @@ proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
       "relayListeners": before.getOrDefault("relayListeners"),
     }))
     return
-  mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+  discard mergeTsnetListenAddrsIntoPeerInfo(n, transport)
   publishTsnetLocalPeerInfo(n, transport)
   discard await syncAdvertisedPeerInfo(
     n,
@@ -3523,7 +3714,7 @@ proc runTailnetWarmAsync(n: NimNode) {.async.} =
       $warmRes.get()
     )
     debugLog("[nimlibp2p] tailnet warm async: merge_listen_addrs_begin")
-    mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+    discard mergeTsnetListenAddrsIntoPeerInfo(n, transport)
     debugLog("[nimlibp2p] tailnet warm async: publish_local_peer_info_after_merge")
     publishTsnetLocalPeerInfo(n, transport)
     debugLog("[nimlibp2p] tailnet warm async: merged concrete tsnet listen addrs")
@@ -3561,7 +3752,7 @@ proc processTailnetWarmCompletion(n: NimNode) {.gcsafe, raises: [].} =
   if transport.isNil:
     updateTailnetStartStatus(n, "failed", false, "tsnet transport unavailable")
     return
-  mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+  discard mergeTsnetListenAddrsIntoPeerInfo(n, transport)
   publishTsnetLocalPeerInfo(n, transport)
   debugLog("[nimlibp2p] tailnet warm completion: merged concrete tsnet listen addrs")
   ensureTailnetControlRefreshLoop(n)
@@ -5238,34 +5429,47 @@ proc ensurePeerIdentified(
       "[nimlibp2p] ensurePeerIdentified explicit identify failed peer=" & peerText &
       " err=" & exc.msg
     )
-
-  await waitForPeerIdentifiedWithinDeadline(n, peer, identifyWaitMs)
+  let identifiedOk = await waitForPeerIdentifiedWithinDeadline(n, peer, identifyWaitMs)
+  debugLog(
+    "[nimlibp2p] ensurePeerIdentified final wait done peer=" & peerText &
+    " identifiedOk=" & $identifiedOk &
+    " timeoutMs=" & $identifyWaitMs
+  )
+  identifiedOk
 
 proc waitForSecureChannel(n: NimNode, peerId: string, timeoutMs: int): Future[bool] {.async.}
+
+proc waitForPeerReadyDetailed(
+    n: NimNode,
+    peerIdText: string,
+    timeoutMs: int
+): Future[tuple[ok: bool, phase: string]] {.async.} =
+  if n.isNil:
+    return (false, "invalid_node")
+  let safePeerId = peerIdText.strip()
+  if safePeerId.len == 0:
+    return (false, "missing_peer")
+  var peer: PeerId
+  if not peer.init(safePeerId):
+    return (false, "invalid_peer")
+  let totalBudgetMs = max(timeoutMs, 250)
+  let startedAtMs = nowMillis()
+  let secureOk = await waitForSecureChannel(n, safePeerId, totalBudgetMs)
+  if not secureOk:
+    return (false, "secure_timeout")
+  let elapsedMs = int(max(0'i64, nowMillis() - startedAtMs))
+  let remainingMs = max(totalBudgetMs - elapsedMs, 0)
+  if remainingMs == 0:
+    return (peerCurrentlyIdentified(n, peer), "identify_timeout")
+  let identifiedOk = await ensurePeerIdentified(n, peer, remainingMs)
+  (identifiedOk, if identifiedOk: "ready" else: "identify_timeout")
 
 proc waitForPeerReady(
     n: NimNode,
     peerIdText: string,
     timeoutMs: int
 ): Future[bool] {.async.} =
-  if n.isNil:
-    return false
-  let safePeerId = peerIdText.strip()
-  if safePeerId.len == 0:
-    return false
-  var peer: PeerId
-  if not peer.init(safePeerId):
-    return false
-  let totalBudgetMs = max(timeoutMs, 250)
-  let startedAtMs = nowMillis()
-  let secureOk = await waitForSecureChannel(n, safePeerId, totalBudgetMs)
-  if not secureOk:
-    return false
-  let elapsedMs = int(max(0'i64, nowMillis() - startedAtMs))
-  let remainingMs = max(totalBudgetMs - elapsedMs, 0)
-  if remainingMs == 0:
-    return peerCurrentlyIdentified(n, peer)
-  await ensurePeerIdentified(n, peer, remainingMs)
+  (await waitForPeerReadyDetailed(n, peerIdText, timeoutMs)).ok
 
 
 proc updateStartupStatus(
@@ -5598,6 +5802,17 @@ proc sendDirectJsonNoAck(
   except CatchableError as exc:
     return (false, if exc.msg.len > 0: exc.msg else: $exc.name)
 
+proc parsePreferredDirectMultiaddrs(
+    addresses: seq[string]
+): seq[MultiAddress] {.gcsafe, raises: [].} =
+  for addr in addresses:
+    let text = addr.strip()
+    if text.len == 0:
+      continue
+    let maRes = MultiAddress.init(text)
+    if maRes.isOk():
+      result.add(maRes.get())
+
 proc awaitDirectAckWaiter(
     n: NimNode,
     messageId: string,
@@ -5648,12 +5863,51 @@ proc sendDirectWithAckWaiter(
     remotePid: PeerId,
     payload: seq[byte],
     messageId: string,
-    timeout: chronos.Duration
+    timeout: chronos.Duration,
+    preferredAddrs: seq[MultiAddress] = @[],
+    requestKey = "",
+    source = "",
+    addressCount = 0
 ): Future[(bool, string)] {.async.} =
   if n.isNil or n.dmService.isNil:
     return (false, "direct message service unavailable")
   if messageId.len == 0:
     return (false, "missing_message_id")
+  proc updateWaiterStage(stage: string, detail: JsonNode = newJNull()) {.gcsafe, raises: [].} =
+    let safeRequestKey = requestKey.strip()
+    if safeRequestKey.len == 0:
+      return
+    let errorNode =
+      if detail.kind == JObject:
+        detail{"error"}
+      else:
+        nil
+    let errText =
+      if not errorNode.isNil and errorNode.kind == JString:
+        errorNode.getStr("").strip()
+      else:
+        ""
+    try:
+      ffiNodeSafe:
+        updateSendWithAckKickoffProgress(
+          safeRequestKey,
+          $remotePid,
+          stage,
+          addressCount,
+          source,
+          true,
+          messageId,
+          errText,
+          detail,
+        )
+    except CatchableError:
+      discard
+    debugLog(
+      "[nimlibp2p] sendDirectWithAckWaiter stage peer=" & $remotePid &
+      " mid=" & messageId &
+      " stage=" & stage &
+      (if errText.len > 0: " err=" & errText else: "")
+    )
   ## For direct-stream delivery, treat the in-stream LP ack as the authority.
   ## The legacy directWaiter path depends on a second out-of-band ack message,
   ## which can diverge from the stream ack and cause false timeouts.
@@ -5663,9 +5917,17 @@ proc sendDirectWithAckWaiter(
       payload,
       true,
       messageId,
-      timeout
+      timeout,
+      preferredAddrs = preferredAddrs,
+      progress = updateWaiterStage
     )
   except CatchableError as exc:
+    updateWaiterStage("dm_send_exception", %*{
+      "dmPhase": "send_exception",
+      "peer": $remotePid,
+      "messageId": messageId,
+      "error": (if exc.msg.len > 0: exc.msg else: $exc.name),
+    })
     return (false, if exc.msg.len > 0: exc.msg else: $exc.name)
 
 proc sendFileChunkResponse(
@@ -6997,7 +7259,42 @@ proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] {.gcsafe.} =
     base = n.switchInstance.peerInfo.listenAddrs
   if base.len == 0:
     base = n.switchInstance.peerInfo.addrs
+  if wantsTsnetTransport(n.cfg):
+    var tsnetBase = base.filterIt(safeMultiaddrText(it).toLowerAscii().contains("/tsnet"))
+    if tsnetBase.len == 0:
+      tsnetBase = n.switchInstance.peerInfo.listenAddrs.filterIt(
+        safeMultiaddrText(it).toLowerAscii().contains("/tsnet")
+      )
+    if tsnetBase.len == 0:
+      tsnetBase = n.switchInstance.peerInfo.addrs.filterIt(
+        safeMultiaddrText(it).toLowerAscii().contains("/tsnet")
+      )
+    if tsnetBase.len > 0:
+      base = tsnetBase
   let preservedBase = base
+  if wantsTsnetTransport(n.cfg):
+    var seen = initHashSet[string]()
+    var dedup: seq[MultiAddress] = @[]
+    for ma in base:
+      let key = safeMultiaddrText(ma)
+      if key.len == 0 or isUnspecifiedMultiaddrText(key):
+        continue
+      if key notin seen:
+        dedup.add(ma)
+        seen.incl(key)
+    if dedup.len == 0 and preservedBase.len > 0:
+      debugLog(
+        "[nimlibp2p] refreshLanAwareAddrs tsnet_only preserve-base=" &
+        preservedBase.mapIt($it).join(",")
+      )
+      return preservedBase
+    debugLog(
+      "[nimlibp2p] refreshLanAwareAddrs tsnet_only dedup=" &
+      (if dedup.len > 0: dedup.mapIt($it).join(",") else: "<empty>")
+    )
+    n.switchInstance.peerInfo.listenAddrs = dedup
+    n.switchInstance.peerInfo.addrs = dedup
+    return dedup
   let hostNetwork = currentHostNetworkStatus(n)
   let preferredIpv4 = jsonGetStr(
     hostNetwork,
@@ -9663,9 +9960,10 @@ proc ensureTailnetControlRefreshLoop(n: NimNode) {.gcsafe, raises: [].} =
           let payloadRes = ffiTsnetSafe:
             transport.tailnetStatusPayload()
           if payloadRes.isOk() and jsonGetBool(payloadRes.get(), "providerReady", false):
-            mergeTsnetListenAddrsIntoPeerInfo(n, transport)
+            let changed = mergeTsnetListenAddrsIntoPeerInfo(n, transport)
             publishTsnetLocalPeerInfo(n, transport)
-            spawnTailnetWarmAdvertisedPeerInfo(n)
+            if changed:
+              spawnTailnetWarmAdvertisedPeerInfo(n)
       await sleepAsync(chronos.milliseconds(TailnetControlRefreshMs))
   let refreshFuture = loop()
   n.tailnetControlRefreshLoop = refreshFuture
@@ -11404,9 +11702,12 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         if not n.relayReservationLoop.isNil:
           n.relayReservationLoop.cancel()
           n.relayReservationLoop = nil
-        if not n.tailnetControlRefreshLoop.isNil:
-          n.tailnetControlRefreshLoop.cancel()
-          n.tailnetControlRefreshLoop = nil
+          if not n.tailnetControlRefreshLoop.isNil:
+            n.tailnetControlRefreshLoop.cancel()
+            n.tailnetControlRefreshLoop = nil
+          if not n.tailnetAdvertisedPeerSyncTask.isNil:
+            n.tailnetAdvertisedPeerSyncTask.cancelSoon()
+            n.tailnetAdvertisedPeerSyncTask = nil
         if not n.relayReservationCycle.isNil:
           n.relayReservationCycle.cancelSoon()
           n.relayReservationCycle = nil
@@ -12401,16 +12702,20 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
               }
             )
           let existingTask = n.bootstrapSeedConnectTasks.getOrDefault(safePeerId, nil)
-          if existingTask.isNil or existingTask.finished():
-            let task = runBootstrapSeedConnectExactAsync(
-              n,
-              safePeerId,
-              selectedAddrs,
-              safeSource,
-              safeSecureTimeoutMs,
+          if not existingTask.isNil and not existingTask.finished():
+            await cancelFutureAndDrain(
+              existingTask,
+              "bootstrapSeedConnectExactKickoff_replace:" & safePeerId,
             )
-            n.bootstrapSeedConnectTasks[safePeerId] = task
-            asyncSpawn task
+          let task = runBootstrapSeedConnectExactAsync(
+            n,
+            safePeerId,
+            selectedAddrs,
+            safeSource,
+            safeSecureTimeoutMs,
+          )
+          n.bootstrapSeedConnectTasks[safePeerId] = task
+          asyncSpawn task
           command.resultCode = NimResultOk
     of cmdUdpEchoProbe:
       if not n.started:
@@ -12427,196 +12732,44 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.errorMsg = jsonGetStr(probePayload, "error", "udp_echo_probe_failed")
         command.resultCode = NimResultOk
     of cmdSendDirect:
+      await executeSendDirectCommand(n, command)
+    of cmdSendDirectKickoff:
       if not n.started:
         command.resultCode = NimResultInvalidState
         command.errorMsg = "node not started"
-      elif command.peerId.len == 0:
+      elif command.streamKey.len == 0:
         command.resultCode = NimResultInvalidArgument
-        command.errorMsg = "missing peer id"
+        command.errorMsg = "missing request key"
+      elif command.peerId.len == 0 or command.jsonString.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peer id or payload"
       else:
-        debugLog("[nimlibp2p] cmdSendDirect start peer=" & command.peerId &
-          " jsonLen=" & $command.jsonString.len & " payloadLen=" & $command.payload.len)
-        await setupDefaultTopics(n)
-        if n.dmService.isNil:
-          command.resultCode = NimResultInvalidState
-          command.errorMsg = "direct message service unavailable"
-          return
-        var remotePid: PeerId
-        if not remotePid.init(command.peerId):
-          command.resultCode = NimResultInvalidArgument
-          command.errorMsg = "invalid peer id"
-          return
-        let local = localPeerId(n)
-        if local.len == 0:
-          command.resultCode = NimResultInvalidState
-          command.errorMsg = "local peer id unavailable"
-          return
-        if command.addresses.len > 0:
-          command.addresses = normalizePeerTargetAddresses(command.peerId, command.addresses)
-          try:
-            registerInitialPeerHints(
-              n,
-              command.addresses,
-              if command.source.len > 0: command.source else: "cmd_send_direct"
-            )
-          except CatchableError as exc:
-            debugLog(
-              "[nimlibp2p] cmdSendDirect registerInitialPeerHints failed peer=" &
-              command.peerId &
-              " err=" & exc.msg
-            )
-        var envelope: JsonNode
-        if command.preSerializedJson and command.jsonString.len > 0:
-          envelope = nil
-        elif command.jsonString.len > 0:
-          try:
-            envelope = parseJson(command.jsonString)
-          except CatchableError as exc:
-            warn "cmdSendDirect: invalid json", err = exc.msg
-            envelope = newJObject()
-        if not command.preSerializedJson and (envelope.isNil or envelope.kind != JObject):
-          envelope = newJObject()
-        var mid =
-          if command.preSerializedJson:
-            ""
-          else:
-            jsonGetStr(envelope, "mid")
-        if command.messageId.len > 0:
-          mid = command.messageId
-        mid = ensureMessageId(mid)
-        let opValue =
-          if command.op.len > 0:
-            command.op
-          elif command.preSerializedJson:
-            "text"
-          elif jsonGetStr(envelope, "op").len > 0:
-            jsonGetStr(envelope, "op")
-          else:
-            "text"
-        if not command.preSerializedJson:
-          envelope["op"] = %opValue
-          envelope["mid"] = %mid
-          envelope["from"] = %local
-          envelope["timestamp_ms"] = %nowMillis()
-          let ackFlag = command.ackRequested or jsonGetBool(envelope, "ackRequested")
-          command.ackRequested = ackFlag
-          envelope["ackRequested"] = %ackFlag
-          if command.replyTo.len > 0:
-            envelope["reply_to"] = %command.replyTo
-          if command.target.len > 0:
-            envelope["target"] = %command.target
-          if command.textPayload.len > 0:
-            envelope["body"] = %command.textPayload
-          elif command.payload.len > 0:
-            envelope["payload_b64"] = %base64.encode(command.payload)
-        let timeout =
-          if command.timeoutMs > 0:
-            chronos.milliseconds(max(command.timeoutMs, 500))
-          else:
-            chronos.milliseconds(12_000)
-        let connectivityOk = await ensurePeerConnectivity(
-          n,
-          remotePid,
-          preferWanBootstrap = shouldPreferWanBootstrapForDirectOp(opValue)
-        )
-        if not connectivityOk:
-          let errMsg = if command.errorMsg.len > 0: command.errorMsg else: "peer unreachable"
-          command.errorMsg = errMsg
-          command.boolResult = false
-          command.resultCode = NimResultError
-          n.lastDirectError = errMsg
-          if command.ackRequested and
-              opValue.toLowerAscii() notin ["ack", "bw_probe_push", "bw_probe_chunk"]:
-            recordDirectAckLatencyFailure(n, command.peerId, errMsg)
-          debugLog("[nimlibp2p] cmdSendDirect connectivity missing peer=" & command.peerId & " err=" & errMsg)
-          info "cmdSendDirect failed", peer = command.peerId, mid = mid, err = errMsg
-          return
-        let identifyWaitMs =
-          if command.timeoutMs > 0:
-            max(min(command.timeoutMs div 2, 8_000), 1_000)
-          else:
-            8_000
-        let identifiedOk = await ensurePeerIdentified(
-          n,
-          remotePid,
-          identifyWaitMs,
-        )
-        if not identifiedOk:
-          let errMsg = "peer identify not ready"
-          command.boolResult = false
-          command.errorMsg = errMsg
-          command.resultCode = NimResultError
-          n.lastDirectError = errMsg
-          debugLog(
-            "[nimlibp2p] cmdSendDirect identify not ready peer=" & command.peerId &
-            " waitMs=" & $identifyWaitMs
+        let requestKey = command.streamKey.strip()
+        ffiNodeSafe:
+          setSendWithAckKickoffState(
+            requestKey,
+            "running",
+            %*{
+              "ok": false,
+              "requestKey": requestKey,
+              "peerId": command.peerId,
+              "stage": "kickoff",
+            }
           )
-          info "cmdSendDirect failed", peer = command.peerId, mid = mid, err = errMsg
-          return
-        debugLog("[nimlibp2p] cmdSendDirect connectivity peer=" & command.peerId &
-          " ok=true identified=" & $identifiedOk &
-          " ackRequested=" & $command.ackRequested)
-        let bytes =
-          if command.preSerializedJson:
-            stringToBytes(command.jsonString)
-          else:
-            stringToBytes($envelope)
-        var sendOk = false
-        var sendErr = ""
-        let sendStartMs = nowMillis()
-        try:
-          let resultTuple =
-            if command.ackRequested:
-              await sendDirectWithAckWaiter(n, remotePid, bytes, mid, timeout)
-            else:
-              await n.dmService.send(remotePid, bytes, false, mid, timeout)
-          sendOk = resultTuple[0]
-          sendErr = resultTuple[1]
-        except CatchableError as exc:
-          sendOk = false
-          sendErr = if exc.msg.len > 0: exc.msg else: $exc.name
-          warn "cmdSendDirect send failed", peer = command.peerId, err = sendErr
-
-        var errMsg = ""
-        if sendOk:
-          command.boolResult = true
-          command.errorMsg = ""
-          n.lastDirectError = ""
-          command.resultCode = NimResultOk
-          info "cmdSendDirect success", peer = command.peerId, mid = mid
-          debugLog("[nimlibp2p] cmdSendDirect success peer=" & command.peerId &
-            " mid=" & mid)
-        else:
-          if sendErr.len > 0:
-            errMsg = sendErr
-          elif command.ackRequested:
-            errMsg =
-              if command.errorMsg.len > 0: command.errorMsg else: "ack timeout"
-          else:
-            errMsg =
-              if command.errorMsg.len > 0: command.errorMsg else: "delivery failed"
-          command.boolResult = false
-          command.errorMsg = errMsg
-          n.lastDirectError = errMsg
-          command.resultCode = NimResultError
-          debugLog("[nimlibp2p] cmdSendDirect failure peer=" & command.peerId &
-            " mid=" & mid & " err=" & errMsg & " ackRequested=" & $command.ackRequested &
-            " connectivityOk=true")
-          info "cmdSendDirect failed", peer = command.peerId, mid = mid, err = errMsg
-
-        if command.ackRequested:
-          let latencyMs = int(max(0'i64, nowMillis() - sendStartMs))
-          let recordAckLatency =
-            opValue.toLowerAscii() notin ["ack", "bw_probe_push", "bw_probe_chunk"]
-          if recordAckLatency:
-            if sendOk:
-              recordDirectAckLatencySuccess(n, command.peerId, latencyMs)
-            else:
-              let latencyErr =
-                if sendErr.len > 0: sendErr
-                elif errMsg.len > 0: errMsg
-                else: "ack timeout"
-              recordDirectAckLatencyFailure(n, command.peerId, latencyErr)
+        let existingTask = n.sendDirectKickoffTasks.getOrDefault(requestKey, nil)
+        if existingTask.isNil or existingTask.finished():
+          let task = runSendDirectKickoffAsync(
+            n,
+            requestKey,
+            command.peerId,
+            command.jsonString,
+            command.timeoutMs,
+            command.addresses,
+            command.source,
+          )
+          n.sendDirectKickoffTasks[requestKey] = task
+          asyncSpawn task
+        command.resultCode = NimResultOk
     of cmdSendChatAck:
       if not n.started:
         command.resultCode = NimResultInvalidState
@@ -13680,8 +13833,13 @@ proc idleWakeLoop(n: NimNode) {.async.} =
           asyncSpawn(refreshPublicIpProbeAsync(n, hostStatus))
       if n.started and (tailnetListenerRepairTask.isNil or tailnetListenerRepairTask.finished()) and
           (lastTailnetListenerRepairMs == 0 or nowMs - lastTailnetListenerRepairMs >= TailnetListenerRepairLoopMs):
-        let tailnet = buildTailnetStatusPayload(n)
-        if tailnetListenerNeedsRepair(tailnet):
+        let transport = activeTsnetTransport(n)
+        let needsRepair =
+          if transport.isNil:
+            false
+          else:
+            transport.listenerNeedsRepair()
+        if needsRepair:
           lastTailnetListenerRepairMs = nowMs
           tailnetListenerRepairTask = reconcileTailnetRelayListeners(n)
           asyncSpawn(tailnetListenerRepairTask)
@@ -13865,10 +14023,12 @@ proc submitCommandNoWait(node: NimNode, cmd: Command): bool =
   if not active:
     warn "submitCommandNoWait rejected: node not running", kind = $cmd.kind
     cmd.resultCode = NimResultInvalidState
+    cmd.errorMsg = "node not running"
     return false
   if node.signal.isNil:
     warn "submitCommandNoWait rejected: node signal missing", kind = $cmd.kind
     cmd.resultCode = NimResultInvalidState
+    cmd.errorMsg = "node signal missing"
     return false
   if cmd.completion.isNil:
     let signalRes = ThreadSignalPtr.new()
@@ -14107,6 +14267,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       tailnetLastDurationMs: 0,
       tailnetAttempts: 0,
       bootstrapSeedConnectTasks: initTable[string, Future[void]](),
+      sendDirectKickoffTasks: initTable[string, Future[void]](),
     )
     initLock(node.eventLogLock)
     initLock(node.mediaFrameLogLock)
@@ -14736,6 +14897,156 @@ proc libp2p_send_with_ack*(
     node.lastDirectError = result.errorMsg
   destroyCommand(cmd)
   ok
+
+proc libp2p_send_with_ack_kickoff*(
+    handle: pointer,
+    requestKey: cstring,
+    peerId: cstring,
+    jsonPayload: cstring,
+    timeoutMs: cint
+): bool {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let safeRequestKey = (if requestKey.isNil: "" else: $requestKey).strip()
+  if safeRequestKey.len == 0 or peerId.isNil or jsonPayload.isNil:
+    return false
+  let cmd = makeCommand(cmdSendDirectKickoff)
+  cmd.streamKey = safeRequestKey
+  cmd.peerId = $peerId
+  cmd.jsonString = $jsonPayload
+  cmd.timeoutMs = int(timeoutMs)
+  let derivedOp = parseDirectEnvelopeOp(cmd.jsonString)
+  if derivedOp.len > 0:
+    cmd.op = derivedOp
+  cmd.ackRequested = parseDirectEnvelopeAckRequested(cmd.jsonString, true)
+  ffiNodeSafe:
+    setSendWithAckKickoffState(
+      safeRequestKey,
+      "queued",
+      %*{
+        "ok": false,
+        "requestKey": safeRequestKey,
+        "peerId": cmd.peerId,
+        "stage": "queued",
+        "addressCount": 0,
+        "ackRequested": cmd.ackRequested,
+      }
+    )
+  let ok = submitCommandNoWait(node, cmd)
+  if not ok:
+    let kickoffErr =
+      if cmd.errorMsg.len > 0: cmd.errorMsg
+      else: "send_with_ack_kickoff_failed"
+    node.lastDirectError = kickoffErr
+    setSendWithAckKickoffState(
+      safeRequestKey,
+      "done",
+      %*{
+        "ok": false,
+        "requestKey": safeRequestKey,
+        "peerId": cmd.peerId,
+        "stage": "kickoff",
+        "addressCount": 0,
+        "ackRequested": cmd.ackRequested,
+        "error": kickoffErr,
+      },
+      kickoffErr
+    )
+    destroyCommand(cmd)
+  ok
+
+proc libp2p_send_with_ack_seeded_kickoff*(
+    handle: pointer,
+    requestKey: cstring,
+    peerId: cstring,
+    jsonPayload: cstring,
+    addressesJson: cstring,
+    source: cstring,
+    timeoutMs: cint
+): bool {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let safeRequestKey = (if requestKey.isNil: "" else: $requestKey).strip()
+  let safePeerId = (if peerId.isNil: "" else: $peerId).strip()
+  let safePayload = (if jsonPayload.isNil: "" else: $jsonPayload).strip()
+  if safeRequestKey.len == 0 or safePeerId.len == 0 or safePayload.len == 0:
+    return false
+  var addresses: seq[string] = @[]
+  if addressesJson != nil:
+    try:
+      let parsed = parseJson($addressesJson)
+      if parsed.kind == JArray:
+        for item in parsed.items:
+          if item.kind == JString:
+            let value = item.getStr().strip()
+            if value.len > 0:
+              addresses.add(value)
+    except CatchableError:
+      discard
+  let normalizedAddrs = normalizePeerTargetAddresses(safePeerId, addresses)
+  let cmd = makeCommand(cmdSendDirectKickoff)
+  cmd.streamKey = safeRequestKey
+  cmd.peerId = safePeerId
+  cmd.jsonString = safePayload
+  cmd.timeoutMs = int(timeoutMs)
+  cmd.addresses = normalizedAddrs
+  if source != nil:
+    cmd.source = $source
+  let derivedOp = parseDirectEnvelopeOp(cmd.jsonString)
+  if derivedOp.len > 0:
+    cmd.op = derivedOp
+  cmd.ackRequested = parseDirectEnvelopeAckRequested(cmd.jsonString, true)
+  ffiNodeSafe:
+    setSendWithAckKickoffState(
+      safeRequestKey,
+      "queued",
+      %*{
+        "ok": false,
+        "requestKey": safeRequestKey,
+        "peerId": cmd.peerId,
+        "stage": "queued",
+        "addressCount": normalizedAddrs.len,
+        "source": cmd.source,
+        "ackRequested": cmd.ackRequested,
+      }
+    )
+  let ok = submitCommandNoWait(node, cmd)
+  if not ok:
+    let kickoffErr =
+      if cmd.errorMsg.len > 0: cmd.errorMsg
+      else: "send_with_ack_seeded_kickoff_failed"
+    node.lastDirectError = kickoffErr
+    setSendWithAckKickoffState(
+      safeRequestKey,
+      "done",
+      %*{
+        "ok": false,
+        "requestKey": safeRequestKey,
+        "peerId": cmd.peerId,
+        "stage": "kickoff",
+        "addressCount": normalizedAddrs.len,
+        "source": cmd.source,
+        "ackRequested": cmd.ackRequested,
+        "error": kickoffErr,
+      },
+      kickoffErr
+    )
+    destroyCommand(cmd)
+  ok
+
+proc libp2p_send_with_ack_kickoff_status*(
+    requestKey: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  allocCString(
+    getSendWithAckKickoffState(
+      if requestKey.isNil:
+        ""
+      else:
+        $requestKey
+    )
+  )
 
 proc libp2p_get_last_direct_error*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
@@ -21065,17 +21376,44 @@ proc libp2p_get_listen_addresses*(handle: pointer): cstring {.exportc, cdecl, dy
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("[]")
-  var addrs = node.cfg.listenAddresses
+  var addrs: seq[string] = @[]
   try:
     if not node.switchInstance.isNil:
+      let tsnetTransport = node.switchInstance.tsnetTransport()
+      if not tsnetTransport.isNil:
+        let published = tsnetTransport.publishedAddrs()
+        if published.len > 0:
+          addrs = published.mapIt($it)
       let info = node.switchInstance.peerInfo
-      if not info.isNil:
+      if addrs.len == 0 and not info.isNil:
         let refreshed = refreshLanAwareAddrs(node)
         var runtimeAddrs = if refreshed.len > 0: refreshed else: info.listenAddrs
         if runtimeAddrs.len == 0:
           runtimeAddrs = info.addrs
         if runtimeAddrs.len > 0:
           addrs = runtimeAddrs.mapIt($it)
+  except CatchableError:
+    discard
+  if addrs.len == 0:
+    addrs = node.cfg.listenAddresses
+  addrs = filterPublishableTsnetAddrTexts(node, addrs)
+  allocCString(jsonEncodeStringSeq(addrs))
+
+proc libp2p_get_runtime_listen_addresses*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("[]")
+  var addrs: seq[string] = @[]
+  try:
+    if not node.switchInstance.isNil and not node.switchInstance.peerInfo.isNil:
+      let refreshed = refreshLanAwareAddrs(node)
+      let runtimeAddrs =
+        if refreshed.len > 0:
+          refreshed
+        else:
+          node.switchInstance.peerInfo.listenAddrs
+      if runtimeAddrs.len > 0:
+        addrs = runtimeAddrs.mapIt($it)
   except CatchableError:
     discard
   addrs = filterPublishableTsnetAddrTexts(node, addrs)
@@ -21085,11 +21423,20 @@ proc libp2p_get_dialable_addresses*(handle: pointer): cstring {.exportc, cdecl, 
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("[]")
-  var addrs = node.cfg.listenAddresses.filterIt(not it.endsWith("/tcp/0"))
+  var addrs: seq[string] = @[]
   try:
     if not node.switchInstance.isNil:
+      let tsnetTransport = node.switchInstance.tsnetTransport()
+      if not tsnetTransport.isNil:
+        let published = tsnetTransport.publishedAddrs().mapIt($it).filterIt(
+          (not it.endsWith("/tcp/0")) and
+          (not it.contains("/ip4/0.0.0.0/")) and
+          (not it.contains("/ip6/::/"))
+        )
+        if published.len > 0:
+          addrs = published
       let info = node.switchInstance.peerInfo
-      if not info.isNil:
+      if addrs.len == 0 and not info.isNil:
         let refreshed = refreshLanAwareAddrs(node)
         var runtimeAddrs = (if refreshed.len > 0: refreshed else: info.listenAddrs).mapIt($it)
         if runtimeAddrs.len == 0:
@@ -21103,6 +21450,8 @@ proc libp2p_get_dialable_addresses*(handle: pointer): cstring {.exportc, cdecl, 
           addrs = filtered
   except CatchableError:
     discard
+  if addrs.len == 0:
+    addrs = node.cfg.listenAddresses.filterIt(not it.endsWith("/tcp/0"))
   addrs = filterPublishableTsnetAddrTexts(node, addrs)
   let ordered = preferStableAddrStrings(addrs)
   allocCString(jsonEncodeStringSeq(ordered))
@@ -21512,6 +21861,683 @@ proc exactSeedConnectTotalBudgetMs(addrs: openArray[string]): int {.gcsafe.} =
     total += exactSeedConnectAttemptBudgetMs(addr)
   max(total, 5_000)
 
+proc ensurePeerReadyViaExplicitAddresses(
+    n: NimNode,
+    peerIdText: string,
+    addresses: seq[string],
+    source: string,
+    timeoutMs: int
+): Future[tuple[ok: bool, err: string, phase: string, detail: JsonNode]] {.async.} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0:
+    return (false, "peer id missing", "invalid_peer", %*{"phase": "invalid_peer"})
+  let selectedAddrs = prioritizeGameSeedAddrs(
+    preferStableAddrStrings(normalizePeerTargetAddresses(safePeerId, addresses))
+  )
+  if selectedAddrs.len == 0:
+    return (false, "no valid addresses", "invalid_addresses", %*{"phase": "invalid_addresses"})
+  let hintSource =
+    if source.strip().len > 0:
+      source.strip()
+    else:
+      "send_with_ack_seeded"
+  let registerRes = registerPeerHintsInternal(n, safePeerId, selectedAddrs, hintSource)
+  if registerRes.isErr():
+    return (
+      false,
+      registerRes.error,
+      "register_hints_failed",
+      %*{
+        "phase": "register_hints_failed",
+        "error": registerRes.error,
+      }
+    )
+  let totalBudgetMs =
+    if timeoutMs > 0:
+      max(1_000, min(timeoutMs, exactSeedConnectTotalBudgetMs(selectedAddrs)))
+    else:
+      exactSeedConnectTotalBudgetMs(selectedAddrs)
+  let startedAtMs = nowMillis()
+  var lastError = ""
+  var lastPhase = "connect_timeout"
+  var lastDetail = %*{
+    "phase": lastPhase,
+    "attemptCount": selectedAddrs.len,
+  }
+  for idx, addr in selectedAddrs:
+    let elapsedBeforeAttempt = int(nowMillis() - startedAtMs)
+    var remainingBudgetMs = totalBudgetMs - elapsedBeforeAttempt
+    if remainingBudgetMs <= 0:
+      break
+    let lowerAddr = addr.toLowerAscii()
+    let addrPathKind =
+      if "/p2p-circuit" in lowerAddr: "relay" else: "direct"
+    let remainingAttempts = max(1, selectedAddrs.len - idx)
+    var reservedForFutureMs = 0
+    if remainingAttempts > 1:
+      for futureAddr in selectedAddrs[(idx + 1) ..< selectedAddrs.len]:
+        reservedForFutureMs += exactSeedConnectAttemptBudgetMs(futureAddr)
+    let connectTimeoutMs =
+      max(
+        750,
+        min(
+          exactSeedConnectAttemptBudgetMs(addr),
+          max(750, remainingBudgetMs - reservedForFutureMs)
+        )
+      )
+    var attemptDetail = %*{
+      "phase": "connect_start",
+      "lastAddr": addr,
+      "attemptIndex": idx + 1,
+      "attemptCount": selectedAddrs.len,
+      "path": addrPathKind,
+      "connectTimeoutMs": connectTimeoutMs,
+      "remainingBudgetMs": remainingBudgetMs,
+      "connectOk": false,
+      "secureOk": false,
+      "identifiedOk": false,
+      "peerConnected": false,
+    }
+    debugLog(
+      "[nimlibp2p] ensurePeerReadyViaExplicitAddresses attempt:start peer=" & safePeerId &
+      " addr=" & addr &
+      " timeoutMs=" & $connectTimeoutMs &
+      " remainingBudgetMs=" & $remainingBudgetMs
+    )
+    let connectRes = await connectMultiaddrExactAsync(
+      n,
+      addr,
+      connectTimeoutMs,
+      remainingAttempts == 1 and
+        (lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/"))
+    )
+    debugLog(
+      "[nimlibp2p] ensurePeerReadyViaExplicitAddresses attempt:connect_done peer=" & safePeerId &
+      " addr=" & addr &
+      " ok=" & $connectRes.ok &
+      " peerConnected=" & $connectRes.peerConnected &
+      " err=" & connectRes.err
+    )
+    attemptDetail["connectOk"] = %connectRes.ok
+    attemptDetail["peerConnected"] = %connectRes.peerConnected
+    attemptDetail["phase"] = %(
+      if connectRes.ok: "connect_done"
+      elif connectRes.err == "connect timeout": "connect_timeout"
+      else: "connect_failed"
+    )
+    if connectRes.err.len > 0:
+      attemptDetail["error"] = %connectRes.err
+    if not connectRes.ok:
+      lastPhase =
+        if connectRes.err == "connect timeout":
+          "connect_timeout"
+        else:
+          "connect_failed"
+      if connectRes.err.len > 0:
+        lastError = connectRes.err
+      lastDetail = attemptDetail
+      continue
+    let elapsedBeforeReady = int(nowMillis() - startedAtMs)
+    remainingBudgetMs = totalBudgetMs - elapsedBeforeReady
+    let readyWaitMs =
+      max(
+        250,
+        min(
+          if lowerAddr.contains("/quic-v1") or lowerAddr.contains("/quic/"):
+            8_000
+          else:
+            2_000,
+          remainingBudgetMs
+        )
+      )
+    debugLog(
+      "[nimlibp2p] ensurePeerReadyViaExplicitAddresses attempt:peer_ready_wait_start peer=" & safePeerId &
+      " addr=" & addr &
+      " waitMs=" & $readyWaitMs
+    )
+    let readyRes = await waitForPeerReadyDetailed(n, safePeerId, readyWaitMs)
+    debugLog(
+      "[nimlibp2p] ensurePeerReadyViaExplicitAddresses attempt:peer_ready_wait_done peer=" & safePeerId &
+      " addr=" & addr &
+      " ready=" & $readyRes.ok &
+      " phase=" & readyRes.phase
+    )
+    attemptDetail["phase"] = %readyRes.phase
+    attemptDetail["secureOk"] = %(readyRes.phase != "secure_timeout")
+    attemptDetail["identifiedOk"] = %readyRes.ok
+    if not readyRes.ok:
+      attemptDetail["error"] = %(
+        case readyRes.phase
+        of "secure_timeout":
+          "peer secure channel not ready"
+        of "identify_timeout":
+          "peer identify not ready"
+        else:
+          "peer not ready"
+      )
+    if readyRes.ok:
+      return (true, "", "ready", attemptDetail)
+    lastPhase = readyRes.phase
+    lastError =
+      case readyRes.phase
+      of "secure_timeout":
+        "peer secure channel not ready"
+      of "identify_timeout":
+        "peer identify not ready"
+      else:
+        "peer not ready"
+    lastDetail = attemptDetail
+  if lastError.len == 0:
+    lastError = "peer unreachable"
+  if lastDetail.kind == JObject:
+    lastDetail["phase"] = %lastPhase
+    lastDetail["error"] = %lastError
+  (false, lastError, lastPhase, lastDetail)
+
+proc executeSendDirectCommand(
+    n: NimNode,
+    command: Command
+): Future[void] {.async.} =
+  template updateKickoffStage(stageText: string, errText = "", detailNode: JsonNode = newJNull()) =
+    ffiNodeSafe:
+      updateSendWithAckKickoffProgress(
+        command.streamKey,
+        command.peerId,
+        stageText,
+        command.addresses.len,
+        command.source,
+        command.ackRequested,
+        command.messageId,
+        errText,
+        detailNode,
+      )
+
+  if not n.started:
+    command.resultCode = NimResultInvalidState
+    command.errorMsg = "node not started"
+    return
+  if command.peerId.len == 0:
+    command.resultCode = NimResultInvalidArgument
+    command.errorMsg = "missing peer id"
+    return
+  debugLog("[nimlibp2p] cmdSendDirect start peer=" & command.peerId &
+    " jsonLen=" & $command.jsonString.len & " payloadLen=" & $command.payload.len)
+  updateKickoffStage("prepare")
+  await setupDefaultTopics(n)
+  if n.dmService.isNil:
+    command.resultCode = NimResultInvalidState
+    command.errorMsg = "direct message service unavailable"
+    return
+  var remotePid: PeerId
+  if not remotePid.init(command.peerId):
+    command.resultCode = NimResultInvalidArgument
+    command.errorMsg = "invalid peer id"
+    return
+  let local = localPeerId(n)
+  if local.len == 0:
+    command.resultCode = NimResultInvalidState
+    command.errorMsg = "local peer id unavailable"
+    return
+  if command.addresses.len > 0:
+    command.addresses = normalizePeerTargetAddresses(command.peerId, command.addresses)
+    try:
+      registerInitialPeerHints(
+        n,
+        command.addresses,
+        if command.source.len > 0: command.source else: "cmd_send_direct"
+      )
+    except Exception as exc:
+      debugLog(
+        "[nimlibp2p] cmdSendDirect registerInitialPeerHints failed peer=" &
+        command.peerId &
+        " err=" & exc.msg
+      )
+  var envelope: JsonNode
+  if command.jsonString.len > 0:
+    try:
+      envelope = parseJson(command.jsonString)
+    except CatchableError as exc:
+      warn "cmdSendDirect: invalid json", err = exc.msg
+      envelope = if command.preSerializedJson: nil else: newJObject()
+  if not command.preSerializedJson and (envelope.isNil or envelope.kind != JObject):
+    envelope = newJObject()
+  var mid =
+    if not envelope.isNil and envelope.kind == JObject:
+      jsonGetStr(envelope, "mid")
+    elif command.preSerializedJson:
+      ""
+    else:
+      jsonGetStr(envelope, "mid")
+  if command.messageId.len > 0:
+    mid = command.messageId
+  mid = ensureMessageId(mid)
+  command.messageId = mid
+  updateKickoffStage("envelope_ready")
+  let opValue =
+    if command.op.len > 0:
+      command.op
+    elif command.preSerializedJson:
+      "text"
+    elif jsonGetStr(envelope, "op").len > 0:
+      jsonGetStr(envelope, "op")
+    else:
+      "text"
+  command.op = opValue
+  if not envelope.isNil and envelope.kind == JObject:
+    if jsonGetStr(envelope, "op").len == 0:
+      envelope["op"] = %opValue
+    if mid.len > 0:
+      if jsonGetStr(envelope, "mid").len == 0:
+        envelope["mid"] = %mid
+      if jsonGetStr(envelope, "messageId").len == 0:
+        envelope["messageId"] = %mid
+    if jsonGetStr(envelope, "from").len == 0:
+      envelope["from"] = %local
+    if not envelope.hasKey("timestamp_ms"):
+      envelope["timestamp_ms"] = %nowMillis()
+    if not envelope.hasKey("timestampMs"):
+      envelope["timestampMs"] = cloneJson(envelope["timestamp_ms"])
+    let ackFlag = command.ackRequested or jsonGetBool(envelope, "ackRequested")
+    command.ackRequested = ackFlag
+    envelope["ackRequested"] = %ackFlag
+    if command.replyTo.len > 0 and jsonGetStr(envelope, "reply_to").len == 0:
+      envelope["reply_to"] = %command.replyTo
+    if command.target.len > 0 and jsonGetStr(envelope, "target").len == 0:
+      envelope["target"] = %command.target
+    if not command.preSerializedJson:
+      if command.textPayload.len > 0:
+        envelope["body"] = %command.textPayload
+      elif command.payload.len > 0:
+        envelope["payload_b64"] = %base64.encode(command.payload)
+  elif not command.preSerializedJson:
+    envelope["op"] = %opValue
+    envelope["mid"] = %mid
+    envelope["from"] = %local
+    envelope["timestamp_ms"] = %nowMillis()
+    let ackFlag = command.ackRequested or jsonGetBool(envelope, "ackRequested")
+    command.ackRequested = ackFlag
+    envelope["ackRequested"] = %ackFlag
+    if command.replyTo.len > 0:
+      envelope["reply_to"] = %command.replyTo
+    if command.target.len > 0:
+      envelope["target"] = %command.target
+    if command.textPayload.len > 0:
+      envelope["body"] = %command.textPayload
+    elif command.payload.len > 0:
+      envelope["payload_b64"] = %base64.encode(command.payload)
+  let timeout =
+    if command.timeoutMs > 0:
+      chronos.milliseconds(max(command.timeoutMs, 500))
+    else:
+      chronos.milliseconds(12_000)
+  let preferredDmAddrs =
+    if command.addresses.len > 0:
+      parsePreferredDirectMultiaddrs(command.addresses)
+    else:
+      @[]
+  var peerReadyOk = false
+  var peerReadyErr = ""
+  if command.addresses.len > 0:
+    if peerCurrentlyConnected(n, remotePid):
+      let readyWaitMs =
+        if command.timeoutMs > 0:
+          max(min(command.timeoutMs, 8_000), 500)
+        else:
+          5_000
+      updateKickoffStage("peer_ready_wait")
+      let readyRes = await waitForPeerReadyDetailed(n, command.peerId, readyWaitMs)
+      let readyDetail = %*{
+        "phase": readyRes.phase,
+        "secureOk": readyRes.phase != "secure_timeout",
+        "identifiedOk": readyRes.ok,
+        "peerConnected": true,
+      }
+      peerReadyOk = readyRes.ok
+      if not peerReadyOk:
+        peerReadyErr =
+          case readyRes.phase
+          of "secure_timeout":
+            "peer secure channel not ready"
+          of "identify_timeout":
+            "peer identify not ready"
+          else:
+            "peer not ready"
+      updateKickoffStage(
+        if peerReadyOk: "peer_ready"
+        else:
+          case readyRes.phase
+          of "secure_timeout":
+            "peer_ready_wait_secure_failed"
+          of "identify_timeout":
+            "peer_ready_wait_identify_failed"
+          else:
+            "peer_ready_wait_failed",
+        peerReadyErr,
+        readyDetail
+      )
+      debugLog(
+        "[nimlibp2p] cmdSendDirect reuse connected peer=" & command.peerId &
+        " addrCount=" & $command.addresses.len &
+        " ready=" & $peerReadyOk
+      )
+    else:
+      updateKickoffStage("connect_exact")
+      let exactReady = await ensurePeerReadyViaExplicitAddresses(
+        n,
+        command.peerId,
+        command.addresses,
+        if command.source.len > 0: command.source else: "cmd_send_direct",
+        command.timeoutMs,
+      )
+      peerReadyOk = exactReady.ok
+      peerReadyErr = exactReady.err
+      updateKickoffStage(
+        if peerReadyOk: "peer_ready"
+        else:
+          case exactReady.phase
+          of "connect_timeout":
+            "connect_exact_connect_timeout"
+          of "connect_failed":
+            "connect_exact_connect_failed"
+          of "secure_timeout":
+            "connect_exact_secure_wait_failed"
+          of "identify_timeout":
+            "connect_exact_identify_wait_failed"
+          else:
+            "connect_exact_failed",
+        peerReadyErr,
+        exactReady.detail
+      )
+  else:
+    updateKickoffStage("ensure_connectivity")
+    let connectivityOk = await ensurePeerConnectivity(
+      n,
+      remotePid,
+      preferWanBootstrap = shouldPreferWanBootstrapForDirectOp(opValue)
+    )
+    if connectivityOk:
+      updateKickoffStage("identify_wait")
+      let identifyWaitMs =
+        if command.timeoutMs > 0:
+          max(min(command.timeoutMs div 2, 8_000), 1_000)
+        else:
+          8_000
+      peerReadyOk = await ensurePeerIdentified(
+        n,
+        remotePid,
+        identifyWaitMs,
+      )
+      if not peerReadyOk:
+        peerReadyErr = "peer identify not ready"
+      updateKickoffStage(
+        if peerReadyOk: "peer_ready"
+        else: "identify_wait_failed",
+        peerReadyErr
+      )
+    else:
+      peerReadyErr =
+        if command.errorMsg.len > 0:
+          command.errorMsg
+        else:
+          "peer unreachable"
+      updateKickoffStage("ensure_connectivity_failed", peerReadyErr)
+  if not peerReadyOk:
+    let errMsg =
+      if peerReadyErr.len > 0:
+        peerReadyErr
+      else:
+        "peer identify not ready"
+    command.boolResult = false
+    command.errorMsg = errMsg
+    command.resultCode = NimResultError
+    n.lastDirectError = errMsg
+    debugLog(
+      "[nimlibp2p] cmdSendDirect peer ready missing peer=" & command.peerId &
+      " addrCount=" & $command.addresses.len &
+      " err=" & errMsg
+    )
+    updateKickoffStage("peer_ready_failed", errMsg)
+    if command.ackRequested and
+        opValue.toLowerAscii() notin ["ack", "bw_probe_push", "bw_probe_chunk"]:
+      recordDirectAckLatencyFailure(n, command.peerId, errMsg)
+    info "cmdSendDirect failed", peer = command.peerId, mid = mid, err = errMsg
+    return
+  debugLog("[nimlibp2p] cmdSendDirect connectivity peer=" & command.peerId &
+    " ok=true identified=true" &
+    " ackRequested=" & $command.ackRequested)
+  updateKickoffStage("send_begin")
+  let bytes =
+    if command.preSerializedJson and (envelope.isNil or envelope.kind != JObject):
+      stringToBytes(command.jsonString)
+    else:
+      stringToBytes($envelope)
+  var sendOk = false
+  var sendErr = ""
+  let sendStartMs = nowMillis()
+  try:
+    let resultTuple =
+      if command.ackRequested:
+        await sendDirectWithAckWaiter(
+          n,
+          remotePid,
+          bytes,
+          mid,
+          timeout,
+          preferredAddrs = preferredDmAddrs,
+          requestKey = command.streamKey,
+          source = command.source,
+          addressCount = command.addresses.len
+        )
+      else:
+        await n.dmService.send(
+          remotePid,
+          bytes,
+          false,
+          mid,
+          timeout,
+          preferredAddrs = preferredDmAddrs
+        )
+    sendOk = resultTuple[0]
+    sendErr = resultTuple[1]
+    updateKickoffStage(
+      if sendOk: "send_done" else: "send_failed",
+      sendErr
+    )
+  except CatchableError as exc:
+    sendOk = false
+    sendErr = if exc.msg.len > 0: exc.msg else: $exc.name
+    updateKickoffStage("send_exception", sendErr)
+    warn "cmdSendDirect send failed", peer = command.peerId, err = sendErr
+
+  var errMsg = ""
+  if sendOk:
+    command.boolResult = true
+    command.errorMsg = ""
+    n.lastDirectError = ""
+    command.resultCode = NimResultOk
+    info "cmdSendDirect success", peer = command.peerId, mid = mid
+    debugLog("[nimlibp2p] cmdSendDirect success peer=" & command.peerId &
+      " mid=" & mid)
+  else:
+    if sendErr.len > 0:
+      errMsg = sendErr
+    elif command.ackRequested:
+      errMsg =
+        if command.errorMsg.len > 0: command.errorMsg else: "ack timeout"
+    else:
+      errMsg =
+        if command.errorMsg.len > 0: command.errorMsg else: "delivery failed"
+    command.boolResult = false
+    command.errorMsg = errMsg
+    n.lastDirectError = errMsg
+    command.resultCode = NimResultError
+    debugLog("[nimlibp2p] cmdSendDirect failure peer=" & command.peerId &
+      " mid=" & mid & " err=" & errMsg & " ackRequested=" & $command.ackRequested &
+      " connectivityOk=true")
+    info "cmdSendDirect failed", peer = command.peerId, mid = mid, err = errMsg
+
+  if command.ackRequested:
+    let latencyMs = int(max(0'i64, nowMillis() - sendStartMs))
+    let recordAckLatency =
+      opValue.toLowerAscii() notin ["ack", "bw_probe_push", "bw_probe_chunk"]
+    if recordAckLatency:
+      if sendOk:
+        recordDirectAckLatencySuccess(n, command.peerId, latencyMs)
+      else:
+        let latencyErr =
+          if sendErr.len > 0: sendErr
+          elif errMsg.len > 0: errMsg
+          else: "ack timeout"
+        recordDirectAckLatencyFailure(n, command.peerId, latencyErr)
+
+proc runSendDirectKickoffAsync(
+    n: NimNode,
+    requestKey: string,
+    peerId: string,
+    jsonPayload: string,
+    timeoutMs: int,
+    addresses: seq[string],
+    source: string,
+) {.async.} =
+  let safeRequestKey = requestKey.strip()
+  let safePeerId = peerId.strip()
+  let safePayload = jsonPayload.strip()
+  let safeAddresses = normalizePeerTargetAddresses(safePeerId, addresses)
+  let safeSource = source.strip()
+  let ackRequested = parseDirectEnvelopeAckRequested(safePayload, true)
+  let startedAtMs = nowMillis()
+  debugLog(
+    "[nimlibp2p] sendWithAckKickoff task begin request=" & safeRequestKey &
+    " peer=" & safePeerId &
+    " addrCount=" & $safeAddresses.len &
+    " timeoutMs=" & $timeoutMs &
+    " source=" & safeSource
+  )
+  let payloadMid = block:
+    if safePayload.len == 0:
+      ""
+    else:
+      try:
+        let node = parseJson(safePayload)
+        if node.kind == JObject:
+          let existingMid = jsonGetStr(node, "mid").strip()
+          if existingMid.len > 0:
+            existingMid
+          else:
+            let messageId = jsonGetStr(node, "messageId").strip()
+            if messageId.len > 0: messageId else: jsonGetStr(node, "id").strip()
+        else:
+          ""
+      except CatchableError:
+        ""
+  var cmd = makeCommand(cmdSendDirect)
+  cmd.streamKey = safeRequestKey
+  cmd.peerId = safePeerId
+  cmd.jsonString = safePayload
+  cmd.preSerializedJson = true
+  cmd.ackRequested = ackRequested
+  cmd.timeoutMs = if timeoutMs > 0: timeoutMs else: 8_000
+  cmd.addresses = safeAddresses
+  cmd.source =
+    if safeSource.len > 0:
+      safeSource
+    elif safeAddresses.len > 0:
+      "send_with_ack_seeded"
+    else:
+      ""
+  if payloadMid.len > 0:
+    cmd.messageId = payloadMid
+  let derivedOp = parseDirectEnvelopeOp(safePayload)
+  if derivedOp.len > 0:
+    cmd.op = derivedOp
+  try:
+    await executeSendDirectCommand(n, cmd)
+    let durationMs = nowMillis() - startedAtMs
+    let ok = cmd.resultCode == NimResultOk and cmd.boolResult
+    debugLog(
+      "[nimlibp2p] sendWithAckKickoff task command_done request=" & safeRequestKey &
+      " peer=" & safePeerId &
+      " ok=" & $ok &
+      " resultCode=" & $cmd.resultCode &
+      " err=" & cmd.errorMsg &
+      " durationMs=" & $durationMs
+    )
+    var progressStage = ""
+    if not ok:
+      ffiNodeSafe:
+        if sendWithAckKickoffProgressStage.hasKey(safeRequestKey):
+          progressStage =
+            sendWithAckKickoffProgressStage.getOrDefault(safeRequestKey, "").strip()
+    let finalStage =
+      if ok:
+        "sent"
+      else:
+        if progressStage.len > 0 and progressStage != "send_done":
+          progressStage
+        else:
+          "send_with_ack"
+    let progressPayload = ffiNodeSafe:
+      getSendWithAckKickoffPayloadSnapshot(safeRequestKey)
+    var payload = progressPayload
+    if payload.kind != JObject:
+      payload = newJObject()
+    payload["ok"] = %ok
+    payload["peerId"] = %safePeerId
+    payload["messageId"] = %cmd.messageId
+    payload["op"] = %cmd.op
+    payload["stage"] = %finalStage
+    payload["durationMs"] = %durationMs
+    payload["addressCount"] = %safeAddresses.len
+    payload["source"] = %cmd.source
+    payload["ackRequested"] = %cmd.ackRequested
+    payload["error"] = %cmd.errorMsg
+    ffiNodeSafe:
+      setSendWithAckKickoffState(
+        safeRequestKey,
+        "done",
+        payload,
+        if ok: "" else: cmd.errorMsg
+      )
+  except CatchableError as exc:
+    debugLog(
+      "[nimlibp2p] sendWithAckKickoff task exception request=" & safeRequestKey &
+      " peer=" & safePeerId &
+      " err=" & exc.msg
+    )
+    var failureStage = "send_exception"
+    ffiNodeSafe:
+      if sendWithAckKickoffProgressStage.hasKey(safeRequestKey):
+        let progressStage =
+          sendWithAckKickoffProgressStage.getOrDefault(safeRequestKey, "").strip()
+        if progressStage.len > 0:
+          failureStage = progressStage
+    let progressPayload = ffiNodeSafe:
+      getSendWithAckKickoffPayloadSnapshot(safeRequestKey)
+    var payload = progressPayload
+    if payload.kind != JObject:
+      payload = newJObject()
+    payload["ok"] = %false
+    payload["peerId"] = %safePeerId
+    payload["messageId"] = %cmd.messageId
+    payload["stage"] = %failureStage
+    payload["addressCount"] = %safeAddresses.len
+    payload["source"] = %cmd.source
+    payload["ackRequested"] = %cmd.ackRequested
+    payload["error"] = %exc.msg
+    payload["durationMs"] = %(nowMillis() - startedAtMs)
+    ffiNodeSafe:
+      setSendWithAckKickoffState(
+        safeRequestKey,
+        "done",
+        payload,
+        exc.msg
+      )
+  finally:
+    destroyCommand(cmd)
+    if not n.isNil and safeRequestKey.len > 0:
+      if n.sendDirectKickoffTasks.hasKey(safeRequestKey):
+        n.sendDirectKickoffTasks.del(safeRequestKey)
+
 type BootstrapSeedConnectExactKickoffArg = object
   handle: pointer
   peerId: cstring
@@ -21854,18 +22880,18 @@ proc libp2p_bootstrap_seed_connect_exact*(
             )
           )
         debugLog(
-          "[nimlibp2p] bootstrapSeedConnectExact attempt:identify_wait_start peer=" & safePeerId &
+          "[nimlibp2p] bootstrapSeedConnectExact attempt:peer_ready_wait_start peer=" & safePeerId &
           " addr=" & addr &
           " waitMs=" & $identifyWaitMs &
           " remainingBudgetMs=" & $remainingBudgetMs
         )
-        identifiedOk = waitForPeerIdentifiedWithinDeadlineSync(
-          node,
-          peerRes.get(),
-          identifyWaitMs,
+        identifiedOk = libp2p_wait_peer_ready_ffi(
+          handle,
+          safePeerId.cstring,
+          identifyWaitMs.cint,
         )
         debugLog(
-          "[nimlibp2p] bootstrapSeedConnectExact attempt:identify_wait_done peer=" & safePeerId &
+          "[nimlibp2p] bootstrapSeedConnectExact attempt:peer_ready_wait_done peer=" & safePeerId &
           " addr=" & addr &
           " identifiedOk=" & $identifiedOk
         )
@@ -21887,7 +22913,7 @@ proc libp2p_bootstrap_seed_connect_exact*(
     attemptNode["bootstrapConnected"] = %bootstrapConnected
     attempts.add(attemptNode)
 
-    if rc == NimResultOk or secureOk or peerConnected or bootstrapConnected:
+    if identifiedOk:
       debugLog(
         "[nimlibp2p] bootstrapSeedConnectExact success peer=" & safePeerId &
         " addr=" & addr &
@@ -21945,6 +22971,12 @@ proc runBootstrapSeedConnectExactAsync(
     effectiveSource: string,
     safeSecureTimeoutMs: int
 ) {.async.} =
+  debugLog(
+    "[nimlibp2p] bootstrapSeedConnectExactAsync start peer=" & safePeerId &
+    " source=" & effectiveSource &
+    " secureTimeoutMs=" & $safeSecureTimeoutMs &
+    " addrs=" & selectedAddrs.join("|")
+  )
   var attempts: seq[JsonNode] = @[]
   var attemptedAddr = ""
   var lastError = ""
@@ -21952,6 +22984,10 @@ proc runBootstrapSeedConnectExactAsync(
   try:
     let registerRes = registerPeerHintsInternal(node, safePeerId, selectedAddrs, effectiveSource)
     if registerRes.isErr():
+      debugLog(
+        "[nimlibp2p] bootstrapSeedConnectExactAsync registerHints failed peer=" & safePeerId &
+        " err=" & registerRes.error
+      )
       let payload = %*{
         "ok": false,
         "peerId": safePeerId,
@@ -21989,6 +23025,13 @@ proc runBootstrapSeedConnectExactAsync(
             remainingBudgetMs - reservedForFutureMs
           )
         )
+      debugLog(
+        "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:start peer=" & safePeerId &
+        " addr=" & addr &
+        " path=" & addrPathKind &
+        " timeoutMs=" & $timeoutMs &
+        " remainingBudgetMs=" & $remainingBudgetMs
+      )
 
       var attemptNode = newJObject()
       attemptNode["addr"] = %addr
@@ -22021,6 +23064,13 @@ proc runBootstrapSeedConnectExactAsync(
         err = connectRes.err
       except CatchableError as exc:
         err = if exc.msg.len > 0: exc.msg else: $exc.name
+      debugLog(
+        "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:connect_done peer=" & safePeerId &
+        " addr=" & addr &
+        " connectOk=" & $connectOk &
+        " peerConnected=" & $peerConnected &
+        " err=" & err
+      )
 
       if peerRes.isOk():
         peerConnected = peerCurrentlyConnected(node, peerRes.get())
@@ -22094,7 +23144,17 @@ proc runBootstrapSeedConnectExactAsync(
               remainingBudgetMs - reservedForFutureMs
             )
           )
+        debugLog(
+          "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:secure_wait_start peer=" & safePeerId &
+          " addr=" & addr &
+          " waitMs=" & $secureWaitMs
+        )
         secureOk = await waitForSecureChannel(node, safePeerId, secureWaitMs)
+        debugLog(
+          "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:secure_wait_done peer=" & safePeerId &
+          " addr=" & addr &
+          " secureOk=" & $secureOk
+        )
         if not peerConnected and peerRes.isOk():
           peerConnected = peerCurrentlyConnected(node, peerRes.get())
           attemptNode["peerConnected"] = %peerConnected
@@ -22109,13 +23169,23 @@ proc runBootstrapSeedConnectExactAsync(
                   8_000
                 else:
                   2_000,
-                remainingBudgetMs - reservedForFutureMs
+              remainingBudgetMs - reservedForFutureMs
               )
             )
-          identifiedOk = await waitForPeerIdentifiedWithinDeadline(
+          debugLog(
+            "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:peer_ready_wait_start peer=" & safePeerId &
+            " addr=" & addr &
+            " waitMs=" & $identifyWaitMs
+          )
+          identifiedOk = await waitForPeerReady(
             node,
-            peerRes.get(),
+            safePeerId,
             identifyWaitMs,
+          )
+          debugLog(
+            "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:peer_ready_wait_done peer=" & safePeerId &
+            " addr=" & addr &
+            " identifiedOk=" & $identifiedOk
           )
       attemptNode["secureOk"] = %secureOk
       attemptNode["identifiedOk"] = %identifiedOk
@@ -22133,7 +23203,15 @@ proc runBootstrapSeedConnectExactAsync(
       attemptNode["bootstrapConnected"] = %bootstrapConnected
       attempts.add(attemptNode)
 
-      if connectOk or secureOk or peerConnected or bootstrapConnected:
+      if identifiedOk:
+        debugLog(
+          "[nimlibp2p] bootstrapSeedConnectExactAsync success peer=" & safePeerId &
+          " addr=" & addr &
+          " connectOk=" & $connectOk &
+          " secureOk=" & $secureOk &
+          " peerConnected=" & $peerConnected &
+          " bootstrapConnected=" & $bootstrapConnected
+        )
         asyncSpawn(promoteConnectedBootstrapPeerDetached(
           node,
           safePeerId,
@@ -22165,6 +23243,11 @@ proc runBootstrapSeedConnectExactAsync(
 
     if lastError.len == 0:
       lastError = "bootstrap_seed_connect_timeout"
+    debugLog(
+      "[nimlibp2p] bootstrapSeedConnectExactAsync failed peer=" & safePeerId &
+      " attemptedAddr=" & attemptedAddr &
+      " lastError=" & lastError
+    )
     let payload = bootstrapSeedConnectExactPayload(
       node,
       safePeerId,

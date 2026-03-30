@@ -33,6 +33,7 @@
 | 数据流只能承载 bridge 数据 | 不能顺手塞 `ready` 或 `route_status` |
 | 一个 `bridgeId` 只能绑定一条数据流 | 防止串线 |
 | 一个流关闭不能影响同连接其他流 | 这是 builtin QUIC 的基础要求 |
+| 控制流每一步读写都必须有 deadline | 任何一步超时，都必须立即判定这条控制流失效并撤销 route |
 
 ## 3. 控制消息
 
@@ -142,6 +143,13 @@ gateway 必须满足下面两个条件才允许继续：
 }
 ```
 
+这里还有一个硬约束：
+
+| 约束 | 说明 |
+| --- | --- |
+| `incoming` 写入不能无限等待 | gateway 对 listener 长期控制流写 `incoming` 必须有固定超时 |
+| `incoming` 写超时即判控制流失效 | gateway 必须立即断开这条 listener 控制流，撤销 route，并释放 route 锁 |
+
 ### 4.3 listener 确认 ready
 
 listener 准备好本地目标后，在**同一条长期控制流**返回：
@@ -154,6 +162,11 @@ listener 准备好本地目标后，在**同一条长期控制流**返回：
   "sessionId": "<bridgeId>"
 }
 ```
+
+| 约束 | 说明 |
+| --- | --- |
+| `ready` 写入不能无限等待 | listener 对长期控制流回 `ready` 也必须有固定超时 |
+| `ready` 写超时即判这条 accept 流失效 | listener 必须主动关闭 accept 流并重新走 `accept -> await` |
 
 ### 4.4 listener 附着数据流
 
@@ -206,6 +219,14 @@ gateway 确认后，才能把这条数据流和 dialer 的短流桥起来。
 | `listen + accept` 成功 | 否 |
 | `listen + accept + await(published=true)` | 是 |
 | 长期控制流断开 | 否，立即撤销 |
+
+### 5.3 状态接口约束
+
+| 约束 | 说明 |
+| --- | --- |
+| `tailnet_status` / `local_info` 只能读本地快照 | 不能在状态接口里同步新开流或探测 gateway |
+| route 发布态只能由 listener 后台控制流维护 | `await(published=true)` 负责置 ready，控制流断开负责清 ready |
+| 禁止在状态接口里发 `route_status` | 状态查询不能再把产品节点拖进网络等待 |
 
 ## 6. 数据流规则
 

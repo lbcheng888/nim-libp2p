@@ -233,6 +233,10 @@ proc providerCapabilitiesSafe(self: TsnetTransport): TsnetProviderCapabilities {
       else:
         self.provider.capabilities()
 
+proc providerListenerNeedsRepairSafe(self: TsnetTransport): bool {.gcsafe.} =
+  tsnetSafe:
+    result = not self.provider.isNil and self.provider.listenerNeedsRepair()
+
 proc parseTsnetAddress(
     address: MultiAddress, listen: bool
 ): Result[TsnetParsedAddress, string] {.gcsafe.}
@@ -1236,6 +1240,11 @@ proc tailnetStatusPayload*(self: TsnetTransport): Result[JsonNode, string] {.gcs
     "tailnetDerpMapSummary": "",
     "tailnetPeers": newJArray(),
   }))
+
+proc listenerNeedsRepair*(self: TsnetTransport): bool {.gcsafe.} =
+  if self.isNil:
+    return false
+  self.providerListenerNeedsRepairSafe()
 
 proc tailnetPingPayload*(
     self: TsnetTransport,

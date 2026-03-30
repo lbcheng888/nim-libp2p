@@ -445,6 +445,17 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check probe.connected
       check probe.acknowledged
 
+    test "relay dial host keeps explicit public ip":
+      let publicHost = resolveDialHostForTest("64.176.84.12", 9446'u16).valueOr:
+        checkpoint("resolve public host failed: " & error)
+        ""
+      check publicHost == "64.176.84.12"
+
+      let loopbackHost = resolveDialHostForTest("127.0.0.1", 9446'u16).valueOr:
+        checkpoint("resolve loopback host failed: " & error)
+        ""
+      check loopbackHost == "127.0.0.1"
+
     test "gateway exchanges listener and dialer candidates":
       let (gateway, relayUrl) = startRelayGateway()
       defer:
@@ -513,6 +524,133 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check exchange.ok
       check exchange.listenerCandidates == listenerCandidates
       check exchange.dialerCandidates == dialerCandidates
+
+    test "route_status repairs ready state when local cache is missing":
+      let (controlGateway, controlUrl) = startControlGateway()
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        controlGateway.stop()
+        gateway.stop()
+
+      let server = buildRuntime(
+        controlUrl,
+        relayUrl,
+        "relay-server",
+        tempRuntimeDir("ready-cache-server")
+      )
+      try:
+        let started = startRuntimeSafe(server)
+        check started.isOk()
+        let rawLocal = MultiAddress.init("/ip4/127.0.0.1/udp/4001/quic-v1").tryGet()
+        let listenRes = server.listenUdpProxy("ip4", 4001, rawLocal)
+        check listenRes.isOk()
+        check waitForProxyListenersReady(server)
+        check server.udpListenerRoutes.len == 1
+        let route = server.udpListenerRoutes[0]
+        check relayRouteReady(server.runtimeId, route)
+        let cacheMissOwnerId = server.runtimeId + 1000
+        check not relayRouteReady(cacheMissOwnerId, route)
+        check relayRouteReadyOrPublished(cacheMissOwnerId, relayUrl, route)
+        check relayRouteReady(cacheMissOwnerId, route)
+      finally:
+        stopRuntimeSafe(server)
+
+    test "stopRelayListeners only clears ready routes for one owner":
+      let (controlGateway, controlUrl) = startControlGateway()
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        controlGateway.stop()
+        gateway.stop()
+
+      let server = buildRuntime(
+        controlUrl,
+        relayUrl,
+        "relay-server",
+        tempRuntimeDir("ready-cache-stop-owner")
+      )
+      try:
+        let started = startRuntimeSafe(server)
+        check started.isOk()
+        let rawLocal = MultiAddress.init("/ip4/127.0.0.1/udp/4001/quic-v1").tryGet()
+        let listenRes = server.listenUdpProxy("ip4", 4001, rawLocal)
+        check listenRes.isOk()
+        check waitForProxyListenersReady(server)
+        let route = server.udpListenerRoutes[0]
+        let shadowOwnerId = server.runtimeId + 2000
+        check relayRouteReady(server.runtimeId, route)
+        check relayRouteReadyOrPublished(shadowOwnerId, relayUrl, route)
+        check relayRouteReady(shadowOwnerId, route)
+        stopRelayListeners(shadowOwnerId)
+        check relayRouteReady(server.runtimeId, route)
+        check not relayRouteReady(shadowOwnerId, route)
+      finally:
+        stopRuntimeSafe(server)
+
+    test "route_status clears stale ready state after gateway loses route":
+      let (controlGateway, controlUrl) = startControlGateway()
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        controlGateway.stop()
+
+      let server = buildRuntime(
+        controlUrl,
+        relayUrl,
+        "relay-server",
+        tempRuntimeDir("ready-cache-clears")
+      )
+      try:
+        let started = startRuntimeSafe(server)
+        check started.isOk()
+        let rawLocal = MultiAddress.init("/ip4/127.0.0.1/udp/4001/quic-v1").tryGet()
+        let listenRes = server.listenUdpProxy("ip4", 4001, rawLocal)
+        check listenRes.isOk()
+        check waitForProxyListenersReady(server)
+        check server.udpListenerRoutes.len == 1
+        let route = server.udpListenerRoutes[0]
+        check relayRouteReady(server.runtimeId, route)
+
+        gateway.dropListenerRouteForTests(route)
+
+        check not relayRouteReadyOrPublished(server.runtimeId, relayUrl, route)
+        check not relayRouteReady(server.runtimeId, route)
+
+        let states = relayListenerStatesPayload(server.runtimeId)
+        check states.kind == JArray
+        check states.anyIt(
+          it.kind == JObject and
+          it.getOrDefault("route").getStr("") == route and
+          it.getOrDefault("stage").getStr("").toLowerAscii() == "dropped"
+        )
+      finally:
+        stopRuntimeSafe(server)
+
+    test "runtime listener repair fires after gateway unpublishes awaiting route":
+      let (controlGateway, controlUrl) = startControlGateway()
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        controlGateway.stop()
+        gateway.stop()
+
+      let server = buildRuntime(
+        controlUrl,
+        relayUrl,
+        "relay-server",
+        tempRuntimeDir("listener-repair-awaiting")
+      )
+      try:
+        let started = startRuntimeSafe(server)
+        check started.isOk()
+        let rawLocal = MultiAddress.init("/ip4/127.0.0.1/udp/4001/quic-v1").tryGet()
+        let listenRes = server.listenUdpProxy("ip4", 4001, rawLocal)
+        check listenRes.isOk()
+        check waitForProxyListenersReady(server)
+        let route = server.udpListenerRoutes[0]
+
+        gateway.dropListenerRouteForTests(route)
+
+        check server.listenerNeedsRepair()
+      finally:
+        stopRuntimeSafe(server)
 
     test "udp bridge session binds exactly one client source":
       let target = initTAddress("127.0.0.1", Port(40111))

@@ -54,6 +54,7 @@ when defined(libp2p_quic_support) and not defined(libp2p_msquic_experimental):
   {.error: "libp2p_quic_support has been removed. Enable -d:libp2p_msquic_experimental only.".}
 when defined(libp2p_msquic_experimental):
   import transports/msquictransport as quictransport
+  import transports/msquicconnection
 when not defined(libp2p_disable_datatransfer):
   from protocols/datatransfer/protobuf import DataTransferExtension
 
@@ -72,6 +73,12 @@ const
   ConcurrentUpgrades* = 4
   BitswapDefaultTopDebtorsLimit* = 20
   BitswapDefaultTopDebtorsMinBytes* = 64'u64 * 1024
+
+proc shouldAutoIdentifyIncoming(conn: Connection): bool {.inline.} =
+  when defined(libp2p_msquic_experimental):
+    if conn of msquicconnection.MsQuicConnection:
+      return false
+  true
 
 type
   Switch* {.public.} = ref object of Dial
@@ -1075,7 +1082,13 @@ proc upgrader(
           protocol = muxed.connection.protocol,
           negotiated = muxed.connection.negotiatedMuxer,
           description = exc.msg
-    asyncSpawn finishIncomingIdentify()
+    if shouldAutoIdentifyIncoming(muxed.connection):
+      asyncSpawn finishIncomingIdentify()
+    else:
+      warn "incoming upgrader auto identify skipped",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
   except CancelledError as e:
     when defined(lsmr_diag):
       echo "switch incoming-upgrade-cancel self=", $switch.peerInfo.peerId,

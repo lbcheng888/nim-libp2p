@@ -46,6 +46,7 @@ type
     pendingWaitTailnetReady
     pendingWaitPeerReady
     pendingConnectExact
+    pendingSendDm
     pendingWaitDm
 
   WatchClient = ref object
@@ -57,6 +58,7 @@ type
     socket: Socket
     deadlineMs: int64
     kind: PendingKind
+    requestKey: string
     peerId: string
     bodyContains: string
 
@@ -64,8 +66,23 @@ const
   ProductProtocolVersion = 1
   MaxFrameBytes = 16 * 1024 * 1024
 
+var productRpcNonce: uint64 = 0
+
 proc nowMillis(): int64 {.gcsafe.} =
   int64(epochTime() * 1000)
+
+proc nextProductRpcNonce(): uint64 =
+  inc productRpcNonce
+  productRpcNonce
+
+proc ensureProductMessageId(messageId: string): string =
+  let trimmed = messageId.strip()
+  if trimmed.len > 0:
+    return trimmed
+  "dm-" & $nowMillis() & "-" & $nextProductRpcNonce()
+
+proc makeProductRequestKey(prefix, messageId: string): string =
+  prefix & ":" & messageId
 
 proc fail(msg: string) {.noreturn.} =
   raise newException(IOError, msg)
@@ -102,32 +119,6 @@ proc safeJson(value: cstring; fallback = "{}"): JsonNode {.gcsafe, raises: [].} 
       parseJson(text)
   except CatchableError:
     parseJsonFallback(fallback)
-
-proc bootstrapSeedConnectExactJson(
-    node: ProductNode;
-    peerId: string;
-    addressesJson: string;
-    timeoutMs: int
-): JsonNode {.raises: [].} =
-  try:
-    safeJson(
-      libp2p_bootstrap_seed_connect_exact(
-        node.handle,
-        peerId.cstring,
-        addressesJson.cstring,
-        "product_connect_exact".cstring,
-        cint(
-          try:
-            parseJson(addressesJson).len
-          except CatchableError:
-            0
-        ),
-        cint(max(250, min(timeoutMs, 10_000)))
-      ),
-      """{"ok":false,"error":"connect_exact_failed","attempts":[]}"""
-    )
-  except Exception:
-    %*{"ok": false, "error": "connect_exact_failed", "attempts": []}
 
 proc encodeFrame(payload: string): string {.gcsafe.} =
   result = newStringOfCap(4 + payload.len)
@@ -215,6 +206,60 @@ proc withPeerIdSuffix(listenAddrs: JsonNode; peerId: string): JsonNode {.gcsafe.
     if "/p2p/" notin lower and "/ipfs/" notin lower:
       maText.add("/p2p/" & peerId)
     result.add(%maText)
+
+proc filterConnectableListenAddrs(listenAddrs: JsonNode): JsonNode {.gcsafe.} =
+  if listenAddrs.kind != JArray:
+    return listenAddrs
+  result = newJArray()
+  var seen = initHashSet[string]()
+  for item in listenAddrs.items:
+    if item.kind != JString:
+      continue
+    let maText = item.getStr().strip()
+    if maText.len == 0:
+      continue
+    let lower = maText.toLowerAscii()
+    if lower.startsWith("/awdl/") or lower.startsWith("/nan/") or lower.startsWith("/nearlink/"):
+      continue
+    if maText in seen:
+      continue
+    seen.incl(maText)
+    result.add(%maText)
+
+proc discoveryListenAddrs(node: ProductNode): JsonNode =
+  if node.isNil or node.handle.isNil:
+    return newJArray()
+  let snapshot =
+    safeJson(libp2p_network_discovery_snapshot(node.handle, nil, 0.cint, 0.cint), "{}")
+  if snapshot.kind != JObject:
+    return newJArray()
+  filterConnectableListenAddrs(snapshot.getOrDefault("listenAddresses"))
+
+proc relayPublishedListenAddrs(tailnetPayload: JsonNode): JsonNode {.gcsafe.} =
+  if tailnetPayload.kind != JObject:
+    return newJArray()
+  let listeners = tailnetPayload.getOrDefault("relayListeners")
+  if listeners.kind != JArray:
+    return newJArray()
+  result = newJArray()
+  var seen = initHashSet[string]()
+  for item in listeners.items:
+    if item.kind != JObject:
+      continue
+    let route = item.getOrDefault("route")
+    let stage = item.getOrDefault("stage")
+    if route.kind != JString or stage.kind != JString:
+      continue
+    let routeText = route.getStr().strip()
+    let stageText = stage.getStr().strip().toLowerAscii()
+    if routeText.len == 0:
+      continue
+    if stageText in ["failed", "dropped", "stopped"]:
+      continue
+    if routeText in seen:
+      continue
+    seen.incl(routeText)
+    result.add(%routeText)
 
 proc synthesizedTsnetListenAddrs(
     node: ProductNode;
@@ -504,17 +549,40 @@ proc localInfo(node: ProductNode): JsonNode {.raises: [].} =
   let tailnetStartPayload = node.tailnetStartStatus()
   let tailnetPayload = node.tailnetStatus()
   let peerId = safeCString(libp2p_get_local_peer_id(node.handle))
-  var listenAddrs = withPeerIdSuffix(
-    safeJson(libp2p_get_listen_addresses(node.handle), "[]"),
-    peerId
-  )
+  let relayListenAddrs =
+    withPeerIdSuffix(
+      filterConnectableListenAddrs(relayPublishedListenAddrs(tailnetPayload)),
+      peerId
+    )
+  var listenAddrs = relayListenAddrs
+  var listenAddrSource = "relay_listeners"
+  if listenAddrs.kind != JArray or listenAddrs.len == 0:
+    listenAddrs =
+      withPeerIdSuffix(
+        filterConnectableListenAddrs(
+          safeJson(libp2p_get_runtime_listen_addresses(node.handle), "[]")
+        ),
+        peerId
+      )
+    listenAddrSource = "runtime"
+  if listenAddrs.kind != JArray or listenAddrs.len == 0:
+    listenAddrs =
+      withPeerIdSuffix(
+        filterConnectableListenAddrs(
+          safeJson(libp2p_get_listen_addresses(node.handle), "[]")
+        ),
+        peerId
+      )
+    listenAddrSource = "published"
   if listenAddrs.kind != JArray or listenAddrs.len == 0:
     listenAddrs = synthesizedTsnetListenAddrs(node, peerId, tailnetPayload)
+    listenAddrSource = "synthesized"
   %*{
     "label": node.opts.label,
     "hostname": node.opts.hostname,
     "peerId": peerId,
     "listenAddrs": listenAddrs,
+    "listenAddrSource": listenAddrSource,
     "startStatus": startPayload,
     "tailnetStartStatus": tailnetStartPayload,
     "updatedAtMs": nowMillis()
@@ -548,6 +616,15 @@ proc tailnetReadySnapshot(node: ProductNode): JsonNode {.raises: [].} =
     "peerId": %peerId
   }
 
+proc connectExactKickoff(
+    node: ProductNode;
+    peerId: string;
+    listenAddrs: JsonNode;
+    timeoutMs: int
+): JsonNode {.raises: [].}
+
+proc connectExactStatus(peerId: string): JsonNode {.raises: [].}
+
 proc peerReadySnapshot(node: ProductNode; peerId: string; sliceTimeoutMs: int): JsonNode {.raises: [].} =
   if peerId.len == 0:
     return %*{"ok": false, "error": "peer_id_missing"}
@@ -572,30 +649,37 @@ proc connectExact(node: ProductNode; peerId: string; listenAddrs: JsonNode; time
     return %*{"ok": false, "error": "peer_id_missing"}
   if listenAddrs.kind != JArray or listenAddrs.len == 0:
     return %*{"ok": false, "error": "listen_addrs_missing"}
-  let normalizedAddrs = normalizeExactDialAddrs(peerId, listenAddrs)
-  if normalizedAddrs.len == 0:
-    return %*{"ok": false, "error": "no_supported_exact_addrs"}
+  let kickoffPayload = connectExactKickoff(node, peerId, listenAddrs, timeoutMs)
+  if not boolField(kickoffPayload, "ok"):
+    return kickoffPayload
   let startedAtMs = nowMillis()
-  let exactAddressesJson = $(%normalizedAddrs)
-  let exactPayload = bootstrapSeedConnectExactJson(
-    node,
-    peerId,
-    exactAddressesJson,
-    timeoutMs
-  )
-  if not boolField(exactPayload, "ok"):
-    return exactPayload
-  var payload = exactPayload
-  payload["ok"] = %true
-  if not payload.hasKey("secureOk"):
-    let elapsedMs = int(max(0'i64, nowMillis() - startedAtMs))
-    let remainingMs = max(1_000, timeoutMs - elapsedMs)
-    let readyPayload = peerReadySnapshot(node, peerId, remainingMs)
-    payload["secureOk"] = readyPayload.getOrDefault("secureOk")
-    payload["identifiedOk"] = readyPayload.getOrDefault("identifiedOk")
-  elif not payload.hasKey("identifiedOk"):
-    payload["identifiedOk"] = %false
-  payload
+  let deadlineMs = startedAtMs + int64(max(1_000, timeoutMs))
+  while nowMillis() <= deadlineMs:
+    let kickoffState = connectExactStatus(peerId)
+    let status = strField(kickoffState, "status")
+    if status == "done":
+      var payload =
+        if kickoffState.kind == JObject and kickoffState.hasKey("payload"):
+          kickoffState.getOrDefault("payload")
+        else:
+          %*{"ok": false, "peerId": peerId, "error": "connect_exact_missing_payload"}
+      if boolField(payload, "ok"):
+        if not payload.hasKey("secureOk"):
+          let elapsedMs = int(max(0'i64, nowMillis() - startedAtMs))
+          let remainingMs = max(1_000, timeoutMs - elapsedMs)
+          let readyPayload = peerReadySnapshot(node, peerId, remainingMs)
+          payload["secureOk"] = readyPayload.getOrDefault("secureOk")
+          payload["identifiedOk"] = readyPayload.getOrDefault("identifiedOk")
+        elif not payload.hasKey("identifiedOk"):
+          payload["identifiedOk"] = %false
+      return payload
+    sleep(100)
+  %*{
+    "ok": false,
+    "peerId": peerId,
+    "error": "connect_exact_timeout",
+    "state": connectExactStatus(peerId)
+  }
 
 proc connectExactKickoff(
     node: ProductNode;
@@ -649,41 +733,93 @@ proc connectExactStatus(peerId: string): JsonNode {.raises: [].} =
   except CatchableError as exc:
     %*{"ok": false, "peerId": peerId, "status": "error", "error": exc.msg}
 
-proc sendDm(
+proc sendDmKickoff(
     node: ProductNode;
     peerId, listenAddrsJson, messageId, text, replyTo: string;
     requestAck: bool;
     timeoutMs: int
 ): JsonNode {.raises: [].} =
-  let ok =
+  let safePeerId = peerId.strip()
+  let safeText = text
+  if safePeerId.len == 0:
+    return %*{"ok": false, "error": "peer_id_missing"}
+  if safeText.len == 0:
+    return %*{"ok": false, "error": "text_missing", "peerId": safePeerId}
+  let mid = ensureProductMessageId(messageId)
+  let requestKey = makeProductRequestKey("send_dm", mid)
+  var envelope = newJObject()
+  envelope["op"] = %"text"
+  envelope["mid"] = %mid
+  envelope["messageId"] = %mid
+  envelope["body"] = %safeText
+  envelope["ackRequested"] = %requestAck
+  envelope["timestamp_ms"] = %nowMillis()
+  if replyTo.len > 0:
+    envelope["reply_to"] = %replyTo
+  let addressCount =
+    if listenAddrsJson.len == 0:
+      0
+    else:
+      try:
+        let rows = parseJson(listenAddrsJson)
+        if rows.kind == JArray: rows.len else: 0
+      except CatchableError:
+        0
+  let kickoffOk =
     try:
-      if listenAddrsJson.len > 0:
-        libp2p_send_direct_text_with_addresses(
-          node.handle,
-          peerId.cstring,
-          listenAddrsJson.cstring,
-          messageId.cstring,
-          text.cstring,
-          (if replyTo.len > 0: replyTo.cstring else: nil),
-          requestAck,
-          cint(timeoutMs)
-        )
-      else:
-        libp2p_send_direct_text(
-          node.handle,
-          peerId.cstring,
-          messageId.cstring,
-          text.cstring,
-          (if replyTo.len > 0: replyTo.cstring else: nil),
-          requestAck,
-          cint(timeoutMs)
-        )
-    except Exception:
+      libp2p_send_with_ack_seeded_kickoff(
+        node.handle,
+        requestKey.cstring,
+        safePeerId.cstring,
+        ($envelope).cstring,
+        (if listenAddrsJson.len > 0: listenAddrsJson.cstring else: "[]".cstring),
+        "product_send_dm_async".cstring,
+        cint(timeoutMs)
+      )
+    except CatchableError:
       false
+  if not kickoffOk:
+    return %*{
+      "ok": false,
+      "peerId": safePeerId,
+      "messageId": mid,
+      "requestKey": requestKey,
+      "error": safeCString(libp2p_get_last_direct_error(node.handle))
+    }
   %*{
-    "ok": ok,
-    "error": safeCString(libp2p_get_last_direct_error(node.handle))
+    "ok": true,
+    "status": "queued",
+    "peerId": safePeerId,
+    "messageId": mid,
+    "requestKey": requestKey,
+    "requestAck": requestAck,
+    "addressCount": addressCount,
+    "timeoutMs": timeoutMs
   }
+
+proc sendDmStatus(requestKey: string): JsonNode {.raises: [].} =
+  if requestKey.strip().len == 0:
+    return %*{"ok": false, "status": "missing", "error": "request_key_missing"}
+  try:
+    safeJson(
+      libp2p_send_with_ack_kickoff_status(requestKey.cstring),
+      """{"ok":false,"requestKey":"","status":"missing"}"""
+    )
+  except CatchableError as exc:
+    %*{
+      "ok": false,
+      "requestKey": requestKey,
+      "status": "error",
+      "error": exc.msg
+    }
+
+proc requestListenAddrsNode(request: JsonNode): JsonNode {.gcsafe, raises: [].} =
+  if request.isNil or request.kind != JObject or not request.hasKey("listenAddrs"):
+    return newJNull()
+  let value = request.getOrDefault("listenAddrs")
+  if value.isNil:
+    return newJNull()
+  value
 
 proc dmRows(node: ProductNode): JsonNode {.raises: [].} =
   safeJson(social_received_direct_messages(node.handle, 128), """{"items":[]}""")
@@ -786,26 +922,60 @@ proc evaluatePending(node: ProductNode; pending: PendingRequest): tuple[done: bo
     let kickoffState = connectExactStatus(pending.peerId)
     let status = strField(kickoffState, "status")
     if status == "done":
-      let payload =
+      var payload =
         if kickoffState.kind == JObject and kickoffState.hasKey("payload"):
           kickoffState.getOrDefault("payload")
         else:
           %*{"ok": false, "peerId": pending.peerId, "error": "connect_exact_missing_payload"}
+      if boolField(payload, "ok") and not boolField(payload, "identifiedOk"):
+        let remainingMs = max(250, int(pending.deadlineMs - nowMillis()))
+        let readyPayload = peerReadySnapshot(node, pending.peerId, remainingMs)
+        payload["secureOk"] = readyPayload.getOrDefault("secureOk")
+        payload["identifiedOk"] = readyPayload.getOrDefault("identifiedOk")
+        if not boolField(readyPayload, "ok"):
+          payload["ok"] = %false
+          payload["error"] = %"peer_identify_not_ready"
+      return (true, rpcResponse(true, payload))
+    if timedOut:
+      let payload =
+        %*{
+          "ok": false,
+          "peerId": pending.peerId,
+          "error": "connect_exact_timeout",
+          "state": kickoffState
+        }
+      return (true, rpcResponse(true, payload))
+  of pendingSendDm:
+    let kickoffState = sendDmStatus(pending.requestKey)
+    let status = strField(kickoffState, "status")
+    if status == "done":
+      let payload =
+        if kickoffState.kind == JObject and kickoffState.hasKey("payload"):
+          kickoffState.getOrDefault("payload")
+        else:
+          %*{
+            "ok": false,
+            "requestKey": pending.requestKey,
+            "peerId": pending.peerId,
+            "error": "send_dm_missing_payload"
+          }
       return (true, rpcResponse(true, payload))
     if status == "missing" or timedOut:
       let payload =
         if timedOut:
           %*{
             "ok": false,
+            "requestKey": pending.requestKey,
             "peerId": pending.peerId,
-            "error": "connect_exact_timeout",
+            "error": "send_dm_timeout",
             "state": kickoffState
           }
         else:
           %*{
             "ok": false,
+            "requestKey": pending.requestKey,
             "peerId": pending.peerId,
-            "error": "connect_exact_missing_state",
+            "error": "send_dm_missing_state",
             "state": kickoffState
           }
       return (true, rpcResponse(true, payload))
@@ -826,7 +996,9 @@ proc registerPendingRequest(
 ): bool =
   let op = strField(request, "op").toLowerAscii()
   let timeoutMs = max(1_000, intField(request, "timeoutMs", 30_000))
+  let requestListenAddrs = requestListenAddrsNode(request)
   var pendingKind: PendingKind
+  var requestKey = ""
   case op
   of "wait_started":
     pendingKind = pendingWaitStarted
@@ -836,12 +1008,27 @@ proc registerPendingRequest(
     pendingKind = pendingWaitPeerReady
   of "wait_dm":
     pendingKind = pendingWaitDm
-  of "connect_exact":
-    let requestListenAddrs =
-      if request.kind == JObject:
-        request.getOrDefault("listenAddrs")
+  of "send_dm":
+    let kickoffPayload = sendDmKickoff(
+      node,
+      strField(request, "peerId"),
+      if requestListenAddrs.kind != JNull:
+        $requestListenAddrs
       else:
-        newJNull()
+        "",
+      strField(request, "messageId"),
+      strField(request, "text"),
+      strField(request, "replyTo"),
+      boolField(request, "requestAck", true),
+      timeoutMs
+    )
+    if not boolField(kickoffPayload, "ok"):
+      sendFrame(client, $rpcResponse(true, kickoffPayload))
+      closeSocketQuiet(client)
+      return true
+    pendingKind = pendingSendDm
+    requestKey = strField(kickoffPayload, "requestKey")
+  of "connect_exact":
     let kickoffPayload = connectExactKickoff(
       node,
       strField(request, "peerId"),
@@ -860,6 +1047,7 @@ proc registerPendingRequest(
     socket: client,
     deadlineMs: nowMillis() + int64(timeoutMs),
     kind: pendingKind,
+    requestKey: requestKey,
     peerId: strField(request, "peerId"),
     bodyContains: strField(request, "bodyContains")
   )
@@ -876,11 +1064,7 @@ proc handleRequest(
     request: JsonNode
 ): JsonNode {.raises: [].} =
   let op = strField(request, "op").toLowerAscii()
-  let requestListenAddrs =
-    if request.kind == JObject:
-      request.getOrDefault("listenAddrs")
-    else:
-      newJNull()
+  let requestListenAddrs = requestListenAddrsNode(request)
   if op == "ping":
     return rpcResponse(true, %*{"pong": true, "label": node.opts.label})
   if op == "status":
@@ -928,10 +1112,10 @@ proc handleRequest(
     )
   if op == "connect_exact_status":
     return rpcResponse(true, connectExactStatus(strField(request, "peerId")))
-  if op == "send_dm":
+  if op == "send_dm_kickoff":
     return rpcResponse(
       true,
-      sendDm(
+      sendDmKickoff(
         node,
         strField(request, "peerId"),
         if requestListenAddrs.kind != JNull:
@@ -945,6 +1129,10 @@ proc handleRequest(
         max(1_000, intField(request, "timeoutMs", 30_000))
       )
     )
+  if op == "send_dm_status":
+    return rpcResponse(true, sendDmStatus(strField(request, "requestKey")))
+  if op == "send_dm":
+    return rpcResponse(false, %*{"error": "send_dm_requires_pending_registration"})
   if op == "dm_rows":
     return rpcResponse(true, dmRows(node))
   if op == "wait_dm":
