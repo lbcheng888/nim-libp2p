@@ -1262,11 +1262,13 @@ proc serveRequestStream(
     let response = handleGatewayRequest(gateway, request)
     quicGatewayDebug("response-json=" & $response)
     await writeJsonMessage(stream, response)
+    await stream.closeWrite()
     await sleepAsync(QuicGatewayResponseDrainDelay)
   except CatchableError as exc:
     quicGatewayDebug("serveRequestStream error=" & exc.msg)
     try:
       await writeJsonMessage(stream, rpcError(exc.msg))
+      await stream.closeWrite()
       await sleepAsync(QuicGatewayResponseDrainDelay)
     except CatchableError:
       discard
@@ -1548,6 +1550,9 @@ proc executeSingleQuicRequest(
     quicClientDebug("stream created; sending request")
     let requestFuture = proc(): Future[JsonNode] {.async.} =
       await writeJsonMessage(stream, request)
+      # This RPC is exactly one request per stream; half-close the write side
+      # so peers that wait for FIN can start processing immediately.
+      await stream.closeWrite()
       quicClientDebug("request sent; awaiting response")
       await readJsonMessage(stream)
     let responseFut = requestFuture()

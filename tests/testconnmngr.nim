@@ -245,6 +245,25 @@ suite "Connection Manager":
     await liveMux.close()
     await connMngr.close()
 
+  asyncTest "replace same-direction live muxer when peer slot is full":
+    let connMngr = ConnManager.new(maxConnsPerPeer = 1)
+    let peerId = PeerId.init(PrivateKey.random(ECDSA, (newRng())[]).tryGet()).tryGet()
+    let oldMux = getMuxer(peerId, Direction.In)
+    let newMux = getMuxer(peerId, Direction.In)
+
+    connMngr.storeMuxer(oldMux)
+    connMngr.storeMuxer(newMux)
+
+    check connMngr.connCount(peerId) == 1
+    check connMngr.selectMuxer(peerId, Direction.In) == newMux
+    check oldMux notin connMngr
+
+    checkUntilTimeout:
+      oldMux.connection.closed
+
+    await newMux.close()
+    await connMngr.close()
+
   asyncTest "reindex muxer when peer id becomes known after identify":
     let connMngr = ConnManager.new()
     let unresolvedPeer = default(PeerId)
@@ -266,7 +285,7 @@ suite "Connection Manager":
     await connMngr.close()
 
   asyncTest "drop connections for peer":
-    let connMngr = ConnManager.new()
+    let connMngr = ConnManager.new(maxConnsPerPeer = 2)
     let peerId = PeerId.init(PrivateKey.random(ECDSA, (newRng())[]).tryGet()).tryGet()
 
     for i in 0 ..< 2:

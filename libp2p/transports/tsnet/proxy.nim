@@ -76,19 +76,20 @@ proc clearSharedKey(value: var TsnetSharedKey) =
   value.text = ""
 
 proc sharedKeyToString(value: TsnetSharedKey): string =
+  if value.text.len == 0:
+    return ""
   value.text
 
 proc sharedKeyEquals(value: TsnetSharedKey, expected: string): bool =
   sharedKeyToString(value) == expected
 
 proc validSharedKey(value: TsnetSharedKey): bool =
-  value.text.len > 0
+  sharedKeyToString(value).len > 0
 
 proc replaceSharedKey(value: var TsnetSharedKey, text: string) =
   if sharedKeyEquals(value, text):
     return
-  clearSharedKey(value)
-  value = initSharedKey(text)
+  value.text = text
 
 proc freeProxyRegistration(registration: var TsnetProxyRegistration) =
   clearSharedKey(registration.advertisedKey)
@@ -132,29 +133,23 @@ proc validDirectRouteRegistration(
 
 proc sanitizeProxyRoutesUnsafe() =
   var keptRoutes: seq[TsnetProxyRegistration] = @[]
-  for registration in proxyRegistrations.mitems():
+  for registration in proxyRegistrations.items():
     if validProxyRegistration(registration):
       keptRoutes.add(registration)
-    else:
-      freeProxyRegistration(registration)
   proxyRegistrations = keptRoutes
 
 proc sanitizeResolvedRemotesUnsafe() =
   var keptResolved: seq[TsnetResolvedRemoteRegistration] = @[]
-  for registration in proxyResolvedRemotes.mitems():
+  for registration in proxyResolvedRemotes.items():
     if validResolvedRemoteRegistration(registration):
       keptResolved.add(registration)
-    else:
-      freeResolvedRemoteRegistration(registration)
   proxyResolvedRemotes = keptResolved
 
 proc sanitizeDirectRoutesUnsafe() =
   var keptDirect: seq[TsnetDirectRouteRegistration] = @[]
-  for registration in proxyDirectRoutes.mitems():
+  for registration in proxyDirectRoutes.items():
     if validDirectRouteRegistration(registration):
       keptDirect.add(registration)
-    else:
-      freeDirectRouteRegistration(registration)
   proxyDirectRoutes = keptDirect
 
 proc sanitizeProxyRegistryUnsafe() =
@@ -302,27 +297,21 @@ proc unregisterProxyRoutes*(ownerId: int) =
     withLock(proxyRegistryLock):
       sanitizeProxyRegistryUnsafe()
       var keptRoutes: seq[TsnetProxyRegistration] = @[]
-      for registration in proxyRegistrations.mitems():
+      for registration in proxyRegistrations.items():
         if registration.ownerId != ownerId:
           keptRoutes.add(registration)
-        else:
-          freeProxyRegistration(registration)
       proxyRegistrations = keptRoutes
 
       var keptResolved: seq[TsnetResolvedRemoteRegistration] = @[]
-      for registration in proxyResolvedRemotes.mitems():
+      for registration in proxyResolvedRemotes.items():
         if registration.ownerId != ownerId:
           keptResolved.add(registration)
-        else:
-          freeResolvedRemoteRegistration(registration)
       proxyResolvedRemotes = keptResolved
 
       var keptDirect: seq[TsnetDirectRouteRegistration] = @[]
-      for registration in proxyDirectRoutes.mitems():
+      for registration in proxyDirectRoutes.items():
         if registration.ownerId != ownerId:
           keptDirect.add(registration)
-        else:
-          freeDirectRouteRegistration(registration)
       proxyDirectRoutes = keptDirect
 
 proc proxyRouteSnapshots*(ownerId: int): seq[TsnetProxyRouteSnapshot] {.gcsafe.} =

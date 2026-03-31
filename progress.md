@@ -64,3 +64,24 @@
 | 2026-03-31 | 已把 Android interactive native priority 窗口上限从 30 秒提到 120 秒，并把消息发送入口的窗口时长从 12 秒提到 90 秒，避免 tsnet 发送尚未结束时后台轮询恢复直打 native |
 | 2026-03-31 | 已删除 `BridgeFacades.sendDirectText` 里的同步 `prepareDirectRoutePeer`；消息页现在只做 `register_hints + send_with_ack_kickoff(seedAddrs)`，不再先走一条错层的 `connectPeer/socialConnectPeer/connectMultiaddr` 预连接 |
 | 2026-03-31 | 已把 tsnet 发送 budget 调整为由 `send_with_ack` 自己覆盖完整 `connect + ack`，并重新安装 Android Debug 包；设备 `com.unimaker.native.debug` 更新时间为 `2026-03-31 00:32:43` |
+| 2026-03-31 | 已修 `connmanager`：`maxConnsPerPeer=1` 不再因 off-by-one 先放进第 2 条 live 连接；同一 peer 的新同方向连接到来时会先踢掉旧残留，再收新连接 |
+| 2026-03-31 | `tests/testconnmngr.nim` 已回归通过，当前是 `25 OK`，并新增覆盖“peer slot 已满时替换同方向旧 live muxer”的测试 |
+| 2026-03-31 | 新一轮 Android 生产 UI 实跑里，本地节点不再出现 `Too many connections for peer`；真实失败已前移成 `dm_fresh_dial_begin 33082ms send_with_ack_timeout` |
+| 2026-03-31 | 本地节点日志已坐实这轮真死点不是 `connmanager`，而是 listener 持久 accept 流在同一 relay client 上跑 `route_status` 校验时 10 秒超时，把正在跑的 bridge 一起关掉 |
+| 2026-03-31 | 已把 listener 持久 accept 流的 `route_status` revalidate 改成独立 fresh probe，不再复用当前 live control client 连接自杀式校验 |
+| 2026-03-31 | 已修 `tsnet_product_node.relayPublishedListenAddrs` 的 nil 崩溃；此前 `local_info` 会因空 `tailnetPayload/relayListeners` 直接 SIGSEGV 杀掉本地产品节点 |
+| 2026-03-31 | 当前最新 blocker 是本地产品节点 listener 启动期反复报 `udp listener register ack after 10s`；节点最终能回到 `listenAddrSource=relay_listeners`，但 `proxyListenersReady` 仍可能停在 `false/connecting`，导致这轮尚未完成稳定的端到端 DM 复验 |
+| 2026-03-31 | 已给 `quicrelay.sharedRelayClient` 增加失效路径：UDP listener 创建注册流失败、`register ack` 超时或被拒时，会主动丢掉当前坏 relay client，下轮 fresh connect，不再死复用同一条卡死连接 |
+| 2026-03-31 | 最新一轮带 stale-client 修复的本地节点重启后，tailnet warm 又前移卡在 `warm_provider_begin`；`local_info` 40 秒后仍是 `listenAddrSource=synthesized`、`tailnetStartStatus.stage=starting`，因此本轮还不能继续做可信的 Android 端到端 DM 结论 |
+| 2026-03-31 | 已修 `quiccontrol.executeSingleQuicRequest`：builtin QUIC control 单请求流在写完 framed request 后会立刻 `closeWrite()`；本地 `testtsnetquiccontrol.nim` 现在是 `7 OK` |
+| 2026-03-31 | 已新增 `tests/testtsnetquiccontrol_fin.nim`，覆盖“服务端必须等 EOF/FIN 才开始解码 request”的场景；当前 builtin QUIC 下回归结果是 `1 OK` |
+| 2026-03-31 | 已用同一份 builtin QUIC wire probe 做本地/远端对照：本地 `tsnet_quic_gateway_service` 在 `framed+SNI`、`raw+SNI`、`raw+no SNI` 三组请求下都能秒回；远端 `64.176.84.12:9444` 在同三组请求下都表现为“握手成功、写成功、零响应” |
+| 2026-03-31 | 当前 blocker 已进一步坐实到远端 `nim-tsnet-gateway` control 服务可用性/部署状态，不再是本地 builtin QUIC 客户端的 FIN、framing、SNI 或 DM 上层语义问题 |
+| 2026-03-31 | 已修 `tsnet/proxy.nim` 的 registry nil 崩溃；`proxyRouteSnapshots -> sanitizeProxyRoutesUnsafe -> sharedKeyToString` 现在不会再因半残 key 把本地产品节点打成 `SIGSEGV`，`tests/testtsnetproxy.nim` 当前是 `9 OK` |
+| 2026-03-31 | 已把 `quicrelay` gateway 的重复 `listen/accept` 收紧成“不覆盖正在 `ready_wait/busy` 的 active listener”，远端 journal 不再出现 `nim_quic relay accept stream lost attached listener route` 这条真 bug |
+| 2026-03-31 | 修补后重启本地产品节点，`local_info` 再次稳定回到 `listenAddrSource=relay_listeners`、`tailnet_status.providerReady=true`；本地节点不再在发送窗口里自崩 |
+| 2026-03-31 | 最新一轮 Android instrumentation 没进入发送链路，失败点前移成 `send button not shown`；远端 gateway 同窗口里只有周期性的 `route_status`，没有新的 `dial/bridge attach`，说明这轮是 UI 自动化入口问题，不是 DM 底层新回退 |
+| 2026-03-31 | 已修 `quicrelay.readJsonMessage/readBinaryFrame` 的 framed reader 真 bug：当 `takeCachedBytes()` 已经拿到完整 frame 时，现在会先直接消费，不再错误继续 `stream.read()` 把 persistent accept lane 卡死；同时补了 listener restart 时关闭后未清空 `acceptStream/regStream` 的悬挂引用 |
+| 2026-03-31 | 新增 `cached complete json/binary frame is consumed before waiting for more bytes` 两条回归并通过，`accept stream can receive incoming over the same client initiated stream`、`route_status stays published while listener ready is pending` 也继续通过 |
+| 2026-03-31 | 用新二进制重启本地产品节点后，`tailnet_status.proxyListenersReady=true`、`relayListeners[0].stage=awaiting`、`local_info.listenAddrSource=relay_listeners` 已恢复，说明本地 relay listener 稳态正常 |
+| 2026-03-31 | 最新一轮 Android 生产 UI 真发结果仍是 `发送失败 peer_ready_failed 10110ms connect timeout`，本地 `wait_dm` 超时；这次不再是“gateway 已写 incoming 但本地不读”的旧主因，而是更前面的真实 connect timeout 还没打通 |

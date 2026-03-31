@@ -91,6 +91,11 @@ proc closeWriteAndCloseLater(
       discard
   asyncSpawn runner()
 
+proc isRetryableStaleConnError(exc: ref CatchableError): bool =
+  exc of LPStreamConnDownError or
+    exc of LPStreamClosedError or
+    exc of LPStreamResetError
+
 proc notifySendProgress(
     progress: DirectMessageSendProgress,
     stage: string,
@@ -371,6 +376,197 @@ proc send*(
       @[]
   let hasConn =
     (not svc.switch.connManager.isNil) and svc.switch.connManager.connCount(peer) > 0
+  var connFromLive = false
+
+  proc dialFreshConnection(): Future[void] {.async.} =
+    if orderedAddrs.len == 0:
+      return
+    try:
+      notifySendProgress(progress, "dm_fresh_dial_begin", %*{
+        "dmPhase": "fresh_dial",
+        "peer": $peer,
+        "codec": svc.codec,
+        "addressCount": orderedAddrs.len,
+        "source": (if preferredAddrs.len > 0: "preferred" else: "peerstore"),
+      })
+      debug "direct message fresh dial begin",
+        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len,
+        source = (if preferredAddrs.len > 0: "preferred" else: "peerstore")
+      conn = await svc.switch.dial(
+        peer,
+        orderedAddrs,
+        @[svc.codec],
+        forceDial = true,
+        reuseConnection = false,
+      )
+      notifySendProgress(progress, "dm_fresh_dial_ready", %*{
+        "dmPhase": "fresh_dial_ready",
+        "peer": $peer,
+        "codec": svc.codec,
+        "addressCount": orderedAddrs.len,
+      })
+      debug "direct message fresh dial succeeded",
+        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
+      connFromLive = false
+      dialErr = ""
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      dialErr = exc.msg
+      notifySendProgress(progress, "dm_fresh_dial_failed", %*{
+        "dmPhase": "fresh_dial_failed",
+        "peer": $peer,
+        "codec": svc.codec,
+        "addressCount": orderedAddrs.len,
+        "error": dialErr,
+      })
+      warn "direct message fresh dial failed", peer = $peer, err = dialErr
+
+  proc sendOnConnection(activeConn: Connection): Future[(bool, string, bool)] {.async.} =
+    try:
+      notifySendProgress(progress, "dm_write_begin", %*{
+        "dmPhase": "write_begin",
+        "peer": $peer,
+        "bytes": payload.len,
+        "ackRequested": ackRequested,
+        "messageId": messageId,
+      })
+      debug "direct message writeLp begin",
+        peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+      await activeConn.writeLp(payload)
+      notifySendProgress(progress, "dm_write_done", %*{
+        "dmPhase": "write_done",
+        "peer": $peer,
+        "bytes": payload.len,
+        "ackRequested": ackRequested,
+        "messageId": messageId,
+      })
+      debug "direct message writeLp done",
+        peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+      if not ackRequested:
+        debug "direct message closeWrite begin", peer = $peer, mid = messageId
+        await activeConn.closeWrite()
+        debug "direct message closeWrite done", peer = $peer, mid = messageId
+        debug "direct message delayed close scheduled", peer = $peer, mid = messageId
+        closeConnLater(activeConn, 1200.milliseconds)
+      debug "direct message payload sent", peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+    except CatchableError as exc:
+      notifySendProgress(progress, "dm_write_failed", %*{
+        "dmPhase": "write_failed",
+        "peer": $peer,
+        "messageId": messageId,
+        "error": exc.msg,
+        "retryableFreshDial": isRetryableStaleConnError(exc),
+      })
+      warn "direct message write path failed", peer = $peer, mid = messageId, err = exc.msg
+      try:
+        await activeConn.close()
+      except CatchableError:
+        discard
+      return (false, exc.msg, isRetryableStaleConnError(exc))
+
+    if not ackRequested or messageId.len == 0:
+      return (true, "", false)
+
+    let ackFuture = activeConn.readLp(svc.maxAckBytes)
+    let timeoutFuture = sleepAsync(timeout)
+    notifySendProgress(progress, "dm_ack_wait", %*{
+      "dmPhase": "ack_wait",
+      "peer": $peer,
+      "messageId": messageId,
+      "timeoutMs": timeout.milliseconds.int,
+    })
+    debug "direct message ack wait begin",
+      peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
+    let timedOut =
+      try:
+        discard await race(ackFuture, timeoutFuture)
+        not ackFuture.finished()
+      except CancelledError as exc:
+        raise exc
+      except CatchableError as exc:
+        notifySendProgress(progress, "dm_ack_wait_failed", %*{
+          "dmPhase": "ack_wait_failed",
+          "peer": $peer,
+          "messageId": messageId,
+          "error": exc.msg,
+          "retryableFreshDial": isRetryableStaleConnError(exc),
+        })
+        warn "direct message ack wait failed", peer = $peer, err = exc.msg
+        try:
+          await activeConn.close()
+        except CatchableError:
+          discard
+        return (false, exc.msg, isRetryableStaleConnError(exc))
+      finally:
+        if not timeoutFuture.finished():
+          timeoutFuture.cancelSoon()
+
+    if timedOut:
+      notifySendProgress(progress, "dm_ack_timeout", %*{
+        "dmPhase": "ack_timeout",
+        "peer": $peer,
+        "messageId": messageId,
+        "timeoutMs": timeout.milliseconds.int,
+        "error": "ack timeout",
+      })
+      debug "direct message ack timeout", peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
+      closeConnSoon(activeConn)
+      return (false, "ack timeout", false)
+
+    var ackBytes: seq[byte]
+    try:
+      ackBytes = await ackFuture
+    except CatchableError as exc:
+      notifySendProgress(progress, "dm_ack_read_failed", %*{
+        "dmPhase": "ack_read_failed",
+        "peer": $peer,
+        "messageId": messageId,
+        "error": exc.msg,
+        "retryableFreshDial": isRetryableStaleConnError(exc),
+      })
+      closeConnSoon(activeConn)
+      return (false, exc.msg, isRetryableStaleConnError(exc))
+
+    let ackResult = parseAckPayload(ackBytes)
+    try:
+      debug "direct message post-ack closeWrite begin", peer = $peer, mid = messageId
+      await activeConn.closeWrite()
+      debug "direct message post-ack closeWrite done", peer = $peer, mid = messageId
+    except CatchableError as closeErr:
+      warn "direct message post-ack closeWrite failed", peer = $peer, err = closeErr.msg
+    closeConnSoon(activeConn)
+
+    if not ackResult.ok or ackResult.mid != messageId:
+      notifySendProgress(progress, "dm_ack_invalid", %*{
+        "dmPhase": "ack_invalid",
+        "peer": $peer,
+        "messageId": messageId,
+        "receivedMessageId": ackResult.mid,
+        "error": "invalid ack payload",
+      })
+      warn "direct message received invalid ack", peer = $peer, expected = messageId, received = ackResult.mid
+      return (false, "invalid ack payload", false)
+
+    if not ackResult.success:
+      if ackResult.error.len > 0:
+        warn "direct message ack reported failure", peer = $peer, mid = messageId, err = ackResult.error
+      notifySendProgress(progress, "dm_ack_failed", %*{
+        "dmPhase": "ack_failed",
+        "peer": $peer,
+        "messageId": messageId,
+        "error": (if ackResult.error.len > 0: ackResult.error else: "ack failed"),
+      })
+      return (false, if ackResult.error.len > 0: ackResult.error else: "ack failed", false)
+
+    notifySendProgress(progress, "dm_ack_done", %*{
+      "dmPhase": "ack_done",
+      "peer": $peer,
+      "messageId": messageId,
+    })
+    debug "direct message ack received", peer = $peer, mid = messageId
+    (true, "", false)
+
   if hasConn:
     try:
       let liveDialBudget =
@@ -410,6 +606,7 @@ proc send*(
           peer = $peer, codec = svc.codec, timeoutMs = liveDialBudget.milliseconds.int
       else:
         conn = await liveDialFuture
+        connFromLive = true
         notifySendProgress(progress, "dm_conn_live_ready", %*{
           "dmPhase": "reuse_live_connection_ready",
           "peer": $peer,
@@ -429,44 +626,7 @@ proc send*(
       warn "direct message live connection dial failed", peer = $peer, err = dialErr
 
   if conn.isNil and orderedAddrs.len > 0:
-    try:
-      notifySendProgress(progress, "dm_fresh_dial_begin", %*{
-        "dmPhase": "fresh_dial",
-        "peer": $peer,
-        "codec": svc.codec,
-        "addressCount": orderedAddrs.len,
-        "source": (if preferredAddrs.len > 0: "preferred" else: "peerstore"),
-      })
-      debug "direct message fresh dial begin",
-        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len,
-        source = (if preferredAddrs.len > 0: "preferred" else: "peerstore")
-      conn = await svc.switch.dial(
-        peer,
-        orderedAddrs,
-        @[svc.codec],
-        forceDial = true,
-        reuseConnection = false,
-      )
-      notifySendProgress(progress, "dm_fresh_dial_ready", %*{
-        "dmPhase": "fresh_dial_ready",
-        "peer": $peer,
-        "codec": svc.codec,
-        "addressCount": orderedAddrs.len,
-      })
-      debug "direct message fresh dial succeeded",
-        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
-    except CancelledError as exc:
-      raise exc
-    except CatchableError as exc:
-      dialErr = exc.msg
-      notifySendProgress(progress, "dm_fresh_dial_failed", %*{
-        "dmPhase": "fresh_dial_failed",
-        "peer": $peer,
-        "codec": svc.codec,
-        "addressCount": orderedAddrs.len,
-        "error": dialErr,
-      })
-      warn "direct message fresh dial failed", peer = $peer, err = dialErr
+    await dialFreshConnection()
 
   if conn.isNil and dialErr.len == 0 and not hasConn:
     dialErr = "no existing connection"
@@ -484,143 +644,21 @@ proc send*(
     debug "direct message dial aborted without fallback", peer = $peer, err = dialErr
     return (false, if dialErr.len > 0: dialErr else: "dial failed without fallback")
 
-  try:
-    notifySendProgress(progress, "dm_write_begin", %*{
-      "dmPhase": "write_begin",
-      "peer": $peer,
-      "bytes": payload.len,
-      "ackRequested": ackRequested,
-      "messageId": messageId,
-    })
-    debug "direct message writeLp begin",
-      peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
-    await conn.writeLp(payload)
-    notifySendProgress(progress, "dm_write_done", %*{
-      "dmPhase": "write_done",
-      "peer": $peer,
-      "bytes": payload.len,
-      "ackRequested": ackRequested,
-      "messageId": messageId,
-    })
-    debug "direct message writeLp done",
-      peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
-    if not ackRequested:
-      debug "direct message closeWrite begin", peer = $peer, mid = messageId
-      await conn.closeWrite()
-      debug "direct message closeWrite done", peer = $peer, mid = messageId
-      debug "direct message delayed close scheduled", peer = $peer, mid = messageId
-      closeConnLater(conn, 1200.milliseconds)
-    debug "direct message payload sent", peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
-  except CatchableError as exc:
-    notifySendProgress(progress, "dm_write_failed", %*{
-      "dmPhase": "write_failed",
+  var sendResult = await sendOnConnection(conn)
+  if not sendResult[0] and connFromLive and orderedAddrs.len > 0 and sendResult[2]:
+    notifySendProgress(progress, "dm_live_stale_retry", %*{
+      "dmPhase": "live_stale_retry",
       "peer": $peer,
       "messageId": messageId,
-      "error": exc.msg,
+      "error": sendResult[1],
+      "addressCount": orderedAddrs.len,
     })
-    warn "direct message write path failed", peer = $peer, mid = messageId, err = exc.msg
-    try:
-      await conn.close()
-    except CatchableError:
-      discard
-    return (false, exc.msg)
+    warn "direct message live connection stale, retrying fresh dial",
+      peer = $peer, mid = messageId, err = sendResult[1]
+    conn = nil
+    await dialFreshConnection()
+    if conn.isNil:
+      return (false, if dialErr.len > 0: dialErr else: sendResult[1])
+    sendResult = await sendOnConnection(conn)
 
-  if not ackRequested or messageId.len == 0:
-    return (true, "")
-
-  let ackFuture = conn.readLp(svc.maxAckBytes)
-  let timeoutFuture = sleepAsync(timeout)
-  notifySendProgress(progress, "dm_ack_wait", %*{
-    "dmPhase": "ack_wait",
-    "peer": $peer,
-    "messageId": messageId,
-    "timeoutMs": timeout.milliseconds.int,
-  })
-  debug "direct message ack wait begin",
-    peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
-  let timedOut =
-    try:
-      discard await race(ackFuture, timeoutFuture)
-      not ackFuture.finished()
-    except CancelledError as exc:
-      raise exc
-    except CatchableError as exc:
-      notifySendProgress(progress, "dm_ack_wait_failed", %*{
-        "dmPhase": "ack_wait_failed",
-        "peer": $peer,
-        "messageId": messageId,
-        "error": exc.msg,
-      })
-      warn "direct message ack wait failed", peer = $peer, err = exc.msg
-      try:
-        await conn.close()
-      except CatchableError:
-        discard
-      return (false, exc.msg)
-    finally:
-      if not timeoutFuture.finished():
-        timeoutFuture.cancelSoon()
-
-  if timedOut:
-    notifySendProgress(progress, "dm_ack_timeout", %*{
-      "dmPhase": "ack_timeout",
-      "peer": $peer,
-      "messageId": messageId,
-      "timeoutMs": timeout.milliseconds.int,
-      "error": "ack timeout",
-    })
-    debug "direct message ack timeout", peer = $peer, mid = messageId, timeoutMs = timeout.milliseconds.int
-    closeConnSoon(conn)
-    return (false, "ack timeout")
-
-  var ackBytes: seq[byte]
-  try:
-    ackBytes = await ackFuture
-  except CatchableError as exc:
-    notifySendProgress(progress, "dm_ack_read_failed", %*{
-      "dmPhase": "ack_read_failed",
-      "peer": $peer,
-      "messageId": messageId,
-      "error": exc.msg,
-    })
-    closeConnSoon(conn)
-    return (false, exc.msg)
-
-  let ackResult = parseAckPayload(ackBytes)
-  try:
-    debug "direct message post-ack closeWrite begin", peer = $peer, mid = messageId
-    await conn.closeWrite()
-    debug "direct message post-ack closeWrite done", peer = $peer, mid = messageId
-  except CatchableError as closeErr:
-    warn "direct message post-ack closeWrite failed", peer = $peer, err = closeErr.msg
-  closeConnSoon(conn)
-
-  if not ackResult.ok or ackResult.mid != messageId:
-    notifySendProgress(progress, "dm_ack_invalid", %*{
-      "dmPhase": "ack_invalid",
-      "peer": $peer,
-      "messageId": messageId,
-      "receivedMessageId": ackResult.mid,
-      "error": "invalid ack payload",
-    })
-    warn "direct message received invalid ack", peer = $peer, expected = messageId, received = ackResult.mid
-    return (false, "invalid ack payload")
-
-  if not ackResult.success:
-    if ackResult.error.len > 0:
-      warn "direct message ack reported failure", peer = $peer, mid = messageId, err = ackResult.error
-    notifySendProgress(progress, "dm_ack_failed", %*{
-      "dmPhase": "ack_failed",
-      "peer": $peer,
-      "messageId": messageId,
-      "error": (if ackResult.error.len > 0: ackResult.error else: "ack failed"),
-    })
-    return (false, if ackResult.error.len > 0: ackResult.error else: "ack failed")
-
-  notifySendProgress(progress, "dm_ack_done", %*{
-    "dmPhase": "ack_done",
-    "peer": $peer,
-    "messageId": messageId,
-  })
-  debug "direct message ack received", peer = $peer, mid = messageId
-  (true, "")
+  (sendResult[0], sendResult[1])

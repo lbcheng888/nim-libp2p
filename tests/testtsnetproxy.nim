@@ -105,6 +105,21 @@ suite "Tsnet proxy runtime":
     unregisterProxyRoutes(7001)
     unregisterProxyRoutes(7002)
 
+  test "proxy route snapshots ignore invalid proxy rows without crashing":
+    unregisterProxyRoutes(7006)
+    let advertised = MultiAddress.init("/ip4/100.64.0.16/udp/4006/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/41016/quic-v1").tryGet()
+    check registerProxyRoute(7006, advertised, raw).isOk()
+    injectInvalidProxyRegistrationForTest(7006, "/ip4/127.0.0.1/udp/49992/quic-v1")
+
+    let snapshots = proxyRouteSnapshots(7006)
+    check snapshots.len == 1
+    check snapshots[0].advertised == advertised
+    check snapshots[0].raw == raw
+    check snapshots[0].kind == TsnetProxyKind.Quic
+
+    unregisterProxyRoutes(7006)
+
   test "direct route snapshots ignore invalid resolved remote rows":
     unregisterProxyRoutes(7003)
     let advertised = MultiAddress.init("/ip4/100.64.0.12/udp/4002/quic-v1/tsnet").tryGet()
@@ -119,6 +134,40 @@ suite "Tsnet proxy runtime":
     check normalizeTailnetPath(snapshots[0].pathKind) == TsnetPathDirect
 
     unregisterProxyRoutes(7003)
+
+  test "resolved remote cleanup survives unregister without crashing":
+    unregisterProxyRoutes(7004)
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/49997/quic-v1").tryGet()
+    let advertised = MultiAddress.init("/ip4/100.64.0.13/udp/4003/quic-v1/tsnet").tryGet()
+    registerResolvedRemote(7004, raw, advertised)
+    injectInvalidResolvedRemoteRegistrationForTest(7004, "/ip4/127.0.0.1/udp/49996/quic-v1")
+
+    let looked = resolveAdvertisedRemote(raw)
+    check looked.isOk()
+    check looked.get() == advertised
+
+    unregisterProxyRoutes(7004)
+    check resolveAdvertisedRemote(raw).isErr()
+
+  test "resolved remote register survives invalid rows during sanitize":
+    unregisterProxyRoutes(7005)
+    let rawA = MultiAddress.init("/ip4/127.0.0.1/udp/49995/quic-v1").tryGet()
+    let advertisedA = MultiAddress.init("/ip4/100.64.0.14/udp/4004/quic-v1/tsnet").tryGet()
+    let rawB = MultiAddress.init("/ip4/127.0.0.1/udp/49994/quic-v1").tryGet()
+    let advertisedB = MultiAddress.init("/ip4/100.64.0.15/udp/4005/quic-v1/tsnet").tryGet()
+    injectInvalidResolvedRemoteRegistrationForTest(7005, "/ip4/127.0.0.1/udp/49993/quic-v1")
+
+    registerResolvedRemote(7005, rawA, advertisedA)
+    registerResolvedRemote(7005, rawB, advertisedB)
+
+    let lookedA = resolveAdvertisedRemote(rawA)
+    check lookedA.isOk()
+    check lookedA.get() == advertisedA
+    let lookedB = resolveAdvertisedRemote(rawB)
+    check lookedB.isOk()
+    check lookedB.get() == advertisedB
+
+    unregisterProxyRoutes(7005)
 
   test "status payload ignores invalid direct route rows":
     let runtimeDir = tempRuntimeDir("invalid-direct-route-status")

@@ -236,19 +236,19 @@ proc discoveryListenAddrs(node: ProductNode): JsonNode =
   filterConnectableListenAddrs(snapshot.getOrDefault("listenAddresses"))
 
 proc relayPublishedListenAddrs(tailnetPayload: JsonNode): JsonNode {.gcsafe.} =
-  if tailnetPayload.kind != JObject:
+  if tailnetPayload.isNil or tailnetPayload.kind != JObject:
     return newJArray()
   let listeners = tailnetPayload.getOrDefault("relayListeners")
-  if listeners.kind != JArray:
+  if listeners.isNil or listeners.kind != JArray:
     return newJArray()
   result = newJArray()
   var seen = initHashSet[string]()
   for item in listeners.items:
-    if item.kind != JObject:
+    if item.isNil or item.kind != JObject:
       continue
     let route = item.getOrDefault("route")
     let stage = item.getOrDefault("stage")
-    if route.kind != JString or stage.kind != JString:
+    if route.isNil or stage.isNil or route.kind != JString or stage.kind != JString:
       continue
     let routeText = route.getStr().strip()
     let stageText = stage.getStr().strip().toLowerAscii()

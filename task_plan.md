@@ -2,6 +2,13 @@
 
 | files | action | verify | done |
 | --- | --- | --- | --- |
+| `libp2p/connmanager.nim` `tests/testconnmngr.nim` | 修每 peer 连接上限的 off-by-one，并在名额已满时优先替换同方向旧 live 连接，避免新入站被历史残留卡死 | `nim c -r tests/testconnmngr.nim` 通过，`25 OK` | yes |
+| `libp2p/transports/tsnet/quicrelay.nim` | listener 持久 accept 流的 `route_status` 校验改走独立 fresh probe，避免校验复用当前 control client 把正在跑的 bridge 连坐打死 | 编译通过，生产节点实跑不再出现 `Too many connections for peer`，继续收 relay listener 真状态 | in_progress |
+| `libp2p/transports/tsnet/quiccontrol.nim` `tests/testtsnetquiccontrol_fin.nim` | 把 control 单请求流收成“写完即 half-close”，并补一条“服务端等 EOF 才解码”回归，先把 builtin QUIC 底层请求结束语义钉死 | `nim c -r -d:ssl -d:libp2p_msquic_experimental -d:libp2p_msquic_builtin tests/testtsnetquiccontrol.nim` 为 `7 OK`，`nim c -r -d:ssl -d:libp2p_msquic_experimental -d:libp2p_msquic_builtin tests/testtsnetquiccontrol_fin.nim` 为 `1 OK` | yes |
+| `libp2p/transports/tsnet/proxy.nim` `tests/testtsnetproxy.nim` | 修 `proxyRouteSnapshots/sanitizeProxyRoutesUnsafe` 上的半残 key 崩溃，禁止产品节点在 listener route 丢失后因为 proxy registry 脏行直接 SIGSEGV | `nim c -r -d:ssl -d:libp2p_msquic_experimental -d:libp2p_msquic_builtin tests/testtsnetproxy.nim` 为 `9 OK`，本地产品节点重启后 `19125` 不再因这条崩溃掉线 | yes |
+| `libp2p/transports/tsnet/quicrelay.nim` | gateway 同一路由重复 `listen/accept` 时，不得覆盖正在 `ready_wait/busy` 的 active listener；先收掉 `accept stream lost attached listener route` | 远端 journal 不再出现 `lost attached listener route`，本地产品节点重启后 Android 再发时 gateway 可继续进入真实 `dial/bridge` 或给出新的准确失败 | in_progress |
+| `libp2p/transports/tsnet/quicrelay.nim` `libp2p/transports/msquicstream.nim` `tests/testtsnetquicrelay.nim` | 修 framed reader 对 cached 完整 frame 的漏消费，并清掉 listener restart 后悬挂的 `acceptStream/regStream`，禁止 persistent accept lane 因“缓存里已有完整 incoming 但还继续 read”卡死 | `nim c tests/testtsnetquicrelay.nim` 通过；`cached complete json/binary frame...`、`accept stream can receive incoming...`、`route_status stays published while listener ready is pending` 全绿；本地产品节点重启后 `proxyListenersReady=true`、`listenAddrSource=relay_listeners` | yes |
+| `examples/mobile_ffi/tsnet_product_node.nim` | `relayPublishedListenAddrs` 做 nil 安全，`local_info` 不能再把产品节点打崩 | 本地重启后 `local_info` 不再 SIGSEGV | yes |
 | `docs/android_native_async_architecture.md` | 固化 Android/native 异步架构约束 | 文档存在且约束清楚 | yes |
 | `BridgeFacades.kt` | 发送链改成 hints + native kickoff，不再同步 preconnect；消息页删除 `prepareDirectRoutePeer` 这条错层同步预连接 | Kotlin 编译、安装 APK、生产 UI 发送 | in_progress |
 | `ChengLibp2pNative.kt` | 增加 seeded kickoff，把 seed addrs 直接带进 native 异步任务 | Kotlin 编译、安装 APK、生产 UI 发送 | in_progress |
@@ -30,3 +37,4 @@
 | `BridgeFacades.kt` `libnimlibp2p.nim` | 继续收 Android 生产 UI 当前 `send_with_ack_timeout@send_begin`；现在页面正确、draft 正确、消息真正发出，但 Mac 仍未收到 | Android 生产 UI 单发 token 后，本地 Mac `wait_dm` 能收到 | in_progress |
 | `BridgeFacades.kt` `NativeAppViewModel.kt` | Android 生产 UI 自动发送动作必须跟随当前页面真实输入框和发送按钮位置，不能复用旧坐标 | 重装 APK 后自动输入/发送仍能稳定触发一次真实发送 | in_progress |
 | `NativeAppViewModel.kt` `ChengLibp2pNative.kt` | 发送生命周期必须全程保持 interactive native priority，不能 12 秒后让后台 `getConnectedPeers/socialListDiscoveredPeers` 恢复直打 native 并触发 `FD_SET>=1024` 崩溃 | Android 发送期间不再被系统拉回桌面，crash buffer 不再出现 `FD_SET` 越界 | in_progress |
+| `libp2p/transports/tsnet/quicrelay.nim` `libnimlibp2p.nim` `examples/mobile_ffi/tsnet_product_node.nim` | 继续收 Android 生产 UI 这轮新的真实 `peer_ready_failed 10s connect timeout`；当前本地 listener 稳态已恢复，但发送还没走到 `incoming/ready`，说明 blocker 已前移回 connect 阶段 | Android 生产 UI 再发时，不再是 `peer_ready_failed connect timeout`，且本地 `wait_dm` 能收到 token | in_progress |

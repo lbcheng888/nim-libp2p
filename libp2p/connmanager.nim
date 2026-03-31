@@ -90,8 +90,61 @@ proc isActiveMuxer(muxer: Muxer): bool {.inline.} =
     not muxer.connection.closed and
     not muxer.connection.atEof
 
+proc effectiveMaxConnsPerPeer(c: ConnManager): int {.inline.} =
+  if c.maxConnsPerPeer <= 0:
+    1
+  else:
+    c.maxConnsPerPeer
+
 proc liveMuxers(c: ConnManager, peerId: PeerId): seq[Muxer] =
   c.muxed.getOrDefault(peerId).filterIt(isActiveMuxer(it))
+
+proc closeMuxer(muxer: Muxer) {.async: (raises: [CancelledError]).}
+
+proc compactPeerMuxers(c: ConnManager, peerId: PeerId): seq[Muxer] =
+  let activeMuxers = c.liveMuxers(peerId)
+  if activeMuxers.len > 0:
+    c.muxed[peerId] = activeMuxers
+  else:
+    c.muxed.del(peerId)
+  activeMuxers
+
+proc evictSameDirectionMuxers(
+    c: ConnManager, peerId: PeerId, liveMuxers: var seq[Muxer], dir: Direction
+) =
+  if c.maxConnsPerPeer <= 0:
+    return
+
+  let maxConnsPerPeer = c.effectiveMaxConnsPerPeer()
+  if liveMuxers.len < maxConnsPerPeer:
+    return
+
+  var evicted: seq[Muxer]
+  for existingMuxer in liveMuxers:
+    if liveMuxers.len - evicted.len < maxConnsPerPeer:
+      break
+    if isNil(existingMuxer) or isNil(existingMuxer.connection):
+      continue
+    if existingMuxer.connection.dir == dir:
+      evicted.add(existingMuxer)
+
+  if evicted.len == 0:
+    return
+
+  liveMuxers = liveMuxers.filterIt(it notin evicted)
+  if liveMuxers.len > 0:
+    c.muxed[peerId] = liveMuxers
+  else:
+    c.muxed.del(peerId)
+
+  debug "Replacing live muxers for peer",
+    peerId,
+    dir,
+    replaced = evicted.len,
+    remaining = liveMuxers.len
+
+  for evictedMuxer in evicted:
+    asyncSpawn closeMuxer(evictedMuxer)
 
 proc newTooManyConnectionsError(): ref TooManyConnectionsError {.inline.} =
   result = newException(TooManyConnectionsError, "Too many connections")
@@ -316,6 +369,13 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
   let
     peerId = muxer.connection.peerId
     dir = muxer.connection.dir
+    maxConnsPerPeer = c.effectiveMaxConnsPerPeer()
+  var liveMuxers = c.compactPeerMuxers(peerId)
+  let hadLivePeer = liveMuxers.len > 0
+
+  if muxer in liveMuxers:
+    debug "Duplicate muxer registration skipped", peerId, dir
+    return
 
   var permit: ResourcePermit = nil
   if not c.resourceManager.isNil:
@@ -326,40 +386,28 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
 
   # we use getOrDefault in the if below instead of [] to avoid the KeyError
   try:
-    if c.liveMuxers(peerId).len > c.maxConnsPerPeer:
+    if liveMuxers.len >= maxConnsPerPeer:
       let key = (peerId, dir)
       let expectedConn = c.expectedConnectionsOverLimit.getOrDefault(key)
       if expectedConn != nil and not expectedConn.finished:
         expectedConn.complete(muxer)
       else:
-        debug "Too many connections for peer",
-          conns = c.muxed.getOrDefault(peerId).len, peerId, dir
+        c.evictSameDirectionMuxers(peerId, liveMuxers, dir)
+        if liveMuxers.len >= maxConnsPerPeer:
+          debug "Too many connections for peer",
+            conns = liveMuxers.len, peerId, dir
 
-        raise newTooManyConnectionsError()
+          raise newTooManyConnectionsError()
 
-    var newPeer = false
-    c.muxed.withValue(peerId, muxers):
-      let activeMuxers = muxers[].filterIt(isActiveMuxer(it))
-      if activeMuxers.len != muxers[].len:
-        muxers[] = activeMuxers
-      if muxers[].len == 0:
-        # Unexpected empty entry; treat as a fresh peer record instead of aborting.
-        muxers[] = @[muxer]
-        newPeer = true
-      elif muxer notin muxers[]:
-        muxers[].add(muxer)
-      else:
-        debug "Duplicate muxer registration skipped", peerId, dir
-    do:
-      c.muxed[peerId] = @[muxer]
-      newPeer = true
+    liveMuxers.add(muxer)
+    c.muxed[peerId] = liveMuxers
     libp2p_peers.set(c.muxed.len.int64)
 
     asyncSpawn c.triggerConnEvent(
       peerId, ConnEvent(kind: ConnEventKind.Connected, incoming: dir == Direction.In)
     )
 
-    if newPeer:
+    if not hadLivePeer:
       asyncSpawn c.triggerPeerEvents(
         peerId, PeerEvent(kind: PeerEventKind.Joined, initiator: dir == Direction.Out)
       )

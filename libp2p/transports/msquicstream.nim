@@ -71,6 +71,9 @@ proc takeCachedBytes*(stream: MsQuicStream): seq[byte] {.gcsafe, raises: [].} =
     return @[]
   swap(result, stream.cached)
 
+proc newCachedMsQuicStreamForTests*(payload: seq[byte]): MsQuicStream {.gcsafe, raises: [].} =
+  MsQuicStream(cached: payload)
+
 proc restoreCachedBytes*(stream: MsQuicStream; payload: seq[byte]) {.gcsafe, raises: [].} =
   if stream.isNil:
     return

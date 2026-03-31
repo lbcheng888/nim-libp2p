@@ -255,6 +255,22 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
     if data.len > 0:
       copyMem(addr result[0], unsafeAddr data[0], data.len)
 
+  proc frameBytes(payload: seq[byte]): seq[byte] =
+    result = newSeqOfCap[byte](4 + payload.len)
+    let frameLen = uint32(payload.len)
+    result.add(byte((frameLen shr 24) and 0xFF'u32))
+    result.add(byte((frameLen shr 16) and 0xFF'u32))
+    result.add(byte((frameLen shr 8) and 0xFF'u32))
+    result.add(byte(frameLen and 0xFF'u32))
+    result.add(payload)
+
+  proc frameJson(node: JsonNode): seq[byte] =
+    let encoded = $node
+    var payload = newSeqOfCap[byte](encoded.len)
+    for ch in encoded:
+      payload.add(byte(ord(ch)))
+    frameBytes(payload)
+
   proc probeDialViaAcceptStream(
       relayUrl: string,
       route: string,
@@ -416,6 +432,14 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       waitFor sleepAsync(100)
     err(lastError)
 
+  proc waitForListenerRepair(runtime: TsnetInAppRuntime, timeoutMs = 5000): bool =
+    let maxPolls = max(1, timeoutMs div 100)
+    for _ in 0..<maxPolls:
+      if runtime.listenerNeedsRepair():
+        return true
+      waitFor sleepAsync(100)
+    false
+
   suite "Tsnet QUIC relay":
     test "minimal listener registration probe succeeds":
       let (gateway, relayUrl) = startRelayGateway()
@@ -501,7 +525,21 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check exchange.listenerCandidates == listenerCandidates
       check exchange.dialerCandidates == dialerCandidates
 
-    test "accept stream stays healthy while same connection route_status runs concurrently":
+    test "cached complete json frame is consumed before waiting for more bytes":
+      let payload = frameJson(%*{
+        "op": "incoming",
+        "sessionId": "cached-json"
+      })
+      let node = waitFor readRelayJsonMessageFromCachedForTests(payload)
+      check node{"op"}.getStr("") == "incoming"
+      check node{"sessionId"}.getStr("") == "cached-json"
+
+    test "cached complete binary frame is consumed before waiting for more bytes":
+      let payload = frameBytes(@[byte 1, 2, 3, 4, 5])
+      let data = waitFor readRelayBinaryFrameFromCachedForTests(payload)
+      check data == @[byte 1, 2, 3, 4, 5]
+
+    test "route_status stays published while listener ready is pending":
       let (gateway, relayUrl) = startRelayGateway()
       defer:
         gateway.stop()
@@ -513,7 +551,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         "/ip4/203.0.113.30/udp/4556/quic-v1"
       ]
       let exchange =
-        waitFor probeAcceptStreamRouteStatusReuse(
+        waitFor probeAcceptStreamPendingReadyRouteStatus(
           relayUrl,
           "/ip4/100.64.0.20/udp/4001/quic-v1/tsnet",
           listenerCandidates,
@@ -524,6 +562,23 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check exchange.ok
       check exchange.listenerCandidates == listenerCandidates
       check exchange.dialerCandidates == dialerCandidates
+
+    test "startUdpRelayListener skips duplicate active route":
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        gateway.stop()
+        stopRelayListeners(9101)
+
+      let advertised = MultiAddress.init("/ip4/100.64.0.10/udp/4001/quic-v1/tsnet").tryGet()
+      let rawLocal = MultiAddress.init("/ip4/127.0.0.1/udp/4001/quic-v1").tryGet()
+
+      let first = startUdpRelayListener(9101, relayUrl, advertised, rawLocal)
+      check first.isOk()
+      check relayOwnerTaskCountForTests(9101) == 1
+
+      let duplicate = startUdpRelayListener(9101, relayUrl, advertised, rawLocal)
+      check duplicate.isOk()
+      check relayOwnerTaskCountForTests(9101) == 1
 
     test "route_status repairs ready state when local cache is missing":
       let (controlGateway, controlUrl) = startControlGateway()
@@ -648,7 +703,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
 
         gateway.dropListenerRouteForTests(route)
 
-        check server.listenerNeedsRepair()
+        check waitForListenerRepair(server)
       finally:
         stopRuntimeSafe(server)
 
