@@ -164,3 +164,53 @@ suite "Switch":
     await conn.close()
 
     await allFuturesThrowing(done.wait(5.seconds), switch1.stop(), switch2.stop())
+
+  when defined(libp2p_msquic_experimental):
+    asyncTest "incoming MsQuic connect is auto identified and reusable":
+      let (handle, initErr) = initMsQuicTransportForAsync()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+        return
+      shutdownMsQuicTransportForAsync(handle)
+
+      let done: Future[void].Raising([]) =
+        cast[Future[void].Raising([])](newFuture[void]())
+      proc handleIncoming(conn: Connection, proto: string) {.async: (raises: [CancelledError]).} =
+        try:
+          let msg = string.fromBytes(await conn.readLp(1024))
+          check msg == "Hello from server!"
+          await conn.writeLp("Hello from client!")
+        except LPStreamError:
+          discard
+        finally:
+          await conn.close()
+          done.complete()
+
+      let testProto = new TestProto
+      testProto.codec = TestCodec
+      testProto.handler = handleIncoming
+
+      let listenAddr = MultiAddress.init("/ip4/127.0.0.1/udp/0/quic-v1").tryGet()
+      let server = newStandardSwitch(
+        transport = TransportType.QUIC,
+        addrs = @[listenAddr]
+      )
+      let client = newStandardSwitch(transport = TransportType.QUIC)
+      client.mount(testProto)
+
+      await server.start()
+      await client.start()
+
+      await client.connect(server.peerInfo.peerId, server.peerInfo.addrs)
+
+      checkUntilTimeoutCustom(5.seconds, 50.milliseconds):
+        server.isConnected(client.peerInfo.peerId)
+
+      let conn = await server.dial(client.peerInfo.peerId, TestCodec)
+      await conn.writeLp("Hello from server!")
+      let msg = string.fromBytes(await conn.readLp(1024))
+      check msg == "Hello from client!"
+      await conn.close()
+
+      await allFuturesThrowing(done.wait(5.seconds), server.stop(), client.stop())

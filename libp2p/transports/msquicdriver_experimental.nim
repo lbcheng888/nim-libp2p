@@ -21,18 +21,19 @@ export msquicruntime.MsQuicLoadOptions
 logScope:
   topics = "libp2p msquicdriver"
 
-proc relayStreamTraceEnabled(): bool {.gcsafe, raises: [].} =
-  getEnv("NIM_TSNET_RELAY_STREAM_TRACE", "").strip().toLowerAscii() in
-    ["1", "true", "yes", "on"]
+var RelayStreamTraceEnabled {.global.} = false
 
-proc relayStreamTrace(message: string) {.gcsafe, raises: [].} =
-  if not relayStreamTraceEnabled():
-    return
-  try:
-    stderr.writeLine("[tsnet-msquicstream] " & message)
-    flushFile(stderr)
-  except CatchableError:
-    discard
+block:
+  let traceEnv = getEnv("NIM_TSNET_RELAY_STREAM_TRACE", "").strip().toLowerAscii()
+  RelayStreamTraceEnabled = traceEnv in ["1", "true", "yes", "on"]
+
+template relayStreamTrace(messageExpr: untyped) =
+  if RelayStreamTraceEnabled:
+    try:
+      stderr.writeLine("[tsnet-msquicstream] " & (messageExpr))
+      flushFile(stderr)
+    except CatchableError:
+      discard
 
 const
   DefaultEventQueueLimit* = 0
@@ -667,6 +668,33 @@ proc failWaiters(state: MsQuicConnectionState) =
     let err = newException(MsQuicEventQueueClosed, "MsQuic connection event queue closed")
     fut.fail(err)
 
+proc pruneFinishedPendingStreamWaiters(state: MsQuicConnectionState) =
+  if state.isNil:
+    return
+  state.withStateLock:
+    var idx = 0
+    while idx < state.pendingStreamWaiters.len:
+      let fut = state.pendingStreamWaiters[idx]
+      if fut.isNil or fut.finished():
+        state.pendingStreamWaiters.delete(idx)
+      else:
+        inc idx
+
+proc failPendingStreamWaiters(state: MsQuicConnectionState) =
+  var waiters: seq[Future[MsQuicStreamState]]
+  state.withStateLock:
+    if state.pendingStreamWaiters.len == 0:
+      return
+    waiters = state.pendingStreamWaiters
+    state.pendingStreamWaiters.setLen(0)
+  if waiters.len == 0:
+    return
+  for fut in waiters:
+    if fut.isNil or fut.finished():
+      continue
+    let err = newException(MsQuicEventQueueClosed, "MsQuic pending stream queue closed")
+    fut.fail(err)
+
 proc deliverConnectionEvents(state: MsQuicConnectionState) =
   while true:
     var fut: Future[msevents.ConnectionEvent] = nil
@@ -693,6 +721,40 @@ proc deliverConnectionEvents(state: MsQuicConnectionState) =
       failWaiters(state)
       return
 
+proc deliverPendingStreamWaiters(state: MsQuicConnectionState) =
+  while true:
+    var fut: Future[MsQuicStreamState] = nil
+    var pending: MsQuicStreamState = nil
+    var shouldFail = false
+    pruneFinishedPendingStreamWaiters(state)
+    state.withStateLock:
+      if state.pendingStreamWaiters.len > 0:
+        while state.pendingStreamOrder.len > 0:
+          let streamPtr = state.pendingStreamOrder.popFirst()
+          let queued = state.pendingStreams.getOrDefault(streamPtr)
+          if queued.isNil:
+            continue
+          pending = queued
+          state.pendingStreams.del(streamPtr)
+          break
+        if not pending.isNil:
+          fut = state.pendingStreamWaiters[0]
+          state.pendingStreamWaiters.delete(0)
+        elif state.closed:
+          shouldFail = true
+        else:
+          return
+      elif state.closed:
+        shouldFail = true
+      else:
+        return
+    if not fut.isNil:
+      if not fut.finished():
+        fut.complete(pending)
+    elif shouldFail:
+      failPendingStreamWaiters(state)
+      return
+
 proc connectionSignalPump(state: MsQuicConnectionState): Future[void] {.async.} =
   try:
     while true:
@@ -709,26 +771,37 @@ proc connectionSignalPump(state: MsQuicConnectionState): Future[void] {.async.} 
         trace "MsQuic signal wait failed", err = exc.msg
         break
       deliverConnectionEvents(state)
+      deliverPendingStreamWaiters(state)
   finally:
     failWaiters(state)
+    failPendingStreamWaiters(state)
     closeSignal(state)
     state.signalLoop = nil
 
 proc ensureConnectionSignalLoop(state: MsQuicConnectionState) =
+  if state.isNil or state.closed:
+    return
   if state.signalLoop.isNil:
     let fut = connectionSignalPump(state)
     state.signalLoop = fut
     asyncSpawn fut
 
 proc triggerConnectionDelivery(state: MsQuicConnectionState) =
-  state.ensureConnectionSignalLoop()
+  if state.isNil or state.closed:
+    return
   if state.signal.isNil:
     deliverConnectionEvents(state)
+    deliverPendingStreamWaiters(state)
+    return
+  if state.signalLoop.isNil:
+    deliverConnectionEvents(state)
+    deliverPendingStreamWaiters(state)
     return
   let res = state.signal.fireSync()
   if res.isErr():
     trace "MsQuic signal fire failed", err = res.error
     deliverConnectionEvents(state)
+    deliverPendingStreamWaiters(state)
 
 proc enqueueConnectionEvent(state: MsQuicConnectionState; event: msevents.ConnectionEvent) =
   var shouldSignal = false
@@ -790,35 +863,26 @@ proc storePendingStream(state: MsQuicConnectionState; stream: pointer;
   if state.isNil or stream.isNil or streamState.isNil:
     return
   cacheStreamId(streamState)
-  var waiter: Future[MsQuicStreamState] = nil
   var queueHandle = false
+  var shouldSignal = false
   state.withStateLock:
     state.knownStreams[stream] = streamState
     if streamState.streamIdKnown:
       state.knownStreamsById[streamState.streamIdCached] = streamState
-    var idx = 0
-    while idx < state.pendingStreamWaiters.len:
-      let candidate = state.pendingStreamWaiters[idx]
-      if candidate.isNil or candidate.finished():
-        state.pendingStreamWaiters.delete(idx)
+    queueHandle = not state.pendingStreams.hasKey(stream)
+    state.pendingStreams[stream] = streamState
+    if queueHandle:
+      if prepend:
+        state.pendingStreamOrder.addFirst(stream)
       else:
-        waiter = candidate
-        state.pendingStreamWaiters.delete(idx)
-        break
-    if waiter.isNil:
-      queueHandle = not state.pendingStreams.hasKey(stream)
-      state.pendingStreams[stream] = streamState
-      if queueHandle:
-        if prepend:
-          state.pendingStreamOrder.addFirst(stream)
-        else:
-          state.pendingStreamOrder.addLast(stream)
+        state.pendingStreamOrder.addLast(stream)
+    shouldSignal = state.pendingStreamWaiters.len > 0
   when defined(libp2p_msquic_debug):
     warn "MsQuic pending stream stored",
       stream = cast[uint64](stream),
       connection = cast[uint64](state.connection)
-  if not waiter.isNil and not waiter.finished():
-    waiter.complete(streamState)
+  if shouldSignal:
+    triggerConnectionDelivery(state)
 
 proc takePendingStream(state: MsQuicConnectionState; stream: pointer):
     Option[MsQuicStreamState] =
@@ -1013,7 +1077,6 @@ proc newMsQuicConnectionState(handle: MsQuicTransportHandle;
     close(state)
     return err("failed to initialize MsQuic thread signal: " & signalRes.error)
   state.signal = signalRes.get()
-  state.ensureConnectionSignalLoop()
   handle.registerActiveState(state)
   ok(state)
 
@@ -1108,6 +1171,8 @@ proc awaitPendingStreamState*(state: MsQuicConnectionState):
     fut.fail(newException(MsQuicEventQueueClosed, "MsQuic connection state closed"))
   elif immediate.isSome:
     fut.complete(immediate.get())
+  else:
+    state.ensureConnectionSignalLoop()
   fut
 
 proc msquicConnectionEventRelay(event: msevents.ConnectionEvent) {.gcsafe.} =
@@ -1394,8 +1459,6 @@ proc ensureStreamSignalLoop(state: MsQuicStreamState) =
 proc triggerStreamDelivery(state: MsQuicStreamState) =
   if state.isNil or state.closed:
     return
-  if state.signalLoop.isNil:
-    state.ensureStreamSignalLoop()
   if state.signal.isNil:
     deliverStreamEvents(state)
     deliverStreamReads(state)
@@ -1703,7 +1766,6 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     close(state)
     return err("failed to initialize MsQuic stream signal: " & signalRes.error)
   state.signal = signalRes.get()
-  state.ensureStreamSignalLoop()
   handle.registerActiveState(state)
   ok(state)
 
@@ -1821,14 +1883,20 @@ proc listenerSignalPump(state: MsQuicListenerState): Future[void] {.async.} =
     state.signalLoop = nil
 
 proc ensureListenerSignalLoop(state: MsQuicListenerState) =
+  if state.isNil or state.closed:
+    return
   if state.signalLoop.isNil:
     let fut = listenerSignalPump(state)
     state.signalLoop = fut
     asyncSpawn fut
 
 proc triggerListenerDelivery(state: MsQuicListenerState) =
-  state.ensureListenerSignalLoop()
+  if state.isNil or state.closed:
+    return
   if state.signal.isNil:
+    deliverListenerEvents(state)
+    return
+  if state.signalLoop.isNil:
     deliverListenerEvents(state)
     return
   let res = state.signal.fireSync()
@@ -1961,7 +2029,6 @@ proc newMsQuicListenerState(handle: MsQuicTransportHandle; queueLimit: int;
     close(state)
     return err("failed to initialize MsQuic listener signal: " & signalRes.error)
   state.signal = signalRes.get()
-  state.ensureListenerSignalLoop()
   handle.registerActiveState(state)
   ok(state)
 

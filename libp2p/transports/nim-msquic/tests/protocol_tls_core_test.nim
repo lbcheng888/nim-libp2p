@@ -60,6 +60,18 @@ suite "tls_core protocol helpers":
     check parsed.ticket == @[0xAA'u8, 0xBB'u8, 0xCC'u8]
     check parsed.maxEarlyData == 32_768'u32
 
+  test "builtin zero-rtt material is stable across repeated derivation":
+    let ticket = newSeqWith(64, 0x5A'u8)
+    let first = deriveBuiltinZeroRttMaterial(ticket)
+    check first.key.len == 16
+    check first.iv.len == 12
+    check first.hp.len == 16
+    for _ in 0 ..< 256:
+      let current = deriveBuiltinZeroRttMaterial(ticket)
+      check current.key == first.key
+      check current.iv == first.iv
+      check current.hp == first.hp
+
   test "finished verify succeeds and tamper fails":
     var baseSecret = newSeq[byte](32)
     var transcriptHash = newSeq[byte](32)

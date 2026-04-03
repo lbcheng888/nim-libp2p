@@ -31,7 +31,8 @@ type
 
 var relayRegistryLock {.global.}: Lock
 var relayNextRouteId {.global.}: int
-var relayOwnerTasks {.global.}: Table[int, seq[TsnetRelayTaskHandle]] = initTable[int, seq[TsnetRelayTaskHandle]]()
+var relayOwnerTasks {.global.}: Table[int, Table[int, TsnetRelayTaskHandle]] =
+  initTable[int, Table[int, TsnetRelayTaskHandle]]()
 
 initLock(relayRegistryLock)
 
@@ -247,17 +248,21 @@ proc relayRegisterTask(
       server: server,
       task: task
     )
-    var handles = relayOwnerTasks.getOrDefault(ownerId)
-    handles.add(result)
-    relayOwnerTasks[ownerId] = handles
+    var handles = relayOwnerTasks.getOrDefault(ownerId, initTable[int, TsnetRelayTaskHandle]())
+    handles[result.routeId] = result
+    relayOwnerTasks[ownerId] = move(handles)
 
 proc stopRelayListeners*(ownerId: int) =
   if ownerId <= 0:
     return
   var handles: seq[TsnetRelayTaskHandle] = @[]
   withLock(relayRegistryLock):
-    handles = relayOwnerTasks.getOrDefault(ownerId)
-    relayOwnerTasks.del(ownerId)
+    if relayOwnerTasks.hasKey(ownerId):
+      let ownerHandles = relayOwnerTasks.getOrDefault(ownerId, initTable[int, TsnetRelayTaskHandle]())
+      handles = newSeqOfCap[TsnetRelayTaskHandle](ownerHandles.len)
+      for _, handle in ownerHandles.pairs:
+        handles.add(handle)
+      relayOwnerTasks.del(ownerId)
   for handle in handles:
     if not handle.server.isNil:
       safeCloseServer(handle.server)

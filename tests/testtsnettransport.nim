@@ -110,6 +110,7 @@ suite "Tsnet transport":
     let privKey = PrivateKey.random(rng[]).expect("private key")
     var cfg = TsnetTransportBuilderConfig.init()
     cfg.controlUrl = "https://64-176-84-12.sslip.io"
+    cfg.relayEndpoint = "quic://64.176.84.12:9446/nim-tsnet-relay-quic/v1"
     cfg.stateDir = dir
     cfg.hostname = "nim-transport-test"
     cfg.enableDebug = true
@@ -118,9 +119,11 @@ suite "Tsnet transport":
     await transport.start(@[MultiAddress.init("/ip4/0.0.0.0/tcp/0/tsnet").tryGet()])
     check transport.warmProvider().isOk()
     let payload = transport.tailnetStatusPayload().tryGet()
+    let payloadAgain = transport.tailnetStatusPayload().tryGet()
     check payload["providerKind"].getStr() == "nim-inapp"
     check payload["tailnetDerpMapSummary"].getStr() == "901/sin"
     check payload["providerCapabilities"]["proxyBacked"].getBool()
+    check payloadAgain["providerCapabilities"]["proxyBacked"].getBool()
     check transport.addrs.len == 1
     check ($transport.addrs[0]).endsWith("/tsnet")
     await transport.stop()

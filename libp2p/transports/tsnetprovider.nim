@@ -1,6 +1,7 @@
 {.push raises: [].}
 
 import std/[json, strutils]
+import chronos
 
 import ../multiaddress
 import ../utility
@@ -10,6 +11,12 @@ import ./tsnetproviderlegacy as legacy
 import ./tsnetprovidertypes
 
 export tsnetprovidertypes
+
+proc ownedText(text: string): string {.gcsafe, raises: [].} =
+  if text.len == 0:
+    return ""
+  result = newStringOfCap(text.len)
+  result.add(text)
 
 type
   TsnetProvider* = ref object
@@ -22,7 +29,10 @@ type
 
 proc new*(_: type[TsnetProvider], cfg: TsnetProviderConfig): TsnetProvider =
   TsnetProvider(
-    cfg: cfg,
+    cfg: block:
+      var copy = cfg
+      copy.bridgeExtraJson = ownedText(cfg.bridgeExtraJson)
+      copy,
     kind: TsnetProviderKind.BuiltinSynthetic,
     started: false,
     lastError: ""
@@ -97,6 +107,33 @@ proc listenerNeedsRepair*(provider: TsnetProvider): bool {.gcsafe.} =
   else:
     false
 
+proc proxyListenersReady*(provider: TsnetProvider): bool {.gcsafe.} =
+  if provider.isNil:
+    return false
+  case provider.kind
+  of TsnetProviderKind.InAppUnavailable, TsnetProviderKind.InAppReal:
+    tsnetproviderinapp.proxyListenersReady(provider.runtime)
+  else:
+    false
+
+proc proxyRouteCount*(provider: TsnetProvider): int {.gcsafe.} =
+  if provider.isNil:
+    return 0
+  case provider.kind
+  of TsnetProviderKind.InAppUnavailable, TsnetProviderKind.InAppReal:
+    tsnetproviderinapp.proxyRouteCount(provider.runtime)
+  else:
+    0
+
+proc publishedAddrTexts*(provider: TsnetProvider): seq[string] {.gcsafe.} =
+  if provider.isNil:
+    return @[]
+  case provider.kind
+  of TsnetProviderKind.InAppUnavailable, TsnetProviderKind.InAppReal:
+    tsnetproviderinapp.publishedAddrTexts(provider.runtime)
+  else:
+    @[]
+
 proc failure*(provider: TsnetProvider): string {.gcsafe.} =
   if provider.isNil:
     return ""
@@ -105,9 +142,10 @@ proc failure*(provider: TsnetProvider): string {.gcsafe.} =
 proc updateBridgeExtraJson*(provider: TsnetProvider, bridgeExtraJson: string) {.gcsafe.} =
   if provider.isNil:
     return
-  provider.cfg.bridgeExtraJson = bridgeExtraJson
+  let ownedJson = ownedText(bridgeExtraJson)
+  provider.cfg.bridgeExtraJson = ownedJson
   if tsnetproviderinapp.runtimePresent(provider.runtime):
-    provider.runtime.cfg.bridgeExtraJson = bridgeExtraJson
+    provider.runtime.cfg.bridgeExtraJson = ownedJson
 
 proc jsonField(node: JsonNode, key: string): JsonNode {.gcsafe.} =
   if node.isNil or node.kind != JObject or not node.hasKey(key):
@@ -207,12 +245,14 @@ proc refreshControlMetadata*(provider: TsnetProvider): Result[void, string] {.gc
   provider.lastError = ""
   ok()
 
-proc reconcileProxyListeners*(provider: TsnetProvider): Result[void, string] {.gcsafe.} =
+proc reconcileProxyListeners*(
+    provider: TsnetProvider
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   if provider.isNil:
     return err("tsnet provider is nil")
   if provider.kind != TsnetProviderKind.InAppReal or not tsnetproviderinapp.runtimePresent(provider.runtime):
     return ok()
-  let repaired = tsnetproviderinapp.reconcileProxyListeners(provider.runtime)
+  let repaired = await tsnetproviderinapp.reconcileProxyListeners(provider.runtime)
   if repaired.isErr():
     provider.lastError = repaired.error
     return err(repaired.error)
@@ -304,6 +344,17 @@ proc dialTcpProxy*(
     return tsnetproviderinapp.dialTcpProxy(provider.runtime, family, ip, port)
   legacy.dialTcpProxy(provider.bridge, family, ip, port)
 
+proc dialTcpProxyExact*(
+    provider: TsnetProvider,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] =
+  if not provider.isProxyBacked():
+    return err("tsnet provider does not expose tcp proxy routing")
+  if provider.kind == TsnetProviderKind.InAppReal:
+    return tsnetproviderinapp.dialTcpProxyExact(provider.runtime, family, ip, port)
+  legacy.dialTcpProxyExact(provider.bridge, family, ip, port)
+
 proc dialUdpProxy*(
     provider: TsnetProvider,
     family, ip: string,
@@ -315,6 +366,28 @@ proc dialUdpProxy*(
     return tsnetproviderinapp.dialUdpProxy(provider.runtime, family, ip, port)
   legacy.dialUdpProxy(provider.bridge, family, ip, port)
 
+proc dialUdpProxyExact*(
+    provider: TsnetProvider,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] =
+  if not provider.isProxyBacked():
+    return err("tsnet provider does not expose udp proxy routing")
+  if provider.kind == TsnetProviderKind.InAppReal:
+    return tsnetproviderinapp.dialUdpProxyExact(provider.runtime, family, ip, port)
+  legacy.dialUdpProxyExact(provider.bridge, family, ip, port)
+
+proc dialUdpProxyExactTarget*(
+    provider: TsnetProvider,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] =
+  if not provider.isProxyBacked():
+    return err("tsnet provider does not expose udp proxy routing")
+  if provider.kind == TsnetProviderKind.InAppReal:
+    return tsnetproviderinapp.dialUdpProxyExactTarget(provider.runtime, family, ip, port)
+  legacy.dialUdpProxyExactTarget(provider.bridge, family, ip, port)
+
 proc dialUdpProxyRelayFallback*(
     provider: TsnetProvider,
     family, ip: string,
@@ -325,6 +398,17 @@ proc dialUdpProxyRelayFallback*(
   if provider.kind == TsnetProviderKind.InAppReal:
     return tsnetproviderinapp.dialUdpProxyRelayFallback(provider.runtime, family, ip, port)
   legacy.dialUdpProxy(provider.bridge, family, ip, port)
+
+proc dialUdpProxyRelayFallbackTarget*(
+    provider: TsnetProvider,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] =
+  if not provider.isProxyBacked():
+    return err("tsnet provider does not expose udp proxy routing")
+  if provider.kind == TsnetProviderKind.InAppReal:
+    return tsnetproviderinapp.dialUdpProxyRelayFallbackTarget(provider.runtime, family, ip, port)
+  legacy.dialUdpProxyRelayFallbackTarget(provider.bridge, family, ip, port)
 
 proc markFailedDirectProxyRoute*(
     provider: TsnetProvider,

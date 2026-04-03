@@ -114,6 +114,21 @@ proc shouldRetryCancelledRead(stream: MsQuicStream): bool {.gcsafe, raises: [].}
   except Exception:
     false
 
+proc connectionUsable*(stream: MsQuicStream): bool {.gcsafe, raises: [].} =
+  if stream.isNil or stream.state.isNil or stream.state.closed:
+    return false
+  let connState = stream.state.connectionState
+  if connState.isNil or connState.closed:
+    return false
+  try:
+    let handshakeComplete = msquicdrv.connectionHandshakeComplete(connState)
+    let closeReason = msquicdrv.connectionCloseReason(connState)
+    handshakeComplete and closeReason.len == 0
+  except CatchableError:
+    false
+  except Exception:
+    false
+
 proc shouldRetryReadFailure*(
     stream: MsQuicStream,
     errMsg: string
@@ -269,6 +284,11 @@ proc closeState(stream: MsQuicStream) =
     msquicdrv.closeStream(stream.handle, nativeStream, stream.state)
   stream.state = nil
 
+proc closeNow*(stream: MsQuicStream) {.gcsafe, raises: [].} =
+  if stream.isNil:
+    return
+  stream.closeState()
+
 method closeWrite*(stream: MsQuicStream) {.async: (raises: []).} =
   if stream.isNil or stream.state.isNil:
     return
@@ -293,7 +313,7 @@ method closeWrite*(stream: MsQuicStream) {.async: (raises: []).} =
       discard
 
 method closeImpl*(stream: MsQuicStream) {.async: (raises: []).} =
-  stream.closeState()
+  stream.closeNow()
 
 proc sendFin*(stream: MsQuicStream) {.async: (raises: [CancelledError, LPStreamError]).} =
   stream.ensureOpen()

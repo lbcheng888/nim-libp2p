@@ -35,6 +35,12 @@ template tsnetSafe(body: untyped) =
   {.cast(gcsafe).}:
     body
 
+proc ownedText(text: string): string {.gcsafe, raises: [].} =
+  if text.len == 0:
+    return ""
+  result = newStringOfCap(text.len)
+  result.add(text)
+
 proc currentUnixMilli(): int64 =
   int64(epochTime() * 1000.0)
 
@@ -83,6 +89,8 @@ type
     published: bool
     raw: MultiAddress
     advertised: MultiAddress
+    rawText: string
+    advertisedText: string
 
   TsnetTransport* = ref object of Transport
     cfg*: TsnetTransportBuilderConfig
@@ -100,12 +108,20 @@ type
 var tsnetRegistryLock {.global.}: Lock
 var tsnetSyntheticNodeCounter {.global.} = 0
 var tsnetAdvertisedToRaw {.global.}: Table[string, string] = initTable[string, string]()
-var tsnetRawListenerToAdvertised {.global.}: Table[string, string] =
-  initTable[string, string]()
-var tsnetRawEndpointToAdvertised {.global.}: Table[string, string] =
-  initTable[string, string]()
 
 initLock(tsnetRegistryLock)
+
+proc listenerMappingSnapshot(
+    mappings: seq[TsnetListenerMapping]
+): seq[TsnetListenerMapping] {.gcsafe.} =
+  result = newSeqOfCap[TsnetListenerMapping](mappings.len)
+  for mapping in mappings.items():
+    result.add(mapping)
+
+proc listenerMappingCount(self: TsnetTransport): int {.gcsafe.} =
+  if self.isNil:
+    return 0
+  self.listenerMappings.len
 
 proc init*(_: type[TsnetTransportBuilderConfig]): TsnetTransportBuilderConfig =
   result = TsnetTransportBuilderConfig(
@@ -139,7 +155,7 @@ proc providerConfig(cfg: TsnetTransportBuilderConfig): TsnetProviderConfig =
     bridgeLibraryPath: cfg.bridgeLibraryPath,
     logLevel: cfg.logLevel,
     enableDebug: cfg.enableDebug,
-    bridgeExtraJson: cfg.bridgeExtraJson
+    bridgeExtraJson: ownedText(cfg.bridgeExtraJson)
   )
 
 proc mergeBridgeExtraJson(
@@ -237,6 +253,22 @@ proc providerListenerNeedsRepairSafe(self: TsnetTransport): bool {.gcsafe.} =
   tsnetSafe:
     result = not self.provider.isNil and self.provider.listenerNeedsRepair()
 
+proc providerProxyRouteCountSafe(self: TsnetTransport): int {.gcsafe.} =
+  tsnetSafe:
+    result =
+      if self.provider.isNil:
+        0
+      else:
+        self.provider.proxyRouteCount()
+
+proc providerPublishedAddrTextsSafe(self: TsnetTransport): seq[string] {.gcsafe.} =
+  tsnetSafe:
+    result =
+      if self.provider.isNil:
+        @[]
+      else:
+        self.provider.publishedAddrTexts()
+
 proc parseTsnetAddress(
     address: MultiAddress, listen: bool
 ): Result[TsnetParsedAddress, string] {.gcsafe.}
@@ -259,24 +291,34 @@ proc refreshListenerMapping(
     advertised: MultiAddress
 ): Result[void, string] {.gcsafe.} =
   tsnetSafe:
-    if index < 0 or index >= transport.listenerMappings.len:
+    var nextMappings = listenerMappingSnapshot(transport.listenerMappings)
+    if index < 0 or index >= nextMappings.len:
       return err("tsnet listener mapping index out of range")
-    let raw = transport.listenerMappings[index].raw
-    let oldAdvertised = transport.listenerMappings[index].advertised
+    let raw = nextMappings[index].raw
     let advertisedKey = $advertised
-    let rawKey = $raw
-    let oldAdvertisedKey = $oldAdvertised
+    let rawKey =
+      if nextMappings[index].rawText.len > 0:
+        nextMappings[index].rawText
+      else:
+        $raw
+    let oldAdvertisedKey =
+      if nextMappings[index].advertisedText.len > 0:
+        nextMappings[index].advertisedText
+      else:
+        $nextMappings[index].advertised
     withLock(tsnetRegistryLock):
       let existing = tsnetAdvertisedToRaw.getOrDefault(advertisedKey)
       if existing.len > 0 and existing != rawKey:
         return err("duplicate /tsnet listener registration: " & advertisedKey)
-      if transport.listenerMappings[index].published and oldAdvertisedKey != advertisedKey:
+      if nextMappings[index].published and oldAdvertisedKey != advertisedKey:
         if tsnetAdvertisedToRaw.getOrDefault(oldAdvertisedKey) == rawKey:
           tsnetAdvertisedToRaw.del(oldAdvertisedKey)
       tsnetAdvertisedToRaw[advertisedKey] = rawKey
-      tsnetRawListenerToAdvertised[rawKey] = advertisedKey
-    transport.listenerMappings[index].published = true
-    transport.listenerMappings[index].advertised = advertised
+    nextMappings[index].published = true
+    nextMappings[index].advertised = advertised
+    nextMappings[index].advertisedText = ownedText(advertisedKey)
+    nextMappings[index].rawText = ownedText(rawKey)
+    transport.listenerMappings = nextMappings
   ok()
 
 proc activateProviderListeners(
@@ -288,7 +330,8 @@ proc activateProviderListeners(
     if self.providerListenersActivated or not self.providerUsesProxyRouting():
       return ok()
     var activated: seq[MultiAddress] = @[]
-    for idx, mapping in self.listenerMappings:
+    let mappings = listenerMappingSnapshot(self.listenerMappings)
+    for idx, mapping in mappings:
       let parsed = parseTsnetAddress(mapping.advertised, listen = true).valueOr:
         return err(error)
       let upgraded =
@@ -333,8 +376,9 @@ proc publishLocalPeerInfo*(
   if self.isNil:
     return
   let nextJson = mergeBridgeExtraJson(self.cfg.bridgeExtraJson, peerId, listenAddrs)
-  self.cfg.bridgeExtraJson = nextJson
-  self.provider.updateBridgeExtraJson(nextJson)
+  let ownedJson = ownedText(nextJson)
+  self.cfg.bridgeExtraJson = ownedJson
+  self.provider.updateBridgeExtraJson(ownedJson)
 
 proc refreshProviderControlMetadata*(self: TsnetTransport): Result[void, string] {.gcsafe.} =
   tsnetSafe:
@@ -342,26 +386,60 @@ proc refreshProviderControlMetadata*(self: TsnetTransport): Result[void, string]
       return err("tsnet transport is nil")
     result = self.provider.refreshControlMetadata()
 
-proc reconcileProviderListeners*(self: TsnetTransport): Result[void, string] {.gcsafe.} =
+proc reconcileProviderListeners*(
+    self: TsnetTransport
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   tsnetSafe:
     if self.isNil:
       return err("tsnet transport is nil")
     if not self.providerUsesProxyRouting():
       return ok()
-    let repaired = self.provider.reconcileProxyListeners()
+    let repaired = await self.provider.reconcileProxyListeners()
     if repaired.isErr():
       return err(repaired.error)
+    let routeRegistryMissing =
+      self.listenerMappingCount() > 0 and self.providerProxyRouteCountSafe() == 0
+    if routeRegistryMissing:
+      # Only republish from the transport-side authoritative mapping when the
+      # provider-side proxy-route registry is truly empty. Inner relay listeners
+      # can legitimately self-heal while readiness is temporarily below expected.
+      self.providerListenersActivated = false
+      let reactivated = self.activateProviderListeners()
+      if reactivated.isErr():
+        return err(reactivated.error)
     self.providerListenersActivated = true
     result = ok()
 
 proc publishedAddrs*(self: TsnetTransport): seq[MultiAddress] {.gcsafe.} =
   if self.isNil:
     return @[]
-  for mapping in self.listenerMappings:
+  if self.providerUsesProxyRouting():
+    let providerPublished = self.providerPublishedAddrTextsSafe()
+    if providerPublished.len > 0:
+      result = newSeqOfCap[MultiAddress](providerPublished.len)
+      for route in providerPublished:
+        if route.len > 0:
+          result.add(parseKnownAddress(route))
+      if result.len > 0:
+        return
+  let mappings = listenerMappingSnapshot(self.listenerMappings)
+  for mapping in mappings:
     if mapping.published:
       result.add(mapping.advertised)
   if result.len == 0:
     result = self.addrs
+
+proc publishedAddrTexts*(self: TsnetTransport): seq[string] {.gcsafe.} =
+  if self.isNil:
+    return @[]
+  if self.providerUsesProxyRouting():
+    let providerPublished = self.providerPublishedAddrTextsSafe()
+    if providerPublished.len > 0:
+      return providerPublished
+  let mappings = listenerMappingSnapshot(self.listenerMappings)
+  for mapping in mappings:
+    if mapping.published and mapping.advertisedText.len > 0:
+      result.add(ownedText(mapping.advertisedText))
 
 proc providerResetSafe(self: TsnetTransport) {.gcsafe.} =
   tsnetSafe:
@@ -414,6 +492,14 @@ proc providerDialTcpSafe(
   tsnetSafe:
     result = self.provider.dialTcpProxy(family, ip, port)
 
+proc providerDialTcpExactSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.dialTcpProxyExact(family, ip, port)
+
 proc providerDialUdpSafe(
     self: TsnetTransport,
     family, ip: string,
@@ -422,6 +508,22 @@ proc providerDialUdpSafe(
   tsnetSafe:
     result = self.provider.dialUdpProxy(family, ip, port)
 
+proc providerDialUdpExactSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.dialUdpProxyExact(family, ip, port)
+
+proc providerDialUdpExactTargetSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.dialUdpProxyExactTarget(family, ip, port)
+
 proc providerDialUdpFallbackSafe(
     self: TsnetTransport,
     family, ip: string,
@@ -429,6 +531,14 @@ proc providerDialUdpFallbackSafe(
 ): Result[MultiAddress, string] {.gcsafe.} =
   tsnetSafe:
     result = self.provider.dialUdpProxyRelayFallback(family, ip, port)
+
+proc providerDialUdpFallbackTargetSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.dialUdpProxyRelayFallbackTarget(family, ip, port)
 
 proc providerMarkFailedDirectUdpSafe(
     self: TsnetTransport,
@@ -461,6 +571,15 @@ proc providerStatusPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {
   tsnetSafe:
     result = self.provider.statusPayload()
 
+proc providerReadySafe*(self: TsnetTransport): bool {.gcsafe.} =
+  tsnetSafe:
+    result = not self.isNil and not self.provider.isNil and self.provider.ready()
+
+proc proxyListenersReadySafe*(self: TsnetTransport): bool {.gcsafe.} =
+  tsnetSafe:
+    result = not self.isNil and not self.provider.isNil and
+      self.provider.proxyListenersReady()
+
 proc providerPingPayloadSafe(
     self: TsnetTransport,
     payload: JsonNode
@@ -474,13 +593,17 @@ proc providerDerpMapPayloadSafe(self: TsnetTransport): Result[JsonNode, string] 
 
 proc waitForProviderUdpDialReady(
     self: TsnetTransport,
-    rawAddress: MultiAddress
+    dialTarget: TsnetProxyDialTarget
 ) {.async: (raises: [CancelledError, transport.TransportError]).} =
   const
     pollStep = 25.milliseconds
     dialReadyTimeout = 30.seconds
     dialProgressStallNoticeMs = 3_000'i64
 
+  if dialTarget.mode != TsnetProxyDialMode.RelayBridge:
+    return
+
+  let rawAddress = dialTarget.rawAddress
   let deadline = Moment.now() + dialReadyTimeout
   var lastPhase = ""
   var lastDetail = ""
@@ -490,7 +613,14 @@ proc waitForProviderUdpDialReady(
   while true:
     let state = self.providerUdpDialStateSafe(rawAddress)
     if not state.known:
-      return
+      if Moment.now() >= deadline:
+        raise newException(
+          TsnetTransportDialError,
+          "timeout waiting for tsnet udp relay dial state for " & $rawAddress &
+            " mode=relay_bridge"
+        )
+      await sleepAsync(pollStep)
+      continue
     if state.ready:
       return
     if state.phase.len > 0 and (
@@ -777,33 +907,51 @@ proc registerListenerMapping(
       if tsnetAdvertisedToRaw.hasKey(advertisedKey):
         return err("duplicate /tsnet listener registration: " & advertisedKey)
       tsnetAdvertisedToRaw[advertisedKey] = rawKey
-      tsnetRawListenerToAdvertised[rawKey] = advertisedKey
-  transport.listenerMappings.add(
-    TsnetListenerMapping(published: true, raw: raw, advertised: advertised)
+  var nextMappings = listenerMappingSnapshot(transport.listenerMappings)
+  nextMappings.add(
+    TsnetListenerMapping(
+      published: true,
+      raw: raw,
+      advertised: advertised,
+      rawText: ownedText(rawKey),
+      advertisedText: ownedText(advertisedKey)
+    )
   )
+  transport.listenerMappings = nextMappings
   ok()
 
 proc rememberListenerMapping(
     transport: TsnetTransport, advertised: MultiAddress, raw: MultiAddress
 ): Result[void, string] {.gcsafe.} =
-  transport.listenerMappings.add(
-    TsnetListenerMapping(published: false, raw: raw, advertised: advertised)
+  let advertisedKey = $advertised
+  let rawKey = $raw
+  var nextMappings = listenerMappingSnapshot(transport.listenerMappings)
+  nextMappings.add(
+    TsnetListenerMapping(
+      published: false,
+      raw: raw,
+      advertised: advertised,
+      rawText: ownedText(rawKey),
+      advertisedText: ownedText(advertisedKey)
+    )
   )
+  transport.listenerMappings = nextMappings
   ok()
 
 proc clearListenerMappings(transport: TsnetTransport) {.gcsafe.} =
+  let snapshot = listenerMappingSnapshot(transport.listenerMappings)
+  transport.listenerMappings = @[]
   tsnetSafe:
     withLock(tsnetRegistryLock):
-      for mapping in transport.listenerMappings:
+      for mapping in snapshot:
         if not mapping.published:
           continue
-        let advertisedKey = $mapping.advertised
-        let rawKey = $mapping.raw
+        let advertisedKey = mapping.advertisedText
+        let rawKey = mapping.rawText
+        if advertisedKey.len == 0 or rawKey.len == 0:
+          continue
         if tsnetAdvertisedToRaw.getOrDefault(advertisedKey) == rawKey:
           tsnetAdvertisedToRaw.del(advertisedKey)
-        if tsnetRawListenerToAdvertised.getOrDefault(rawKey) == advertisedKey:
-          tsnetRawListenerToAdvertised.del(rawKey)
-  transport.listenerMappings.setLen(0)
 
 proc lookupRawListener(address: MultiAddress): Opt[MultiAddress] {.gcsafe.} =
   tsnetSafe:
@@ -814,24 +962,21 @@ proc lookupRawListener(address: MultiAddress): Opt[MultiAddress] {.gcsafe.} =
         return Opt.some(parseKnownAddress(rawValue))
   Opt.none(MultiAddress)
 
-proc lookupAdvertisedForRaw(
-    rawAddress: MultiAddress
+proc lookupAdvertisedListenerForRaw(
+    transport: TsnetTransport, rawAddress: MultiAddress
 ): Opt[MultiAddress] {.gcsafe.} =
   tsnetSafe:
+    if transport.isNil:
+      return Opt.none(MultiAddress)
     let key = $rawAddress
-    withLock(tsnetRegistryLock):
-      let listenerValue = tsnetRawListenerToAdvertised.getOrDefault(key)
-      if listenerValue.len > 0:
-        return Opt.some(parseKnownAddress(listenerValue))
-      let endpointValue = tsnetRawEndpointToAdvertised.getOrDefault(key)
-      if endpointValue.len > 0:
-        return Opt.some(parseKnownAddress(endpointValue))
+    let mappings = listenerMappingSnapshot(transport.listenerMappings)
+    for mapping in mappings:
+      if mapping.rawText != key:
+        continue
+      if mapping.advertisedText.len == 0:
+        continue
+      return Opt.some(parseKnownAddress(mapping.advertisedText))
   Opt.none(MultiAddress)
-
-proc registerEndpoint(rawAddress: MultiAddress, advertised: MultiAddress) {.gcsafe.} =
-  tsnetSafe:
-    withLock(tsnetRegistryLock):
-      tsnetRawEndpointToAdvertised[$rawAddress] = $advertised
 
 proc rewriteAcceptedConnection(
     transport: TsnetTransport, conn: Connection, kind: TsnetPathKind
@@ -839,11 +984,11 @@ proc rewriteAcceptedConnection(
   if conn.isNil:
     return
   if conn.localAddr.isSome:
-    let localOpt = lookupAdvertisedForRaw(conn.localAddr.get())
+    let localOpt = transport.lookupAdvertisedListenerForRaw(conn.localAddr.get())
     if localOpt.isSome:
       conn.localAddr = Opt.some(localOpt.get())
   if conn.observedAddr.isSome:
-    let observedOpt = lookupAdvertisedForRaw(conn.observedAddr.get())
+    let observedOpt = transport.lookupAdvertisedListenerForRaw(conn.observedAddr.get())
     if observedOpt.isSome:
       conn.observedAddr = Opt.some(observedOpt.get())
     elif transport.providerUsesProxyRouting():
@@ -877,6 +1022,7 @@ proc new*(
     syntheticIPv6: syntheticTailnetIPv6(syntheticId),
     provider: TsnetProvider.new(providerConfig(cfg))
   )
+  result.cfg.bridgeExtraJson = ownedText(result.cfg.bridgeExtraJson)
   procCall Transport(result).initialize()
   result.tcpTransport = TcpTransport.new(flags = {ServerFlags.TcpNoDelay}, upgrade = upgrader)
   when defined(libp2p_msquic_experimental):
@@ -1007,7 +1153,7 @@ method start*(
     raise newException(TsnetTransportError, exc.msg, exc)
 
   var advertised: seq[MultiAddress] = @[]
-  for mapping in self.listenerMappings:
+  for mapping in listenerMappingSnapshot(self.listenerMappings):
     if mapping.published:
       advertised.add(mapping.advertised)
   await procCall Transport(self).start(advertised)
@@ -1090,16 +1236,21 @@ method dial*(
   if not self.providerUsesProxyRouting() and not self.provider.isNil and self.provider.runtimeRequested():
     discard self.providerStartSafe().valueOr:
       raise newException(TsnetTransportDialError, error)
+  var udpDialTarget = TsnetProxyDialTarget(
+    rawAddress: buildRawLoopbackAddress(parsed),
+    mode: TsnetProxyDialMode.Local,
+  )
   let rawTarget =
     if self.providerUsesProxyRouting():
       case parsed.kind
       of TsnetPathKind.Tcp:
-        self.providerDialTcpSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+        self.providerDialTcpExactSafe(parsed.family, parsed.ip, parsed.port).valueOr:
           raise newException(TsnetTransportDialError, error)
       of TsnetPathKind.Quic:
         when defined(libp2p_msquic_experimental):
-          self.providerDialUdpSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+          udpDialTarget = self.providerDialUdpExactTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
             raise newException(TsnetTransportDialError, error)
+          udpDialTarget.rawAddress
         else:
           raise newException(
             TsnetTransportDialError,
@@ -1132,7 +1283,7 @@ method dial*(
           except CatchableError as exc:
             raise newException(TsnetTransportDialError, exc.msg, exc)
         if self.providerUsesProxyRouting():
-          await self.waitForProviderUdpDialReady(rawTarget)
+          await self.waitForProviderUdpDialReady(udpDialTarget)
         let dialHostname = self.quicDialHostname(hostname, rawTarget)
         try:
           await self.quicTransport.dial(dialHostname, rawTarget, peerId)
@@ -1148,13 +1299,13 @@ method dial*(
                 ""
             if path in [TsnetPathDirect, TsnetPathPunchedDirect]:
               discard self.providerMarkFailedDirectUdpSafe(parsed.full, rawTarget)
-              let fallbackTarget = self.providerDialUdpFallbackSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+              let fallbackTarget = self.providerDialUdpFallbackTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
                 raise newException(TsnetTransportDialError, exc.msg, exc)
-              if $fallbackTarget != $rawTarget:
+              if $fallbackTarget.rawAddress != $rawTarget:
                 await self.waitForProviderUdpDialReady(fallbackTarget)
-                let fallbackHostname = self.quicDialHostname(hostname, fallbackTarget)
+                let fallbackHostname = self.quicDialHostname(hostname, fallbackTarget.rawAddress)
                 try:
-                  return await self.quicTransport.dial(fallbackHostname, fallbackTarget, peerId)
+                  return await self.quicTransport.dial(fallbackHostname, fallbackTarget.rawAddress, peerId)
                 except CancelledError as retryExc:
                   raise retryExc
                 except CatchableError:
@@ -1173,7 +1324,6 @@ method dial*(
         self.providerSynthesizedEndpointSafe(rawLocal, parsed.kind)
       else:
         self.synthesizedEndpoint(rawLocal, parsed.kind)
-    registerEndpoint(rawLocal, advertisedLocal)
     conn.localAddr = Opt.some(advertisedLocal)
   else:
     conn.localAddr = Opt.some(self.fallbackDialEndpoint(parsed.family, parsed.kind))
@@ -1194,7 +1344,7 @@ proc tailnetStatus*(self: TsnetTransport): TsnetStatusSnapshot {.public, gcsafe.
     let payload = self.providerStatusPayloadSafe().valueOr:
       return TsnetStatusSnapshot(
         tailnetIPs: @[self.syntheticIPv4, self.syntheticIPv6],
-        tailnetPath: if self.listenerMappings.len > 0: "direct" else: "idle",
+        tailnetPath: if self.listenerMappingCount() > 0: "direct" else: "idle",
         tailnetRelay: "",
         tailnetDerpMapSummary: "",
         tailnetPeers: @[]
@@ -1219,7 +1369,7 @@ proc tailnetStatus*(self: TsnetTransport): TsnetStatusSnapshot {.public, gcsafe.
     )
   TsnetStatusSnapshot(
     tailnetIPs: @[self.syntheticIPv4, self.syntheticIPv6],
-    tailnetPath: if self.listenerMappings.len > 0: "direct" else: "idle",
+    tailnetPath: if self.listenerMappingCount() > 0: "direct" else: "idle",
     tailnetRelay: "",
     tailnetDerpMapSummary: "",
     tailnetPeers: @[]
@@ -1235,7 +1385,7 @@ proc tailnetStatusPayload*(self: TsnetTransport): Result[JsonNode, string] {.gcs
     "ok": true,
     "started": self.running,
     "tailnetIPs": @[self.syntheticIPv4, self.syntheticIPv6],
-    "tailnetPath": (if self.listenerMappings.len > 0: "direct" else: "idle"),
+    "tailnetPath": (if self.listenerMappingCount() > 0: "direct" else: "idle"),
     "tailnetRelay": "",
     "tailnetDerpMapSummary": "",
     "tailnetPeers": newJArray(),

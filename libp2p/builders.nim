@@ -1590,6 +1590,11 @@ proc newStandardSwitchBuilder*(
     httpConfig: lpHttp.HttpConfig = lpHttp.HttpConfig.init(),
 ): SwitchBuilder {.raises: [LPError], public.} =
   ## Helper for common switch configurations.
+  let effectiveSecureManagers =
+    if transport == TransportType.QUIC:
+      @[]
+    else:
+      @secureManagers
   var b = SwitchBuilder
     .new()
     .withRng(rng)
@@ -1599,7 +1604,7 @@ proc newStandardSwitchBuilder*(
     .withMaxOut(maxOut)
     .withMaxConnsPerPeer(maxConnsPerPeer)
     .withPeerStore(capacity = peerStoreCapacity)
-    .withSecureManagers(secureManagers)
+    .withSecureManagers(effectiveSecureManagers)
 
   privKey.withValue(pkey):
     b = b.withPrivateKey(pkey)
@@ -1618,21 +1623,26 @@ proc newStandardSwitchBuilder*(
     when defined(libp2p_msquic_experimental):
       if addrs.len == 0:
         addrs = @[MultiAddress.init("/ip4/0.0.0.0/udp/0/quic-v1").tryGet()]
-      b = b.withMsQuicTransport().withAddresses(addrs).withMplex(
-        inTimeout, outTimeout
-      )
+      # QUIC already provides native bidirectional streams. The MsQuic transport
+      # upgrades directly to `MsQuicMuxer`, so QUIC-only builders must not
+      # register an extra libp2p stream muxer or an implicit secure layer here.
+      b = b.withoutImplicitSecureDefault().withMsQuicTransport().withAddresses(addrs)
     else:
       raiseAssert "QUIC not supported in this build"
   of TransportType.TCP:
     if addrs.len == 0:
       addrs = @[MultiAddress.init("/ip4/127.0.0.1/tcp/0").tryGet()]
-    b = b.withTcpTransport(transportFlags).withAddresses(addrs).withMplex(
-        inTimeout, outTimeout
-      )
+    b = b.withTcpTransport(transportFlags).withAddresses(addrs).withYamux(
+      inTimeout = inTimeout,
+      outTimeout = outTimeout,
+    )
   of TransportType.Memory:
     if addrs.len == 0:
       addrs = @[MultiAddress.init(MemoryAutoAddress).tryGet()]
-    b = b.withMemoryTransport().withAddresses(addrs).withMplex(inTimeout, outTimeout)
+    b = b.withMemoryTransport().withAddresses(addrs).withYamux(
+      inTimeout = inTimeout,
+      outTimeout = outTimeout,
+    )
 
   fetchHandler.withValue(fetchCb):
     b = b.withFetch(fetchCb, fetchConfig)

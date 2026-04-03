@@ -469,6 +469,15 @@ method newStream*(
         protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
         name = name,
         lazy = lazy
+    if not m.bootstrapOutbound.isNil:
+      let channel = m.bootstrapOutbound
+      m.bootstrapOutbound = nil
+      when defined(ohos):
+        warn "MsQuic muxer reused bootstrap outbound stream",
+          peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
+          protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
+          name = name
+      return channel
     let stream = m.session.openMsQuicStream(false, Direction.Out)
     when defined(ohos):
       warn "MsQuic muxer newStream opened",
@@ -527,6 +536,11 @@ method close*(m: MsQuicMuxer) {.async: (raises: []).} =
 
 method getStreams*(m: MsQuicMuxer): seq[Connection] =
   @[]
+
+proc hasBootstrapOutboundForTests*(m: Muxer): bool {.gcsafe, raises: [].} =
+  if m.isNil or not (m of MsQuicMuxer):
+    return false
+  not MsQuicMuxer(m).bootstrapOutbound.isNil
 
 proc initWebtransportDefaults(transport: MsQuicTransport) =
   transport.webtransportPath = DefaultWebtransportPath
@@ -3224,7 +3238,7 @@ method dial*(
       self.handle,
       connPtr,
       connState,
-      createPrimaryStream = false,
+      createPrimaryStream = not useWebtransport,
       observed = Opt.some(address),
       local = localAddr,
       onClosed = proc(c: MsQuicConnection): Future[void] {.async.} =
@@ -3297,7 +3311,9 @@ method upgrade*(
   let muxer = MsQuicMuxer(session: session, connection: conn)
   if not detached.state.isNil:
     if detached.localInitiated:
-      closePendingMsQuicState(session.transportHandle(), detached.state)
+      muxer.bootstrapOutbound = muxer.channelFromState(detached.state, Direction.Out)
+      if muxer.bootstrapOutbound.isNil:
+        closePendingMsQuicState(session.transportHandle(), detached.state)
     else:
       muxer.bootstrapInbound = muxer.channelFromState(detached.state, Direction.In)
       if muxer.bootstrapInbound.isNil:

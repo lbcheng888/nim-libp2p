@@ -53,7 +53,9 @@ type
     path*: LsmrPath
     addrs*: seq[string]
     publicKey*: string
+    routeVersion*: uint64
     createdAt*: int64
+    signature*: string
 
   EventAttestation* = object
     eventId*: string

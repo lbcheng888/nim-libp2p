@@ -40,6 +40,16 @@ method connect*(
 
   doAssert(false, "[Dial.connect] abstract method not implemented!")
 
+method connectMuxer*(
+    self: Dial,
+    address: MultiAddress,
+    allowUnknownPeerId = false,
+    reuseConnection = true,
+): Future[Muxer] {.base, async: (raises: [DialFailedError, CancelledError]).} =
+  ## Connects to a peer by address and returns the live muxer for this dial.
+
+  doAssert(false, "[Dial.connectMuxer] abstract method not implemented!")
+
 method dial*(
     self: Dial, peerId: PeerId, protos: seq[string]
 ): Future[Connection] {.base, async: (raises: [DialFailedError, CancelledError]).} =

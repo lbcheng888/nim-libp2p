@@ -82,6 +82,8 @@ const
   ExtBuiltinZeroRttAccepted = 0xFFA3'u16
   ExtBuiltinTicketAge = 0xFFA4'u16
   ExtTlsEarlyData = 0x002A'u16
+  MaxBuiltinHkdfLabelLen = 128
+  MaxBuiltinHkdfExpandInputLen = MaxBuiltinHkdfLabelLen + 32 + 1
 
   TpMaxIdleTimeout = 0x01'u64
   TpMaxUdpPayloadSize = 0x03'u64
@@ -239,42 +241,48 @@ proc hmacSha256(key, data: openArray[byte]): array[32, byte] =
   discard bhmac.hmacOut(ctx, addr result[0])
 
 proc hkdfExpand[Len: static int](prk: openArray[byte], info: openArray[byte]): array[Len, byte] =
-  # RFC 5869 Section 2.3. Expand
-  # T(0) = empty
-  # T(1) = HMAC-Hash(PRK, T(0) | info | 0x01)
-  # ...
-  var n = (Len + 32 - 1) div 32
-  var t: seq[byte] = @[]
-  var okm: seq[byte] = @[]
-  
-  for i in 1 .. n:
-    var input: seq[byte] = @[]
-    input.add(t)
-    input.add(info)
-    input.add(byte(i))
-    let digest = hmacSha256(prk, input)
-    t = @digest
-    okm.add(t)
-    
+  static:
+    doAssert Len <= 32
+  doAssert info.len + 1 <= MaxBuiltinHkdfExpandInputLen
+  var input: array[MaxBuiltinHkdfExpandInputLen, byte]
+  var inputLen = 0
+  for b in info:
+    input[inputLen] = b
+    inc inputLen
+  input[inputLen] = 0x01'u8
+  inc inputLen
+  let digest = hmacSha256(prk, input.toOpenArray(0, inputLen - 1))
   for i in 0 ..< Len:
-    result[i] = okm[i]
+    result[i] = digest[i]
 
 proc deriveSecretWithContext[Len: static int](secret: openArray[byte];
     label: string; context: openArray[byte]): array[Len, byte] =
-  var hkdfLabel: seq[byte] = @[]
-  var lenNet: uint16
-  var lenHost = uint16(Len)
-  bigEndian16(addr lenNet, addr lenHost)
-  hkdfLabel.add(cast[ptr array[2, byte]](addr lenNet)[])
+  let fullLabelLen = LabelPrefix.len + label.len
+  let hkdfLabelLen = 2 + 1 + fullLabelLen + 1 + context.len
+  doAssert fullLabelLen <= high(byte).int
+  doAssert context.len <= high(byte).int
+  doAssert hkdfLabelLen <= MaxBuiltinHkdfLabelLen
 
-  let fullLabel = LabelPrefix & label
-  hkdfLabel.add(byte(fullLabel.len))
-  for c in fullLabel:
-    hkdfLabel.add(byte(c))
-
-  hkdfLabel.add(byte(context.len))
-  hkdfLabel.add(context)
-  hkdfExpand[Len](secret, hkdfLabel)
+  var hkdfLabel: array[MaxBuiltinHkdfLabelLen, byte]
+  var pos = 0
+  hkdfLabel[pos] = byte((Len shr 8) and 0xFF)
+  inc pos
+  hkdfLabel[pos] = byte(Len and 0xFF)
+  inc pos
+  hkdfLabel[pos] = byte(fullLabelLen)
+  inc pos
+  for c in LabelPrefix:
+    hkdfLabel[pos] = byte(c)
+    inc pos
+  for c in label:
+    hkdfLabel[pos] = byte(c)
+    inc pos
+  hkdfLabel[pos] = byte(context.len)
+  inc pos
+  for b in context:
+    hkdfLabel[pos] = b
+    inc pos
+  hkdfExpand[Len](secret, hkdfLabel.toOpenArray(0, pos - 1))
 
 proc deriveSecret[Len: static int](secret: openArray[byte], label: string): array[Len, byte] =
   deriveSecretWithContext[Len](secret, label, [])

@@ -48,6 +48,22 @@ proc eventSigningNode*(event: FabricEvent): JsonNode =
   result["routingPath"] = toJson(event.routingPath)
   result["createdAt"] = %event.createdAt
 
+proc peerAnnouncementSigningNode*(item: PeerAnnouncement): JsonNode =
+  result = newJObject()
+  result["account"] = %item.account
+  result["peerId"] = %item.peerId
+  result["path"] = toJson(item.path)
+  result["addrs"] = %sortedStrings(item.addrs)
+  result["publicKey"] = %item.publicKey
+  result["routeVersion"] = %item.routeVersion
+  result["createdAt"] = %item.createdAt
+
+proc peerAnnouncementSigningBytes*(item: PeerAnnouncement): seq[byte] =
+  let payload = $peerAnnouncementSigningNode(item)
+  result = newSeq[byte](payload.len)
+  if payload.len > 0:
+    copyMem(addr result[0], unsafeAddr payload[0], payload.len)
+
 proc computeEventId*(event: FabricEvent): string =
   hashHex($eventSigningNode(event))
 

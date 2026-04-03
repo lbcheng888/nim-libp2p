@@ -8,6 +8,7 @@ import "../libp2p/transports/msquicdriver" as msdriver
 import "../libp2p/transports/quicruntime" as quicrt
 import "../libp2p/transports/nim-msquic/api/api_impl" as msapi
 import "../libp2p/transports/nim-msquic/api/param_catalog" as msparam
+from "../libp2p/transports/nim-msquic/core/mod" import ceHandshake
 
 when defined(libp2p_msquic_experimental):
   suite "MsQuic experimental driver":
@@ -227,6 +228,68 @@ when defined(libp2p_msquic_experimental):
                 nextConnectionEventOfKind(serverState, quicrt.qceConnected)
               check serverConnectedErr.len == 0
               check serverConnectedOpt.isSome
+
+    test "handshake PTO probe appends sent packet from keyed ledger":
+      let (handle, initErr) = msdriver.initMsQuicTransport()
+      if initErr.len > 0 or handle.isNil:
+        echo "MsQuic runtime unavailable: ", initErr
+        skip()
+      else:
+        defer:
+          if not handle.isNil:
+            msdriver.shutdown(handle)
+
+        let (listenerOpt, listenerErr) = startLoopbackListener(handle)
+        if listenerErr.len > 0 or listenerOpt.isNone:
+          echo "MsQuic listener unavailable: ", listenerErr
+          skip()
+        else:
+          let listener = listenerOpt.get()
+          defer:
+            discard msdriver.stopListener(handle, listener.listener)
+            msdriver.closeListener(handle, listener.listener, listener.state)
+
+          var connection: msapi.HQUIC = nil
+          let clientCid = [0x01'u8, 0x02, 0x03, 0x04]
+          let serverCid = [0xA1'u8, 0xA2, 0xA3, 0xA4]
+          check msapi.createAcceptedConnectionForTest(
+            cast[msapi.HQUIC](listener.listener),
+            LoopbackDialHost.cstring,
+            listener.port,
+            "127.0.0.1".cstring,
+            listener.port,
+            unsafeAddr clientCid[0],
+            uint32(clientCid.len),
+            unsafeAddr serverCid[0],
+            uint32(serverCid.len),
+            connection
+          )
+          check not connection.isNil
+          check msapi.prepareConnectionPacketSendForTest(connection, ceHandshake)
+
+          for idx in 1 .. 256:
+            check msapi.seedSentPacketForTest(
+              connection,
+              ceHandshake,
+              uint64(idx),
+              1'u64,
+              frameKind = msapi.sfkCrypto,
+              framePayload = @[byte(idx and 0xFF)]
+            )
+
+          var beforeCount = 0'u32
+          check msapi.getConnectionSentPacketCountForTest(connection, beforeCount)
+          check beforeCount == 256'u32
+
+          check msapi.runConnectionMaintenanceForTest(connection)
+
+          var afterCount = 0'u32
+          check msapi.getConnectionSentPacketCountForTest(connection, afterCount)
+          check afterCount > beforeCount
+
+          var frameKind = msapi.sfkPing
+          check msapi.getConnectionLastSentFrameKindForTest(connection, frameKind)
+          check frameKind == msapi.sfkCrypto
 else:
   suite "MsQuic experimental driver":
     test "experimental features disabled":

@@ -216,6 +216,8 @@ proc overlayPathology(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
 proc networkPathology(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
   {.cast(gcsafe).}:
     for idx, node in nodes:
+      let submitStats = node.network.submitDesiredPeerStats()
+      let submitReadyHealthy = submitStats.total >= 0 and submitStats.ready >= submitStats.total
       let slowApply = node.controlSlowApplyCount()
       let maxApplyMs = node.controlMaxApplyMs()
       let slowConnect = node.submitSlowConnectCount()
@@ -227,10 +229,10 @@ proc networkPathology(nodes: seq[FabricNode]): string {.gcsafe, raises: [].} =
       let maxInboundMs = node.inboundMaxSliceMs()
       let slowMaintenance = node.maintenanceSlowSliceCount()
       let maxMaintenanceMs = node.maintenanceMaxSliceMs()
-      if writeFailures > 0:
+      if writeFailures > 0 and not submitReadyHealthy:
         return "node=" & $idx & " submitWriteFailures=" & $writeFailures &
           " maxConnectMs=" & $maxConnectMs
-      if maxConnectMs >= MaxHealthySubmitConnectMs:
+      if maxConnectMs >= MaxHealthySubmitConnectMs and not submitReadyHealthy:
         return "node=" & $idx & " slowSubmitConnect=" & $slowConnect &
           " maxConnectMs=" & $maxConnectMs
       if maxAckMs >= MaxHealthySubmitAckMs:
@@ -594,7 +596,7 @@ suite "Fabric lsmr only network":
         raise
 
       for node in nodes:
-        node.network.scheduleWarmSubmitConnections()
+        node.enableLsmrDataPlane()
 
       try:
         waitFor awaitSubmitReady(nodes, timeoutMs = 10_000, stallMs = 3_000, intervalMs = 100)

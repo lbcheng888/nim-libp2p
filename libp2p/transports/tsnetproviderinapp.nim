@@ -1,6 +1,7 @@
 {.push raises: [].}
 
 import std/[json, strutils]
+import chronos
 
 import ./tsnetprovidertypes
 import ./tsnet/runtime as tsruntime
@@ -60,6 +61,18 @@ proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
   inAppSafe:
     result = tsruntime.listenerNeedsRepair(runtime)
 
+proc proxyListenersReady*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
+  inAppSafe:
+    result = tsruntime.proxyListenersReady(runtime)
+
+proc proxyRouteCount*(runtime: TsnetInAppRuntime): int {.gcsafe.} =
+  inAppSafe:
+    result = tsruntime.proxyRouteCount(runtime)
+
+proc publishedAddrTexts*(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.} =
+  inAppSafe:
+    result = tsruntime.publishedListenerRoutes(runtime)
+
 proc openInAppRuntime*(cfg: TsnetProviderConfig): Result[TsnetInAppRuntime, string] =
   let runtime = tsruntime.TsnetInAppRuntime.new(cfg)
   let started = tsruntime.start(runtime)
@@ -92,11 +105,13 @@ proc refreshControlMetadata*(runtime: TsnetInAppRuntime): Result[void, string] {
   inAppSafe:
     result = tsruntime.refreshControlMetadata(runtime)
 
-proc reconcileProxyListeners*(runtime: TsnetInAppRuntime): Result[void, string] {.gcsafe.} =
+proc reconcileProxyListeners*(
+    runtime: TsnetInAppRuntime
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   if runtime.isNil:
     return err("tsnet in-app runtime is nil")
   inAppSafe:
-    result = tsruntime.reconcileProxyListeners(runtime)
+    result = await tsruntime.reconcileProxyListeners(runtime)
 
 proc statusPayload*(runtime: TsnetInAppRuntime): Result[JsonNode, string] =
   tsruntime.statusPayload(runtime)
@@ -133,6 +148,13 @@ proc dialTcpProxy*(
 ): Result[MultiAddress, string] =
   tsruntime.dialTcpProxy(runtime, family, ip, port)
 
+proc dialTcpProxyExact*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] =
+  tsruntime.dialTcpProxyExact(runtime, family, ip, port)
+
 proc dialUdpProxy*(
     runtime: TsnetInAppRuntime,
     family, ip: string,
@@ -140,12 +162,33 @@ proc dialUdpProxy*(
 ): Result[MultiAddress, string] =
   tsruntime.dialUdpProxy(runtime, family, ip, port)
 
+proc dialUdpProxyExact*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] =
+  tsruntime.dialUdpProxyExact(runtime, family, ip, port)
+
+proc dialUdpProxyExactTarget*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] =
+  tsruntime.dialUdpProxyExactTarget(runtime, family, ip, port)
+
 proc dialUdpProxyRelayFallback*(
     runtime: TsnetInAppRuntime,
     family, ip: string,
     port: int
 ): Result[MultiAddress, string] =
   tsruntime.dialUdpProxyRelayFallback(runtime, family, ip, port)
+
+proc dialUdpProxyRelayFallbackTarget*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] =
+  tsruntime.dialUdpProxyRelayFallbackTarget(runtime, family, ip, port)
 
 proc markFailedDirectProxyRoute*(
     runtime: TsnetInAppRuntime,

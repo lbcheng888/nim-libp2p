@@ -75,8 +75,13 @@ const
   BitswapDefaultTopDebtorsMinBytes* = 64'u64 * 1024
 
 proc shouldAutoIdentifyIncoming(conn: Connection): bool {.inline.} =
+  if conn.isNil:
+    return false
   when defined(libp2p_msquic_experimental):
     if conn of msquicconnection.MsQuicConnection:
+      # Fresh native QUIC exact-connect still deadlocks if the receiver eagerly
+      # opens identify while the dialer is bringing up its own first control
+      # stream. For this path we only allow dialer-side or explicit identify.
       return false
   true
 
@@ -945,6 +950,16 @@ method connect*(
   ## you to MiTM attacks, so it shouldn't be used without care!
 
   s.dialer.connect(address, allowUnknownPeerId)
+
+method connectMuxer*(
+    s: Switch,
+    address: MultiAddress,
+    allowUnknownPeerId = false,
+    reuseConnection = true,
+): Future[Muxer] {.async: (raises: [DialFailedError, CancelledError], raw: true).} =
+  ## Connects to a peer by address and returns the live muxer for this dial.
+
+  s.dialer.connectMuxer(address, allowUnknownPeerId, reuseConnection)
 
 method dial*(
     s: Switch, peerId: PeerId, protos: seq[string]

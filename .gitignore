@@ -138,3 +138,7 @@ AGENTS.md
 examples/mobile_ffi/tsnet_product_node
 examples/tsnet_quic_gateway_service
 lessons.md
+examples/tsnet_quic_relay_accept_probe
+examples/tsnet_quic_relay_probe
+libp2p/transports/nim-msquic/tests/protocol_unprotected_header_test
+tests/inspect_store_tmp

@@ -231,6 +231,21 @@ proc promoteCoordinateClosureAsync(
   ]] {.
     async: (raises: [CancelledError])
 .}
+proc blockedCoordinatePeers(
+    svc: LsmrService, peerIds: openArray[PeerId]
+): seq[(PeerId, string)] {.gcsafe.}
+proc blockedCoordinateRecoveryPeers(
+    svc: LsmrService, peerId: PeerId, reason: string
+): seq[PeerId] {.gcsafe.}
+proc coordinatePublishChain(
+    svc: LsmrService, peerId: PeerId
+): seq[SignedLsmrCoordinateRecord] {.gcsafe.}
+proc knownCoordinatePeers(
+    svc: LsmrService
+): seq[PeerId] {.gcsafe.}
+proc validateLsmrPeer*(
+    switch: Switch, config: LsmrConfig, peerId: PeerId, nowMs = 0'i64
+): LsmrValidationSnapshot {.gcsafe.}
 proc storeCoordinateRecord(
     switch: Switch,
     config: LsmrConfig,
@@ -317,8 +332,7 @@ proc collectCoordinateRecordsAsync(
   var seen = initHashSet[string]()
   for item in items:
     let encoded = item.getStr()
-    if encoded.len == 0 or encoded in seen or
-        (not svc.isNil and encoded in svc.appliedCoordinatePayloads):
+    if encoded.len == 0 or encoded in seen:
       controlApplyCheckpoint(processed, result.yields, result.maxSliceMs, sliceStartedAt)
       continue
     seen.incl(encoded)
@@ -438,6 +452,9 @@ proc queueControlPublishDelta(
 proc queueCoordinateDelta(
     svc: LsmrService, subjectPeerIds: openArray[PeerId]
 ) {.gcsafe, raises: [].}
+proc queueStrongTopologyConvergence(
+    svc: LsmrService, subjectPeerIds: openArray[PeerId]
+) {.gcsafe, raises: [].}
 proc queueTopologyDelta(
     svc: LsmrService, publishAllKnown = false
 ) {.gcsafe, raises: [].}
@@ -484,18 +501,12 @@ proc buildCoordinateSyncResponse(svc: LsmrService): JsonNode {.gcsafe.} =
     seenAddrPeers.incl(key)
     peerAddresses.add(buildPeerAddressEntry(peerId, addrs))
   addPeerAddrs(svc.switch.peerInfo.peerId)
-  for _, records in svc.switch.peerStore[LsmrChainBook].book.pairs:
-    for record in records.sortedCoordinateRecords():
+  for peerId in svc.knownCoordinatePeers():
+    for record in svc.coordinatePublishChain(peerId):
       let encoded = encodeSignedRecord(record)
       if encoded.len > 0:
         coordinateRecords.add(%encoded)
-      addPeerAddrs(record.data.peerId)
-  if coordinateRecords.len == 0:
-    for _, record in svc.switch.peerStore[ActiveLsmrBook].book.pairs:
-      let encoded = encodeSignedRecord(record)
-      if encoded.len > 0:
-        coordinateRecords.add(%encoded)
-      addPeerAddrs(record.data.peerId)
+    addPeerAddrs(peerId)
   for _, records in svc.switch.peerStore[LsmrMigrationBook].book.pairs:
     for record in records:
       let encoded = encodeSignedMigration(record)
@@ -527,6 +538,64 @@ proc appendPeerAddress(
     return
   seenAddrPeers.incl(key)
   peerAddresses.add(buildPeerAddressEntry(peerId, addrs))
+
+proc coordinatePublishChain(
+    svc: LsmrService, peerId: PeerId
+): seq[SignedLsmrCoordinateRecord] {.gcsafe.} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or peerId.data.len == 0:
+    return @[]
+  let chain = svc.switch.peerStore[LsmrChainBook][peerId].sortedCoordinateRecords()
+  var tip = none(SignedLsmrCoordinateRecord)
+  if svc.switch.peerStore[ActiveLsmrBook].contains(peerId):
+    tip = some(svc.switch.peerStore[ActiveLsmrBook][peerId])
+  elif svc.switch.peerStore[LsmrBook].contains(peerId):
+    tip = some(svc.switch.peerStore[LsmrBook][peerId])
+  elif chain.len > 0:
+    tip = some(chain[^1])
+  if chain.len > 0 and tip.isSome():
+    let target = tip.get()
+    let targetPrefix = target.data.certifiedPrefix()
+    let targetEpoch = target.data.epochId
+    var closure: seq[SignedLsmrCoordinateRecord] = @[]
+    for record in chain:
+      if record.data.epochId != targetEpoch:
+        continue
+      let prefix = record.data.certifiedPrefix()
+      if prefix.len == 0 or not pathStartsWith(targetPrefix, prefix):
+        continue
+      closure.add(record)
+    if closure.len > 0:
+      return closure.sortedCoordinateRecords()
+  if svc.switch.peerStore[ActiveLsmrBook].contains(peerId):
+    return @[svc.switch.peerStore[ActiveLsmrBook][peerId]]
+  if svc.switch.peerStore[LsmrBook].contains(peerId):
+    return @[svc.switch.peerStore[LsmrBook][peerId]]
+  @[]
+
+proc knownCoordinatePeers(
+    svc: LsmrService
+): seq[PeerId] {.gcsafe.} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return @[]
+  var seen = initHashSet[string]()
+  for peerId, _ in svc.switch.peerStore[LsmrChainBook].book.pairs:
+    let key = $peerId
+    if peerId.data.len == 0 or key in seen:
+      continue
+    seen.incl(key)
+    result.add(peerId)
+  for peerId, _ in svc.switch.peerStore[ActiveLsmrBook].book.pairs:
+    let key = $peerId
+    if peerId.data.len == 0 or key in seen:
+      continue
+    seen.incl(key)
+    result.add(peerId)
+  for peerId, _ in svc.switch.peerStore[LsmrBook].book.pairs:
+    let key = $peerId
+    if peerId.data.len == 0 or key in seen:
+      continue
+    seen.incl(key)
+    result.add(peerId)
 
 proc fillCoordinatePublishState(
     svc: LsmrService,
@@ -629,7 +698,31 @@ proc applyCoordinateRecords(
     if promoteResult.maxSliceMs > maxSliceMs:
       maxSliceMs = promoteResult.maxSliceMs
     if promoteResult.changedPeerIds.len > 0:
-      svc.queueCoordinateDelta(promoteResult.changedPeerIds)
+      svc.queueStrongTopologyConvergence(promoteResult.changedPeerIds)
+    let blocked = svc.blockedCoordinatePeers(touchedPeerIds)
+    if blocked.len > 0:
+      var recoveryPeers: seq[PeerId] = @[]
+      var recoverySeen = initHashSet[string]()
+      proc addRecoveryPeer(peerId: PeerId) =
+        let key = $peerId
+        if peerId.data.len == 0 or key in recoverySeen:
+          return
+        recoverySeen.incl(key)
+        recoveryPeers.add(peerId)
+      for item in blocked:
+        for peerId in svc.blockedCoordinateRecoveryPeers(item[0], item[1]):
+          addRecoveryPeer(peerId)
+      when defined(lsmr_diag):
+        var blockedItems: seq[string] = @[]
+        for item in blocked:
+          blockedItems.add($item[0] & ":" & item[1])
+        echo "lsmr convergence-recover self=", $svc.switch.peerInfo.peerId,
+          " blocked=", blockedItems.join(","),
+          " recoveryPeers=",
+          recoveryPeers.mapIt($it).join(",")
+      svc.scheduleCoordinateRevalidation()
+      for peerId in recoveryPeers:
+        svc.queueControlSync(peerId)
   svc.noteControlApplyElapsed(
     "apply",
     appliedCoords,
@@ -661,6 +754,16 @@ proc isolationDigestKey(evidence: SignedLsmrIsolationEvidence): string {.gcsafe.
 proc buildCoordinatePublishBatch(
     svc: LsmrService, session: LsmrControlSession
 ): LsmrPublishBatch {.gcsafe.} =
+  var publishAllKnown = false
+  var publishPeers: seq[PeerId] = @[]
+  if not session.isNil:
+    publishAllKnown = session.publishAllKnown
+    session.publishAllKnown = false
+    for _, peerId in session.publishPeers.pairs:
+      publishPeers.add(peerId)
+    session.publishPeers.clear()
+  publishPeers.sort(proc(a, b: PeerId): int = cmp($a, $b))
+
   let coordinateRecords = newJArray()
   let migrationRecords = newJArray()
   let isolationEvidence = newJArray()
@@ -686,7 +789,7 @@ proc buildCoordinatePublishBatch(
     if encoded.len == 0:
       return
     let digest = coordinateDigestKey(record)
-    if (not session.isNil and
+    if (not publishAllKnown and not session.isNil and
         (encoded in session.publishedCoordinatePayloads or
          (digest.len > 0 and digest in session.publishedCoordinateDigests))):
       return
@@ -702,7 +805,7 @@ proc buildCoordinatePublishBatch(
     if encoded.len == 0:
       return
     let digest = migrationDigestKey(record)
-    if (not session.isNil and
+    if (not publishAllKnown and not session.isNil and
         (encoded in session.publishedMigrationPayloads or
          (digest.len > 0 and digest in session.publishedMigrationDigests))):
       return
@@ -716,7 +819,7 @@ proc buildCoordinatePublishBatch(
     if encoded.len == 0:
       return
     let digest = isolationDigestKey(evidence)
-    if (not session.isNil and
+    if (not publishAllKnown and not session.isNil and
         (encoded in session.publishedIsolationPayloads or
          (digest.len > 0 and digest in session.publishedIsolationDigests))):
       return
@@ -728,27 +831,22 @@ proc buildCoordinatePublishBatch(
   if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
     return LsmrPublishBatch(request: newJNull())
 
-  var publishAllKnown = false
-  var publishPeers: seq[PeerId] = @[]
-  if not session.isNil:
-    publishAllKnown = session.publishAllKnown
-    session.publishAllKnown = false
-    for _, peerId in session.publishPeers.pairs:
-      publishPeers.add(peerId)
-    session.publishPeers.clear()
-  publishPeers.sort(proc(a, b: PeerId): int = cmp($a, $b))
+  var expandedPeers = initHashSet[string]()
 
   proc addSubjectPeerState(peerId: PeerId) =
     if peerId.data.len == 0:
       return
-    var chain = svc.switch.peerStore[LsmrChainBook][peerId].sortedCoordinateRecords()
-    if chain.len > 0:
-      for record in chain:
-        addCoordinateRecord(record)
-    elif svc.switch.peerStore[ActiveLsmrBook].contains(peerId):
-      addCoordinateRecord(svc.switch.peerStore[ActiveLsmrBook][peerId])
-    elif svc.switch.peerStore[LsmrBook].contains(peerId):
-      addCoordinateRecord(svc.switch.peerStore[LsmrBook][peerId])
+    let key = $peerId
+    if key in expandedPeers:
+      return
+    expandedPeers.incl(key)
+    let chain = svc.coordinatePublishChain(peerId)
+    for record in chain:
+      addCoordinateRecord(record)
+      for signedWitness in record.data.witnesses:
+        let anchorPeerId = signedWitness.data.anchorPeerId
+        if anchorPeerId.data.len > 0 and anchorPeerId != peerId:
+          addSubjectPeerState(anchorPeerId)
     for record in svc.switch.peerStore[LsmrMigrationBook][peerId]:
       addMigrationRecord(record)
     for evidence in svc.switch.peerStore[LsmrIsolationBook][peerId]:
@@ -756,12 +854,8 @@ proc buildCoordinatePublishBatch(
     svc.appendPeerAddress(peerId, peerAddresses, seenAddrPeers)
 
   if publishAllKnown:
-    for _, records in svc.switch.peerStore[LsmrChainBook].book.pairs:
-      for record in records.sortedCoordinateRecords():
-        addCoordinateRecord(record)
-    if coordinateRecords.len == 0:
-      for _, record in svc.switch.peerStore[ActiveLsmrBook].book.pairs:
-        addCoordinateRecord(record)
+    for peerId in svc.knownCoordinatePeers():
+      addSubjectPeerState(peerId)
     for _, records in svc.switch.peerStore[LsmrMigrationBook].book.pairs:
       for record in records:
         addMigrationRecord(record)
@@ -822,11 +916,10 @@ proc restoreQueuedPublishState(session: LsmrControlSession, batch: LsmrPublishBa
     return
   if batch.publishAllKnown:
     session.publishAllKnown = true
-  else:
-    for peerId in batch.publishPeers:
-      if peerId.data.len == 0:
-        continue
-      session.publishPeers[$peerId] = peerId
+  for peerId in batch.publishPeers:
+    if peerId.data.len == 0:
+      continue
+    session.publishPeers[$peerId] = peerId
 
 proc applyCoordinatePublishRequest(
     svc: LsmrService, request: JsonNode
@@ -893,7 +986,31 @@ proc applyCoordinatePublishRequest(
     if promoteResult.maxSliceMs > maxSliceMs:
       maxSliceMs = promoteResult.maxSliceMs
     if promoteResult.changedPeerIds.len > 0:
-      svc.queueCoordinateDelta(promoteResult.changedPeerIds)
+      svc.queueStrongTopologyConvergence(promoteResult.changedPeerIds)
+    let blocked = svc.blockedCoordinatePeers(touchedPeerIds)
+    if blocked.len > 0:
+      var recoveryPeers: seq[PeerId] = @[]
+      var recoverySeen = initHashSet[string]()
+      proc addRecoveryPeer(peerId: PeerId) =
+        let key = $peerId
+        if peerId.data.len == 0 or key in recoverySeen:
+          return
+        recoverySeen.incl(key)
+        recoveryPeers.add(peerId)
+      for item in blocked:
+        for peerId in svc.blockedCoordinateRecoveryPeers(item[0], item[1]):
+          addRecoveryPeer(peerId)
+      when defined(lsmr_diag):
+        var blockedItems: seq[string] = @[]
+        for item in blocked:
+          blockedItems.add($item[0] & ":" & item[1])
+        echo "lsmr convergence-recover self=", $svc.switch.peerInfo.peerId,
+          " blocked=", blockedItems.join(","),
+          " recoveryPeers=",
+          recoveryPeers.mapIt($it).join(",")
+      svc.scheduleCoordinateRevalidation()
+      for peerId in recoveryPeers:
+        svc.queueControlSync(peerId)
   svc.noteControlApplyElapsed(
     "publish-apply",
     decoded.records.len,
@@ -1171,6 +1288,11 @@ proc encodedLocalRecord(svc: LsmrService): Option[seq[byte]] =
 proc localCoordinateRecord*(switch: Switch): Option[SignedLsmrCoordinateRecord] =
   if switch.isNil or switch.peerInfo.isNil:
     return none(SignedLsmrCoordinateRecord)
+  if not switch.peerStore.isNil:
+    if switch.peerStore[ActiveLsmrBook].contains(switch.peerInfo.peerId):
+      return some(switch.peerStore[ActiveLsmrBook][switch.peerInfo.peerId])
+    if switch.peerStore[LsmrBook].contains(switch.peerInfo.peerId):
+      return some(switch.peerStore[LsmrBook][switch.peerInfo.peerId])
   if switch.peerInfo.metadata.hasKey(LsmrCoordinateMetadataKey):
     let decoded =
       SignedLsmrCoordinateRecord.decode(
@@ -1178,8 +1300,6 @@ proc localCoordinateRecord*(switch: Switch): Option[SignedLsmrCoordinateRecord] 
       )
     if decoded.isOk():
       return some(decoded.get())
-  if not switch.peerStore.isNil and switch.peerStore[LsmrBook].contains(switch.peerInfo.peerId):
-    return some(switch.peerStore[LsmrBook][switch.peerInfo.peerId])
   none(SignedLsmrCoordinateRecord)
 
 proc activeCoordinateRecord*(
@@ -1703,6 +1823,68 @@ proc validateLsmrPeer*(
     if localCheck.trust == trusted:
       result.distance = lsmrDistance(localCheck.prefix, certifiedPrefix)
 
+proc blockedCoordinatePeers(
+    svc: LsmrService, peerIds: openArray[PeerId]
+): seq[(PeerId, string)] {.gcsafe.} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
+    return @[]
+  var seen = initHashSet[string]()
+  for peerId in peerIds:
+    let key = $peerId
+    if peerId.data.len == 0 or key in seen or not svc.switch.peerStore[LsmrBook].contains(peerId):
+      continue
+    seen.incl(key)
+    let latest = svc.switch.peerStore[LsmrBook][peerId]
+    let activeMatches =
+      svc.switch.peerStore[ActiveLsmrBook].contains(peerId) and
+      svc.switch.peerStore[ActiveLsmrBook][peerId].data.recordDigest == latest.data.recordDigest and
+      svc.switch.peerStore[ActiveLsmrBook][peerId].data.certifiedPrefix() == latest.data.certifiedPrefix()
+    if activeMatches:
+      continue
+    let snapshot = validateLsmrPeer(svc.switch, svc.config, peerId)
+    if snapshot.trust == trusted:
+      continue
+    result.add((peerId, snapshot.reason))
+
+proc blockedCoordinateRecoveryPeers(
+    svc: LsmrService, peerId: PeerId, reason: string
+): seq[PeerId] {.gcsafe.} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or peerId.data.len == 0:
+    return @[]
+  var seen = initHashSet[string]()
+
+  case reason
+  of "unauthorized_witness_issuer":
+    let selfKey = $peerId
+    seen.incl(selfKey)
+    result.add(peerId)
+    if not svc.switch.peerStore[LsmrBook].contains(peerId):
+      return
+    let record = svc.switch.peerStore[LsmrBook][peerId]
+    let targetPrefix = record.data.certifiedPrefix()
+    let parent =
+      if targetPrefix.len > 1:
+        targetPrefix.parentPrefix()
+      else:
+        @[]
+    for signedWitness in record.data.witnesses:
+      if signedWitness.checkValid().isErr:
+        continue
+      let anchorPeerId = signedWitness.data.anchorPeerId
+      if parent.len > 0 and svc.switch.peerStore[ActiveLsmrBook].contains(anchorPeerId):
+        let anchorPrefix = svc.switch.peerStore[ActiveLsmrBook][anchorPeerId].data.certifiedPrefix()
+        if pathStartsWith(anchorPrefix, parent):
+          continue
+      let key = $anchorPeerId
+      if anchorPeerId.data.len == 0 or key in seen:
+        continue
+      seen.incl(key)
+      result.add(anchorPeerId)
+  of "missing_parent_record", "coordinate_parent_mismatch":
+    result.add(peerId)
+  else:
+    discard
+
 proc promoteValidatedCoordinateRecord*(
     switch: Switch, config: LsmrConfig, peerId: PeerId
 ): bool {.gcsafe.} =
@@ -2037,8 +2219,6 @@ proc buildWitnessProtocol(svc: LsmrService): LPProtocol =
           " ts=", nowMillis(),
           " elapsedMs=", nowMillis() - requestStartedAt
       await conn.writeLp(stringToBytes($response))
-      if knowsCoordinatePeer(svc, conn.peerId) or targetPrefix.len == 1:
-        svc.queueControlPublish(conn.peerId)
     except CancelledError as exc:
       raise exc
     except CatchableError as exc:
@@ -2571,7 +2751,7 @@ proc runCoordinateRevalidation(svc: LsmrService): Future[void] {.async: (raises:
     try:
       let promoteResult = await promoteCoordinateClosureAsync(svc, peerIds)
       if promoteResult.changedPeerIds.len > 0:
-        svc.queueCoordinateDelta(promoteResult.changedPeerIds)
+        svc.queueStrongTopologyConvergence(promoteResult.changedPeerIds)
     except CancelledError:
       return
     except CatchableError:
@@ -2951,22 +3131,33 @@ proc runControlSession(svc: LsmrService, peerId: PeerId): Future[void] {.async: 
         " publishPending-before=", session.publishPending
     let doPublish = session.publishPending
     let doSync = session.syncPending
+    let publishIsDelta =
+      doPublish and not session.publishAllKnown and session.publishPeers.len > 0
     session.publishPending = false
     session.syncPending = false
     try:
       var syncOk = not doSync
       var publishOk = not doPublish
-      if doSync:
-        syncOk = await svc.syncCoordinatesFromPeer(peerId)
-        if not syncOk:
-          session.syncPending = true
-      if doPublish and session.syncPending:
-        session.publishPending = true
-        continue
-      if doPublish:
+      if publishIsDelta:
         publishOk = await svc.publishLocalStateToPeer(peerId)
         if not publishOk:
           session.publishPending = true
+        if doSync and not session.publishPending:
+          syncOk = await svc.syncCoordinatesFromPeer(peerId)
+          if not syncOk:
+            session.syncPending = true
+      else:
+        if doSync:
+          syncOk = await svc.syncCoordinatesFromPeer(peerId)
+          if not syncOk:
+            session.syncPending = true
+        if doPublish and session.syncPending:
+          session.publishPending = true
+          continue
+        if doPublish:
+          publishOk = await svc.publishLocalStateToPeer(peerId)
+          if not publishOk:
+            session.publishPending = true
       if not syncOk or not publishOk:
         when defined(lsmr_diag):
           echo "lsmr control-requeue self=", $svc.switch.peerInfo.peerId,
@@ -3024,6 +3215,37 @@ proc queueControlSync(svc: LsmrService, peerId: PeerId) {.gcsafe.} =
   if session.runner.isNil or session.runner.finished():
     session.runner = svc.runControlSession(peerId)
 
+proc preferIncrementalPublish(
+    svc: LsmrService, peerId: PeerId
+): bool {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or
+      peerId.data.len == 0:
+    return false
+  localCoordinateRecord(svc.switch).isSome() and
+    svc.switch.peerStore[ActiveLsmrBook].contains(peerId)
+
+proc downgradePendingFullPublish(
+    svc: LsmrService, peerId: PeerId
+) {.gcsafe, raises: [].} =
+  if not svc.preferIncrementalPublish(peerId):
+    return
+  let key = $peerId
+  let session = svc.controlSessions.getOrDefault(key)
+  if session.isNil or not session.publishAllKnown:
+    return
+  session.publishAllKnown = false
+  let selfPeerId =
+    if svc.switch.isNil or svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  if selfPeerId.data.len > 0 and selfPeerId != peerId:
+    session.publishPeers[$selfPeerId] = selfPeerId
+  when defined(lsmr_diag):
+    echo "lsmr control-downgrade self=", $svc.switch.peerInfo.peerId,
+      " peer=", $peerId,
+      " peers=", session.publishPeers.len
+
 proc queueControlPublish(svc: LsmrService, peerId: PeerId) {.gcsafe.} =
   if svc.isNil or svc.switch.isNil or peerId.data.len == 0 or
       peerId == svc.switch.peerInfo.peerId:
@@ -3032,7 +3254,6 @@ proc queueControlPublish(svc: LsmrService, peerId: PeerId) {.gcsafe.} =
     return
   let session = svc.getOrCreateControlSession(peerId)
   session.publishAllKnown = true
-  session.publishPeers.clear()
   session.publishPending = true
   when defined(lsmr_diag):
     echo "lsmr control-queue self=", $svc.switch.peerInfo.peerId,
@@ -3052,11 +3273,12 @@ proc queueControlPublishDelta(
   if not svc.hasDialableRoute(peerId):
     return
   let session = svc.getOrCreateControlSession(peerId)
-  if not session.publishAllKnown:
-    for subjectPeerId in subjectPeerIds:
-      if subjectPeerId.data.len == 0 or subjectPeerId == peerId:
-        continue
-      session.publishPeers[$subjectPeerId] = subjectPeerId
+  if svc.preferIncrementalPublish(peerId):
+    session.publishAllKnown = false
+  for subjectPeerId in subjectPeerIds:
+    if subjectPeerId.data.len == 0 or subjectPeerId == peerId:
+      continue
+    session.publishPeers[$subjectPeerId] = subjectPeerId
   session.publishPending = true
   when defined(lsmr_diag):
     echo "lsmr control-queue self=", $svc.switch.peerInfo.peerId,
@@ -3094,6 +3316,26 @@ proc queueCoordinateDelta(
       continue
     svc.queueControlPublishDelta(peerId, uniqueSubjects)
 
+proc queueStrongTopologyConvergence(
+    svc: LsmrService, subjectPeerIds: openArray[PeerId]
+) {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil:
+    return
+  var uniqueSubjects: seq[PeerId] = @[]
+  var seen = initHashSet[string]()
+  for peerId in subjectPeerIds:
+    let key = $peerId
+    if peerId.data.len == 0 or key in seen:
+      continue
+    seen.incl(key)
+    uniqueSubjects.add(peerId)
+  if uniqueSubjects.len == 0:
+    return
+  when defined(lsmr_diag):
+    echo "lsmr convergence-broadcast self=", $svc.switch.peerInfo.peerId,
+      " peers=", uniqueSubjects.len
+  svc.queueCoordinateDelta(uniqueSubjects)
+
 proc runRefreshQueue(svc: LsmrService): Future[void] {.async: (raises: []).} =
   while svc.running and svc.refreshPending:
     svc.refreshPending = false
@@ -3106,14 +3348,25 @@ proc runRefreshQueue(svc: LsmrService): Future[void] {.async: (raises: []).} =
     try:
       discard await svc.refreshCoordinateRecord()
       if localCoordinateRecord(svc.switch).isSome():
+        let selfPeerId =
+          if svc.switch.isNil or svc.switch.peerInfo.isNil:
+            PeerId()
+          else:
+            svc.switch.peerInfo.peerId
         if publishAll:
           for peerId in svc.knownSyncPeers():
             svc.queueControlSync(peerId)
-            svc.queueControlPublish(peerId)
+            if selfPeerId.data.len > 0 and svc.preferIncrementalPublish(peerId):
+              svc.queueControlPublishDelta(peerId, [selfPeerId])
+            else:
+              svc.queueControlPublish(peerId)
         else:
           for peerId in publishPeers:
             svc.queueControlSync(peerId)
-            svc.queueControlPublish(peerId)
+            if selfPeerId.data.len == 0:
+              svc.queueControlPublish(peerId)
+            else:
+              svc.queueControlPublishDelta(peerId, [selfPeerId])
         svc.scheduleOverlayMaintenance()
     except CancelledError:
       break
@@ -3416,8 +3669,17 @@ method setup*(
         return
       if event.kind == ConnEventKind.Connected:
         if localCoordinateRecord(svc.switch).isSome():
-          svc.queueControlPublish(peerId)
+          svc.downgradePendingFullPublish(peerId)
           svc.queueControlSync(peerId)
+          let selfPeerId =
+            if svc.switch.peerInfo.isNil:
+              PeerId()
+            else:
+              svc.switch.peerInfo.peerId
+          if selfPeerId.data.len > 0 and svc.preferIncrementalPublish(peerId):
+            svc.queueControlPublishDelta(peerId, [selfPeerId])
+          else:
+            svc.queueControlPublish(peerId)
           svc.scheduleOverlayMaintenance()
         else:
           scheduleImmediateRefresh(svc, some(peerId))

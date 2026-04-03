@@ -104,6 +104,7 @@ type
     sfkConnectionClose
 
   SentPacketMeta = object
+    recordId: uint64
     packetNumber: uint64
     epoch: CryptoEpoch
     ackEliciting: bool
@@ -155,6 +156,11 @@ type
   QUIC_UINT62* = uint64
   QUIC_TLS_ALERT_CODES* = uint16
   HQUIC* = pointer
+
+  SentPacketKey = tuple[epoch: CryptoEpoch, packetNumber: uint64]
+
+  SentPacketRecord = ref object
+    meta: SentPacketMeta
 
   QuicBuffer* {.bycopy.} = object
     Length*: uint32
@@ -467,7 +473,8 @@ type
     pendingAckRemotes: array[CryptoEpoch, TransportAddress]
     lossDetection: qloss.LossDetectionModel
     congestionController: qcc.CongestionController
-    sentPackets: seq[SentPacketMeta]
+    sentPackets: Table[SentPacketKey, SentPacketRecord]
+    nextSentPacketRecordId: uint64
     pendingDatagrams: seq[PendingDatagram]
     pendingControlFrames: seq[PendingControlFrame]
     nextLocalBidiStreamId: uint64
@@ -615,7 +622,10 @@ proc sendProbeForEpoch(conn: ConnectionState; epoch: CryptoEpoch): uint8 {.gcsaf
 proc currentBuiltinNewSessionTicketLifetimeSec(): uint32 {.gcsafe.}
 proc currentBuiltinNewSessionTicketMaxEarlyData(conn: ConnectionState): uint32 {.gcsafe.}
 proc flushPendingControlFrames(conn: ConnectionState) {.gcsafe.}
-proc closeOwnedDatagramTransport(transp: DatagramTransport) {.gcsafe, raises: [].}
+proc closeOwnedDatagramTransport(
+    transp: DatagramTransport,
+    owner: QuicHandleState = nil
+) {.gcsafe, raises: [].}
 proc stopConnectionMaintenance(conn: ConnectionState) {.gcsafe, raises: [].}
 proc removeAcceptedConnection(state: ListenerState; conn: ConnectionState) {.gcsafe, raises: [].}
 proc emitConnectionEvent(state: ConnectionState; event: var ConnectionEvent) {.gcsafe, raises: [].}
@@ -1164,13 +1174,56 @@ proc prependPendingControlFrame(conn: ConnectionState;
       return
   conn.pendingControlFrames.insert(frame, 0)
 
+proc sentPacketKey(epoch: CryptoEpoch; packetNumber: uint64): SentPacketKey {.inline.} =
+  (epoch: epoch, packetNumber: packetNumber)
+
+proc sentPacketKey(meta: SentPacketMeta): SentPacketKey {.inline.} =
+  sentPacketKey(meta.epoch, meta.packetNumber)
+
+proc storeSentPacket(conn: ConnectionState; meta: SentPacketMeta) {.gcsafe.} =
+  if conn.isNil:
+    return
+  inc conn.nextSentPacketRecordId
+  var stored = meta
+  stored.recordId = conn.nextSentPacketRecordId
+  conn.sentPackets[sentPacketKey(stored)] = SentPacketRecord(meta: stored)
+
+proc loadSentPacket(conn: ConnectionState; epoch: CryptoEpoch; packetNumber: uint64;
+    meta: var SentPacketMeta): bool {.gcsafe.} =
+  if conn.isNil:
+    return false
+  let record = conn.sentPackets.getOrDefault(sentPacketKey(epoch, packetNumber), nil)
+  if record.isNil:
+    return false
+  meta = record.meta
+  true
+
+proc orderedSentPacketSnapshot(conn: ConnectionState): seq[SentPacketMeta] {.gcsafe.} =
+  if conn.isNil or conn.sentPackets.len == 0:
+    return @[]
+  result = newSeqOfCap[SentPacketMeta](conn.sentPackets.len)
+  for record in conn.sentPackets.values:
+    if not record.isNil:
+      result.add(record.meta)
+  result.sort(proc(a, b: SentPacketMeta): int =
+    if a.recordId < b.recordId:
+      -1
+    elif a.recordId > b.recordId:
+      1
+    else:
+      0
+  )
+
 proc latestAckElicitingSentTime(conn: ConnectionState; epoch: CryptoEpoch): uint64 {.gcsafe.} =
   if conn.isNil:
     return 0'u64
   var found = false
   var bestSentTimeUs = 0'u64
   var bestPn = 0'u64
-  for meta in conn.sentPackets:
+  for record in conn.sentPackets.values:
+    if record.isNil:
+      continue
+    let meta = record.meta
     if meta.epoch != epoch or not meta.ackEliciting:
       continue
     if not found or meta.sentTimeUs > bestSentTimeUs or
@@ -1187,7 +1240,10 @@ proc newestAckElicitingSentPacket(conn: ConnectionState; epoch: CryptoEpoch;
   var found = false
   var bestSentTimeUs = 0'u64
   var bestPn = 0'u64
-  for sent in conn.sentPackets:
+  for record in conn.sentPackets.values:
+    if record.isNil:
+      continue
+    let sent = record.meta
     if sent.epoch != epoch or not sent.ackEliciting:
       continue
     if not found or sent.sentTimeUs > bestSentTimeUs or
@@ -1206,7 +1262,8 @@ proc clearDeferredProbeDeadline(conn: ConnectionState; epoch: CryptoEpoch) {.gcs
 proc clearConnectionRecoveryState(conn: ConnectionState) {.gcsafe.} =
   if conn.isNil:
     return
-  conn.sentPackets = @[]
+  conn.sentPackets = initTable[SentPacketKey, SentPacketRecord]()
+  conn.nextSentPacketRecordId = 0'u64
   conn.pendingDatagrams = @[]
   conn.pendingControlFrames = @[]
   conn.lossDetection = qloss.initLossDetectionModel()
@@ -1232,7 +1289,7 @@ proc closeConnectionDueToLocalTimeout(conn: ConnectionState; note: string) {.gcs
   if not conn.listenerOwner.isNil:
     conn.listenerOwner.removeAcceptedConnection(conn)
   if conn.transportOwned and not conn.transport.isNil:
-    closeOwnedDatagramTransport(conn.transport)
+    closeOwnedDatagramTransport(conn.transport, conn)
     conn.transport = nil
     conn.transportOwned = false
   var initiated = ConnectionEvent(
@@ -1330,7 +1387,7 @@ proc selectLossDetectionSchedule(conn: ConnectionState; epoch: var CryptoEpoch;
 proc recordSentPacket(conn: ConnectionState; meta: SentPacketMeta) {.gcsafe.} =
   if conn.isNil:
     return
-  conn.sentPackets.add(meta)
+  conn.storeSentPacket(meta)
   conn.clearDeferredProbeDeadline(meta.epoch)
   let packet = qloss.PacketRecord(
     packetNumber: meta.packetNumber,
@@ -1900,7 +1957,7 @@ proc handleRemoteConnectionClose(conn: ConnectionState; errorCode: uint64;
   if not effectiveOwner.isNil:
     effectiveOwner.removeAcceptedConnection(conn)
   if conn.transportOwned and not conn.transport.isNil:
-    closeOwnedDatagramTransport(conn.transport)
+    closeOwnedDatagramTransport(conn.transport, conn)
     conn.transport = nil
     conn.transportOwned = false
   var initiated = ConnectionEvent(
@@ -2172,13 +2229,7 @@ proc applyPathResponse(conn: ConnectionState; response: array[8, byte]) {.gcsafe
 
 proc findSentPacket(conn: ConnectionState; packetNumber: uint64; epoch: CryptoEpoch;
     meta: var SentPacketMeta): bool {.gcsafe.} =
-  if conn.isNil:
-    return false
-  for sent in conn.sentPackets:
-    if sent.epoch == epoch and sent.packetNumber == packetNumber:
-      meta = sent
-      return true
-  false
+  conn.loadSentPacket(epoch, packetNumber, meta)
 
 proc packetAckedByFrame(ack: proto.AckFrame; packetNumber: uint64): bool {.gcsafe.} =
   if ack.ranges.len == 0:
@@ -2189,23 +2240,34 @@ proc packetAckedByFrame(ack: proto.AckFrame; packetNumber: uint64): bool {.gcsaf
   false
 
 proc findNewestAckedAckElicitingPacket(conn: ConnectionState; ack: proto.AckFrame;
-    epoch: CryptoEpoch; meta: var SentPacketMeta): bool {.gcsafe.} =
+    epoch: CryptoEpoch; sentTimeUs: var uint64; totalBytesSentAtSend: var uint64;
+    appLimited: var bool): bool {.gcsafe.} =
   if conn.isNil:
     return false
   var found = false
   var bestSentTimeUs = 0'u64
   var bestPn = 0'u64
-  for sent in conn.sentPackets:
+  var bestTotalBytesSentAtSend = 0'u64
+  var bestAppLimited = false
+  for record in conn.sentPackets.values:
+    if record.isNil:
+      continue
+    let sent = record.meta
     if sent.epoch != epoch or not sent.ackEliciting:
       continue
     if not packetAckedByFrame(ack, sent.packetNumber):
       continue
     if not found or sent.sentTimeUs > bestSentTimeUs or
         (sent.sentTimeUs == bestSentTimeUs and sent.packetNumber > bestPn):
-      meta = sent
       bestSentTimeUs = sent.sentTimeUs
       bestPn = sent.packetNumber
+      bestTotalBytesSentAtSend = sent.totalBytesSentAtSend
+      bestAppLimited = sent.appLimited
       found = true
+  if found:
+    sentTimeUs = bestSentTimeUs
+    totalBytesSentAtSend = bestTotalBytesSentAtSend
+    appLimited = bestAppLimited
   found
 
 proc currentProbeTimeoutUs(conn: ConnectionState; epoch: CryptoEpoch = ceOneRtt): uint64 {.gcsafe, raises: [].} =
@@ -2304,13 +2366,17 @@ proc detectAckDrivenLosses(conn: ConnectionState; ack: proto.AckFrame; epoch: Cr
     return 0'u64
   let lossDelayUs = conn.currentLossDelayUs()
   var nextLossTime = 0'u64
-  var remaining: seq[SentPacketMeta] = @[]
+  var droppedKeys: seq[SentPacketKey] = @[]
   var lostStreams: seq[StreamState] = @[]
   var earliestLostSentUs = high(uint64)
   var latestLostSentUs = 0'u64
-  for meta in conn.sentPackets:
+  for key, record in conn.sentPackets.pairs:
+    if record.isNil:
+      continue
+    let meta = record.meta
     if meta.epoch == epoch:
       if packetAckedByFrame(ack, meta.packetNumber):
+        droppedKeys.add(key)
         continue
       if meta.ackEliciting and meta.packetNumber < ack.largestAcked:
         let packetThresholdLoss =
@@ -2337,11 +2403,12 @@ proc detectAckDrivenLosses(conn: ConnectionState; ack: proto.AckFrame; epoch: Cr
                 " packetThreshold=" & $packetThresholdLoss &
                 " timeThreshold=" & $timeThresholdLoss
             ))
+          droppedKeys.add(key)
           continue
         if nextLossTime == 0'u64 or lossDeadlineUs < nextLossTime:
           nextLossTime = lossDeadlineUs
-    remaining.add(meta)
-  conn.sentPackets = remaining
+  for key in droppedKeys:
+    conn.sentPackets.del(key)
   if not conn.quicConn.isNil:
     conn.quicConn.model.packetSpaces[epoch].lossTime = nextLossTime
   persistentCongestion = conn.isPersistentCongestion(epoch, earliestLostSentUs, latestLostSentUs)
@@ -2398,13 +2465,16 @@ proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
       ))
     conn.updateLossDetectionTimer()
     return
-  var remaining: seq[SentPacketMeta] = @[]
+  var droppedKeys: seq[SentPacketKey] = @[]
   var lostStreams: seq[StreamState] = @[]
   var largestLost = 0'u64
   var lostBytes = 0'u32
   var earliestLostSentUs = high(uint64)
   var latestLostSentUs = 0'u64
-  for meta in conn.sentPackets:
+  for key, record in conn.sentPackets.pairs:
+    if record.isNil:
+      continue
+    let meta = record.meta
     if meta.epoch == selectedEpoch and meta.ackEliciting and
         nowUs >= meta.sentTimeUs and nowUs - meta.sentTimeUs >= lossDelayUs:
       qloss.markPacketLost(conn.lossDetection, meta.packetNumber, selectedEpoch)
@@ -2425,9 +2495,9 @@ proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
             " mode=loss" &
             " threshold=" & $lossDelayUs
         ))
-    else:
-      remaining.add(meta)
-  conn.sentPackets = remaining
+      droppedKeys.add(key)
+  for key in droppedKeys:
+    conn.sentPackets.del(key)
   if not conn.quicConn.isNil:
     conn.quicConn.model.packetSpaces[selectedEpoch].lossTime = 0'u64
   if lostBytes > 0:
@@ -3637,10 +3707,21 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
   if conn.isNil:
     return
   var ackedBytes = 0'u32
-  var ackedMeta: SentPacketMeta
-  var ackedMetaFound = conn.findNewestAckedAckElicitingPacket(ack, epoch, ackedMeta)
+  var ackedSentTimeUs = 0'u64
+  var ackedTotalBytesSentAtSend = 0'u64
+  var ackedAppLimited = false
+  var ackedMetaFound = conn.findNewestAckedAckElicitingPacket(
+    ack,
+    epoch,
+    ackedSentTimeUs,
+    ackedTotalBytesSentAtSend,
+    ackedAppLimited
+  )
   var ackedPacketNumbers: seq[uint64] = @[]
-  for meta in conn.sentPackets:
+  for record in conn.sentPackets.values:
+    if record.isNil:
+      continue
+    let meta = record.meta
     if meta.epoch == epoch and packetAckedByFrame(ack, meta.packetNumber):
       ackedPacketNumbers.add(meta.packetNumber)
   for packetNumber in ackedPacketNumbers:
@@ -3655,8 +3736,8 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
       maxAckDelayUs = MaxAckDelayDefaultMs.uint64 * 1_000'u64
     if ackDelayUs > maxAckDelayUs:
       ackDelayUs = maxAckDelayUs
-  if ackedMetaFound and ackedMeta.sentTimeUs > 0 and nowUs >= ackedMeta.sentTimeUs:
-    var sampleRtt = nowUs - ackedMeta.sentTimeUs
+  if ackedMetaFound and ackedSentTimeUs > 0 and nowUs >= ackedSentTimeUs:
+    var sampleRtt = nowUs - ackedSentTimeUs
     if epoch == ceOneRtt and conn.minRttUs > 0 and sampleRtt > conn.minRttUs + ackDelayUs:
       sampleRtt -= ackDelayUs
     conn.latestRttUs = sampleRtt
@@ -3684,8 +3765,8 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
     ackEpoch: epoch,
     largestAck: ack.largestAcked,
     largestSentPacketNumber: conn.lossDetection.largestSentPacketNumber,
-    timeOfLargestAckedPacketSent: ackedMeta.sentTimeUs,
-    totalBytesSentAtLargestAck: ackedMeta.totalBytesSentAtSend,
+    timeOfLargestAckedPacketSent: ackedSentTimeUs,
+    totalBytesSentAtLargestAck: ackedTotalBytesSentAtSend,
     totalAckedRetransmittableBytes: conn.lossDetection.totalBytesAcked + uint64(ackedBytes),
     ackedRetransmittableBytes: ackedBytes,
     smoothedRtt: max(conn.smoothedRttUs, 1'u64),
@@ -3694,7 +3775,7 @@ proc applyAckFrame(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoc
     adjustedAckTime: nowUs - min(nowUs, ackDelayUs),
     implicitAck: false,
     hasLoss: lostBytes > 0,
-    largestAckAppLimited: ackedMetaFound and ackedMeta.appLimited,
+    largestAckAppLimited: ackedMetaFound and ackedAppLimited,
     minRttValid: true
   )
   let preserveEpochProbeBackoff =
@@ -4543,7 +4624,7 @@ proc msquicListenerClose(listener: HQUIC) {.cdecl.} =
   let state = toListener(listener)
   if not state.isNil:
     if not state.transport.isNil:
-      closeOwnedDatagramTransport(state.transport)
+      closeOwnedDatagramTransport(state.transport, state)
       state.transport = nil
     if not state.stopped:
       listenerEmitEvent(state, QUIC_LISTENER_EVENT_STOP_COMPLETE, proc (buf: ptr uint8) {.gcsafe.} =
@@ -4621,7 +4702,8 @@ proc newAcceptedConnection(state: ListenerState; remote, local: TransportAddress
   conn.ackTracker = qack.initAckTracker()
   conn.lossDetection = qloss.initLossDetectionModel()
   conn.congestionController = qcc.initCongestionController(caCubic, DefaultCongestionDatagramBytes)
-  conn.sentPackets = @[]
+  conn.sentPackets = initTable[SentPacketKey, SentPacketRecord]()
+  conn.nextSentPacketRecordId = 0'u64
   conn.pendingDatagrams = @[]
   conn.pendingControlFrames = @[]
   conn.latestAckedPacket = 0'u64
@@ -5833,17 +5915,33 @@ proc msquicListenerStart(listener: HQUIC; alpn: ptr QuicBuffer;
       note: "Bind failed: " & exc.msg))
     QUIC_STATUS_INTERNAL_ERROR
 
-proc closeOwnedDatagramTransport(transp: DatagramTransport) {.gcsafe, raises: [].} =
+proc closeOwnedDatagramTransport(
+    transp: DatagramTransport,
+    owner: QuicHandleState = nil
+) {.gcsafe, raises: [].} =
   if transp.isNil:
     return
+  let rootedOwner = owner
+  if not rootedOwner.isNil:
+    GC_ref(rootedOwner)
   try:
     transp.close()
   except CatchableError:
     discard
   try:
-    asyncCheck transp.closeWait()
+    let closeWaitFut = transp.closeWait()
+    if rootedOwner.isNil:
+      asyncCheck closeWaitFut
+    else:
+      asyncCheck (proc() {.async: (raises: []).} =
+        try:
+          await closeWaitFut
+        finally:
+          GC_unref(rootedOwner)
+      )()
   except CatchableError:
-    discard
+    if not rootedOwner.isNil:
+      GC_unref(rootedOwner)
 
 proc msquicListenerStop(listener: HQUIC) {.cdecl.} =
   let state = toListener(listener)
@@ -5901,7 +5999,8 @@ proc msquicConnectionOpen(registration: HQUIC; handler: QuicConnectionCallback;
   state.ackTracker = qack.initAckTracker()
   state.lossDetection = qloss.initLossDetectionModel()
   state.congestionController = qcc.initCongestionController(caCubic, DefaultCongestionDatagramBytes)
-  state.sentPackets = @[]
+  state.sentPackets = initTable[SentPacketKey, SentPacketRecord]()
+  state.nextSentPacketRecordId = 0'u64
   state.pendingDatagrams = @[]
   state.pendingControlFrames = @[]
   state.nextLocalBidiStreamId = 0'u64
@@ -5935,7 +6034,7 @@ proc msquicConnectionClose(connection: HQUIC) {.cdecl.} =
   if not state.isNil:
     state.stopConnectionMaintenance()
     if state.transportOwned and not state.transport.isNil:
-      closeOwnedDatagramTransport(state.transport)
+      closeOwnedDatagramTransport(state.transport, state)
       state.transport = nil
       state.transportOwned = false
     var ev = ConnectionEvent(kind: ceShutdownComplete, note: state.closeReason)
@@ -6406,7 +6505,7 @@ proc msquicConnectionStart(connection: HQUIC; configuration: HQUIC;
 
   except CatchableError as exc:
     if state.transportOwned and not state.transport.isNil:
-      closeOwnedDatagramTransport(state.transport)
+      closeOwnedDatagramTransport(state.transport, state)
     state.transport = nil
     state.transportOwned = false
     emitDiagnostics(DiagnosticsEvent(
@@ -7373,33 +7472,37 @@ proc getConnectionSentPacketCountForTest*(connection: HQUIC; count: var uint32):
 proc getConnectionLastSentFramePayloadLenForTest*(connection: HQUIC;
     payloadLen: var uint32): bool =
   let state = toConnection(connection)
-  if state.isNil or state.sentPackets.len == 0:
+  let snapshot = state.orderedSentPacketSnapshot()
+  if snapshot.len == 0:
     return false
-  payloadLen = uint32(state.sentPackets[^1].framePayload.len)
+  payloadLen = uint32(snapshot[^1].framePayload.len)
   true
 
 proc getConnectionLastSentFrameKindForTest*(connection: HQUIC;
     frameKind: var SentFrameKind): bool =
   let state = toConnection(connection)
-  if state.isNil or state.sentPackets.len == 0:
+  let snapshot = state.orderedSentPacketSnapshot()
+  if snapshot.len == 0:
     return false
-  frameKind = state.sentPackets[^1].frameKind
+  frameKind = snapshot[^1].frameKind
   true
 
 proc getConnectionLastSentFramePayloadForTest*(connection: HQUIC;
     payload: var seq[byte]): bool =
   let state = toConnection(connection)
-  if state.isNil or state.sentPackets.len == 0:
+  let snapshot = state.orderedSentPacketSnapshot()
+  if snapshot.len == 0:
     return false
-  payload = state.sentPackets[^1].framePayload
+  payload = snapshot[^1].framePayload
   true
 
 proc getConnectionLastSentTargetRemoteForTest*(connection: HQUIC;
     host: var string; port: var uint16): bool =
   let state = toConnection(connection)
-  if state.isNil or state.sentPackets.len == 0:
+  let snapshot = state.orderedSentPacketSnapshot()
+  if snapshot.len == 0:
     return false
-  let remote = state.sentPackets[^1].targetRemote
+  let remote = snapshot[^1].targetRemote
   if remote.family == AddressFamily.None:
     return false
   host = $remote
@@ -7409,23 +7512,21 @@ proc getConnectionLastSentTargetRemoteForTest*(connection: HQUIC;
 proc getConnectionSentFrameKindAtForTest*(connection: HQUIC; index: uint32;
     frameKind: var SentFrameKind): bool =
   let state = toConnection(connection)
-  if state.isNil:
-    return false
+  let snapshot = state.orderedSentPacketSnapshot()
   let idx = int(index)
-  if idx < 0 or idx >= state.sentPackets.len:
+  if idx < 0 or idx >= snapshot.len:
     return false
-  frameKind = state.sentPackets[idx].frameKind
+  frameKind = snapshot[idx].frameKind
   true
 
 proc getConnectionSentTargetRemoteAtForTest*(connection: HQUIC; index: uint32;
     host: var string; port: var uint16): bool =
   let state = toConnection(connection)
-  if state.isNil:
-    return false
+  let snapshot = state.orderedSentPacketSnapshot()
   let idx = int(index)
-  if idx < 0 or idx >= state.sentPackets.len:
+  if idx < 0 or idx >= snapshot.len:
     return false
-  let remote = state.sentPackets[idx].targetRemote
+  let remote = snapshot[idx].targetRemote
   if remote.family == AddressFamily.None:
     return false
   host = $remote
@@ -7435,12 +7536,11 @@ proc getConnectionSentTargetRemoteAtForTest*(connection: HQUIC; index: uint32;
 proc getConnectionSentFramePayloadAtForTest*(connection: HQUIC; index: uint32;
     payload: var seq[byte]): bool =
   let state = toConnection(connection)
-  if state.isNil:
-    return false
+  let snapshot = state.orderedSentPacketSnapshot()
   let idx = int(index)
-  if idx < 0 or idx >= state.sentPackets.len:
+  if idx < 0 or idx >= snapshot.len:
     return false
-  payload = state.sentPackets[idx].framePayload
+  payload = snapshot[idx].framePayload
   true
 
 proc setConnectionRemoteAddressForTest*(connection: HQUIC; remoteHost: cstring;
@@ -7973,7 +8073,7 @@ proc seedSentPacketForTest*(connection: HQUIC; epoch: CryptoEpoch; packetNumber:
     framePayload: framePayload,
     targetRemote: targetRemote
   )
-  state.sentPackets.add(meta)
+  state.storeSentPacket(meta)
   if packetNumber > state.quicConn.model.packetSpaces[epoch].largestSent:
     state.quicConn.model.packetSpaces[epoch].largestSent = packetNumber
   qloss.onPacketSent(state.lossDetection, qloss.PacketRecord(
@@ -7992,21 +8092,19 @@ proc attachSentPacketStreamHandleForTest*(connection: HQUIC; packetNumber: uint6
   let streamState = toStream(stream)
   if conn.isNil or streamState.isNil:
     return false
-  for idx in 0 ..< conn.sentPackets.len:
-    if conn.sentPackets[idx].packetNumber == packetNumber and
-        conn.sentPackets[idx].epoch == epoch:
-      conn.sentPackets[idx].stream = cast[pointer](streamState)
-      if conn.sentPackets[idx].frameKind == sfkStream and
-          conn.sentPackets[idx].framePayload.len > 0:
-        try:
-          var pos = 0
-          let frame = proto.parseStreamFrame(conn.sentPackets[idx].framePayload, pos)
-          conn.sentPackets[idx].streamOffset = frame.offset
-          conn.sentPackets[idx].streamPayload = frame.data
-          conn.sentPackets[idx].streamFin = frame.fin
-        except ValueError:
-          return false
-      return true
+  let record = conn.sentPackets.getOrDefault(sentPacketKey(epoch, packetNumber), nil)
+  if not record.isNil:
+    record.meta.stream = cast[pointer](streamState)
+    if record.meta.frameKind == sfkStream and record.meta.framePayload.len > 0:
+      try:
+        var pos = 0
+        let frame = proto.parseStreamFrame(record.meta.framePayload, pos)
+        record.meta.streamOffset = frame.offset
+        record.meta.streamPayload = frame.data
+        record.meta.streamFin = frame.fin
+      except ValueError:
+        return false
+    return true
   false
 
 proc applyAckForTest*(connection: HQUIC; epoch: CryptoEpoch; largestAcked: uint64;

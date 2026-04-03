@@ -8,7 +8,8 @@ import ../tsnetprovidertypes
 
 type
   TsnetSharedKey = object
-    text: string
+    len: int
+    data: array[1536, char]
 
   TsnetProxyKind* {.pure.} = enum
     Tcp
@@ -24,10 +25,23 @@ type
     advertisedKey*: TsnetSharedKey
     rawKey*: TsnetSharedKey
 
+  TsnetProxyRouteCacheEntry = object
+    ownerId*: int
+    advertisedKey*: TsnetSharedKey
+    rawKey*: TsnetSharedKey
+    kind*: TsnetProxyKind
+
+  TsnetProxyRegistrationGroup = OrderedTable[string, TsnetProxyRegistration]
+  TsnetProxyRegistrationTable = OrderedTable[string, TsnetProxyRegistrationGroup]
+  TsnetDirectRouteGroup = OrderedTable[string, TsnetDirectRouteRegistration]
+  TsnetDirectRouteTable = OrderedTable[string, TsnetDirectRouteGroup]
+
   TsnetResolvedRemoteRegistration* = object
     ownerId*: int
     rawKey*: TsnetSharedKey
     advertisedKey*: TsnetSharedKey
+    rawText*: string
+    advertisedText*: string
 
   TsnetDirectRouteRegistration* = object
     ownerId*: int
@@ -52,13 +66,36 @@ type
     failureCount*: int
     suspendedUntilUnixMilli*: int64
 
+  TsnetDirectRouteCacheEntry = object
+    ownerId*: int
+    advertisedKey*: TsnetSharedKey
+    rawKey*: TsnetSharedKey
+    pathKind*: TsnetSharedKey
+    hitCount*: int
+    lastSelectedUnixMilli*: int64
+    failureCount*: int
+    suspendedUntilUnixMilli*: int64
+
 const
   DirectRouteFailureBackoffMs* = 5_000'i64
 
+type
+  TsnetResolvedRemoteCacheEntry = object
+    ownerId*: int
+    rawKey*: TsnetSharedKey
+    advertisedKey*: TsnetSharedKey
+
 var proxyRegistryLock {.global.}: Lock
-var proxyRegistrations {.global.}: seq[TsnetProxyRegistration]
-var proxyResolvedRemotes {.global.}: seq[TsnetResolvedRemoteRegistration]
-var proxyDirectRoutes {.global.}: seq[TsnetDirectRouteRegistration]
+var proxyRegistrations {.global.}: TsnetProxyRegistrationTable =
+  initOrderedTable[string, TsnetProxyRegistrationGroup]()
+var proxyRegistrationSnapshots {.global.}: seq[TsnetProxyRouteCacheEntry]
+var proxyRouteCounts {.global.}: Table[int, int] = initTable[int, int]()
+var proxyResolvedRemotes {.global.}: Table[string, TsnetResolvedRemoteRegistration] =
+  initTable[string, TsnetResolvedRemoteRegistration]()
+var proxyResolvedRemoteSnapshots {.global.}: seq[TsnetResolvedRemoteCacheEntry]
+var proxyDirectRoutes {.global.}: TsnetDirectRouteTable =
+  initOrderedTable[string, TsnetDirectRouteGroup]()
+var proxyDirectRouteSnapshots {.global.}: seq[TsnetDirectRouteCacheEntry]
 
 initLock(proxyRegistryLock)
 
@@ -70,26 +107,58 @@ proc parseKnownAddress(text: string): MultiAddress =
   MultiAddress.init(text).expect("tsnet proxy constructed a valid multiaddr")
 
 proc initSharedKey(value: string): TsnetSharedKey =
-  result.text = value
+  if value.len > result.data.len:
+    raiseAssert(
+      "tsnet shared key exceeds fixed storage len=" & $value.len &
+      " cap=" & $result.data.len
+    )
+  result.len = value.len
+  for idx, ch in value:
+    result.data[idx] = ch
 
 proc clearSharedKey(value: var TsnetSharedKey) =
-  value.text = ""
+  value.len = 0
+
+proc sharedKeyLenInBounds(value: TsnetSharedKey): bool =
+  value.len >= 0 and value.len <= value.data.len
 
 proc sharedKeyToString(value: TsnetSharedKey): string =
-  if value.text.len == 0:
+  if value.len <= 0:
     return ""
-  value.text
+  result = newString(value.len)
+  for idx in 0 ..< value.len:
+    result[idx] = value.data[idx]
 
 proc sharedKeyEquals(value: TsnetSharedKey, expected: string): bool =
-  sharedKeyToString(value) == expected
+  if not sharedKeyLenInBounds(value):
+    return false
+  if value.len != expected.len:
+    return false
+  for idx in 0 ..< expected.len:
+    if value.data[idx] != expected[idx]:
+      return false
+  true
 
 proc validSharedKey(value: TsnetSharedKey): bool =
-  sharedKeyToString(value).len > 0
+  sharedKeyLenInBounds(value) and value.len > 0
+
+proc validSharedAddressKey(value: TsnetSharedKey): bool =
+  if not validSharedKey(value):
+    return false
+  MultiAddress.init(sharedKeyToString(value)).isOk()
 
 proc replaceSharedKey(value: var TsnetSharedKey, text: string) =
   if sharedKeyEquals(value, text):
     return
-  value.text = text
+  if text.len > value.data.len:
+    raiseAssert(
+      "tsnet shared key exceeds fixed storage len=" & $text.len &
+      " cap=" & $value.data.len
+    )
+  clearSharedKey(value)
+  value.len = text.len
+  for idx, ch in text:
+    value.data[idx] = ch
 
 proc freeProxyRegistration(registration: var TsnetProxyRegistration) =
   clearSharedKey(registration.advertisedKey)
@@ -100,6 +169,8 @@ proc freeResolvedRemoteRegistration(registration: var TsnetResolvedRemoteRegistr
   clearSharedKey(registration.rawKey)
   clearSharedKey(registration.advertisedKey)
   registration.ownerId = 0
+  registration.rawText = ""
+  registration.advertisedText = ""
 
 proc freeDirectRouteRegistration(registration: var TsnetDirectRouteRegistration) =
   clearSharedKey(registration.advertisedKey)
@@ -113,44 +184,178 @@ proc freeDirectRouteRegistration(registration: var TsnetDirectRouteRegistration)
 
 proc validProxyRegistration(registration: TsnetProxyRegistration): bool =
   registration.ownerId > 0 and
-    validSharedKey(registration.advertisedKey) and
-    validSharedKey(registration.rawKey)
+    validSharedAddressKey(registration.advertisedKey) and
+    validSharedAddressKey(registration.rawKey)
 
 proc validResolvedRemoteRegistration(
     registration: TsnetResolvedRemoteRegistration
 ): bool =
   registration.ownerId > 0 and
-    validSharedKey(registration.rawKey) and
-    validSharedKey(registration.advertisedKey)
+    validSharedAddressKey(registration.rawKey) and
+    validSharedAddressKey(registration.advertisedKey)
 
 proc validDirectRouteRegistration(
     registration: TsnetDirectRouteRegistration
 ): bool =
   registration.ownerId > 0 and
-    validSharedKey(registration.advertisedKey) and
-    validSharedKey(registration.rawKey) and
+    validSharedAddressKey(registration.advertisedKey) and
+    validSharedAddressKey(registration.rawKey) and
     validSharedKey(registration.pathKind)
 
+proc initDirectRouteGroup(): TsnetDirectRouteGroup =
+  initOrderedTable[string, TsnetDirectRouteRegistration]()
+
+proc initProxyRegistrationGroup(): TsnetProxyRegistrationGroup =
+  initOrderedTable[string, TsnetProxyRegistration]()
+
+proc compactProxyRegistrationGroup(
+    source: TsnetProxyRegistrationGroup
+): TsnetProxyRegistrationGroup =
+  result = initProxyRegistrationGroup()
+  for _, registration in source.pairs:
+    if not validProxyRegistration(registration):
+      continue
+    let rawKey = sharedKeyToString(registration.rawKey)
+    if rawKey.len == 0:
+      continue
+    result[rawKey] = registration
+
+proc compactDirectRouteGroup(source: TsnetDirectRouteGroup): TsnetDirectRouteGroup =
+  result = initDirectRouteGroup()
+  for _, registration in source.pairs:
+    if not validDirectRouteRegistration(registration):
+      continue
+    let rawKey = sharedKeyToString(registration.rawKey)
+    if rawKey.len == 0:
+      continue
+    result[rawKey] = registration
+
+proc kindFromAdvertisedKey(advertisedKey: string): TsnetProxyKind =
+  if "/udp/" in advertisedKey.toLowerAscii() and
+      "/quic-v1" in advertisedKey.toLowerAscii():
+    TsnetProxyKind.Quic
+  else:
+    TsnetProxyKind.Tcp
+
+proc compactProxyRegistrations(
+    source: TsnetProxyRegistrationTable
+): TsnetProxyRegistrationTable =
+  result = initOrderedTable[string, TsnetProxyRegistrationGroup]()
+  for _, registrations in source.pairs:
+    for _, registration in registrations.pairs:
+      if not validProxyRegistration(registration):
+        continue
+      let advertisedKey = sharedKeyToString(registration.advertisedKey)
+      let rawKey = sharedKeyToString(registration.rawKey)
+      if advertisedKey.len == 0 or rawKey.len == 0:
+        continue
+      var group = result.getOrDefault(advertisedKey, initProxyRegistrationGroup())
+      group[rawKey] = registration
+      result[advertisedKey] = move(group)
+
+proc compactResolvedRemoteRegistrations(
+    source: Table[string, TsnetResolvedRemoteRegistration]
+): Table[string, TsnetResolvedRemoteRegistration] =
+  result = initTable[string, TsnetResolvedRemoteRegistration]()
+  for _, registration in source.pairs:
+    if not validResolvedRemoteRegistration(registration):
+      continue
+    let rawKey = sharedKeyToString(registration.rawKey)
+    if rawKey.len == 0:
+      continue
+    result[rawKey] = registration
+
+proc refreshProxyRouteSnapshotsUnsafe() =
+  var snapshots: seq[TsnetProxyRouteCacheEntry] = @[]
+  var counts = initTable[int, int]()
+  for _, registrations in proxyRegistrations.pairs:
+    for _, registration in registrations.pairs:
+      if not validProxyRegistration(registration):
+        continue
+      let advertisedKey = sharedKeyToString(registration.advertisedKey)
+      counts[registration.ownerId] = counts.getOrDefault(registration.ownerId, 0) + 1
+      snapshots.add(TsnetProxyRouteCacheEntry(
+        ownerId: registration.ownerId,
+        advertisedKey: registration.advertisedKey,
+        rawKey: registration.rawKey,
+        kind: kindFromAdvertisedKey(advertisedKey)
+      ))
+  proxyRegistrationSnapshots = move(snapshots)
+  proxyRouteCounts = move(counts)
+
+proc upsertProxyRouteSnapshotUnsafe(registration: TsnetProxyRegistration) =
+  if not validProxyRegistration(registration):
+    return
+  let advertisedKey = sharedKeyToString(registration.advertisedKey)
+  let rawKey = sharedKeyToString(registration.rawKey)
+  if advertisedKey.len == 0 or rawKey.len == 0:
+    return
+  let next = TsnetProxyRouteCacheEntry(
+    ownerId: registration.ownerId,
+    advertisedKey: registration.advertisedKey,
+    rawKey: registration.rawKey,
+    kind: kindFromAdvertisedKey(advertisedKey)
+  )
+  for idx in 0 ..< proxyRegistrationSnapshots.len:
+    if sharedKeyEquals(proxyRegistrationSnapshots[idx].advertisedKey, advertisedKey) and
+        sharedKeyEquals(proxyRegistrationSnapshots[idx].rawKey, rawKey):
+      proxyRegistrationSnapshots[idx] = next
+      return
+  proxyRegistrationSnapshots.add(next)
+  proxyRouteCounts[registration.ownerId] = proxyRouteCounts.getOrDefault(registration.ownerId, 0) + 1
+
 proc sanitizeProxyRoutesUnsafe() =
-  var keptRoutes: seq[TsnetProxyRegistration] = @[]
-  for registration in proxyRegistrations.items():
-    if validProxyRegistration(registration):
-      keptRoutes.add(registration)
-  proxyRegistrations = keptRoutes
+  proxyRegistrations = compactProxyRegistrations(proxyRegistrations)
+  refreshProxyRouteSnapshotsUnsafe()
+
+proc refreshResolvedRemoteSnapshotsUnsafe() =
+  var snapshots = newSeqOfCap[TsnetResolvedRemoteCacheEntry](proxyResolvedRemotes.len)
+  for _, registration in proxyResolvedRemotes.pairs:
+    if validResolvedRemoteRegistration(registration):
+      snapshots.add(TsnetResolvedRemoteCacheEntry(
+        ownerId: registration.ownerId,
+        rawKey: registration.rawKey,
+        advertisedKey: registration.advertisedKey
+      ))
+  proxyResolvedRemoteSnapshots = move(snapshots)
+
+proc refreshDirectRouteSnapshotsUnsafe() =
+  var snapshots: seq[TsnetDirectRouteCacheEntry] = @[]
+  for _, routes in proxyDirectRoutes.pairs:
+    for _, registration in routes.pairs:
+      if not validDirectRouteRegistration(registration):
+        continue
+      snapshots.add(TsnetDirectRouteCacheEntry(
+        ownerId: registration.ownerId,
+        advertisedKey: registration.advertisedKey,
+        rawKey: registration.rawKey,
+        pathKind: registration.pathKind,
+        hitCount: registration.hitCount,
+        lastSelectedUnixMilli: registration.lastSelectedUnixMilli,
+        failureCount: registration.failureCount,
+        suspendedUntilUnixMilli: registration.suspendedUntilUnixMilli
+      ))
+  proxyDirectRouteSnapshots = move(snapshots)
 
 proc sanitizeResolvedRemotesUnsafe() =
-  var keptResolved: seq[TsnetResolvedRemoteRegistration] = @[]
-  for registration in proxyResolvedRemotes.items():
-    if validResolvedRemoteRegistration(registration):
-      keptResolved.add(registration)
-  proxyResolvedRemotes = keptResolved
+  proxyResolvedRemotes = compactResolvedRemoteRegistrations(proxyResolvedRemotes)
+  refreshResolvedRemoteSnapshotsUnsafe()
 
 proc sanitizeDirectRoutesUnsafe() =
-  var keptDirect: seq[TsnetDirectRouteRegistration] = @[]
-  for registration in proxyDirectRoutes.items():
-    if validDirectRouteRegistration(registration):
-      keptDirect.add(registration)
-  proxyDirectRoutes = keptDirect
+  var kept = initOrderedTable[string, TsnetDirectRouteGroup]()
+  for _, routes in proxyDirectRoutes.pairs:
+    for _, registration in routes.pairs:
+      if not validDirectRouteRegistration(registration):
+        continue
+      let advertisedKey = sharedKeyToString(registration.advertisedKey)
+      let rawKey = sharedKeyToString(registration.rawKey)
+      if advertisedKey.len == 0 or rawKey.len == 0:
+        continue
+      var group = kept.getOrDefault(advertisedKey, initDirectRouteGroup())
+      group[rawKey] = registration
+      kept[advertisedKey] = move(group)
+  proxyDirectRoutes = move(kept)
+  refreshDirectRouteSnapshotsUnsafe()
 
 proc sanitizeProxyRegistryUnsafe() =
   sanitizeProxyRoutesUnsafe()
@@ -273,21 +478,30 @@ proc registerProxyRoute*(
   if advertisedKey.len == 0 or rawKey.len == 0:
     return err("invalid tsnet proxy registration")
   withLock(proxyRegistryLock):
-    sanitizeProxyRoutesUnsafe()
-    var found = false
-    for registration in proxyRegistrations.mitems():
-      if sharedKeyEquals(registration.advertisedKey, advertisedKey):
-        if not sharedKeyEquals(registration.rawKey, rawKey):
+    var finalRegistration = TsnetProxyRegistration()
+    var registrations = compactProxyRegistrationGroup(
+      proxyRegistrations.getOrDefault(advertisedKey, initProxyRegistrationGroup())
+    )
+    let existing = registrations.getOrDefault(rawKey)
+    if validProxyRegistration(existing):
+      var registration = existing
+      registration.ownerId = ownerId
+      registrations[rawKey] = registration
+      finalRegistration = registration
+    elif registrations.len > 0:
+      for existingRawKey, existingRegistration in registrations.pairs:
+        if validProxyRegistration(existingRegistration) and existingRawKey != rawKey:
           return err("duplicate tsnet proxy registration for " & advertisedKey)
-        registration.ownerId = ownerId
-        found = true
-        break
-    if not found:
-      proxyRegistrations.add(TsnetProxyRegistration(
+    else:
+      let registration = TsnetProxyRegistration(
         ownerId: ownerId,
         advertisedKey: initSharedKey(advertisedKey),
         rawKey: initSharedKey(rawKey)
-      ))
+      )
+      registrations[rawKey] = registration
+      finalRegistration = registration
+    proxyRegistrations[advertisedKey] = move(registrations)
+    upsertProxyRouteSnapshotUnsafe(finalRegistration)
   ok()
 
 proc unregisterProxyRoutes*(ownerId: int) =
@@ -296,48 +510,68 @@ proc unregisterProxyRoutes*(ownerId: int) =
   proxySafe:
     withLock(proxyRegistryLock):
       sanitizeProxyRegistryUnsafe()
-      var keptRoutes: seq[TsnetProxyRegistration] = @[]
-      for registration in proxyRegistrations.items():
-        if registration.ownerId != ownerId:
-          keptRoutes.add(registration)
+      var keptRoutes = initOrderedTable[string, TsnetProxyRegistrationGroup]()
+      for _, registrations in proxyRegistrations.pairs():
+        var keptGroup = initProxyRegistrationGroup()
+        var keptAdvertisedKey = ""
+        for _, registration in registrations.pairs():
+          if registration.ownerId != ownerId:
+            let rawKey = sharedKeyToString(registration.rawKey)
+            keptGroup[rawKey] = registration
+            if keptAdvertisedKey.len == 0:
+              keptAdvertisedKey = sharedKeyToString(registration.advertisedKey)
+        if keptGroup.len > 0 and keptAdvertisedKey.len > 0:
+          keptRoutes[keptAdvertisedKey] = move(keptGroup)
       proxyRegistrations = keptRoutes
+      refreshProxyRouteSnapshotsUnsafe()
 
-      var keptResolved: seq[TsnetResolvedRemoteRegistration] = @[]
-      for registration in proxyResolvedRemotes.items():
+      var keptResolved = initTable[string, TsnetResolvedRemoteRegistration]()
+      for _, registration in proxyResolvedRemotes.pairs():
         if registration.ownerId != ownerId:
-          keptResolved.add(registration)
+          let rawKey = sharedKeyToString(registration.rawKey)
+          if rawKey.len > 0:
+            keptResolved[rawKey] = registration
       proxyResolvedRemotes = keptResolved
+      refreshResolvedRemoteSnapshotsUnsafe()
 
-      var keptDirect: seq[TsnetDirectRouteRegistration] = @[]
-      for registration in proxyDirectRoutes.items():
-        if registration.ownerId != ownerId:
-          keptDirect.add(registration)
+      var keptDirect = initOrderedTable[string, TsnetDirectRouteGroup]()
+      for _, routes in proxyDirectRoutes.pairs():
+        var keptGroup = initDirectRouteGroup()
+        var keptAdvertisedKey = ""
+        for _, registration in routes.pairs():
+          if registration.ownerId != ownerId:
+            let rawKey = sharedKeyToString(registration.rawKey)
+            keptGroup[rawKey] = registration
+            if keptAdvertisedKey.len == 0:
+              keptAdvertisedKey = sharedKeyToString(registration.advertisedKey)
+        if keptGroup.len > 0 and keptAdvertisedKey.len > 0:
+          keptDirect[keptAdvertisedKey] = move(keptGroup)
       proxyDirectRoutes = keptDirect
+      refreshDirectRouteSnapshotsUnsafe()
 
 proc proxyRouteSnapshots*(ownerId: int): seq[TsnetProxyRouteSnapshot] {.gcsafe.} =
   if ownerId <= 0:
     return @[]
   proxySafe:
+    var snapshots: seq[TsnetProxyRouteCacheEntry] = @[]
     withLock(proxyRegistryLock):
-      sanitizeProxyRoutesUnsafe()
-      for registration in proxyRegistrations.items:
-        if registration.ownerId != ownerId:
-          continue
-        let advertisedKey = sharedKeyToString(registration.advertisedKey)
-        let rawKey = sharedKeyToString(registration.rawKey)
-        let advertised = parseKnownAddress(advertisedKey)
-        let raw = parseKnownAddress(rawKey)
-        let kind =
-          if "/udp/" in advertisedKey.toLowerAscii() and
-              "/quic-v1" in advertisedKey.toLowerAscii():
-            TsnetProxyKind.Quic
-          else:
-            TsnetProxyKind.Tcp
-        result.add(TsnetProxyRouteSnapshot(
-          advertised: advertised,
-          raw: raw,
-          kind: kind
-        ))
+      snapshots = newSeqOfCap[TsnetProxyRouteCacheEntry](proxyRegistrationSnapshots.len)
+      for snapshot in proxyRegistrationSnapshots.items:
+        if snapshot.ownerId == ownerId:
+          snapshots.add(snapshot)
+    for snapshot in snapshots:
+      result.add(TsnetProxyRouteSnapshot(
+        advertised: parseKnownAddress(sharedKeyToString(snapshot.advertisedKey)),
+        raw: parseKnownAddress(sharedKeyToString(snapshot.rawKey)),
+        kind: snapshot.kind
+      ))
+
+proc proxyRouteCount*(ownerId: int): int {.gcsafe.} =
+  if ownerId <= 0:
+    return 0
+  proxySafe:
+    withLock(proxyRegistryLock):
+      result = proxyRouteCounts.getOrDefault(ownerId, 0)
 
 proc lookupRawTarget*(
     family, ip: string,
@@ -348,23 +582,26 @@ proc lookupRawTarget*(
     return err(error)
   let advertisedKey = $advertised
   withLock(proxyRegistryLock):
-    sanitizeProxyRoutesUnsafe()
-    for registration in proxyRegistrations.items:
-      if sharedKeyEquals(registration.advertisedKey, advertisedKey):
-        return ok(parseKnownAddress(sharedKeyToString(registration.rawKey)))
+    for snapshot in proxyRegistrationSnapshots.items:
+      if sharedKeyEquals(snapshot.advertisedKey, advertisedKey):
+        return ok(parseKnownAddress(sharedKeyToString(snapshot.rawKey)))
   err("no tsnet proxy route is registered for " & advertisedKey)
 
 proc resolveAdvertisedRemote*(raw: MultiAddress): Result[MultiAddress, string] =
   let rawKey = $raw
+  var advertisedKey = ""
   withLock(proxyRegistryLock):
-    sanitizeResolvedRemotesUnsafe()
-    sanitizeProxyRoutesUnsafe()
-    for registration in proxyResolvedRemotes.items:
+    for registration in proxyResolvedRemoteSnapshots.items:
       if sharedKeyEquals(registration.rawKey, rawKey):
-        return ok(parseKnownAddress(sharedKeyToString(registration.advertisedKey)))
-    for registration in proxyRegistrations.items:
-      if sharedKeyEquals(registration.rawKey, rawKey):
-        return ok(parseKnownAddress(sharedKeyToString(registration.advertisedKey)))
+        advertisedKey = sharedKeyToString(registration.advertisedKey)
+        break
+    if advertisedKey.len == 0:
+      for snapshot in proxyRegistrationSnapshots.items:
+        if sharedKeyEquals(snapshot.rawKey, rawKey):
+          advertisedKey = sharedKeyToString(snapshot.advertisedKey)
+          break
+  if advertisedKey.len > 0:
+    return ok(parseKnownAddress(advertisedKey))
   err("no tsnet proxy remote is registered for " & rawKey)
 
 proc registerResolvedRemote*(
@@ -380,20 +617,24 @@ proc registerResolvedRemote*(
     if rawKey.len == 0 or advertisedKey.len == 0:
       return
     withLock(proxyRegistryLock):
-      sanitizeResolvedRemotesUnsafe()
-      var replaced = false
-      for registration in proxyResolvedRemotes.mitems():
-        if sharedKeyEquals(registration.rawKey, rawKey):
-          registration.ownerId = ownerId
-          replaceSharedKey(registration.advertisedKey, advertisedKey)
-          replaced = true
-          break
-      if not replaced:
-        proxyResolvedRemotes.add(TsnetResolvedRemoteRegistration(
+      let existing = proxyResolvedRemotes.getOrDefault(rawKey)
+      if validResolvedRemoteRegistration(existing):
+        var registration = existing
+        registration.ownerId = ownerId
+        replaceSharedKey(registration.rawKey, rawKey)
+        replaceSharedKey(registration.advertisedKey, advertisedKey)
+        registration.rawText = rawKey
+        registration.advertisedText = advertisedKey
+        proxyResolvedRemotes[rawKey] = registration
+      else:
+        proxyResolvedRemotes[rawKey] = TsnetResolvedRemoteRegistration(
           ownerId: ownerId,
           rawKey: initSharedKey(rawKey),
-          advertisedKey: initSharedKey(advertisedKey)
-        ))
+          advertisedKey: initSharedKey(advertisedKey),
+          rawText: rawKey,
+          advertisedText: advertisedKey
+        )
+      refreshResolvedRemoteSnapshotsUnsafe()
 
 proc registerDirectRoute*(
     ownerId: int,
@@ -414,17 +655,17 @@ proc registerDirectRoute*(
     return err("tsnet direct route candidate is not externally reachable")
   proxySafe:
     withLock(proxyRegistryLock):
-      sanitizeDirectRoutesUnsafe()
-      var found = false
-      for registration in proxyDirectRoutes.mitems():
-        if sharedKeyEquals(registration.advertisedKey, advertisedKey) and
-            sharedKeyEquals(registration.rawKey, rawKey):
-          registration.ownerId = ownerId
-          replaceSharedKey(registration.pathKind, normalizedPath)
-          found = true
-          break
-      if not found:
-        proxyDirectRoutes.add(TsnetDirectRouteRegistration(
+      var routes = compactDirectRouteGroup(
+        proxyDirectRoutes.getOrDefault(advertisedKey, initDirectRouteGroup())
+      )
+      let existing = routes.getOrDefault(rawKey)
+      if validDirectRouteRegistration(existing):
+        var registration = existing
+        registration.ownerId = ownerId
+        replaceSharedKey(registration.pathKind, normalizedPath)
+        routes[rawKey] = registration
+      else:
+        routes[rawKey] = TsnetDirectRouteRegistration(
           ownerId: ownerId,
           advertisedKey: initSharedKey(advertisedKey),
           rawKey: initSharedKey(rawKey),
@@ -433,27 +674,31 @@ proc registerDirectRoute*(
           lastSelectedUnixMilli: 0,
           failureCount: 0,
           suspendedUntilUnixMilli: 0
-        ))
+        )
+      proxyDirectRoutes[advertisedKey] = move(routes)
+      refreshDirectRouteSnapshotsUnsafe()
   ok()
 
 proc directRouteSnapshots*(ownerId: int): seq[TsnetDirectRouteSnapshot] {.gcsafe.} =
   if ownerId <= 0:
     return @[]
   proxySafe:
+    var snapshots: seq[TsnetDirectRouteCacheEntry] = @[]
     withLock(proxyRegistryLock):
-      sanitizeDirectRoutesUnsafe()
-      for registration in proxyDirectRoutes.items:
-        if registration.ownerId != ownerId:
-          continue
-        result.add(TsnetDirectRouteSnapshot(
-          advertised: parseKnownAddress(sharedKeyToString(registration.advertisedKey)),
-          raw: parseKnownAddress(sharedKeyToString(registration.rawKey)),
-          pathKind: sharedKeyToString(registration.pathKind),
-          hitCount: registration.hitCount,
-          lastSelectedUnixMilli: registration.lastSelectedUnixMilli,
-          failureCount: registration.failureCount,
-          suspendedUntilUnixMilli: registration.suspendedUntilUnixMilli
-        ))
+      snapshots = newSeqOfCap[TsnetDirectRouteCacheEntry](proxyDirectRouteSnapshots.len)
+      for snapshot in proxyDirectRouteSnapshots.items:
+        if snapshot.ownerId == ownerId:
+          snapshots.add(snapshot)
+    for snapshot in snapshots:
+      result.add(TsnetDirectRouteSnapshot(
+        advertised: parseKnownAddress(sharedKeyToString(snapshot.advertisedKey)),
+        raw: parseKnownAddress(sharedKeyToString(snapshot.rawKey)),
+        pathKind: sharedKeyToString(snapshot.pathKind),
+        hitCount: snapshot.hitCount,
+        lastSelectedUnixMilli: snapshot.lastSelectedUnixMilli,
+        failureCount: snapshot.failureCount,
+        suspendedUntilUnixMilli: snapshot.suspendedUntilUnixMilli
+      ))
 
 proc directRouteCount*(ownerId: int): int {.gcsafe.} =
   directRouteSnapshots(ownerId).len
@@ -508,26 +753,30 @@ proc lookupDirectTarget*(
     withLock(proxyRegistryLock):
       sanitizeDirectRoutesUnsafe()
       let nowUnixMilli = getTime().toUnix().int64 * 1000
-      var selected = -1
-      for idx, registration in proxyDirectRoutes.mpairs():
+      var routes = proxyDirectRoutes.getOrDefault(advertisedKey, initDirectRouteGroup())
+      var selectedKey = ""
+      var selected = TsnetDirectRouteRegistration()
+      for rawRouteKey, registration in routes.pairs():
         if registration.ownerId != ownerId:
-          continue
-        if not sharedKeyEquals(registration.advertisedKey, advertisedKey):
           continue
         if registration.suspendedUntilUnixMilli > nowUnixMilli:
           continue
-        if selected < 0 or compareDirectRoutePreference(registration, proxyDirectRoutes[selected]):
-          selected = idx
-      if selected >= 0:
-        let selectedPathKind = sharedKeyToString(proxyDirectRoutes[selected].pathKind)
-        inc proxyDirectRoutes[selected].hitCount
-        proxyDirectRoutes[selected].lastSelectedUnixMilli = nowUnixMilli
-        proxyDirectRoutes[selected].failureCount = 0
-        proxyDirectRoutes[selected].suspendedUntilUnixMilli = 0
-        if sharedKeyEquals(proxyDirectRoutes[selected].pathKind, TsnetPathPunchedDirect):
-          replaceSharedKey(proxyDirectRoutes[selected].pathKind, TsnetPathDirect)
+        if selectedKey.len == 0 or compareDirectRoutePreference(registration, selected):
+          selectedKey = rawRouteKey
+          selected = registration
+      if selectedKey.len > 0:
+        let selectedPathKind = sharedKeyToString(selected.pathKind)
+        inc selected.hitCount
+        selected.lastSelectedUnixMilli = nowUnixMilli
+        selected.failureCount = 0
+        selected.suspendedUntilUnixMilli = 0
+        if sharedKeyEquals(selected.pathKind, TsnetPathPunchedDirect):
+          replaceSharedKey(selected.pathKind, TsnetPathDirect)
+        routes[selectedKey] = selected
+        proxyDirectRoutes[advertisedKey] = move(routes)
+        refreshDirectRouteSnapshotsUnsafe()
         return ok(TsnetDirectRouteHit(
-          raw: parseKnownAddress(sharedKeyToString(proxyDirectRoutes[selected].rawKey)),
+          raw: parseKnownAddress(sharedKeyToString(selected.rawKey)),
           pathKind: selectedPathKind
         ))
   err("no tsnet direct route is registered for " & advertisedKey)
@@ -548,14 +797,16 @@ proc markDirectRouteFailure*(
     withLock(proxyRegistryLock):
       sanitizeDirectRoutesUnsafe()
       let nowUnixMilli = getTime().toUnix().int64 * 1000
-      for registration in proxyDirectRoutes.mitems():
-        if registration.ownerId != ownerId:
-          continue
-        if sharedKeyEquals(registration.advertisedKey, advertisedKey) and
-            sharedKeyEquals(registration.rawKey, rawKey):
-          inc registration.failureCount
-          registration.suspendedUntilUnixMilli = nowUnixMilli + max(0'i64, cooldownMs)
-          return ok()
+      var routes = proxyDirectRoutes.getOrDefault(advertisedKey, initDirectRouteGroup())
+      let existing = routes.getOrDefault(rawKey)
+      if validDirectRouteRegistration(existing) and existing.ownerId == ownerId:
+        var registration = existing
+        inc registration.failureCount
+        registration.suspendedUntilUnixMilli = nowUnixMilli + max(0'i64, cooldownMs)
+        routes[rawKey] = registration
+        proxyDirectRoutes[advertisedKey] = move(routes)
+        refreshDirectRouteSnapshotsUnsafe()
+        return ok()
   err("no tsnet direct route matches " & advertisedKey & " -> " & rawKey)
 
 proc injectInvalidProxyRegistrationForTest*(
@@ -564,10 +815,33 @@ proc injectInvalidProxyRegistrationForTest*(
 ) {.gcsafe.} =
   proxySafe:
     withLock(proxyRegistryLock):
-      proxyRegistrations.add(TsnetProxyRegistration(
+      var next = compactProxyRegistrations(proxyRegistrations)
+      var registrations = next.getOrDefault(rawText, initProxyRegistrationGroup())
+      registrations[rawText] = TsnetProxyRegistration(
         ownerId: ownerId,
         rawKey: initSharedKey(rawText)
-      ))
+      )
+      next[rawText] = move(registrations)
+      proxyRegistrations = move(next)
+      refreshProxyRouteSnapshotsUnsafe()
+
+proc injectMalformedProxyRegistrationForTest*(
+    ownerId: int,
+    advertisedText: string,
+    rawText: string
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      var next = compactProxyRegistrations(proxyRegistrations)
+      var registrations = next.getOrDefault(advertisedText, initProxyRegistrationGroup())
+      registrations[rawText] = TsnetProxyRegistration(
+        ownerId: ownerId,
+        advertisedKey: initSharedKey(advertisedText),
+        rawKey: initSharedKey(rawText)
+      )
+      next[advertisedText] = move(registrations)
+      proxyRegistrations = move(next)
+      refreshProxyRouteSnapshotsUnsafe()
 
 proc injectInvalidResolvedRemoteRegistrationForTest*(
     ownerId: int,
@@ -575,10 +849,94 @@ proc injectInvalidResolvedRemoteRegistrationForTest*(
 ) {.gcsafe.} =
   proxySafe:
     withLock(proxyRegistryLock):
-      proxyResolvedRemotes.add(TsnetResolvedRemoteRegistration(
+      proxyResolvedRemotes[rawText] = TsnetResolvedRemoteRegistration(
         ownerId: ownerId,
+        rawKey: initSharedKey(rawText),
+        rawText: rawText
+      )
+      refreshResolvedRemoteSnapshotsUnsafe()
+
+proc injectMalformedResolvedRemoteRegistrationForTest*(
+    ownerId: int,
+    rawText: string,
+    advertisedText: string
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      proxyResolvedRemotes[rawText] = TsnetResolvedRemoteRegistration(
+        ownerId: ownerId,
+        rawKey: initSharedKey(rawText),
+        advertisedKey: initSharedKey(advertisedText),
+        rawText: rawText,
+        advertisedText: advertisedText
+      )
+      refreshResolvedRemoteSnapshotsUnsafe()
+
+proc injectCorruptProxyRegistrationLenForTest*(
+    ownerId: int,
+    advertisedText: string,
+    rawText: string,
+    advertisedLen: int = -1,
+    rawLen: int = -1
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      var registration = TsnetProxyRegistration(
+        ownerId: ownerId,
+        advertisedKey: initSharedKey(advertisedText),
         rawKey: initSharedKey(rawText)
-      ))
+      )
+      if advertisedLen >= 0:
+        registration.advertisedKey.len = advertisedLen
+      if rawLen >= 0:
+        registration.rawKey.len = rawLen
+      var next = compactProxyRegistrations(proxyRegistrations)
+      var registrations = next.getOrDefault(advertisedText, initProxyRegistrationGroup())
+      registrations[rawText] = registration
+      next[advertisedText] = move(registrations)
+      proxyRegistrations = move(next)
+      refreshProxyRouteSnapshotsUnsafe()
+
+proc injectCorruptResolvedRemoteRegistrationLenForTest*(
+    ownerId: int,
+    rawText: string,
+    advertisedText: string,
+    rawLen: int = -1,
+    advertisedLen: int = -1
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      var registration = TsnetResolvedRemoteRegistration(
+        ownerId: ownerId,
+        rawKey: initSharedKey(rawText),
+        advertisedKey: initSharedKey(advertisedText),
+        rawText: rawText,
+        advertisedText: advertisedText
+      )
+      if rawLen >= 0:
+        registration.rawKey.len = rawLen
+      if advertisedLen >= 0:
+        registration.advertisedKey.len = advertisedLen
+      proxyResolvedRemotes[rawText] = registration
+      refreshResolvedRemoteSnapshotsUnsafe()
+
+proc injectResolvedRemoteWithDetachedTextsForTest*(
+    ownerId: int,
+    rawKeyText: string,
+    advertisedKeyText: string,
+    rawText = "",
+    advertisedText = ""
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      proxyResolvedRemotes[rawKeyText] = TsnetResolvedRemoteRegistration(
+        ownerId: ownerId,
+        rawKey: initSharedKey(rawKeyText),
+        advertisedKey: initSharedKey(advertisedKeyText),
+        rawText: rawText,
+        advertisedText: advertisedText
+      )
+      refreshResolvedRemoteSnapshotsUnsafe()
 
 proc injectInvalidDirectRouteRegistrationForTest*(
     ownerId: int,
@@ -587,8 +945,57 @@ proc injectInvalidDirectRouteRegistrationForTest*(
 ) {.gcsafe.} =
   proxySafe:
     withLock(proxyRegistryLock):
-      proxyDirectRoutes.add(TsnetDirectRouteRegistration(
+      var routes = proxyDirectRoutes.getOrDefault(rawText, initDirectRouteGroup())
+      routes[rawText] = TsnetDirectRouteRegistration(
         ownerId: ownerId,
         rawKey: initSharedKey(rawText),
         pathKind: initSharedKey(pathKind)
-      ))
+      )
+      proxyDirectRoutes[rawText] = move(routes)
+      refreshDirectRouteSnapshotsUnsafe()
+
+proc injectCorruptDirectRouteRegistrationLenForTest*(
+    ownerId: int,
+    advertisedText: string,
+    rawText: string,
+    pathKind = TsnetPathDirect,
+    advertisedLen: int = -1,
+    rawLen: int = -1,
+    pathLen: int = -1
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      var registration = TsnetDirectRouteRegistration(
+        ownerId: ownerId,
+        advertisedKey: initSharedKey(advertisedText),
+        rawKey: initSharedKey(rawText),
+        pathKind: initSharedKey(pathKind)
+      )
+      if advertisedLen >= 0:
+        registration.advertisedKey.len = advertisedLen
+      if rawLen >= 0:
+        registration.rawKey.len = rawLen
+      if pathLen >= 0:
+        registration.pathKind.len = pathLen
+      var routes = proxyDirectRoutes.getOrDefault(advertisedText, initDirectRouteGroup())
+      routes[rawText] = registration
+      proxyDirectRoutes[advertisedText] = move(routes)
+      refreshDirectRouteSnapshotsUnsafe()
+
+proc injectMalformedDirectRouteRegistrationForTest*(
+    ownerId: int,
+    advertisedText: string,
+    rawText: string,
+    pathKind = TsnetPathDirect
+) {.gcsafe.} =
+  proxySafe:
+    withLock(proxyRegistryLock):
+      var routes = proxyDirectRoutes.getOrDefault(advertisedText, initDirectRouteGroup())
+      routes[rawText] = TsnetDirectRouteRegistration(
+        ownerId: ownerId,
+        advertisedKey: initSharedKey(advertisedText),
+        rawKey: initSharedKey(rawText),
+        pathKind: initSharedKey(pathKind)
+      )
+      proxyDirectRoutes[advertisedText] = move(routes)
+      refreshDirectRouteSnapshotsUnsafe()

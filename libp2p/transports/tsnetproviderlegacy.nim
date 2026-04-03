@@ -98,12 +98,50 @@ proc dialTcpProxy*(
 ): Result[MultiAddress, string] =
   tsbridge.dialTcpProxy(bridge, family, ip, port)
 
+proc dialTcpProxyExact*(
+    bridge: TsnetLegacyBridgeHandle,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] =
+  tsbridge.dialTcpProxy(bridge, family, ip, port)
+
 proc dialUdpProxy*(
     bridge: TsnetLegacyBridgeHandle,
     family, ip: string,
     port: int
 ): Result[MultiAddress, string] =
   tsbridge.dialUdpProxy(bridge, family, ip, port)
+
+proc dialUdpProxyExact*(
+    bridge: TsnetLegacyBridgeHandle,
+    family, ip: string,
+    port: int
+): Result[MultiAddress, string] =
+  tsbridge.dialUdpProxy(bridge, family, ip, port)
+
+proc dialUdpProxyExactTarget*(
+    bridge: TsnetLegacyBridgeHandle,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] =
+  let rawAddress = tsbridge.dialUdpProxy(bridge, family, ip, port).valueOr:
+    return err(error)
+  ok(TsnetProxyDialTarget(
+    rawAddress: rawAddress,
+    mode: TsnetProxyDialMode.Local,
+  ))
+
+proc dialUdpProxyRelayFallbackTarget*(
+    bridge: TsnetLegacyBridgeHandle,
+    family, ip: string,
+    port: int
+): Result[TsnetProxyDialTarget, string] =
+  let rawAddress = tsbridge.dialUdpProxy(bridge, family, ip, port).valueOr:
+    return err(error)
+  ok(TsnetProxyDialTarget(
+    rawAddress: rawAddress,
+    mode: TsnetProxyDialMode.Local,
+  ))
 
 proc resolveRemote*(
     bridge: TsnetLegacyBridgeHandle,

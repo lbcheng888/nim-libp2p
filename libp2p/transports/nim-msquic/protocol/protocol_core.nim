@@ -58,6 +58,15 @@ proc writeVarInt*(buf: var seq[byte], val: uint64) =
     let p = cast[ptr array[8, byte]](addr outVal)
     buf.add(p[])
 
+proc copyConnectionId(data: openArray[byte], start, length: int): ConnectionId =
+  if length <= 0:
+    return @[]
+  if start < 0 or start > data.len or length > data.len - start:
+    return @[]
+  result = newSeq[byte](length)
+  for i in 0 ..< length:
+    result[i] = data[start + i]
+
 # --- Encoding ---
 
 proc encodeInitialPacket*(destCid, srcCid: ConnectionId, token: seq[byte], 
@@ -381,7 +390,7 @@ proc decodePacket*(data: seq[byte]): QuicPacket =
     let dcidLen = int(data[pos])
     pos += 1
     if pos + dcidLen > data.len: return
-    result.longHeader.destConnectionId = data[pos ..< pos + dcidLen]
+    result.longHeader.destConnectionId = copyConnectionId(data, pos, dcidLen)
     pos += dcidLen
     
     # SCID Len
@@ -389,7 +398,7 @@ proc decodePacket*(data: seq[byte]): QuicPacket =
     let scidLen = int(data[pos])
     pos += 1
     if pos + scidLen > data.len: return
-    result.longHeader.srcConnectionId = data[pos ..< pos + scidLen]
+    result.longHeader.srcConnectionId = copyConnectionId(data, pos, scidLen)
     pos += scidLen
     
     # Token (only for Initial)
@@ -448,7 +457,7 @@ proc parseUnprotectedHeader*(data: openArray[byte]): UnprotectedHeader =
     let dcidLen = int(data[pos])
     pos += 1
     if pos + dcidLen > data.len: return
-    result.destConnectionId = data[pos ..< pos + dcidLen]
+    result.destConnectionId = copyConnectionId(data, pos, dcidLen)
     pos += dcidLen
     
     # SCID Len
@@ -456,7 +465,7 @@ proc parseUnprotectedHeader*(data: openArray[byte]): UnprotectedHeader =
     let scidLen = int(data[pos])
     pos += 1
     if pos + scidLen > data.len: return
-    result.srcConnectionId = data[pos ..< pos + scidLen]
+    result.srcConnectionId = copyConnectionId(data, pos, scidLen)
     pos += scidLen
 
     # Token Length (Initial Only)

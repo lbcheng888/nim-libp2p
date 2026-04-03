@@ -264,6 +264,54 @@ suite "Connection Manager":
     await newMux.close()
     await connMngr.close()
 
+  asyncTest "do not replace unresolved incoming muxers before identify":
+    let connMngr = ConnManager.new(maxConnsPerPeer = 1)
+    let unresolvedPeer = default(PeerId)
+    let oldMux = getMuxer(unresolvedPeer, Direction.In)
+    let newMux = getMuxer(unresolvedPeer, Direction.In)
+
+    connMngr.storeMuxer(oldMux)
+    connMngr.storeMuxer(newMux)
+    await sleepAsync(50.millis)
+
+    check connMngr.connCount(unresolvedPeer) == 2
+    check oldMux in connMngr
+    check newMux in connMngr
+    check not oldMux.connection.closed
+    check not newMux.connection.closed
+
+    await oldMux.close()
+    await newMux.close()
+    await connMngr.close()
+
+  asyncTest "reindex unresolved incoming muxer enforces peer slot limit":
+    let connMngr = ConnManager.new(maxConnsPerPeer = 1)
+    let unresolvedPeer = default(PeerId)
+    let resolvedPeer = PeerId.init(PrivateKey.random(ECDSA, (newRng())[]).tryGet()).tryGet()
+    let oldMux = getMuxer(unresolvedPeer, Direction.In)
+    let newMux = getMuxer(unresolvedPeer, Direction.In)
+
+    connMngr.storeMuxer(oldMux)
+    connMngr.storeMuxer(newMux)
+
+    oldMux.connection.peerId = resolvedPeer
+    connMngr.reindexMuxerPeerId(oldMux, unresolvedPeer, resolvedPeer)
+    check connMngr.connCount(resolvedPeer) == 1
+
+    newMux.connection.peerId = resolvedPeer
+    connMngr.reindexMuxerPeerId(newMux, unresolvedPeer, resolvedPeer)
+
+    check connMngr.connCount(unresolvedPeer) == 0
+    check connMngr.connCount(resolvedPeer) == 1
+    check connMngr.selectMuxer(resolvedPeer, Direction.In) == newMux
+    check oldMux notin connMngr
+
+    checkUntilTimeout:
+      oldMux.connection.closed
+
+    await newMux.close()
+    await connMngr.close()
+
   asyncTest "reindex muxer when peer id becomes known after identify":
     let connMngr = ConnManager.new()
     let unresolvedPeer = default(PeerId)

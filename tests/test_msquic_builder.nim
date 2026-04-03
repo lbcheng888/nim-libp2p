@@ -1,6 +1,8 @@
 import std/[options, unittest]
 
 import "../libp2p/builders"
+import "../libp2p/upgrademngrs/muxedupgrade"
+import "../libp2p/transports/msquictransport"
 
 when defined(libp2p_msquic_experimental):
   suite "MsQuic switch builder":
@@ -15,6 +17,11 @@ when defined(libp2p_msquic_experimental):
       let switchBuilder = newStandardSwitchBuilder(transport = TransportType.QUIC)
       let sw = switchBuilder.build()
       check sw != nil
+      check sw.transports.len == 1
+      check sw.transports[0] of MsQuicTransport
+      check sw.transports[0].upgrader.secureManagers.len == 0
+      let upgrader = MuxedUpgrade(sw.transports[0].upgrader)
+      check upgrader.muxers.len == 0
 
     test "legacy withQuicTransport delegates to MsQuic":
       var builder = SwitchBuilder.new()

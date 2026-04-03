@@ -386,7 +386,7 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
 
   # we use getOrDefault in the if below instead of [] to avoid the KeyError
   try:
-    if liveMuxers.len >= maxConnsPerPeer:
+    if peerId.len > 0 and liveMuxers.len >= maxConnsPerPeer:
       let key = (peerId, dir)
       let expectedConn = c.expectedConnectionsOverLimit.getOrDefault(key)
       if expectedConn != nil and not expectedConn.finished:
@@ -452,6 +452,16 @@ proc reindexMuxerPeerId*(
 
   if not removed:
     return
+
+  if currentPeerId.len > 0:
+    var currentLiveMuxers = c.compactPeerMuxers(currentPeerId)
+    if muxer notin currentLiveMuxers and
+        currentLiveMuxers.len >= c.effectiveMaxConnsPerPeer():
+      c.evictSameDirectionMuxers(
+        currentPeerId,
+        currentLiveMuxers,
+        muxer.connection.dir
+      )
 
   c.muxed.withValue(currentPeerId, muxers):
     let activeMuxers = muxers[].filterIt(isActiveMuxer(it))

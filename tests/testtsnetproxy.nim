@@ -120,6 +120,106 @@ suite "Tsnet proxy runtime":
 
     unregisterProxyRoutes(7006)
 
+  test "proxy route snapshots stay stable across repeated sanitize cycles":
+    unregisterProxyRoutes(7007)
+    unregisterProxyRoutes(7008)
+    let advertised = MultiAddress.init("/ip4/100.64.0.17/udp/4007/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/41017/quic-v1").tryGet()
+    check registerProxyRoute(7007, advertised, raw).isOk()
+    injectInvalidProxyRegistrationForTest(7008, "/ip4/127.0.0.1/udp/49991/quic-v1")
+
+    for _ in 0 .. 255:
+      let snapshots = proxyRouteSnapshots(7007)
+      check snapshots.len == 1
+      check snapshots[0].advertised == advertised
+      check snapshots[0].raw == raw
+      let looked = lookupRawTarget("ip4", "100.64.0.17", 4007, TsnetProxyKind.Quic)
+      check looked.isOk()
+      check looked.get() == raw
+
+    unregisterProxyRoutes(7007)
+    unregisterProxyRoutes(7008)
+
+  test "proxy route snapshots ignore malformed multiaddr rows":
+    unregisterProxyRoutes(7011)
+    unregisterProxyRoutes(7012)
+    let advertised = MultiAddress.init("/ip4/100.64.0.19/udp/4009/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/41019/quic-v1").tryGet()
+    check registerProxyRoute(7011, advertised, raw).isOk()
+    injectMalformedProxyRegistrationForTest(
+      7012,
+      "/ip4/100.64.0.19/udp/4009/quic-v1/tsnet",
+      "invalid-raw-multiaddr"
+    )
+
+    let snapshots = proxyRouteSnapshots(7011)
+    check snapshots.len == 1
+    check snapshots[0].advertised == advertised
+    check snapshots[0].raw == raw
+    let looked = lookupRawTarget("ip4", "100.64.0.19", 4009, TsnetProxyKind.Quic)
+    check looked.isOk()
+    check looked.get() == raw
+
+    unregisterProxyRoutes(7011)
+    unregisterProxyRoutes(7012)
+
+  test "proxy route snapshots ignore corrupted shared key lengths":
+    unregisterProxyRoutes(7015)
+    unregisterProxyRoutes(7016)
+    let advertised = MultiAddress.init("/ip4/100.64.0.21/udp/4011/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/41021/quic-v1").tryGet()
+    check registerProxyRoute(7015, advertised, raw).isOk()
+    injectCorruptProxyRegistrationLenForTest(
+      7016,
+      "/ip4/100.64.0.21/udp/4011/quic-v1/tsnet",
+      "/ip4/127.0.0.1/udp/49989/quic-v1",
+      advertisedLen = 1537
+    )
+
+    for _ in 0 .. 255:
+      let snapshots = proxyRouteSnapshots(7015)
+      check snapshots.len == 1
+      check snapshots[0].advertised == advertised
+      check snapshots[0].raw == raw
+
+    unregisterProxyRoutes(7015)
+    unregisterProxyRoutes(7016)
+
+  test "resolve advertised remote survives invalid proxy rows across repeated sanitize cycles":
+    unregisterProxyRoutes(7009)
+    unregisterProxyRoutes(7010)
+    let advertised = MultiAddress.init("/ip4/100.64.0.18/udp/4008/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/41018/quic-v1").tryGet()
+    check registerProxyRoute(7009, advertised, raw).isOk()
+    injectInvalidProxyRegistrationForTest(7010, "/ip4/127.0.0.1/udp/49990/quic-v1")
+
+    for _ in 0 .. 255:
+      let looked = resolveAdvertisedRemote(raw)
+      check looked.isOk()
+      check looked.get() == advertised
+
+    unregisterProxyRoutes(7009)
+    unregisterProxyRoutes(7010)
+
+  test "resolve advertised remote ignores corrupted shared key lengths":
+    unregisterProxyRoutes(7017)
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/49988/quic-v1").tryGet()
+    let advertised = MultiAddress.init("/ip4/100.64.0.22/udp/4012/quic-v1/tsnet").tryGet()
+    registerResolvedRemote(7017, raw, advertised)
+    injectCorruptResolvedRemoteRegistrationLenForTest(
+      7017,
+      "/ip4/127.0.0.1/udp/49987/quic-v1",
+      "/ip4/100.64.0.23/udp/4013/quic-v1/tsnet",
+      rawLen = 1537
+    )
+
+    for _ in 0 .. 255:
+      let looked = resolveAdvertisedRemote(raw)
+      check looked.isOk()
+      check looked.get() == advertised
+
+    unregisterProxyRoutes(7017)
+
   test "direct route snapshots ignore invalid resolved remote rows":
     unregisterProxyRoutes(7003)
     let advertised = MultiAddress.init("/ip4/100.64.0.12/udp/4002/quic-v1/tsnet").tryGet()
@@ -134,6 +234,52 @@ suite "Tsnet proxy runtime":
     check normalizeTailnetPath(snapshots[0].pathKind) == TsnetPathDirect
 
     unregisterProxyRoutes(7003)
+
+  test "direct route snapshots ignore malformed multiaddr rows":
+    unregisterProxyRoutes(7013)
+    unregisterProxyRoutes(7014)
+    let advertised = MultiAddress.init("/ip4/100.64.0.20/udp/4010/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/203.0.113.20/udp/41020/quic-v1").tryGet()
+    check registerDirectRoute(7013, advertised, raw, TsnetPathDirect).isOk()
+    injectMalformedDirectRouteRegistrationForTest(
+      7014,
+      "/ip4/100.64.0.20/udp/4010/quic-v1/tsnet",
+      "invalid-direct-raw",
+      TsnetPathDirect
+    )
+
+    let snapshots = directRouteSnapshots(7013)
+    check snapshots.len == 1
+    check snapshots[0].advertised == advertised
+    check snapshots[0].raw == raw
+    check normalizeTailnetPath(snapshots[0].pathKind) == TsnetPathDirect
+
+    unregisterProxyRoutes(7013)
+    unregisterProxyRoutes(7014)
+
+  test "direct route snapshots ignore corrupted shared key lengths":
+    unregisterProxyRoutes(7018)
+    unregisterProxyRoutes(7019)
+    let advertised = MultiAddress.init("/ip4/100.64.0.24/udp/4014/quic-v1/tsnet").tryGet()
+    let raw = MultiAddress.init("/ip4/203.0.113.24/udp/41024/quic-v1").tryGet()
+    check registerDirectRoute(7018, advertised, raw, TsnetPathDirect).isOk()
+    injectCorruptDirectRouteRegistrationLenForTest(
+      7019,
+      "/ip4/100.64.0.24/udp/4014/quic-v1/tsnet",
+      "/ip4/203.0.113.25/udp/41025/quic-v1",
+      TsnetPathDirect,
+      rawLen = 1537
+    )
+
+    for _ in 0 .. 255:
+      let snapshots = directRouteSnapshots(7018)
+      check snapshots.len == 1
+      check snapshots[0].advertised == advertised
+      check snapshots[0].raw == raw
+      check normalizeTailnetPath(snapshots[0].pathKind) == TsnetPathDirect
+
+    unregisterProxyRoutes(7018)
+    unregisterProxyRoutes(7019)
 
   test "resolved remote cleanup survives unregister without crashing":
     unregisterProxyRoutes(7004)
@@ -168,6 +314,42 @@ suite "Tsnet proxy runtime":
     check lookedB.get() == advertisedB
 
     unregisterProxyRoutes(7005)
+
+  test "resolved remote register replaces previous advertised for the same raw":
+    unregisterProxyRoutes(7020)
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/49992/quic-v1").tryGet()
+    let advertisedA = MultiAddress.init("/ip4/100.64.0.25/udp/4015/quic-v1/tsnet").tryGet()
+    let advertisedB = MultiAddress.init("/ip4/100.64.0.26/udp/4016/quic-v1/tsnet").tryGet()
+
+    registerResolvedRemote(7020, raw, advertisedA)
+    check resolveAdvertisedRemote(raw).get() == advertisedA
+
+    registerResolvedRemote(7020, raw, advertisedB)
+    let looked = resolveAdvertisedRemote(raw)
+    check looked.isOk()
+    check looked.get() == advertisedB
+
+    unregisterProxyRoutes(7020)
+
+  test "resolved remote lookup ignores detached gc text fields":
+    unregisterProxyRoutes(7021)
+    let raw = MultiAddress.init("/ip4/127.0.0.1/udp/49991/quic-v1").tryGet()
+    let advertised = MultiAddress.init("/ip4/100.64.0.27/udp/4017/quic-v1/tsnet").tryGet()
+
+    injectResolvedRemoteWithDetachedTextsForTest(
+      7021,
+      $raw,
+      $advertised,
+      rawText = "",
+      advertisedText = ""
+    )
+
+    for _ in 0 .. 255:
+      let looked = resolveAdvertisedRemote(raw)
+      check looked.isOk()
+      check looked.get() == advertised
+
+    unregisterProxyRoutes(7021)
 
   test "status payload ignores invalid direct route rows":
     let runtimeDir = tempRuntimeDir("invalid-direct-route-status")
@@ -393,6 +575,89 @@ suite "Tsnet proxy runtime":
     runtime.stop()
     let afterStop = runtime.dialTcpProxy("ip4", "100.64.0.10", 4001)
     check afterStop.isErr()
+
+  test "exact udp dial honors advertised relay route instead of cached direct route":
+    let dir = tempRuntimeDir("exact-udp-dial")
+    let cfg = TsnetProviderConfig(
+      controlUrl: "http://headscale.local",
+      authKey: "tskey-client",
+      hostname: "client-node",
+      stateDir: dir,
+      wireguardPort: 41642,
+      bridgeLibraryPath: "",
+      logLevel: "",
+      enableDebug: false,
+      bridgeExtraJson: ""
+    )
+    let runtime = TsnetInAppRuntime.new(
+      cfg,
+      mockMappedTransport(
+        "client-node",
+        2,
+        "100.64.0.11",
+        "fd7a:115c:a1e0::11",
+        "server-node",
+        1,
+        "100.64.0.10"
+      )
+    )
+
+    check runtime.start().isOk()
+    check runtime.ready()
+
+    let advertised = MultiAddress.init("/ip4/100.64.0.10/udp/4001/quic-v1/tsnet").tryGet()
+    let directRaw = MultiAddress.init("/ip4/198.51.100.10/udp/42012/quic-v1").tryGet()
+
+    check runtime.registerDirectProxyRoute(advertised, directRaw, punched = true).isOk()
+
+    let routeSelectingDial = runtime.dialUdpProxy("ip4", "100.64.0.10", 4001)
+    check routeSelectingDial.isOk()
+    check routeSelectingDial.get() == directRaw
+
+    let exactDial = runtime.dialUdpProxyExact("ip4", "100.64.0.10", 4001)
+    check exactDial.isErr()
+
+    runtime.stop()
+
+  test "exact udp dial target carries explicit readiness mode":
+    let dir = tempRuntimeDir("exact-udp-dial-target")
+    let cfg = TsnetProviderConfig(
+      controlUrl: "http://headscale.local",
+      authKey: "tskey-client",
+      hostname: "client-node",
+      stateDir: dir,
+      wireguardPort: 41642,
+      bridgeLibraryPath: "",
+      logLevel: "",
+      enableDebug: false,
+      bridgeExtraJson: ""
+    )
+    let runtime = TsnetInAppRuntime.new(
+      cfg,
+      mockMappedTransport(
+        "client-node",
+        2,
+        "100.64.0.11",
+        "fd7a:115c:a1e0::11",
+        "server-node",
+        1,
+        "100.64.0.10"
+      )
+    )
+
+    check runtime.start().isOk()
+    check runtime.ready()
+
+    let advertised = MultiAddress.init("/ip4/100.64.0.10/udp/4001/quic-v1/tsnet").tryGet()
+    let localRaw = MultiAddress.init("/ip4/127.0.0.1/udp/42013/quic-v1").tryGet()
+    check registerProxyRoute(runtime.runtimeId, advertised, localRaw).isOk()
+
+    let exactTarget = runtime.dialUdpProxyExactTarget("ip4", "100.64.0.10", 4001)
+    check exactTarget.isOk()
+    check exactTarget.get().rawAddress == localRaw
+    check exactTarget.get().mode == TsnetProxyDialMode.Local
+
+    runtime.stop()
 
   test "failed direct route is temporarily suspended and backup route is selected":
     let dir = tempRuntimeDir("direct-fallback")

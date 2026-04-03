@@ -477,36 +477,10 @@ proc internalConnect(
             peerId = muxed.connection.peerId,
             protocol = muxed.connection.protocol,
             negotiated = muxed.connection.negotiatedMuxer
-          proc finishOhosNativeQuicIdentify() {.async: (raises: []).} =
-            try:
-              let previousPeerId = muxed.connection.peerId
-              warn "internalConnect native QUIC ohos async identify begin",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer
-              await self.peerStore.identify(muxed)
-              self.connManager.reindexMuxerPeerId(
-                muxed,
-                previousPeerId,
-                muxed.connection.peerId,
-              )
-              warn "internalConnect native QUIC ohos async identify done",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer
-              await self.connManager.triggerPeerEvents(
-                muxed.connection.peerId,
-                PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-              )
-            except CancelledError:
-              discard
-            except CatchableError as exc:
-              warn "internalConnect native QUIC ohos async identify failed",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer,
-                description = exc.msg
-          asyncSpawn finishOhosNativeQuicIdentify()
+          warn "internalConnect native QUIC ohos identify skipped",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
         else:
           debug "internalConnect storeMuxer begin",
             peerId = muxed.connection.peerId,
@@ -517,36 +491,10 @@ proc internalConnect(
             peerId = muxed.connection.peerId,
             protocol = muxed.connection.protocol,
             negotiated = muxed.connection.negotiatedMuxer
-          proc finishNativeQuicIdentify() {.async: (raises: []).} =
-            try:
-              let previousPeerId = muxed.connection.peerId
-              warn "internalConnect native QUIC identify begin",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer
-              await self.peerStore.identify(muxed)
-              self.connManager.reindexMuxerPeerId(
-                muxed,
-                previousPeerId,
-                muxed.connection.peerId,
-              )
-              warn "internalConnect native QUIC identify done",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer
-              await self.connManager.triggerPeerEvents(
-                muxed.connection.peerId,
-                PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-              )
-            except CancelledError:
-              discard
-            except CatchableError as exc:
-              warn "internalConnect native QUIC identify failed",
-                peerId = muxed.connection.peerId,
-                protocol = muxed.connection.protocol,
-                negotiated = muxed.connection.negotiatedMuxer,
-                description = exc.msg
-          asyncSpawn finishNativeQuicIdentify()
+          warn "internalConnect native QUIC identify skipped",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
       else:
         debug "internalConnect storeMuxer begin",
           peerId = muxed.connection.peerId,
@@ -675,6 +623,34 @@ method connect*(
 
   return
     (await self.internalConnect(Opt.none(PeerId), @[address], false)).connection.peerId
+
+method connectMuxer*(
+    self: Dialer,
+    address: MultiAddress,
+    allowUnknownPeerId = false,
+    reuseConnection = true,
+): Future[Muxer] {.async: (raises: [DialFailedError, CancelledError]).} =
+  ## Connects to a peer by address and returns the live muxer for this dial.
+
+  parseFullAddress(address).toOpt().withValue(fullAddress):
+    return await self.internalConnect(
+      Opt.some(fullAddress[0]),
+      @[fullAddress[1]],
+      false,
+      reuseConnection = reuseConnection,
+    )
+
+  if allowUnknownPeerId == false:
+    raise newException(
+      DialFailedError, "Address without PeerID and unknown peer id disabled in connectMuxer"
+    )
+
+  return await self.internalConnect(
+    Opt.none(PeerId),
+    @[address],
+    false,
+    reuseConnection = reuseConnection,
+  )
 
 method negotiateStream*(
     self: Dialer, conn: Connection, protos: seq[string]

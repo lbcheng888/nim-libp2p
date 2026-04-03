@@ -2,7 +2,17 @@
 
 import std/[json, strutils]
 
+import ../multiaddress
+
 type
+  TsnetProxyDialMode* {.pure.} = enum
+    Local
+    RelayBridge
+
+  TsnetProxyDialTarget* = object
+    rawAddress*: MultiAddress
+    mode*: TsnetProxyDialMode
+
   TsnetProviderKind* {.pure.} = enum
     BuiltinSynthetic
     InAppUnavailable
