@@ -26,7 +26,8 @@ import
   nameresolving/nameresolver,
   upgrademngrs/upgrade,
   errors,
-  connectiongater
+  connectiongater,
+  transports/tsnettransport
 when defined(libp2p_msquic_experimental):
   import transports/msquicconnection
 
@@ -45,11 +46,40 @@ proc dialDiagNowMs(): int64 =
 type Dialer* = ref object of Dial
   localPeerId*: PeerId
   connManager: ConnManager
-  dialLock: Table[PeerId, AsyncLock]
+  dialLock: Table[string, AsyncLock]
   transports: seq[Transport]
   peerStore: PeerStore
   nameResolver: NameResolver
   gater: ConnectionGater
+
+proc hasTsnetAddr(addrs: openArray[MultiAddress]): bool =
+  for addr in addrs:
+    if "/tsnet" in ($addr).toLowerAscii():
+      return true
+  false
+
+proc dialLockDomain(addrs: openArray[MultiAddress], options: DialOptions): string =
+  if hasTsnetAddr(addrs):
+    if options.routing == dppRelayOnly:
+      return "tsnet_relay"
+    return "tsnet_exact"
+  "default"
+
+proc dialLockIdentity(peerId: Opt[PeerId], addrs: openArray[MultiAddress]): string =
+  if peerId.isSome:
+    return $peerId.get()
+  var texts: seq[string] = @[]
+  for addr in addrs:
+    texts.add($addr)
+  texts.sort(system.cmp[string])
+  texts.join("|")
+
+proc buildDialLockKey(
+    peerId: Opt[PeerId],
+    addrs: openArray[MultiAddress],
+    options: DialOptions
+): string =
+  dialLockIdentity(peerId, addrs) & "|" & dialLockDomain(addrs, options)
 
 proc addrStablePriority(ma: MultiAddress): int =
   let lower = ($ma).toLowerAscii()
@@ -150,6 +180,7 @@ method dialAndUpgrade*(
     hostname: string,
     addrs: MultiAddress,
     dir = Direction.Out,
+    options = DialOptions(),
 ): Future[Muxer] {.async: (raises: [CancelledError, DialFailedError]).} =
   var lastErr: ref CatchableError = nil
   var lastMsg = ""
@@ -170,7 +201,15 @@ method dialAndUpgrade*(
       let dialed =
         try:
           libp2p_total_dial_attempts.inc()
-          await transport.dial(hostname, addrs, peerId)
+          if options.routing == dppRelayOnly and transport of TsnetTransport:
+            await TsnetTransport(transport).dialWithPreference(
+              hostname,
+              addrs,
+              peerId,
+              relayOnly = true,
+            )
+          else:
+            await transport.dial(hostname, addrs, peerId)
         except CancelledError as exc:
           when defined(lsmr_diag):
             echo "dialer dial-cancel peer=", $peerId.get(default(PeerId)),
@@ -325,7 +364,11 @@ proc expandDnsAddr(
     result.add((baseAddrRes.get(), Opt.some(addrPeerIdRes.get())))
 
 method dialAndUpgrade*(
-    self: Dialer, peerId: Opt[PeerId], addrs: seq[MultiAddress], dir = Direction.Out
+    self: Dialer,
+    peerId: Opt[PeerId],
+    addrs: seq[MultiAddress],
+    dir = Direction.Out,
+    options = DialOptions(),
 ): Future[Muxer] {.
     async: (raises: [CancelledError, DialFailedError, MaError, TransportAddressError, LPError])
 .} =
@@ -344,6 +387,7 @@ method dialAndUpgrade*(
       attempt.hostname,
       attempt.address,
       dir,
+      options,
     )
 
   var settled = newSeq[bool](futs.len)
@@ -405,12 +449,13 @@ proc internalConnect(
     forceDial: bool,
     reuseConnection = true,
     dir = Direction.Out,
+    options = DialOptions(),
 ): Future[Muxer] {.async: (raises: [DialFailedError, CancelledError]).} =
   if Opt.some(self.localPeerId) == peerId:
     raise newException(DialFailedError, "internalConnect can't dial self!")
 
   # Ensure there's only one in-flight attempt per peer
-  let lockKey = peerId.get(default(PeerId))
+  let lockKey = buildDialLockKey(peerId, addrs, options)
   var lock = self.dialLock.getOrDefault(lockKey, AsyncLock(nil))
   if lock.isNil:
     lock = newAsyncLock()
@@ -440,7 +485,10 @@ proc internalConnect(
 
   let muxed =
     try:
-      await self.dialAndUpgrade(peerId, addrs, dir)
+      ## direct exact path and relay path are independent state machines.
+      ## Keep their dial serialization separate so background direct warm
+      ## cannot block a foreground relay send for the same peer.
+      await self.dialAndUpgrade(peerId, addrs, dir, options)
     except CancelledError as exc:
       slot.release()
       raise exc
@@ -595,6 +643,7 @@ method connect*(
     forceDial = false,
     reuseConnection = true,
     dir = Direction.Out,
+    options = DialOptions(),
 ) {.async: (raises: [DialFailedError, CancelledError]).} =
   ## connect remote peer without negotiating
   ## a protocol
@@ -604,7 +653,14 @@ method connect*(
     return
 
   discard
-    await self.internalConnect(Opt.some(peerId), addrs, forceDial, reuseConnection, dir)
+    await self.internalConnect(
+      Opt.some(peerId),
+      addrs,
+      forceDial,
+      reuseConnection,
+      dir,
+      options,
+    )
 
 method connect*(
     self: Dialer, address: MultiAddress, allowUnknownPeerId = false
@@ -629,6 +685,7 @@ method connectMuxer*(
     address: MultiAddress,
     allowUnknownPeerId = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Muxer] {.async: (raises: [DialFailedError, CancelledError]).} =
   ## Connects to a peer by address and returns the live muxer for this dial.
 
@@ -638,6 +695,7 @@ method connectMuxer*(
       @[fullAddress[1]],
       false,
       reuseConnection = reuseConnection,
+      options = options,
     )
 
   if allowUnknownPeerId == false:
@@ -650,6 +708,7 @@ method connectMuxer*(
     @[address],
     false,
     reuseConnection = reuseConnection,
+    options = options,
   )
 
 method negotiateStream*(
@@ -746,6 +805,7 @@ method dial*(
     protos: seq[string],
     forceDial = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
   ## create a protocol stream and establish
   ## a connection if one doesn't exist already
@@ -772,6 +832,7 @@ method dial*(
       addrs,
       forceDial,
       reuseConnection,
+      options = options,
     )
     trace "Opening stream", conn
     stream = await self.connManager.getStream(conn)

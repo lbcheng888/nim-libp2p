@@ -281,6 +281,23 @@ proc splitCompleteFramedPayload(
       @[]
   some((frame: frame, rest: rest))
 
+proc parseRelayJsonFrame(
+    frame: openArray[byte]
+): JsonNode {.raises: [CatchableError].} =
+  if frame.len == 0:
+    raise newException(
+      IOError,
+      "nim_quic relay received empty JSON frame"
+    )
+  let payloadText = ownedText(bytesToString(frame))
+  try:
+    parseJson(payloadText)
+  except CatchableError as exc:
+    raise newException(
+      IOError,
+      "nim_quic relay invalid JSON frame: " & exc.msg
+    )
+
 proc defaultRelayPort(parsed: Uri): uint16 =
   if parsed.port.len > 0:
     try:
@@ -1164,47 +1181,20 @@ proc awaitIncomingBidiStream(
       safeCloseStream(handle, cast[pointer](streamState.stream), streamState)
       continue
 
+proc readBinaryFrame(
+    stream: MsQuicStream
+): Future[seq[byte]] {.async: (raises: [CancelledError, CatchableError]).}
+
 proc readJsonMessage(
     stream: MsQuicStream
 ): Future[JsonNode] {.async: (raises: [CancelledError, CatchableError]).} =
-  var payload = stream.takeCachedBytes()
-  let cachedFrame = splitCompleteFramedPayload(payload)
-  if cachedFrame.isSome():
-    let framed = cachedFrame.get()
-    stream.restoreCachedBytes(framed.rest)
-    return parseJson(bytesToString(framed.frame))
-  while true:
-    try:
-      let chunk = await stream.read()
-      if chunk.len == 0:
-        break
-      payload.add(chunk)
-      let framed = splitCompleteFramedPayload(payload)
-      if framed.isSome():
-        let complete = framed.get()
-        stream.restoreCachedBytes(complete.rest)
-        return parseJson(bytesToString(complete.frame))
-    except LPStreamEOFError:
-      break
-    except CatchableError as exc:
-      let framed = splitCompleteFramedPayload(payload)
-      if framed.isSome():
-        let complete = framed.get()
-        stream.restoreCachedBytes(complete.rest)
-        return parseJson(bytesToString(complete.frame))
-      raise exc
-  let framed = splitCompleteFramedPayload(payload)
-  if framed.isSome():
-    let complete = framed.get()
-    stream.restoreCachedBytes(complete.rest)
-    return parseJson(bytesToString(complete.frame))
-  stream.restoreCachedBytes(@[])
-  if payload.len == 0:
+  let frame = await readBinaryFrame(stream)
+  if frame.len == 0:
     raise newException(
       IOError,
       "nim_quic relay stream closed before a complete JSON frame was received"
     )
-  parseJson(bytesToString(payload))
+  parseRelayJsonFrame(frame)
 
 proc writeJsonMessage(
     stream: MsQuicStream,
@@ -1606,6 +1596,12 @@ proc awaitPersistentIncomingWithRouteValidation(
         await sleepAsync(interval)
         if incomingFut.finished():
           return
+        # Once the accept stream is already serving this route locally, the
+        # accept stream plus relay keepalive become the only authoritative
+        # truth. Do not keep a second route_status truth source alive in this
+        # window.
+        if relayRouteServingStage(ownerId, validationRoute):
+          continue
         # Keep route_status on a dedicated client, but reuse that client
         # across validation ticks so the event loop doesn't keep creating
         # fresh relay runtimes after the DM path has already succeeded.

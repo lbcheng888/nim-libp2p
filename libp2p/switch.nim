@@ -933,12 +933,13 @@ method connect*(
     forceDial = false,
     reuseConnection = true,
     dir = Direction.Out,
+    options = DialOptions(),
 ): Future[void] {.
     public, async: (raises: [DialFailedError, CancelledError], raw: true)
 .} =
   ## Connects to a peer without opening a stream to it
 
-  s.dialer.connect(peerId, addrs, forceDial, reuseConnection, dir)
+  s.dialer.connect(peerId, addrs, forceDial, reuseConnection, dir, options)
 
 method connect*(
     s: Switch, address: MultiAddress, allowUnknownPeerId = false
@@ -956,10 +957,11 @@ method connectMuxer*(
     address: MultiAddress,
     allowUnknownPeerId = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Muxer] {.async: (raises: [DialFailedError, CancelledError], raw: true).} =
   ## Connects to a peer by address and returns the live muxer for this dial.
 
-  s.dialer.connectMuxer(address, allowUnknownPeerId, reuseConnection)
+  s.dialer.connectMuxer(address, allowUnknownPeerId, reuseConnection, options)
 
 method dial*(
     s: Switch, peerId: PeerId, protos: seq[string]
@@ -986,13 +988,14 @@ method dial*(
     protos: seq[string],
     forceDial = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Connection] {.
     public, async: (raises: [DialFailedError, CancelledError], raw: true)
 .} =
   ## Connected to a peer and open a stream
   ## with the specified `protos`
 
-  s.dialer.dial(peerId, addrs, protos, forceDial, reuseConnection)
+  s.dialer.dial(peerId, addrs, protos, forceDial, reuseConnection, options)
 
 proc dial*(
     s: Switch,
@@ -1001,13 +1004,14 @@ proc dial*(
     proto: string,
     forceDial = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Connection] {.
     public, async: (raises: [DialFailedError, CancelledError], raw: true)
 .} =
   ## Connected to a peer and open a stream
   ## with the specified `proto`
 
-  dial(s, peerId, addrs, @[proto], forceDial, reuseConnection)
+  dial(s, peerId, addrs, @[proto], forceDial, reuseConnection, options)
 
 proc mount*[T: LPProtocol](
     s: Switch, proto: T, matcher: Matcher = nil

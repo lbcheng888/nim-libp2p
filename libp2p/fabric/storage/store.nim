@@ -132,8 +132,35 @@ proc loadEventRaw*(store: FabricStore, eventId: string): Option[seq[byte]] {.gcs
     return none(seq[byte])
   some(bytesOf(payload.get()))
 
+proc loadAttestationRaw*(
+    store: FabricStore, eventId: string, role: AttestationRole, signer: string
+): Option[seq[byte]] {.gcsafe.} =
+  let payload = store.kv.get(
+    ksEvent,
+    "attestation:" & eventId & ":" & $role & ":" & signer,
+  )
+  if payload.isNone():
+    return none(seq[byte])
+  some(bytesOf(payload.get()))
+
 proc loadEventCertificateRaw*(store: FabricStore, eventId: string): Option[seq[byte]] {.gcsafe.} =
   let payload = store.kv.get(ksTask, "eventcert:" & eventId)
+  if payload.isNone():
+    return none(seq[byte])
+  some(bytesOf(payload.get()))
+
+proc loadCheckpointCandidateRaw*(
+    store: FabricStore, candidateId: string
+): Option[seq[byte]] {.gcsafe.} =
+  let payload = store.kv.get(ksTask, "checkpoint_candidate:" & candidateId)
+  if payload.isNone():
+    return none(seq[byte])
+  some(bytesOf(payload.get()))
+
+proc loadCheckpointVoteRaw*(
+    store: FabricStore, candidateId, validator: string
+): Option[seq[byte]] {.gcsafe.} =
+  let payload = store.kv.get(ksEvent, "checkpoint_vote:" & candidateId & ":" & validator)
   if payload.isNone():
     return none(seq[byte])
   some(bytesOf(payload.get()))
@@ -152,6 +179,18 @@ proc loadLatestCheckpointRaw*(store: FabricStore): Option[seq[byte]] {.gcsafe.} 
 
 proc loadCheckpointSnapshotRaw*(store: FabricStore, checkpointId: string): Option[seq[byte]] {.gcsafe.} =
   store.kv.getBytes(ksTask, "snapshot:" & checkpointId)
+
+proc loadCheckpointBundleRaw*(
+    store: FabricStore, checkpointId: string
+): Option[seq[byte]] {.gcsafe.} =
+  let cert = store.loadCheckpoint(checkpointId)
+  let snapshot = store.loadCheckpointSnapshotRaw(checkpointId)
+  if cert.isNone() or snapshot.isNone():
+    return none(seq[byte])
+  some(bytesOf(encodeObj(CheckpointBundle(
+    certificate: cert.get(),
+    snapshot: snapshot.get(),
+  ))))
 
 proc scanPrefix[T](store: FabricStore, space: KeySpace, prefix: string): seq[T] =
   let page = store.kv.scanPrefix(space, prefix = prefix, limit = 0)

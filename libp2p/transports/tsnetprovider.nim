@@ -388,6 +388,17 @@ proc dialUdpProxyExactTarget*(
     return tsnetproviderinapp.dialUdpProxyExactTarget(provider.runtime, family, ip, port)
   legacy.dialUdpProxyExactTarget(provider.bridge, family, ip, port)
 
+proc lookupUdpDirectRouteTarget*(
+    provider: TsnetProvider,
+    family, ip: string,
+    port: int
+): Result[TsnetDirectRouteTarget, string] =
+  if not provider.isProxyBacked():
+    return err("tsnet provider does not expose direct route lookup")
+  if provider.kind == TsnetProviderKind.InAppReal:
+    return tsnetproviderinapp.lookupUdpDirectRouteTarget(provider.runtime, family, ip, port)
+  err("tsnet provider does not expose direct route lookup")
+
 proc dialUdpProxyRelayFallback*(
     provider: TsnetProvider,
     family, ip: string,

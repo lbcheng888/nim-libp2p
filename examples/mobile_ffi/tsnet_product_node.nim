@@ -774,7 +774,9 @@ proc sendDmKickoff(
         ($envelope).cstring,
         (if listenAddrsJson.len > 0: listenAddrsJson.cstring else: "[]".cstring),
         "product_send_dm_async".cstring,
-        cint(timeoutMs)
+        cint(timeoutMs),
+        clonglong(0),
+        false
       )
     except CatchableError:
       false

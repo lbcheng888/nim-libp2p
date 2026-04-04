@@ -524,6 +524,14 @@ proc providerDialUdpExactTargetSafe(
   tsnetSafe:
     result = self.provider.dialUdpProxyExactTarget(family, ip, port)
 
+proc providerLookupUdpDirectTargetSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int
+): Result[TsnetDirectRouteTarget, string] {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.lookupUdpDirectRouteTarget(family, ip, port)
+
 proc providerDialUdpFallbackSafe(
     self: TsnetTransport,
     family, ip: string,
@@ -547,6 +555,19 @@ proc providerMarkFailedDirectUdpSafe(
 ): Result[void, string] {.gcsafe.} =
   tsnetSafe:
     result = self.provider.markFailedDirectProxyRoute(advertised, rawAddress)
+
+proc lookupUdpDirectRouteTarget*(
+    self: TsnetTransport,
+    address: MultiAddress
+): Result[TsnetDirectRouteTarget, string] {.gcsafe.} =
+  if self.isNil:
+    return err("tsnet transport is nil")
+  let family = familyFromAddress(address)
+  let host = hostFromAddress(address)
+  let port = portFromAddress(address)
+  if family.len == 0 or host.len == 0 or port <= 0:
+    return err("invalid tsnet quic target")
+  self.providerLookupUdpDirectTargetSafe(family, host, port)
 
 proc providerUdpDialStateSafe(
     self: TsnetTransport,
@@ -1225,11 +1246,12 @@ method accept*(
   self.rewriteAcceptedConnection(conn, kind)
   conn
 
-method dial*(
+proc dialWithPreference*(
     self: TsnetTransport,
     hostname: string,
     address: MultiAddress,
     peerId: Opt[PeerId] = Opt.none(PeerId),
+    relayOnly = false,
 ): Future[Connection] {.async: (raises: [transport.TransportError, CancelledError]).} =
   let parsed = parseTsnetAddress(address, listen = false).valueOr:
     raise newException(TsnetTransportDialError, error)
@@ -1244,12 +1266,27 @@ method dial*(
     if self.providerUsesProxyRouting():
       case parsed.kind
       of TsnetPathKind.Tcp:
+        if relayOnly:
+          raise newException(
+            TsnetTransportDialError,
+            "relay-only tsnet dialing is only defined for QUIC routes"
+          )
         self.providerDialTcpExactSafe(parsed.family, parsed.ip, parsed.port).valueOr:
           raise newException(TsnetTransportDialError, error)
       of TsnetPathKind.Quic:
         when defined(libp2p_msquic_experimental):
-          udpDialTarget = self.providerDialUdpExactTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
-            raise newException(TsnetTransportDialError, error)
+          udpDialTarget =
+            if relayOnly:
+              self.providerDialUdpFallbackTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+                raise newException(TsnetTransportDialError, error)
+            else:
+              self.providerDialUdpExactTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+                raise newException(TsnetTransportDialError, error)
+          if relayOnly and udpDialTarget.mode != TsnetProxyDialMode.RelayBridge:
+            raise newException(
+              TsnetTransportDialError,
+              "relay-only tsnet dialing could not acquire relay bridge target"
+            )
           udpDialTarget.rawAddress
         else:
           raise newException(
@@ -1290,7 +1327,7 @@ method dial*(
         except CancelledError as exc:
           raise exc
         except CatchableError as exc:
-          if self.providerUsesProxyRouting():
+          if self.providerUsesProxyRouting() and not relayOnly:
             let status = self.providerStatusPayloadSafe()
             let path =
               if status.isOk():
@@ -1329,6 +1366,14 @@ method dial*(
     conn.localAddr = Opt.some(self.fallbackDialEndpoint(parsed.family, parsed.kind))
   conn.observedAddr = Opt.some(address)
   conn
+
+method dial*(
+    self: TsnetTransport,
+    hostname: string,
+    address: MultiAddress,
+    peerId: Opt[PeerId] = Opt.none(PeerId),
+): Future[Connection] {.async: (raises: [transport.TransportError, CancelledError]).} =
+  await self.dialWithPreference(hostname, address, peerId, relayOnly = false)
 
 method upgrade*(
     self: TsnetTransport, conn: Connection, peerId: Opt[PeerId]

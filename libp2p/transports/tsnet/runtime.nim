@@ -21,6 +21,16 @@ import ./tcpcontrol
 proc runtimeTrace(msg: string) {.gcsafe, raises: [].} =
   echo "[tsnet-runtime] " & msg
 
+when defined(libp2p_msquic_experimental):
+  type TsnetRelayListenerDiagnosticImpl = qrelay.TsnetRelayListenerDiagnostic
+else:
+  type TsnetRelayListenerDiagnosticImpl = object
+    route: string
+    kind: string
+    stage: string
+    detail: string
+    updatedUnixMilli: int64
+
 type
   TsnetInAppRuntimeStatus* {.pure.} = enum
     Stopped
@@ -50,7 +60,7 @@ type
     udpListenerRoutes*: seq[string]
     tcpListenerRouteTargets*: OrderedTable[string, string]
     udpListenerRouteTargets*: OrderedTable[string, string]
-    relayListenerProjectionCache*: OrderedTable[string, qrelay.TsnetRelayListenerDiagnostic]
+    relayListenerProjectionCache*: OrderedTable[string, TsnetRelayListenerDiagnosticImpl]
 
 const
   TsnetInAppRuntimeNotImplementedError* =
@@ -298,7 +308,7 @@ proc clearListenerRoutes(runtime: TsnetInAppRuntime) {.gcsafe.} =
   runtime.udpListenerRoutes = @[]
   runtime.tcpListenerRouteTargets = initOrderedTable[string, string]()
   runtime.udpListenerRouteTargets = initOrderedTable[string, string]()
-  runtime.relayListenerProjectionCache = initOrderedTable[string, qrelay.TsnetRelayListenerDiagnostic]()
+  runtime.relayListenerProjectionCache = initOrderedTable[string, TsnetRelayListenerDiagnosticImpl]()
 
 proc rememberListenerRoute(routes: var seq[string], route: string) {.gcsafe.} =
   if route.len == 0:
@@ -617,7 +627,7 @@ proc new*(_: type[TsnetInAppRuntime], cfg: TsnetProviderConfig): TsnetInAppRunti
     udpListenerRoutes: @[],
     tcpListenerRouteTargets: initOrderedTable[string, string](),
     udpListenerRouteTargets: initOrderedTable[string, string](),
-    relayListenerProjectionCache: initOrderedTable[string, qrelay.TsnetRelayListenerDiagnostic]()
+    relayListenerProjectionCache: initOrderedTable[string, TsnetRelayListenerDiagnosticImpl]()
   )
 
 proc new*(
@@ -1682,6 +1692,23 @@ proc registerDirectProxyRoute*(
     else: TsnetPathDirect
   registerDirectRoute(runtime.runtimeId, advertised, rawAddress, pathKind)
 
+proc lookupUdpDirectRouteTarget*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Result[TsnetDirectRouteTarget, string] =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  if not runtime.ready() or not runtime.session.supportsProxyRouting():
+    return err(unavailablePayloadError())
+  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Quic)
+  if directRoute.isErr():
+    return err(directRoute.error)
+  ok(TsnetDirectRouteTarget(
+    rawAddress: directRoute.get().raw,
+    pathKind: directRoute.get().pathKind,
+  ))
+
 proc markFailedDirectProxyRoute*(
     runtime: TsnetInAppRuntime,
     advertised: MultiAddress,
@@ -1734,6 +1761,10 @@ proc dialTcpProxyExact*(
   let localRoute = lookupRawTarget(family, ip, port, TsnetProxyKind.Tcp)
   if localRoute.isOk():
     return localRoute
+  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Tcp)
+  if directRoute.isOk():
+    runtime.setTailnetPathState(directRoute.get().pathKind)
+    return ok(directRoute.get().raw)
   if runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):
       runtime.demoteRelayPath()
@@ -1811,6 +1842,13 @@ proc dialUdpProxyExactTarget*(
     return ok(TsnetProxyDialTarget(
       rawAddress: localRoute.get(),
       mode: TsnetProxyDialMode.Local,
+    ))
+  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Quic)
+  if directRoute.isOk():
+    runtime.setTailnetPathState(directRoute.get().pathKind)
+    return ok(TsnetProxyDialTarget(
+      rawAddress: directRoute.get().raw,
+      mode: TsnetProxyDialMode.DirectRoute,
     ))
   if runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):

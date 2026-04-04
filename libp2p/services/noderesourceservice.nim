@@ -1,6 +1,6 @@
 {.push raises: [].}
 
-import std/[algorithm, json, options, os, sequtils, strutils, tables]
+import std/[algorithm, json, options, os, sequtils, strtabs, strutils, tables]
 when not defined(android):
   import std/osproc
 from std/times import epochTime
@@ -189,6 +189,36 @@ when defined(android):
     discard command
     discard args
     ""
+elif defined(macosx):
+  proc resolveMacExecCommand(command: string): string =
+    case command
+    of "sw_vers":
+      "/usr/bin/sw_vers"
+    of "sysctl":
+      "/usr/sbin/sysctl"
+    of "vm_stat":
+      "/usr/bin/vm_stat"
+    of "df":
+      "/bin/df"
+    of "system_profiler":
+      "/usr/sbin/system_profiler"
+    else:
+      command
+
+  proc safeExec(command: string, args: seq[string]): string =
+    let resolvedCommand = resolveMacExecCommand(command)
+    if resolvedCommand.len == 0:
+      return ""
+    var emptyEnv = newStringTable(modeCaseSensitive)
+    try:
+      execProcess(
+        resolvedCommand,
+        args = args,
+        env = emptyEnv,
+        options = {poStdErrToStdOut},
+      ).strip()
+    except CatchableError:
+      ""
 else:
   proc safeExec(command: string, args: seq[string]): string =
     try:

@@ -18,6 +18,11 @@ export results
 type
   Dial* = ref object of RootObj
   DialFailedError* = object of LPError
+  DialPathPreference* {.pure.} = enum
+    dppDefault,
+    dppRelayOnly
+  DialOptions* = object
+    routing*: DialPathPreference
 
 method connect*(
     self: Dial,
@@ -26,6 +31,7 @@ method connect*(
     forceDial = false,
     reuseConnection = true,
     dir = Direction.Out,
+    options = DialOptions(),
 ) {.base, async: (raises: [DialFailedError, CancelledError]).} =
   ## connect remote peer without negotiating
   ## a protocol
@@ -45,6 +51,7 @@ method connectMuxer*(
     address: MultiAddress,
     allowUnknownPeerId = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Muxer] {.base, async: (raises: [DialFailedError, CancelledError]).} =
   ## Connects to a peer by address and returns the live muxer for this dial.
 
@@ -65,11 +72,16 @@ method dialAndUpgrade*(
     hostname: string,
     addrs: MultiAddress,
     dir = Direction.Out,
+    options = DialOptions(),
 ): Future[Muxer] {.base, async: (raises: [CancelledError]).} =
   doAssert(false, "[Dial.dialAndUpgrade] abstract method not implemented!")
 
 method dialAndUpgrade*(
-    self: Dial, peerId: Opt[PeerId], addrs: seq[MultiAddress], dir = Direction.Out
+    self: Dial,
+    peerId: Opt[PeerId],
+    addrs: seq[MultiAddress],
+    dir = Direction.Out,
+    options = DialOptions(),
 ): Future[Muxer] {.
     base, async: (raises: [CancelledError, MaError, TransportAddressError, LPError])
 .} =
@@ -82,6 +94,7 @@ method dial*(
     protos: seq[string],
     forceDial = false,
     reuseConnection = true,
+    options = DialOptions(),
 ): Future[Connection] {.base, async: (raises: [DialFailedError, CancelledError]).} =
   ## create a protocol stream and establish
   ## a connection if one doesn't exist already

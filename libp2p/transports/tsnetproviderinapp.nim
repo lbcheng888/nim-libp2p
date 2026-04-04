@@ -176,6 +176,13 @@ proc dialUdpProxyExactTarget*(
 ): Result[TsnetProxyDialTarget, string] =
   tsruntime.dialUdpProxyExactTarget(runtime, family, ip, port)
 
+proc lookupUdpDirectRouteTarget*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Result[TsnetDirectRouteTarget, string] =
+  tsruntime.lookupUdpDirectRouteTarget(runtime, family, ip, port)
+
 proc dialUdpProxyRelayFallback*(
     runtime: TsnetInAppRuntime,
     family, ip: string,

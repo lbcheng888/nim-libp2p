@@ -576,7 +576,7 @@ suite "Tsnet proxy runtime":
     let afterStop = runtime.dialTcpProxy("ip4", "100.64.0.10", 4001)
     check afterStop.isErr()
 
-  test "exact udp dial honors advertised relay route instead of cached direct route":
+  test "exact udp dial can use direct route when exact target is direct-ready":
     let dir = tempRuntimeDir("exact-udp-dial")
     let cfg = TsnetProviderConfig(
       controlUrl: "http://headscale.local",
@@ -615,7 +615,8 @@ suite "Tsnet proxy runtime":
     check routeSelectingDial.get() == directRaw
 
     let exactDial = runtime.dialUdpProxyExact("ip4", "100.64.0.10", 4001)
-    check exactDial.isErr()
+    check exactDial.isOk()
+    check exactDial.get() == directRaw
 
     runtime.stop()
 
@@ -656,6 +657,51 @@ suite "Tsnet proxy runtime":
     check exactTarget.isOk()
     check exactTarget.get().rawAddress == localRaw
     check exactTarget.get().mode == TsnetProxyDialMode.Local
+
+    runtime.stop()
+
+  test "exact udp dial target prefers direct route before relay":
+    let dir = tempRuntimeDir("exact-udp-direct-target")
+    let cfg = TsnetProviderConfig(
+      controlUrl: "http://headscale.local",
+      authKey: "tskey-client",
+      hostname: "client-node",
+      stateDir: dir,
+      wireguardPort: 41642,
+      bridgeLibraryPath: "",
+      logLevel: "",
+      enableDebug: false,
+      bridgeExtraJson: ""
+    )
+    let runtime = TsnetInAppRuntime.new(
+      cfg,
+      mockMappedTransport(
+        "client-node",
+        2,
+        "100.64.0.11",
+        "fd7a:115c:a1e0::11",
+        "server-node",
+        1,
+        "100.64.0.10"
+      )
+    )
+
+    check runtime.start().isOk()
+    check runtime.ready()
+
+    let advertised = MultiAddress.init("/ip4/100.64.0.10/udp/4001/quic-v1/tsnet").tryGet()
+    let directRaw = MultiAddress.init("/ip4/198.51.100.10/udp/42002/quic-v1").tryGet()
+    check runtime.registerDirectProxyRoute(advertised, directRaw, punched = true).isOk()
+
+    let exactTarget = runtime.dialUdpProxyExactTarget("ip4", "100.64.0.10", 4001)
+    check exactTarget.isOk()
+    check exactTarget.get().rawAddress == directRaw
+    check exactTarget.get().mode == TsnetProxyDialMode.DirectRoute
+
+    let status = runtime.statusPayload()
+    check status.isOk()
+    check status.get()["tailnetPath"].getStr() in ["punched_direct", "direct"]
+    check status.get()["tailnetDirectRouteCount"].getInt() == 1
 
     runtime.stop()
 

@@ -7,7 +7,12 @@ import ../multiaddress
 type
   TsnetProxyDialMode* {.pure.} = enum
     Local
+    DirectRoute
     RelayBridge
+
+  TsnetDirectRouteTarget* = object
+    rawAddress*: MultiAddress
+    pathKind*: string
 
   TsnetProxyDialTarget* = object
     rawAddress*: MultiAddress

@@ -40,6 +40,10 @@ type
     DmFrameAck
     DmFrameUnknown
 
+  DirectMessageEstablishIntent* {.pure.} = enum
+    DmEstablishWarm
+    DmEstablishSend
+
   DirectMessageSessionSnapshot* = object
     peer*: PeerId
     peerKey*: string
@@ -191,6 +195,21 @@ proc directPeerKey(peer: PeerId): string =
     $peer
   except CatchableError:
     ""
+
+proc directDialLockKey(
+    peer: PeerId,
+    intent: DirectMessageEstablishIntent,
+    relayOnly: bool
+): string =
+  let peerKey = directPeerKey(peer)
+  if peerKey.len == 0:
+    return ""
+  peerKey & "|" &
+    (case intent
+     of DmEstablishWarm: "warm"
+     of DmEstablishSend: "send") &
+    "|" &
+    (if relayOnly: "relay" else: "direct")
 
 proc directConnKey(conn: Connection): int =
   if conn.isNil:
@@ -582,9 +601,11 @@ proc sessionReaderReady(
 
 proc getOrCreateDialLock(
     svc: DirectMessageService,
-    peer: PeerId
+    peer: PeerId,
+    intent: DirectMessageEstablishIntent,
+    relayOnly: bool
 ): AsyncLock =
-  let peerKey = directPeerKey(peer)
+  let peerKey = directDialLockKey(peer, intent, relayOnly)
   if peerKey.len == 0:
     return nil
   if not svc.dialLocks.hasKey(peerKey):
@@ -1192,6 +1213,8 @@ proc establishOutboundSession(
     messageId = "",
     allowExisting = true,
     startReaderDetached = false,
+    intent = DmEstablishSend,
+    relayOnly = false,
 ): Future[tuple[session: DirectMessageSession, connFromLive: bool, dialErr: string]] {.async.} =
   if svc.isNil or svc.switch.isNil:
     return (nil, false, "direct message service unavailable")
@@ -1315,7 +1338,7 @@ proc establishOutboundSession(
       })
       return (existing, false, "")
 
-  let dialLock = svc.getOrCreateDialLock(peer)
+  let dialLock = svc.getOrCreateDialLock(peer, intent, relayOnly)
   var conn: Connection = nil
   var connFromLive = false
   var dialErr = ""
@@ -1340,6 +1363,13 @@ proc establishOutboundSession(
         @[svc.codec],
         forceDial = true,
         reuseConnection = false,
+        options = DialOptions(
+          routing:
+            if relayOnly:
+              dppRelayOnly
+            else:
+              dppDefault
+        ),
       )
       notifySendProgress(progress, "dm_fresh_dial_ready", %*{
         "dmPhase": "fresh_dial_ready",
@@ -1365,7 +1395,23 @@ proc establishOutboundSession(
       warn "direct message fresh dial failed", peer = $peer, err = dialErr
 
   if not dialLock.isNil:
-    await dialLock.acquire()
+    let lockWaitBudget = remainingEstablishBudget()
+    notifySendProgress(progress, "dm_dial_lock_wait", %*{
+      "dmPhase": "dial_lock_wait",
+      "peer": $peer,
+      "messageId": messageId,
+      "timeoutMs": lockWaitBudget.milliseconds.int,
+      "intent": (case intent
+        of DmEstablishWarm: "warm"
+        of DmEstablishSend: "send"),
+    })
+    if lockWaitBudget <= ZeroDuration:
+      return (nil, false, "direct message dial lock timeout")
+    await awaitFutureWithin(
+      dialLock.acquire(),
+      lockWaitBudget,
+      "direct message dial lock timeout",
+    )
   try:
     if preferredConnKey > 0:
       let preferredSession = svc.getLiveSessionByConnKey(preferredConnKey)
@@ -1633,7 +1679,8 @@ proc warmSessionDetailed*(
     verifiedMuxer: Muxer = nil,
     preferredConnKey = 0,
     reuseVerifiedLiveConnection = false,
-    progress: DirectMessageSendProgress = nil
+    progress: DirectMessageSendProgress = nil,
+    relayOnly = false,
 ): Future[DirectMessageWarmResult] {.async.} =
   if svc.isNil or svc.switch.isNil:
     return DirectMessageWarmResult(
@@ -1650,6 +1697,8 @@ proc warmSessionDetailed*(
     progress = progress,
     allowExisting = preferredAddrs.len == 0 and verifiedMuxer.isNil,
     startReaderDetached = false,
+    intent = DmEstablishWarm,
+    relayOnly = relayOnly,
   )
   if warmRes.session.isNil:
     let errMsg =
@@ -1692,7 +1741,8 @@ proc warmSession*(
     verifiedMuxer: Muxer = nil,
     preferredConnKey = 0,
     reuseVerifiedLiveConnection = false,
-    progress: DirectMessageSendProgress = nil
+    progress: DirectMessageSendProgress = nil,
+    relayOnly = false,
 ): Future[(bool, string)] {.async.} =
   let warmRes = await svc.warmSessionDetailed(
     peer,
@@ -1702,6 +1752,7 @@ proc warmSession*(
     preferredConnKey = preferredConnKey,
     reuseVerifiedLiveConnection = reuseVerifiedLiveConnection,
     progress = progress,
+    relayOnly = relayOnly,
   )
   (warmRes.ok, warmRes.err)
 
@@ -1716,7 +1767,8 @@ proc send*(
     verifiedMuxer: Muxer = nil,
     preferredConnKey = 0,
     reuseVerifiedLiveConnection = false,
-    progress: DirectMessageSendProgress = nil
+    progress: DirectMessageSendProgress = nil,
+    relayOnly = false,
 ): Future[(bool, string)] {.async.} =
   if svc.isNil or svc.switch.isNil:
     return (false, "direct message service unavailable")
@@ -1914,6 +1966,8 @@ proc send*(
     messageId = messageId,
     allowExisting = true,
     startReaderDetached = true,
+    intent = DmEstablishSend,
+    relayOnly = relayOnly,
   )
   session = established.session
   connFromLive = established.connFromLive
@@ -1949,6 +2003,8 @@ proc send*(
       messageId = messageId,
       allowExisting = false,
       startReaderDetached = true,
+      intent = DmEstablishSend,
+      relayOnly = relayOnly,
     )
     session = retryEstablished.session
     connFromLive = retryEstablished.connFromLive
