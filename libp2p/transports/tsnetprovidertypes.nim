@@ -134,3 +134,68 @@ proc toJson*(caps: TsnetProviderCapabilities): JsonNode =
     "pingApi": caps.pingApi,
     "derpMapApi": caps.derpMapApi,
   }
+
+proc jsonField(node: JsonNode, key: string): JsonNode =
+  if node.isNil or node.kind != JObject or not node.hasKey(key):
+    return newJNull()
+  node.getOrDefault(key)
+
+proc jsonString(node: JsonNode, key: string): string =
+  let value = jsonField(node, key)
+  if value.kind == JString:
+    return value.getStr()
+  ""
+
+proc jsonBool(node: JsonNode, key: string): bool =
+  let value = jsonField(node, key)
+  case value.kind
+  of JBool:
+    value.getBool()
+  of JString:
+    value.getStr().strip().toLowerAscii() in ["1", "true", "yes", "y"]
+  else:
+    false
+
+proc jsonInt(node: JsonNode, key: string): int =
+  let value = jsonField(node, key)
+  case value.kind
+  of JInt:
+    value.getBiggestInt().int
+  of JFloat:
+    value.getFloat().int
+  else:
+    0
+
+proc toJson*(cfg: TsnetProviderConfig): JsonNode =
+  %*{
+    "controlUrl": cfg.controlUrl,
+    "controlProtocol": cfg.controlProtocol,
+    "controlEndpoint": cfg.controlEndpoint,
+    "relayEndpoint": cfg.relayEndpoint,
+    "authKey": cfg.authKey,
+    "hostname": cfg.hostname,
+    "stateDir": cfg.stateDir,
+    "wireguardPort": cfg.wireguardPort,
+    "bridgeLibraryPath": cfg.bridgeLibraryPath,
+    "logLevel": cfg.logLevel,
+    "enableDebug": cfg.enableDebug,
+    "bridgeExtraJson": cfg.bridgeExtraJson,
+  }
+
+proc parseProviderConfig*(node: JsonNode): Result[TsnetProviderConfig, string] =
+  if node.isNil or node.kind != JObject:
+    return err("tsnet provider config must be a JSON object")
+  ok(TsnetProviderConfig(
+    controlUrl: jsonString(node, "controlUrl"),
+    controlProtocol: jsonString(node, "controlProtocol"),
+    controlEndpoint: jsonString(node, "controlEndpoint"),
+    relayEndpoint: jsonString(node, "relayEndpoint"),
+    authKey: jsonString(node, "authKey"),
+    hostname: jsonString(node, "hostname"),
+    stateDir: jsonString(node, "stateDir"),
+    wireguardPort: jsonInt(node, "wireguardPort"),
+    bridgeLibraryPath: jsonString(node, "bridgeLibraryPath"),
+    logLevel: jsonString(node, "logLevel"),
+    enableDebug: jsonBool(node, "enableDebug"),
+    bridgeExtraJson: jsonString(node, "bridgeExtraJson"),
+  ))

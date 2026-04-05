@@ -298,6 +298,26 @@ proc toJson*(snapshot: TsnetControlSnapshot): JsonNode =
   result["register"] = snapshot.registerPayload
   result["mapPoll"] = snapshot.mapPollPayload
 
+proc parseControlSnapshot*(node: JsonNode): Result[TsnetControlSnapshot, string] =
+  if node.isNil or node.kind != JObject:
+    return err("tsnet control snapshot must be a JSON object")
+  let capturedAtNode = jsonField(node, "capturedAtUnixMilli")
+  let capturedAtUnixMilli =
+    case capturedAtNode.kind
+    of JInt:
+      capturedAtNode.getBiggestInt().int64
+    of JFloat:
+      capturedAtNode.getFloat().int64
+    else:
+      0'i64
+  ok(TsnetControlSnapshot.init(
+    source = jsonString(node, "source"),
+    capturedAtUnixMilli = capturedAtUnixMilli,
+    probePayload = jsonField(node, "probe"),
+    registerPayload = jsonField(node, "register"),
+    mapPollPayload = jsonField(node, "mapPoll")
+  ))
+
 proc toJson*(keys: TsnetControlServerKey): JsonNode =
   result = newJObject()
   result["capabilityVersion"] = %keys.capabilityVersion

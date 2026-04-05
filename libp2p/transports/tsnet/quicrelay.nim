@@ -1435,6 +1435,19 @@ proc relayRouteStateLabel*(ownerId: int, route: string): string {.gcsafe, raises
         return "known"
     return ""
 
+proc relayRoutePublishedStage*(ownerId: int, route: string): string {.gcsafe, raises: [].} =
+  quicRelaySafe:
+    let normalizedRoute = route.strip()
+    if ownerId <= 0 or normalizedRoute.len == 0:
+      return ""
+    withLock(relayRegistryLock):
+      relayListenerStates.withValue(ownerId, states):
+        let stored = states[].getOrDefault(normalizedRoute)
+        let storedStage = stored.stage.strip()
+        if storedStage.len > 0:
+          return storedStage
+    return ""
+
 proc relayShouldPreserveServingRoute(
     ownerId: int,
     route: string

@@ -68,6 +68,15 @@ suite "Tsnet stored state":
     check loaded.get().peerCache[0].tailscaleIPs[0] == "100.64.0.25"
     check loaded.get().updatedAtUnixMilli >= loaded.get().createdAtUnixMilli
 
+  test "stateDir must be an absolute filesystem path":
+    var state = TsnetStoredState.init(
+      hostname = "nim-invalid-state-dir",
+      controlUrl = "https://64-176-84-12.sslip.io"
+    )
+    let stored = storeStoredState("mkey:not-a-dir", state)
+    check stored.isErr()
+    check stored.error.contains("absolute filesystem path")
+
   test "missing fields recover to defaults":
     let dir = tempStateDir("defaults")
     let path = dir / TsnetStoredStateFilename
@@ -130,3 +139,18 @@ suite "Tsnet stored state":
     check loaded.machinePublicKey == machinePublicKey
     check loaded.nodePublicKey == nodePublicKey
     check loaded.discoPublicKey == discoPublicKey
+
+  test "store updates owner state in place":
+    let dir = tempStateDir("in-place")
+    var state = TsnetStoredState.init(
+      hostname = "nim-in-place",
+      controlUrl = "https://headscale.example"
+    )
+    let before = state.updatedAtUnixMilli
+    sleep(5)
+    let stored = storeStoredState(dir, state)
+    check stored.isOk()
+    check state.updatedAtUnixMilli >= before
+    let loaded = loadStoredState(dir)
+    check loaded.isOk()
+    check loaded.get().updatedAtUnixMilli == state.updatedAtUnixMilli

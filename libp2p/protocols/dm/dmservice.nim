@@ -8,6 +8,7 @@ import ../../multistream
 import ../../muxers/muxer
 import ../../switch
 import ../protocol
+import ../connectivity/relay/relay
 import ../../stream/connection
 import ../../multiaddress
 
@@ -580,6 +581,17 @@ proc hasLiveSessionConnKey*(
     connKey: int
 ): bool {.gcsafe, raises: [].} =
   not svc.getLiveSessionByConnKey(connKey).isNil
+
+proc liveSessionConnPathKind*(
+    svc: DirectMessageService,
+    connKey: int
+): string {.gcsafe, raises: [].} =
+  let session = svc.getLiveSessionByConnKey(connKey)
+  if session.isNil or session.conn.isNil or session.conn.closed:
+    return ""
+  if isRelayed(session.conn):
+    return "relay"
+  "direct"
 
 proc sessionReaderRunning(
     session: DirectMessageSession

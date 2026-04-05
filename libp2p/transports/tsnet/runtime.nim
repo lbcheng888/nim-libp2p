@@ -21,6 +21,12 @@ import ./tcpcontrol
 proc runtimeTrace(msg: string) {.gcsafe, raises: [].} =
   echo "[tsnet-runtime] " & msg
 
+proc ownedText(text: string): string {.gcsafe, raises: [].} =
+  if text.len == 0:
+    return ""
+  result = newStringOfCap(text.len)
+  result.add(text)
+
 when defined(libp2p_msquic_experimental):
   type TsnetRelayListenerDiagnosticImpl = qrelay.TsnetRelayListenerDiagnostic
 else:
@@ -42,6 +48,10 @@ type
     transport: TsnetControlTransport
     endpoint: string
 
+  TsnetListenerRouteTarget = object
+    advertisedText*: string
+    rawText*: string
+
   TsnetInAppRuntime* = ref object
     cfg*: TsnetProviderConfig
     status*: TsnetInAppRuntimeStatus
@@ -58,8 +68,8 @@ type
     oracleFixturePresent*: bool
     tcpListenerRoutes*: seq[string]
     udpListenerRoutes*: seq[string]
-    tcpListenerRouteTargets*: OrderedTable[string, string]
-    udpListenerRouteTargets*: OrderedTable[string, string]
+    tcpListenerRouteTargets*: seq[TsnetListenerRouteTarget]
+    udpListenerRouteTargets*: seq[TsnetListenerRouteTarget]
     relayListenerProjectionCache*: OrderedTable[string, TsnetRelayListenerDiagnosticImpl]
 
 const
@@ -91,30 +101,73 @@ proc listenerRouteSnapshot(routes: seq[string]): seq[string] {.gcsafe.} =
     result.add(route)
 
 proc listenerRouteTargetSnapshot(
-    routeTargets: OrderedTable[string, string]
+    routeTargets: seq[TsnetListenerRouteTarget]
 ): seq[string] {.gcsafe.} =
   result = newSeqOfCap[string](routeTargets.len)
-  for route in routeTargets.keys:
+  for target in routeTargets.items:
+    let route = target.advertisedText.strip()
     if route.len > 0:
       result.add(route)
+
+proc listenerRouteTargetRaw(
+    routeTargets: seq[TsnetListenerRouteTarget],
+    routeText: string
+): string {.gcsafe.} =
+  let normalizedRoute = routeText.strip()
+  if normalizedRoute.len == 0:
+    return ""
+  for target in routeTargets.items:
+    if target.advertisedText == normalizedRoute:
+      return target.rawText
+  ""
+
+proc upsertListenerRouteTarget(
+    routeTargets: seq[TsnetListenerRouteTarget],
+    advertisedText: string,
+    rawText: string
+): seq[TsnetListenerRouteTarget] {.gcsafe.} =
+  let normalizedAdvertised = advertisedText.strip()
+  let normalizedRaw = rawText.strip()
+  result = newSeqOfCap[TsnetListenerRouteTarget](routeTargets.len + 1)
+  var replaced = false
+  for target in routeTargets.items:
+    if target.advertisedText == normalizedAdvertised:
+      if not replaced:
+        result.add(TsnetListenerRouteTarget(
+          advertisedText: normalizedAdvertised,
+          rawText: normalizedRaw
+        ))
+        replaced = true
+      continue
+    result.add(target)
+  if not replaced and normalizedAdvertised.len > 0:
+    result.add(TsnetListenerRouteTarget(
+      advertisedText: normalizedAdvertised,
+      rawText: normalizedRaw
+    ))
 
 proc runtimeListenerRoutes(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.}
 proc liveQuicRelayMode(runtime: TsnetInAppRuntime): bool {.gcsafe.}
 
 when defined(libp2p_msquic_experimental):
   proc relayStageCountsAsReady(stage: string): bool {.gcsafe.} =
-    let lowered = stage.strip().toLowerAscii()
-    lowered in ["awaiting", "incoming", "ready", "bridge_attached", "serving"]
+    stage == "awaiting" or
+      stage == "incoming" or
+      stage == "ready" or
+      stage == "bridge_attached" or
+      stage == "serving"
 
   proc relayStageCountsAsPublished(stage: string): bool {.gcsafe.} =
-    let lowered = stage.strip().toLowerAscii()
-    lowered in ["awaiting", "incoming", "ready", "bridge_attached", "serving"]
+    stage == "awaiting" or
+      stage == "incoming" or
+      stage == "ready" or
+      stage == "bridge_attached" or
+      stage == "serving"
 
   proc relayRouteKind(route: string): string {.gcsafe.} =
-    let lowered = route.toLowerAscii()
-    if "/udp/" in lowered:
+    if "/udp/" in route or "/UDP/" in route:
       return "udp"
-    if "/tcp/" in lowered:
+    if "/tcp/" in route or "/TCP/" in route:
       return "tcp"
     ""
 
@@ -124,17 +177,7 @@ when defined(libp2p_msquic_experimental):
   ): string {.gcsafe.} =
     if runtime.isNil or route.len == 0:
       return ""
-    let directStage = qrelay.relayRouteStateLabel(runtime.runtimeId, route).strip()
-    if directStage.len > 0:
-      return directStage
-    if qrelay.relayRouteDropped(runtime.runtimeId, route):
-      return "dropped"
-    if qrelay.relayRouteLocallyReady(runtime.runtimeId, route) or
-        qrelay.relayRouteReady(runtime.runtimeId, route):
-      return "ready"
-    if qrelay.relayRouteServingStage(runtime.runtimeId, route):
-      return "serving"
-    ""
+    qrelay.relayRoutePublishedStage(runtime.runtimeId, route).strip()
 
   proc relayListenerStatesPayload(
       states: openArray[qrelay.TsnetRelayListenerDiagnostic]
@@ -306,8 +349,8 @@ proc clearListenerRoutes(runtime: TsnetInAppRuntime) {.gcsafe.} =
     return
   runtime.tcpListenerRoutes = @[]
   runtime.udpListenerRoutes = @[]
-  runtime.tcpListenerRouteTargets = initOrderedTable[string, string]()
-  runtime.udpListenerRouteTargets = initOrderedTable[string, string]()
+  runtime.tcpListenerRouteTargets = @[]
+  runtime.udpListenerRouteTargets = @[]
   runtime.relayListenerProjectionCache = initOrderedTable[string, TsnetRelayListenerDiagnosticImpl]()
 
 proc rememberListenerRoute(routes: var seq[string], route: string) {.gcsafe.} =
@@ -350,11 +393,12 @@ proc publishedListenerRoutes*(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.
     return @[]
   when defined(libp2p_msquic_experimental):
     if runtime.liveQuicRelayMode():
-      let projection = relayListenerProjection(runtime)
-      result = newSeqOfCap[string](projection.ready)
-      for state in projection.states:
-        if relayStageCountsAsPublished(state.stage):
-          result.add(state.route)
+      let routes = runtimeListenerRoutes(runtime)
+      result = newSeqOfCap[string](routes.len)
+      for route in routes:
+        let stage = relayRouteStage(runtime, route)
+        if relayStageCountsAsPublished(stage):
+          result.add(route)
       return
   runtimeListenerRoutes(runtime)
 
@@ -625,8 +669,8 @@ proc new*(_: type[TsnetInAppRuntime], cfg: TsnetProviderConfig): TsnetInAppRunti
     oracleFixturePresent: false,
     tcpListenerRoutes: @[],
     udpListenerRoutes: @[],
-    tcpListenerRouteTargets: initOrderedTable[string, string](),
-    udpListenerRouteTargets: initOrderedTable[string, string](),
+    tcpListenerRouteTargets: @[],
+    udpListenerRouteTargets: @[],
     relayListenerProjectionCache: initOrderedTable[string, TsnetRelayListenerDiagnosticImpl]()
   )
 
@@ -1422,7 +1466,7 @@ proc reconcileProxyListeners*(
     proc rememberRepairRoute(
         routeText: string,
         kind: TsnetProxyKind,
-        routeTargets: OrderedTable[string, string]
+        routeTargets: seq[TsnetListenerRouteTarget]
     ) =
       if routeText.len == 0:
         return
@@ -1437,7 +1481,7 @@ proc reconcileProxyListeners*(
       if qrelay.relayOwnerHasRunningRouteTask(runtime.runtimeId, routeText):
         qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, routeText)
         return
-      let rawRoute = routeTargets.getOrDefault(routeText).strip()
+      let rawRoute = listenerRouteTargetRaw(routeTargets, routeText).strip()
       if rawRoute.len == 0:
         missingMappings.rememberListenerRoute(routeText)
         return
@@ -1625,7 +1669,8 @@ proc listenTcpProxy*(
   let advertisedText = $advertised
   runtime.tcpListenerRoutes =
     rememberListenerRouteCopy(runtime.tcpListenerRoutes, advertisedText)
-  runtime.tcpListenerRouteTargets[advertisedText] = $localAddress
+  runtime.tcpListenerRouteTargets =
+    upsertListenerRouteTarget(runtime.tcpListenerRouteTargets, advertisedText, $localAddress)
   if runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):
       let relayStarted = qrelay.startRelayListener(
@@ -1663,7 +1708,8 @@ proc listenUdpProxy*(
   let advertisedText = $advertised
   runtime.udpListenerRoutes =
     rememberListenerRouteCopy(runtime.udpListenerRoutes, advertisedText)
-  runtime.udpListenerRouteTargets[advertisedText] = $localAddress
+  runtime.udpListenerRouteTargets =
+    upsertListenerRouteTarget(runtime.udpListenerRouteTargets, advertisedText, $localAddress)
   if runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):
       let relayStarted = qrelay.startUdpRelayListener(

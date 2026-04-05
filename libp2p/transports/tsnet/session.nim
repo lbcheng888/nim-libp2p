@@ -422,6 +422,23 @@ proc toJson*(snapshot: TsnetSessionSnapshot): JsonNode =
   result["derpMap"] = snapshot.derpMap.toJson()
   result["ping"] = snapshot.ping.toJson()
 
+proc parseSessionSnapshot*(node: JsonNode): Result[TsnetSessionSnapshot, string] =
+  if node.isNil or node.kind != JObject:
+    return err("tsnet session snapshot must be a JSON object")
+  let status = parseStatusSnapshot(jsonField(node, "status")).valueOr:
+    return err(error)
+  let derpMap = parseDerpMapSnapshot(jsonField(node, "derpMap")).valueOr:
+    return err(error)
+  let ping = parsePingSnapshot(jsonField(node, "ping")).valueOr:
+    return err(error)
+  ok(TsnetSessionSnapshot.init(
+    source = jsonString(node, "source"),
+    capturedAtUnixMilli = jsonInt64(node, "capturedAtUnixMilli"),
+    status = status,
+    derpMap = derpMap,
+    ping = ping
+  ))
+
 proc homeDerpLabel*(snapshot: TsnetSessionSnapshot): string =
   if snapshot.status.tailnetDerpMapSummary.len > 0:
     return snapshot.status.tailnetDerpMapSummary

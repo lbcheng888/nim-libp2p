@@ -1,6 +1,6 @@
 {.push raises: [].}
 
-import std/[json, os, strutils, times, sequtils]
+import std/[json, os, parsejson, streams, strutils, times, sequtils]
 import nimcrypto/sysrand
 
 import ../../crypto/curve25519
@@ -52,6 +52,9 @@ const
   TsnetMachinePublicKeyPrefix* = "mkey:"
   TsnetNodePublicKeyPrefix* = "nodekey:"
   TsnetDiscoPublicKeyPrefix* = "discokey:"
+
+proc normalizeState(state: var TsnetStoredState)
+proc syncDerivedPublicKeys*(state: var TsnetStoredState): Result[bool, string]
 
 proc nowUnixMilli(): int64 =
   getTime().toUnix().int64 * 1000
@@ -168,6 +171,301 @@ proc parseStoredPeer(node: JsonNode): TsnetStoredPeer =
     lastHandshakeUnixMilli: jsonInt64(node, "lastHandshakeUnixMilli")
   )
 
+proc parserLocation(parser: JsonParser): string =
+  parser.getFilename() & "(" & $parser.getLine() & ", " & $parser.getColumn() & ")"
+
+proc parserFailure(parser: JsonParser): string =
+  try:
+    parser.errorMsg()
+  except CatchableError:
+    parserLocation(parser) & " Error: invalid JSON"
+
+template valueOr[E](self: Result[void, E], body: untyped): bool =
+  if self.isErr():
+    let error {.inject.} = self.error
+    body
+    false
+  else:
+    true
+
+proc parserNext(parser: var JsonParser): Result[void, string] =
+  try:
+    parser.next()
+    ok()
+  except CatchableError as exc:
+    err(parserLocation(parser) & " Error: failed to read JSON: " & exc.msg)
+
+proc parserStringValue(parser: var JsonParser): Result[string, string] =
+  try:
+    ok(parser.str())
+  except CatchableError as exc:
+    err(parserLocation(parser) & " Error: failed to read JSON string: " & exc.msg)
+
+template requireParserNext(parser: var JsonParser): untyped =
+  block:
+    let parserNextResult = parserNext(parser)
+    if parserNextResult.isErr():
+      return err(parserNextResult.error)
+
+template requireOk(step: untyped): untyped =
+  let stepResult {.inject.} = step
+  if stepResult.isErr():
+    return err(stepResult.error)
+
+proc parserError(parser: JsonParser, msg: string): string =
+  if parser.kind == jsonError:
+    return parserFailure(parser)
+  parserLocation(parser) & " Error: " & msg
+
+proc skipCurrentJsonValue(parser: var JsonParser): Result[void, string] =
+  case parser.kind
+  of jsonString, jsonInt, jsonFloat, jsonTrue, jsonFalse, jsonNull:
+    ok()
+  of jsonObjectStart, jsonArrayStart:
+    var depth = 1
+    while depth > 0:
+      requireParserNext(parser)
+      case parser.kind
+      of jsonError:
+        return err(parserFailure(parser))
+      of jsonEof:
+        return err(parserError(parser, "unexpected EOF while skipping JSON value"))
+      of jsonObjectStart, jsonArrayStart:
+        inc depth
+      of jsonObjectEnd, jsonArrayEnd:
+        dec depth
+      else:
+        discard
+    ok()
+  else:
+    err(parserError(parser, "expected JSON value"))
+
+proc assignJsonStringField(
+    parser: var JsonParser,
+    target: var string
+): Result[void, string] =
+  case parser.kind
+  of jsonString:
+    target = parser.parserStringValue().valueOr:
+      return err(error)
+    ok()
+  of jsonObjectStart:
+    skipCurrentJsonValue(parser)
+  else:
+    ok()
+
+proc assignJsonInt64Field(
+    parser: var JsonParser,
+    target: var int64
+): Result[void, string] =
+  case parser.kind
+  of jsonInt:
+    try:
+      target = parser.getInt().int64
+      ok()
+    except CatchableError:
+      err(parserError(parser, "invalid integer value"))
+  of jsonFloat:
+    try:
+      target = parser.getFloat().int64
+      ok()
+    except CatchableError:
+      err(parserError(parser, "invalid float value"))
+  of jsonObjectStart:
+    skipCurrentJsonValue(parser)
+  else:
+    ok()
+
+proc parseJsonStringArray(
+    parser: var JsonParser,
+    target: var seq[string]
+): Result[void, string] =
+  target = @[]
+  case parser.kind
+  of jsonArrayStart:
+    requireParserNext(parser)
+    while parser.kind != jsonArrayEnd:
+      case parser.kind
+      of jsonError:
+        return err(parserFailure(parser))
+      of jsonEof:
+        return err(parserError(parser, "unexpected EOF while parsing string array"))
+      of jsonString:
+        let item = parser.parserStringValue().valueOr:
+          return err(error)
+        target.add(item)
+      of jsonObjectStart, jsonArrayStart:
+        requireOk(skipCurrentJsonValue(parser))
+      else:
+        discard
+      requireParserNext(parser)
+    ok()
+  of jsonObjectStart:
+    skipCurrentJsonValue(parser)
+  else:
+    ok()
+
+proc parseStoredPeerFromParser(parser: var JsonParser): Result[TsnetStoredPeer, string] =
+  if parser.kind != jsonObjectStart:
+    return err(parserError(parser, "tsnet state peerCache entries must be objects"))
+  var peer: TsnetStoredPeer
+  requireParserNext(parser)
+  while parser.kind != jsonObjectEnd:
+    case parser.kind
+    of jsonError:
+      return err(parserFailure(parser))
+    of jsonEof:
+      return err(parserError(parser, "unexpected EOF while parsing peerCache entry"))
+    of jsonString:
+      let key = parser.parserStringValue().valueOr:
+        return err(error)
+      requireParserNext(parser)
+      case key
+      of "nodeId":
+        requireOk(assignJsonStringField(parser, peer.nodeId))
+      of "hostName":
+        requireOk(assignJsonStringField(parser, peer.hostName))
+      of "dnsName":
+        requireOk(assignJsonStringField(parser, peer.dnsName))
+      of "relay":
+        requireOk(assignJsonStringField(parser, peer.relay))
+      of "tailscaleIPs":
+        requireOk(parseJsonStringArray(parser, peer.tailscaleIPs))
+      of "allowedIPs":
+        requireOk(parseJsonStringArray(parser, peer.allowedIPs))
+      of "lastHandshakeUnixMilli":
+        requireOk(assignJsonInt64Field(parser, peer.lastHandshakeUnixMilli))
+      else:
+        requireOk(skipCurrentJsonValue(parser))
+      requireParserNext(parser)
+    else:
+      return err(parserError(parser, "tsnet state peerCache entry field name must be a string"))
+  ok(peer)
+
+proc parseStoredPeerCache(
+    parser: var JsonParser,
+    target: var seq[TsnetStoredPeer]
+): Result[void, string] =
+  if parser.kind != jsonArrayStart:
+    return err(parserError(parser, "tsnet state peerCache must be an array"))
+  target = @[]
+  requireParserNext(parser)
+  while parser.kind != jsonArrayEnd:
+    case parser.kind
+    of jsonError:
+      return err(parserFailure(parser))
+    of jsonEof:
+      return err(parserError(parser, "unexpected EOF while parsing peerCache"))
+    of jsonObjectStart:
+      let peer = parseStoredPeerFromParser(parser).valueOr:
+        return err(error)
+      target.add(peer)
+      requireParserNext(parser)
+    else:
+      return err(parserError(parser, "tsnet state peerCache entries must be objects"))
+  ok()
+
+proc parseStoredState*(
+    payloadText: string,
+    source = "input"
+): Result[TsnetStoredState, string] =
+  var input = newStringStream(payloadText)
+  var parser: JsonParser
+  try:
+    parser.open(input, source)
+  except CatchableError as exc:
+    return err(source & " Error: failed to open JSON parser: " & exc.msg)
+  defer:
+    try:
+      parser.close()
+    except CatchableError:
+      discard
+
+  requireParserNext(parser)
+  if parser.kind == jsonError:
+    return err(parserFailure(parser))
+  if parser.kind != jsonObjectStart:
+    return err(parserError(parser, "tsnet state file must contain a JSON object"))
+
+  var state: TsnetStoredState
+  requireParserNext(parser)
+  while parser.kind != jsonObjectEnd:
+    case parser.kind
+    of jsonError:
+      return err(parserFailure(parser))
+    of jsonEof:
+      return err(parserError(parser, "unexpected EOF while parsing tsnet state"))
+    of jsonString:
+      let key = parser.parserStringValue().valueOr:
+        return err(error)
+      requireParserNext(parser)
+      case key
+      of "schemaVersion":
+        var schemaVersion = state.schemaVersion.int64
+        requireOk(assignJsonInt64Field(parser, schemaVersion))
+        state.schemaVersion = schemaVersion.int
+      of "machineKey":
+        requireOk(assignJsonStringField(parser, state.machineKey))
+      of "nodeKey":
+        requireOk(assignJsonStringField(parser, state.nodeKey))
+      of "wgKey":
+        requireOk(assignJsonStringField(parser, state.wgKey))
+      of "machinePublicKey":
+        requireOk(assignJsonStringField(parser, state.machinePublicKey))
+      of "nodePublicKey":
+        requireOk(assignJsonStringField(parser, state.nodePublicKey))
+      of "discoPublicKey":
+        requireOk(assignJsonStringField(parser, state.discoPublicKey))
+      of "controlPublicKey":
+        requireOk(assignJsonStringField(parser, state.controlPublicKey))
+      of "controlLegacyPublicKey":
+        requireOk(assignJsonStringField(parser, state.controlLegacyPublicKey))
+      of "hostname":
+        requireOk(assignJsonStringField(parser, state.hostname))
+      of "controlUrl":
+        requireOk(assignJsonStringField(parser, state.controlUrl))
+      of "nodeId":
+        requireOk(assignJsonStringField(parser, state.nodeId))
+      of "userLogin":
+        requireOk(assignJsonStringField(parser, state.userLogin))
+      of "homeDerp":
+        requireOk(assignJsonStringField(parser, state.homeDerp))
+      of "tailnetIPs":
+        requireOk(parseJsonStringArray(parser, state.tailnetIPs))
+      of "peerCache":
+        requireOk(parseStoredPeerCache(parser, state.peerCache))
+      of "mapSessionHandle":
+        requireOk(assignJsonStringField(parser, state.mapSessionHandle))
+      of "mapSessionSeq":
+        requireOk(assignJsonInt64Field(parser, state.mapSessionSeq))
+      of "lastControlSuccessUnixMilli":
+        requireOk(assignJsonInt64Field(parser, state.lastControlSuccessUnixMilli))
+      of "lastRegisterAttemptUnixMilli":
+        requireOk(assignJsonInt64Field(parser, state.lastRegisterAttemptUnixMilli))
+      of "lastMapPollAttemptUnixMilli":
+        requireOk(assignJsonInt64Field(parser, state.lastMapPollAttemptUnixMilli))
+      of "lastControlBootstrapError":
+        requireOk(assignJsonStringField(parser, state.lastControlBootstrapError))
+      of "createdAtUnixMilli":
+        requireOk(assignJsonInt64Field(parser, state.createdAtUnixMilli))
+      of "updatedAtUnixMilli":
+        requireOk(assignJsonInt64Field(parser, state.updatedAtUnixMilli))
+      else:
+        requireOk(skipCurrentJsonValue(parser))
+      requireParserNext(parser)
+    else:
+      return err(parserError(parser, "tsnet state field name must be a string"))
+
+  requireParserNext(parser)
+  if parser.kind == jsonError:
+    return err(parserFailure(parser))
+  if parser.kind != jsonEof:
+    return err(parserError(parser, "unexpected trailing JSON content"))
+
+  normalizeState(state)
+  discard syncDerivedPublicKeys(state)
+  ok(state)
+
 proc init*(
     _: type[TsnetStoredState],
     hostname = "",
@@ -269,7 +567,7 @@ proc ensureIdentityKeys*(state: var TsnetStoredState): Result[bool, string] =
   changed = changed or derived
   ok(changed)
 
-proc toJson*(state: TsnetStoredState): JsonNode =
+proc toJson*(state: var TsnetStoredState): JsonNode =
   result = newJObject()
   result["schemaVersion"] = %state.schemaVersion
   result["machineKey"] = %state.machineKey
@@ -342,22 +640,31 @@ proc parseStoredState*(node: JsonNode): Result[TsnetStoredState, string] =
 
 proc statePath*(stateDir: string): string =
   let clean = stateDir.strip()
-  if clean.len == 0:
+  if clean.len == 0 or not clean.isAbsolute:
     return ""
   clean / TsnetStoredStateFilename
+
+proc validateStateDir*(stateDir: string): Result[string, string] =
+  let clean = stateDir.strip()
+  if clean.len == 0:
+    return err("tsnet stateDir is empty")
+  if not clean.isAbsolute:
+    return err("tsnet stateDir must be an absolute filesystem path")
+  ok(clean)
 
 proc loadStoredState*(
     stateDir: string,
     hostname = "",
     controlUrl = ""
 ): Result[TsnetStoredState, string] =
-  let path = statePath(stateDir)
-  if path.len == 0 or not fileExists(path):
+  let clean = validateStateDir(stateDir).valueOr:
+    return err(error)
+  let path = clean / TsnetStoredStateFilename
+  if not fileExists(path):
     return ok(TsnetStoredState.init(hostname = hostname, controlUrl = controlUrl))
   try:
-    let parsed = parseJson(readFile(path))
-    let loaded = parseStoredState(parsed).valueOr:
-      return err(error)
+    let loaded = parseStoredState(readFile(path), path).valueOr:
+      return err("failed to load tsnet state from " & path & ": " & error)
     var resultState = loaded
     if resultState.hostname.len == 0 and hostname.len > 0:
       resultState.hostname = hostname
@@ -367,16 +674,15 @@ proc loadStoredState*(
   except CatchableError as exc:
     err("failed to load tsnet state from " & path & ": " & exc.msg)
 
-proc storeStoredState*(stateDir: string, state: TsnetStoredState): Result[string, string] =
-  let path = statePath(stateDir)
-  if path.len == 0:
-    return err("tsnet stateDir is empty")
-  var persisted = state
-  normalizeState(persisted)
-  persisted.updatedAtUnixMilli = nowUnixMilli()
+proc storeStoredState*(stateDir: string, state: var TsnetStoredState): Result[string, string] =
+  let clean = validateStateDir(stateDir).valueOr:
+    return err(error)
+  let path = clean / TsnetStoredStateFilename
+  normalizeState(state)
+  state.updatedAtUnixMilli = nowUnixMilli()
   try:
-    createDir(stateDir)
-    writeFile(path, $persisted.toJson())
+    createDir(clean)
+    writeFile(path, $state.toJson())
     ok(path)
   except CatchableError as exc:
     err("failed to store tsnet state to " & path & ": " & exc.msg)

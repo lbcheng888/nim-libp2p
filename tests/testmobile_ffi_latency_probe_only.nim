@@ -113,6 +113,8 @@ proc firstTcpAddrFromJson(raw: string, peerId: string, allowLoopbackFallback: bo
     var multiaddr = item.getStr().strip()
     if not multiaddr.contains("/tcp/"):
       continue
+    if multiaddr.contains("/tcp/0/") or multiaddr.endsWith("/tcp/0"):
+      continue
     if allowLoopbackFallback:
       multiaddr = multiaddr.replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
       multiaddr = multiaddr.replace("/ip6/::/", "/ip6/::1/")
@@ -202,3 +204,33 @@ suite "Mobile FFI latency probe":
 
     check dmLatencyStats["preferredMetric"].getStr() in ["transport_rtt", "dm_ack_rtt"]
     check dmLatencyStats["dmAckRtt"]["lastMs"].getInt() >= 0
+
+    let sendWithAckPayload = %* {
+      "mid": "latency-send-with-ack",
+      "messageId": "latency-send-with-ack",
+      "op": "text",
+      "type": "text",
+      "text": "path-latency-runtime",
+      "body": "path-latency-runtime",
+      "content": "path-latency-runtime",
+      "conversationId": "dm:path-latency-runtime",
+      "timestampMs": nowMillis(),
+      "ackRequested": true,
+    }
+    check libp2p_send_with_ack(
+      nodeA,
+      peerB.cstring,
+      ($sendWithAckPayload).cstring,
+      8_000
+    )
+
+    var dmPathRow = newJNull()
+    waitUntilSatisfied(10_000, 150):
+      let connectedInfo = safeJsonExpr(libp2p_connected_peers_info(nodeA), "[]")
+      dmPathRow = findPeerInfo(connectedInfo, peerB)
+      dmPathRow.kind == JObject and
+        dmPathRow["directDmLatencyMs"].getInt() >= 0 and
+        dmPathRow["dmPathLatencyStats"]["directDm"]["totalSuccessCount"].getInt() >= 1
+
+    check dmPathRow["directDmLatencyMs"].getInt() >= 0
+    check dmPathRow["dmPathLatencyStats"]["directDm"]["totalSuccessCount"].getInt() >= 1

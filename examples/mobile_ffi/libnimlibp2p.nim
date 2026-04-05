@@ -189,6 +189,8 @@ type
   DirectSessionTargetSnapshot = object
     taskKey: string
     peerId: string
+    source: string
+    selectedAddrs: seq[string]
     status: string
     error: string
     ok: bool
@@ -198,6 +200,7 @@ type
     sessionConnKey: int
     routeReady: bool
     routePathKind: string
+    updatedAtMs: int64
     attemptCount: int
     successCount: int
     failureCount: int
@@ -205,6 +208,10 @@ type
     lastReadyAtMs: int64
     lastFailureAtMs: int64
     lastFailureReason: string
+    successRatePct: int
+    taskState: string
+    verifiedMuxerWaitMs: int
+    attemptedAddr: string
   PeerRouteSessionSnapshot = object
     peerId: string
     status: string
@@ -217,7 +224,6 @@ type
 var bootstrapSeedConnectKickoffState {.global.}: Table[string, string] = initTable[string, string]()
 var bootstrapSeedConnectKickoffLatestTaskKey {.global.}: Table[string, string] = initTable[string, string]()
 var bootstrapSeedConnectKickoffStateLock {.global.}: Lock
-var directSessionTargetState {.global.}: Table[string, string] = initTable[string, string]()
 var directSessionTargetSnapshots {.global.}: Table[string, DirectSessionTargetSnapshot] =
   initTable[string, DirectSessionTargetSnapshot]()
 var directSessionTargetLatestTaskKey {.global.}: Table[string, string] = initTable[string, string]()
@@ -240,122 +246,170 @@ proc bootstrapSeedConnectTaskKey(
 ): string {.raises: [].}
 
 proc directSessionTargetStateJson(
-    peerId: string,
-    taskKey: string,
-    status: string,
-    payload: JsonNode = newJNull(),
-    error: string = ""
+    snapshot: DirectSessionTargetSnapshot
 ): string {.raises: [].} =
-  var obj = %*{
-    "status": status,
-    "peerId": peerId,
-    "error": error,
-    "taskKey": taskKey,
-  }
-  if payload.kind != JNull:
-    obj["payload"] = payload
-  $obj
+  proc payloadJson(snapshot: DirectSessionTargetSnapshot): string {.raises: [].} =
+    result = newStringOfCap(768)
+    result.add('{')
+
+    template appendFieldSep() =
+      if result.len > 1:
+        result.add(',')
+
+    template appendStringField(key: string, value: string) =
+      appendFieldSep()
+      result.add('"')
+      result.add(key)
+      result.add("\":")
+      result.add(escapeJson(value))
+
+    template appendBoolField(key: string, value: bool) =
+      appendFieldSep()
+      result.add('"')
+      result.add(key)
+      result.add("\":")
+      result.add(if value: "true" else: "false")
+
+    template appendIntField(key: string, value: SomeInteger) =
+      appendFieldSep()
+      result.add('"')
+      result.add(key)
+      result.add("\":")
+      result.add($value)
+
+    template appendStringSeqField(key: string, values: seq[string]) =
+      appendFieldSep()
+      result.add('"')
+      result.add(key)
+      result.add("\":[")
+      for idx, value in values:
+        if idx > 0:
+          result.add(',')
+        result.add(escapeJson(value))
+      result.add(']')
+
+    appendBoolField("ok", snapshot.ok)
+    appendStringField("peerId", snapshot.peerId)
+    appendStringField("source", snapshot.source)
+    appendStringSeqField("selectedAddrs", snapshot.selectedAddrs)
+    appendStringField("status", snapshot.status)
+    appendStringField("taskKey", snapshot.taskKey)
+    appendBoolField("taskRunning", snapshot.taskRunning)
+    appendBoolField("sessionWarmOk", snapshot.sessionWarmOk)
+    appendBoolField("verifiedMuxer", snapshot.verifiedMuxer)
+    appendIntField("sessionConnKey", snapshot.sessionConnKey)
+    appendBoolField("routeReady", snapshot.routeReady)
+    appendStringField("routePathKind", snapshot.routePathKind)
+    appendIntField("updatedAtMs", snapshot.updatedAtMs)
+    appendIntField("attemptCount", snapshot.attemptCount)
+    appendIntField("successCount", snapshot.successCount)
+    appendIntField("failureCount", snapshot.failureCount)
+    appendIntField("lastAttemptAtMs", snapshot.lastAttemptAtMs)
+    appendIntField("lastReadyAtMs", snapshot.lastReadyAtMs)
+    appendIntField("lastFailureAtMs", snapshot.lastFailureAtMs)
+    appendStringField("lastFailureReason", snapshot.lastFailureReason)
+    appendIntField("successRatePct", snapshot.successRatePct)
+    if snapshot.taskState.len > 0:
+      appendStringField("taskState", snapshot.taskState)
+      appendIntField("verifiedMuxerWaitMs", snapshot.verifiedMuxerWaitMs)
+    if snapshot.attemptedAddr.len > 0:
+      appendStringField("attemptedAddr", snapshot.attemptedAddr)
+    if snapshot.error.len > 0:
+      appendStringField("error", snapshot.error)
+    result.add('}')
+
+  result = newStringOfCap(896)
+  result.add('{')
+
+  template appendFieldSep() =
+    if result.len > 1:
+      result.add(',')
+
+  template appendStringField(key: string, value: string) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(escapeJson(value))
+
+  appendStringField("status", snapshot.status)
+  appendStringField("peerId", snapshot.peerId)
+  appendStringField("error", snapshot.error)
+  appendStringField("taskKey", snapshot.taskKey)
+  appendFieldSep()
+  result.add("\"payload\":")
+  result.add(payloadJson(snapshot))
+  result.add('}')
 
 proc buildDirectSessionTargetSnapshot(
     peerId: string,
     taskKey: string,
     status: string,
-    payload: JsonNode = newJNull(),
-    error: string = ""
+    selectedAddrs: seq[string] = @[],
+    source = "",
+    error = "",
+    ok = false,
+    taskRunning = false,
+    sessionWarmOk = false,
+    verifiedMuxer = false,
+    sessionConnKey = 0,
+    routeReady = false,
+    routePathKind = "",
+    updatedAtMs = 0'i64,
+    attemptCount = 0,
+    successCount = 0,
+    failureCount = 0,
+    lastAttemptAtMs = 0'i64,
+    lastReadyAtMs = 0'i64,
+    lastFailureAtMs = 0'i64,
+    lastFailureReason = "",
+    taskState = "",
+    verifiedMuxerWaitMs = 0,
+    attemptedAddr = ""
 ): DirectSessionTargetSnapshot {.raises: [].} =
+  let successRatePct =
+    if attemptCount > 0:
+      int((successCount * 100) div attemptCount)
+    else:
+      0
   result = DirectSessionTargetSnapshot(
     taskKey: taskKey,
     peerId: peerId,
+    source: source,
+    selectedAddrs: selectedAddrs,
     status: status,
     error: error,
-    ok: false,
-    taskRunning: false,
-    sessionWarmOk: false,
-    verifiedMuxer: false,
-    sessionConnKey: 0,
-    routeReady: false,
-    routePathKind: "",
-    attemptCount: 0,
-    successCount: 0,
-    failureCount: 0,
-    lastAttemptAtMs: 0,
-    lastReadyAtMs: 0,
-    lastFailureAtMs: 0,
-    lastFailureReason: "",
+    ok: ok,
+    taskRunning: taskRunning,
+    sessionWarmOk: sessionWarmOk,
+    verifiedMuxer: verifiedMuxer,
+    sessionConnKey: sessionConnKey,
+    routeReady: routeReady,
+    routePathKind: routePathKind,
+    updatedAtMs: updatedAtMs,
+    attemptCount: attemptCount,
+    successCount: successCount,
+    failureCount: failureCount,
+    lastAttemptAtMs: lastAttemptAtMs,
+    lastReadyAtMs: lastReadyAtMs,
+    lastFailureAtMs: lastFailureAtMs,
+    lastFailureReason: lastFailureReason,
+    successRatePct: successRatePct,
+    taskState: taskState,
+    verifiedMuxerWaitMs: verifiedMuxerWaitMs,
+    attemptedAddr: attemptedAddr,
   )
-  if payload.kind != JObject:
-    return
-  let okNode = payload{"ok"}
-  if not okNode.isNil and okNode.kind == JBool:
-    result.ok = okNode.getBool()
-  let taskRunningNode = payload{"taskRunning"}
-  if not taskRunningNode.isNil and taskRunningNode.kind == JBool:
-    result.taskRunning = taskRunningNode.getBool()
-  let sessionWarmOkNode = payload{"sessionWarmOk"}
-  if not sessionWarmOkNode.isNil and sessionWarmOkNode.kind == JBool:
-    result.sessionWarmOk = sessionWarmOkNode.getBool()
-  let verifiedMuxerNode = payload{"verifiedMuxer"}
-  if not verifiedMuxerNode.isNil and verifiedMuxerNode.kind == JBool:
-    result.verifiedMuxer = verifiedMuxerNode.getBool()
-  let sessionConnKeyNode = payload{"sessionConnKey"}
-  if not sessionConnKeyNode.isNil:
-    case sessionConnKeyNode.kind
-    of JInt:
-      result.sessionConnKey = int(sessionConnKeyNode.getInt())
-    of JString:
-      try:
-        result.sessionConnKey = parseInt(sessionConnKeyNode.getStr())
-      except ValueError:
-        discard
-    else:
-      discard
-  let errorNode = payload{"error"}
-  if not errorNode.isNil and errorNode.kind == JString and result.error.len == 0:
-    result.error = errorNode.getStr()
-  let routeReadyNode = payload{"routeReady"}
-  if not routeReadyNode.isNil and routeReadyNode.kind == JBool:
-    result.routeReady = routeReadyNode.getBool()
-  let routePathKindNode = payload{"routePathKind"}
-  if not routePathKindNode.isNil and routePathKindNode.kind == JString:
-    result.routePathKind = routePathKindNode.getStr()
-  let attemptCountNode = payload{"attemptCount"}
-  if not attemptCountNode.isNil and attemptCountNode.kind == JInt:
-    result.attemptCount = int(attemptCountNode.getInt())
-  let successCountNode = payload{"successCount"}
-  if not successCountNode.isNil and successCountNode.kind == JInt:
-    result.successCount = int(successCountNode.getInt())
-  let failureCountNode = payload{"failureCount"}
-  if not failureCountNode.isNil and failureCountNode.kind == JInt:
-    result.failureCount = int(failureCountNode.getInt())
-  let lastAttemptAtMsNode = payload{"lastAttemptAtMs"}
-  if not lastAttemptAtMsNode.isNil and lastAttemptAtMsNode.kind == JInt:
-    result.lastAttemptAtMs = lastAttemptAtMsNode.getInt()
-  let lastReadyAtMsNode = payload{"lastReadyAtMs"}
-  if not lastReadyAtMsNode.isNil and lastReadyAtMsNode.kind == JInt:
-    result.lastReadyAtMs = lastReadyAtMsNode.getInt()
-  let lastFailureAtMsNode = payload{"lastFailureAtMs"}
-  if not lastFailureAtMsNode.isNil and lastFailureAtMsNode.kind == JInt:
-    result.lastFailureAtMs = lastFailureAtMsNode.getInt()
-  let lastFailureReasonNode = payload{"lastFailureReason"}
-  if not lastFailureReasonNode.isNil and lastFailureReasonNode.kind == JString:
-    result.lastFailureReason = lastFailureReasonNode.getStr()
 
 proc setDirectSessionTargetState(
     peerId: string,
     selectedAddrs: openArray[string],
-    status: string,
-    payload: JsonNode = newJNull(),
-    error: string = ""
+    snapshot: DirectSessionTargetSnapshot
 ) {.raises: [].} =
   let safePeerId = peerId.strip()
   let taskKey = bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs)
   if safePeerId.len == 0 or taskKey.len == 0:
     return
-  let snapshot =
-    buildDirectSessionTargetSnapshot(safePeerId, taskKey, status, payload, error)
   withLock(directSessionTargetStateLock):
-    directSessionTargetState[taskKey] =
-      directSessionTargetStateJson(safePeerId, taskKey, status, payload, error)
     directSessionTargetSnapshots[taskKey] = snapshot
     directSessionTargetLatestTaskKey[safePeerId] = taskKey
 
@@ -366,11 +420,25 @@ proc getDirectSessionTargetState(
   let safePeerId = peerId.strip()
   let taskKey = bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs)
   if safePeerId.len == 0 or taskKey.len == 0:
-    return directSessionTargetStateJson("", "", "missing", newJNull(), "missing_peerId_or_addresses")
+    return directSessionTargetStateJson(
+      buildDirectSessionTargetSnapshot(
+        safePeerId,
+        "",
+        "missing",
+        error = "missing_peerId_or_addresses",
+      )
+    )
   withLock(directSessionTargetStateLock):
-    if directSessionTargetState.hasKey(taskKey):
-      return directSessionTargetState.getOrDefault(taskKey)
-  directSessionTargetStateJson(safePeerId, taskKey, "missing")
+    if directSessionTargetSnapshots.hasKey(taskKey):
+      return directSessionTargetStateJson(directSessionTargetSnapshots.getOrDefault(taskKey))
+  directSessionTargetStateJson(
+    buildDirectSessionTargetSnapshot(
+      safePeerId,
+      taskKey,
+      "missing",
+      selectedAddrs = @selectedAddrs,
+    )
+  )
 
 proc getDirectSessionTargetSnapshot(
     peerId: string,
@@ -897,6 +965,11 @@ type
     dmAckRtt: PeerLatencyMetric
     updatedAtMs: int64
 
+  PeerDmPathLatencyProfile = object
+    directDm: PeerLatencyMetric
+    relayDm: PeerLatencyMetric
+    updatedAtMs: int64
+
   LivestreamSession = object
     streamKey: string
     config: JsonNode
@@ -1012,6 +1085,8 @@ type
     target: string
     jsonString: string
     textPayload: string
+    hostNetworkStatusParam: HostNetworkStatusSnapshot
+    hostNetworkStatusParamSet: bool
     streamKey: string
     sessionConnKey: int
     preSerializedJson: bool
@@ -1206,6 +1281,11 @@ type
     tailnetWarmFinalizePending: Atomic[bool]
     tailnetWarmSucceeded: Atomic[bool]
     commandDrainActive: bool
+    currentCommandKindCode: Atomic[int]
+    currentCommandKind: CommandKind
+    currentCommandPeerId: string
+    currentCommandStreamKey: string
+    currentCommandStartedAtMs: int64
     threadJoined: Atomic[bool]
     directWaiters: Table[string, DirectWaiter]
     pendingFileChunkResponses: Table[string, FileChunkWaiter]
@@ -1263,6 +1343,7 @@ type
     probeInboundTraffic: Table[string, ProbeSessionTraffic]
     peerSystemProfiles: Table[string, JsonNode]
     peerLatencyProfiles: Table[string, PeerLatencyProfile]
+    peerDmPathLatencyProfiles: Table[string, PeerDmPathLatencyProfile]
     lanEndpointsCache: JsonNode
     feedItems: seq[CachedFeedItem]
     livestreams: Table[string, LivestreamSession]
@@ -1319,6 +1400,9 @@ proc reconcileDirectSessionTarget(
 ) {.gcsafe, raises: [].}
 proc ensureDirectSessionTargetReconcileLoop(n: NimNode) {.gcsafe, raises: [].}
 proc ensurePeerRouteSessionReconcileLoop(n: NimNode) {.gcsafe, raises: [].}
+proc bootstrapSeedConnectStateLabel(
+    state: BootstrapSeedConnectState
+): string {.gcsafe, raises: [].}
 proc upsertDirectSessionTarget(
     n: NimNode,
     peerIdText: string,
@@ -1421,7 +1505,10 @@ proc resetCommandFields(cmd: Command) =
   cmd.target = ""
   cmd.jsonString = ""
   cmd.textPayload = ""
+  cmd.hostNetworkStatusParam = HostNetworkStatusSnapshot()
+  cmd.hostNetworkStatusParamSet = false
   cmd.streamKey = ""
+  cmd.sessionConnKey = 0
   cmd.preSerializedJson = false
   cmd.highPriority = false
   cmd.completed.store(false, moRelease)
@@ -1505,6 +1592,14 @@ proc parseDirectEnvelopeAckRequested(
   except CatchableError:
     discard
   defaultValue
+
+proc currentCommandKindTextSnapshot(node: NimNode): string {.gcsafe, raises: [].} =
+  if node.isNil:
+    return "cmdNone"
+  let kindCode = node.currentCommandKindCode.load(moAcquire)
+  if kindCode < ord(low(CommandKind)) or kindCode > ord(high(CommandKind)):
+    return "unknown"
+  $CommandKind(kindCode)
 
 proc classifyDirectCommandOp(cmd: Command): string =
   if cmd.isNil:
@@ -1608,6 +1703,7 @@ proc updateTailnetStartStatus(
     errorMsg: string = ""
 ) {.gcsafe, raises: [].}
 proc joinTailnetWarmThreadIfNeeded(n: NimNode) {.gcsafe, raises: [].}
+proc tailnetWarmWorker(handle: pointer) {.thread.}
 proc ensureMessageId(mid: string): string {.gcsafe, raises: [].}
 proc connectedPeersArray(handle: pointer): JsonNode
 proc addPeerHintSource(n: NimNode, peerId: string, source: string) {.gcsafe.}
@@ -2451,6 +2547,9 @@ proc isRelayBackedWanSeedAddr(addrText: string): bool {.gcsafe.} =
 
 proc replaceIpv4(addrStr: string, ip: string): Option[string] {.gcsafe.}
 proc replaceIpv6(addrStr: string, ip: string): Option[string] {.gcsafe.}
+proc currentHostNetworkStatusSnapshot(
+    n: NimNode
+): HostNetworkStatusSnapshot {.gcsafe.}
 proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.}
 proc dedupeLocalMultiaddrs(addrs: openArray[MultiAddress]): seq[MultiAddress] {.gcsafe.}
 
@@ -3871,6 +3970,56 @@ proc hostNetworkStatusToJson(status: HostNetworkStatusSnapshot): JsonNode {.gcsa
     "reason": status.reason,
   }
 
+proc hostNetworkStatusToJsonText(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  result = newStringOfCap(512)
+  result.add('{')
+
+  template appendFieldSep() =
+    if result.len > 1:
+      result.add(',')
+
+  template appendStringField(key: string, value: string) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(escapeJson(value))
+
+  template appendIntField(key: string, value: SomeInteger) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add($value)
+
+  template appendBoolField(key: string, value: bool) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(if value: "true" else: "false")
+
+  appendStringField("type", "HostNetworkStatus")
+  appendStringField("networkType", status.networkType)
+  appendStringField("transport", status.transport)
+  appendStringField("ssid", status.ssid)
+  appendStringField("localIpv4", status.localIpv4)
+  appendStringField("preferredIpv4", status.preferredIpv4)
+  appendStringField("localIpv6", status.localIpv6)
+  appendStringField("preferredIpv6", status.preferredIpv6)
+  appendStringField("publicIpv4", status.publicIpv4)
+  appendStringField("publicIpv6", status.publicIpv6)
+  appendStringField("publicIpv4ProbeError", status.publicIpv4ProbeError)
+  appendStringField("publicIpv6ProbeError", status.publicIpv6ProbeError)
+  appendIntField("publicIpProbeUpdatedAtMs", status.publicIpProbeUpdatedAtMs)
+  appendBoolField("publicIpv4RequiresHolePunching", status.publicIpv4RequiresHolePunching)
+  appendIntField("listenPort", status.listenPort)
+  appendBoolField("isConnected", status.isConnected)
+  appendBoolField("isMetered", status.isMetered)
+  appendIntField("timestampMs", status.timestampMs)
+  appendStringField("reason", status.reason)
+  result.add('}')
+
 proc defaultHostNetworkStatus(): JsonNode =
   hostNetworkStatusToJson(defaultHostNetworkStatusSnapshot())
 
@@ -4013,10 +4162,12 @@ proc updatePublicIpProbeState(
 ) {.gcsafe.} =
   if n.isNil:
     return
+  let normalizedIpv4 = normalizePublicIpProbeValue(ipv4, 4)
+  let normalizedIpv6 = normalizePublicIpProbeValue(ipv6, 6)
   acquire(n.publicIpProbeLock)
   try:
-    n.publicIpProbeState.ipv4 = ipv4.strip()
-    n.publicIpProbeState.ipv6 = ipv6.strip()
+    n.publicIpProbeState.ipv4 = normalizedIpv4
+    n.publicIpProbeState.ipv6 = normalizedIpv6
     n.publicIpProbeState.ipv4Error = ipv4Error.strip()
     n.publicIpProbeState.ipv6Error = ipv6Error.strip()
     n.publicIpProbeState.updatedAtMs = max(0'i64, updatedAtMs)
@@ -4045,8 +4196,8 @@ proc attachPublicIpProbeFields(
 ) {.gcsafe.} =
   let preferredIpv4 =
     (if status.preferredIpv4.len > 0: status.preferredIpv4 else: status.localIpv4).strip()
-  let publicIpv4 = normalizePublicIpProbeValue(probe.ipv4, 4)
-  let publicIpv6 = normalizePublicIpProbeValue(probe.ipv6, 6)
+  let publicIpv4 = probe.ipv4
+  let publicIpv6 = probe.ipv6
   status.publicIpv4 = publicIpv4
   status.publicIpv6 = publicIpv6
   status.publicIpv4ProbeError = probe.ipv4Error
@@ -4142,6 +4293,12 @@ proc sanitizeHostNetworkStatus(node: JsonNode): JsonNode
 proc sanitizeHostNetworkStatusSnapshot(
     node: JsonNode
 ): HostNetworkStatusSnapshot {.gcsafe.}
+proc sanitizeHostNetworkStatusSnapshot(
+    status: HostNetworkStatusSnapshot
+): HostNetworkStatusSnapshot {.gcsafe.}
+proc parseHostNetworkStatusSnapshot(
+    payloadText: string
+): Result[HostNetworkStatusSnapshot, string] {.gcsafe.}
 proc runHostNetworkStatusSideEffects(
     n: NimNode,
     hostStatus: HostNetworkStatusSnapshot,
@@ -4574,43 +4731,38 @@ proc runHostNetworkStatusSideEffects(
       "[nimlibp2p] cmdUpdateHostNetworkStatus side_effects:error " & exc.msg
     )
 
-proc sanitizeHostNetworkStatusSnapshot(
-    node: JsonNode
+proc buildSanitizedHostNetworkStatusSnapshot(
+    networkTypeRaw: string,
+    transportRaw: string,
+    ssidRaw: string,
+    localIpv4Raw: string,
+    preferredIpv4Raw: string,
+    localIpv6Raw: string,
+    preferredIpv6Raw: string,
+    publicIpv4Raw: string,
+    publicIpv6Raw: string,
+    publicIpv4ProbeErrorRaw: string,
+    publicIpv6ProbeErrorRaw: string,
+    publicIpProbeUpdatedAtMsRaw: int64,
+    listenPortRaw: int,
+    connectedRaw: bool,
+    meteredRaw: bool,
+    timestampMsRaw: int64,
+    reasonRaw: string
 ): HostNetworkStatusSnapshot {.gcsafe.} =
   var status = defaultHostNetworkStatusSnapshot()
-  if node.kind != JObject:
-    status.timestampMs = nowMillis()
-    return status
-
-  var networkType = normalizeHostNetworkType(
-    jsonGetStr(node, "networkType", jsonGetStr(node, "network_type", "none"))
-  )
-  var transport = normalizeHostTransport(
-    jsonGetStr(node, "transport", jsonGetStr(node, "transportType", networkType)),
-    networkType
-  )
-  var connected = jsonGetBool(
-    node,
-    "isConnected",
-    jsonGetBool(node, "connected", networkType != "none" and transport != "none")
-  )
-  var ssid = sanitizeHostSsid(jsonGetStr(node, "ssid", ""))
-  var metered = jsonGetBool(
-    node,
-    "isMetered",
-    jsonGetBool(node, "metered", false)
-  )
+  var networkType = normalizeHostNetworkType(networkTypeRaw)
+  var transport = normalizeHostTransport(transportRaw, networkType)
+  var connected = connectedRaw
+  var ssid = sanitizeHostSsid(ssidRaw)
+  var metered = meteredRaw
   if not connected:
     networkType = "none"
     transport = "none"
     ssid = ""
     metered = false
 
-  let timestampMs = max(0'i64, jsonGetInt64(node, "timestampMs", nowMillis()))
-  let localIpv4Raw = jsonGetStr(node, "localIpv4", jsonGetStr(node, "local_ipv4", ""))
-  let preferredIpv4Raw = jsonGetStr(node, "preferredIpv4", jsonGetStr(node, "preferred_ipv4", localIpv4Raw))
-  let localIpv6Raw = jsonGetStr(node, "localIpv6", jsonGetStr(node, "local_ipv6", ""))
-  let preferredIpv6Raw = jsonGetStr(node, "preferredIpv6", jsonGetStr(node, "preferred_ipv6", localIpv6Raw))
+  let timestampMs = max(0'i64, timestampMsRaw)
   let localIpv4 = sanitizeHostIpv4(localIpv4Raw)
   let preferredIpv4 = block:
     let sanitized = sanitizeHostIpv4(preferredIpv4Raw)
@@ -4619,12 +4771,12 @@ proc sanitizeHostNetworkStatusSnapshot(
   let preferredIpv6 = block:
     let sanitized = sanitizeHostIpv6(preferredIpv6Raw)
     if sanitized.len > 0: sanitized else: localIpv6
-  let publicIpv4 = normalizePublicIpProbeValue(jsonGetStr(node, "publicIpv4", ""), 4)
-  let publicIpv6 = normalizePublicIpProbeValue(jsonGetStr(node, "publicIpv6", ""), 6)
-  let publicIpv4ProbeError = jsonGetStr(node, "publicIpv4ProbeError", "").strip()
-  let publicIpv6ProbeError = jsonGetStr(node, "publicIpv6ProbeError", "").strip()
-  let publicIpProbeUpdatedAtMs = max(0'i64, jsonGetInt64(node, "publicIpProbeUpdatedAtMs", 0))
-  let listenPort = max(0, int(jsonGetInt64(node, "listenPort", jsonGetInt64(node, "listen_port", 0))))
+  let publicIpv4 = normalizePublicIpProbeValue(publicIpv4Raw, 4)
+  let publicIpv6 = normalizePublicIpProbeValue(publicIpv6Raw, 6)
+  let publicIpv4ProbeError = publicIpv4ProbeErrorRaw.strip()
+  let publicIpv6ProbeError = publicIpv6ProbeErrorRaw.strip()
+  let publicIpProbeUpdatedAtMs = max(0'i64, publicIpProbeUpdatedAtMsRaw)
+  let listenPort = max(0, listenPortRaw)
   status.networkType = networkType
   status.transport = transport
   status.ssid = ssid
@@ -4643,13 +4795,96 @@ proc sanitizeHostNetworkStatusSnapshot(
   status.isConnected = connected
   status.isMetered = metered
   status.timestampMs = if timestampMs > 0: timestampMs else: nowMillis()
-  status.reason = normalizeHostReason(jsonGetStr(node, "reason", "manual"))
+  status.reason = normalizeHostReason(reasonRaw)
   status
+
+proc sanitizeHostNetworkStatusSnapshot(
+    node: JsonNode
+): HostNetworkStatusSnapshot {.gcsafe.} =
+  if node.kind != JObject:
+    return buildSanitizedHostNetworkStatusSnapshot(
+      "none",
+      "none",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      0'i64,
+      0,
+      false,
+      false,
+      nowMillis(),
+      "manual",
+    )
+  let networkTypeRaw = jsonGetStr(node, "networkType", jsonGetStr(node, "network_type", "none"))
+  let localIpv4Raw = jsonGetStr(node, "localIpv4", jsonGetStr(node, "local_ipv4", ""))
+  let localIpv6Raw = jsonGetStr(node, "localIpv6", jsonGetStr(node, "local_ipv6", ""))
+  buildSanitizedHostNetworkStatusSnapshot(
+    networkTypeRaw,
+    jsonGetStr(node, "transport", jsonGetStr(node, "transportType", networkTypeRaw)),
+    jsonGetStr(node, "ssid", ""),
+    localIpv4Raw,
+    jsonGetStr(node, "preferredIpv4", jsonGetStr(node, "preferred_ipv4", localIpv4Raw)),
+    localIpv6Raw,
+    jsonGetStr(node, "preferredIpv6", jsonGetStr(node, "preferred_ipv6", localIpv6Raw)),
+    jsonGetStr(node, "publicIpv4", ""),
+    jsonGetStr(node, "publicIpv6", ""),
+    jsonGetStr(node, "publicIpv4ProbeError", ""),
+    jsonGetStr(node, "publicIpv6ProbeError", ""),
+    jsonGetInt64(node, "publicIpProbeUpdatedAtMs", 0),
+    int(jsonGetInt64(node, "listenPort", jsonGetInt64(node, "listen_port", 0))),
+    jsonGetBool(
+      node,
+      "isConnected",
+      jsonGetBool(node, "connected", networkTypeRaw.strip().len > 0 and networkTypeRaw.strip().toLowerAscii() != "none")
+    ),
+    jsonGetBool(node, "isMetered", jsonGetBool(node, "metered", false)),
+    jsonGetInt64(node, "timestampMs", nowMillis()),
+    jsonGetStr(node, "reason", "manual"),
+  )
+
+proc sanitizeHostNetworkStatusSnapshot(
+    status: HostNetworkStatusSnapshot
+): HostNetworkStatusSnapshot {.gcsafe.} =
+  buildSanitizedHostNetworkStatusSnapshot(
+    status.networkType,
+    status.transport,
+    status.ssid,
+    status.localIpv4,
+    status.preferredIpv4,
+    status.localIpv6,
+    status.preferredIpv6,
+    status.publicIpv4,
+    status.publicIpv6,
+    status.publicIpv4ProbeError,
+    status.publicIpv6ProbeError,
+    status.publicIpProbeUpdatedAtMs,
+    status.listenPort,
+    status.isConnected,
+    status.isMetered,
+    status.timestampMs,
+    status.reason,
+  )
+
+proc parseHostNetworkStatusSnapshot(
+    payloadText: string
+): Result[HostNetworkStatusSnapshot, string] {.gcsafe.} =
+  try:
+    ok(sanitizeHostNetworkStatusSnapshot(parseJson(payloadText)))
+  except CatchableError as exc:
+    err("invalid host network status payload: " & exc.msg)
 
 proc sanitizeHostNetworkStatus(node: JsonNode): JsonNode =
   hostNetworkStatusToJson(sanitizeHostNetworkStatusSnapshot(node))
 
-proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.} =
+proc currentHostNetworkStatusSnapshot(
+    n: NimNode
+): HostNetworkStatusSnapshot {.gcsafe.} =
   let base =
     if n.isNil:
       defaultHostNetworkStatusSnapshot()
@@ -4657,20 +4892,24 @@ proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.} =
       n.hostNetworkStatus
   var status = base
   attachPublicIpProbeFields(status, currentPublicIpProbeState(n))
-  result = hostNetworkStatusToJson(status)
+  status
 
-proc buildHostNetworkEvent(status: HostNetworkStatusSnapshot): JsonNode =
-  let normalized = hostNetworkStatusToJson(status)
-  %* {
-    "topic": "network_event",
-    "kind": "host",
-    "entity": "network",
-    "op": "status",
-    "timestampMs": status.timestampMs,
-    "payload": normalized,
-  }
+proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.} =
+  hostNetworkStatusToJson(currentHostNetworkStatusSnapshot(n))
 
-proc applyHostNetworkStatus(n: NimNode, status: JsonNode): JsonNode =
+proc buildHostNetworkEventText(status: HostNetworkStatusSnapshot): string =
+  "{\"topic\":\"network_event\"," &
+    "\"kind\":\"host\"," &
+    "\"entity\":\"network\"," &
+    "\"op\":\"status\"," &
+    "\"timestampMs\":" & $status.timestampMs & "," &
+    "\"payload\":" & hostNetworkStatusToJsonText(status) &
+    "}"
+
+proc applyHostNetworkStatus(
+    n: NimNode,
+    status: HostNetworkStatusSnapshot
+): HostNetworkStatusSnapshot =
   let previous =
     if n.isNil:
       defaultHostNetworkStatusSnapshot()
@@ -4701,7 +4940,7 @@ proc applyHostNetworkStatus(n: NimNode, status: JsonNode): JsonNode =
   n.localSystemProfile = newJObject()
   var current = normalized
   attachPublicIpProbeFields(current, currentPublicIpProbeState(n))
-  result = hostNetworkStatusToJson(current)
+  current
 
 proc quicAvailable(addrs: openArray[string]): bool =
   for addr in addrs:
@@ -4827,6 +5066,19 @@ proc wantsTsnetTransport(cfg: NodeConfig): bool {.gcsafe, raises: [].} =
       return true
   false
 
+proc effectiveTsnetStateDir(
+    cfg: NodeConfig,
+    configuredStateDir: string
+): string {.gcsafe, raises: [].} =
+  let explicitStateDir = configuredStateDir.strip()
+  if explicitStateDir.len > 0:
+    return explicitStateDir
+  if cfg.dataDir.isSome():
+    let dataDir = cfg.dataDir.get().strip()
+    if dataDir.len > 0:
+      return dataDir / "tsnet-state"
+  ""
+
 proc legacyCircuitRelayEnabled(cfg: NodeConfig): bool {.gcsafe, raises: [].} =
   cfg.automations.circuitRelay and not wantsTsnetTransport(cfg)
 
@@ -4892,7 +5144,10 @@ proc configuredTsnetTransportBuilderConfig(
   result.hostname =
     jsonGetStr(tsnetNode, "hostname", "").strip()
   result.stateDir =
-    jsonGetStr(tsnetNode, "stateDir", jsonGetStr(tsnetNode, "state_dir", "")).strip()
+    effectiveTsnetStateDir(
+      cfg,
+      jsonGetStr(tsnetNode, "stateDir", jsonGetStr(tsnetNode, "state_dir", ""))
+    )
   result.wireguardPort = max(
     0,
     int(jsonGetInt64(tsnetNode, "wireguardPort", jsonGetInt64(tsnetNode, "wireguard_port", 0)))
@@ -5400,6 +5655,13 @@ proc latencyMetricJson(metric: PeerLatencyMetric): JsonNode =
   node["lastError"] = %metric.lastError
   node
 
+proc latencyMetricDisplayMs(metric: PeerLatencyMetric): int =
+  if metric.totalSuccessCount <= 0 or metric.lastUpdatedAtMs <= 0:
+    return -1
+  if metric.ewmaMs > 0.0:
+    return int(round(finiteFloat(metric.ewmaMs, float(metric.lastMs))))
+  latencyMetricLastMs(metric)
+
 proc peerLatencyProfileJson(profile: PeerLatencyProfile): JsonNode =
   var node = newJObject()
   let transportLast = latencyMetricLastMs(profile.transportRtt)
@@ -5419,6 +5681,15 @@ proc peerLatencyProfileJson(profile: PeerLatencyProfile): JsonNode =
   node["updatedAtMs"] = %profile.updatedAtMs
   node
 
+proc peerDmPathLatencyProfileJson(profile: PeerDmPathLatencyProfile): JsonNode =
+  var node = newJObject()
+  node["directDm"] = latencyMetricJson(profile.directDm)
+  node["relayDm"] = latencyMetricJson(profile.relayDm)
+  node["directDmDisplayMs"] = %latencyMetricDisplayMs(profile.directDm)
+  node["relayDmDisplayMs"] = %latencyMetricDisplayMs(profile.relayDm)
+  node["updatedAtMs"] = %profile.updatedAtMs
+  node
+
 proc prunePeerLatencyProfiles(n: NimNode) =
   if n.isNil:
     return
@@ -5429,6 +5700,17 @@ proc prunePeerLatencyProfiles(n: NimNode) =
       expired.add(peerId)
   for peerId in expired:
     n.peerLatencyProfiles.del(peerId)
+
+proc prunePeerDmPathLatencyProfiles(n: NimNode) =
+  if n.isNil:
+    return
+  let nowTs = nowMillis()
+  var expired: seq[string] = @[]
+  for peerId, profile in n.peerDmPathLatencyProfiles.pairs:
+    if profile.updatedAtMs <= 0 or nowTs - profile.updatedAtMs > PeerLatencyStatsRetentionMs:
+      expired.add(peerId)
+  for peerId in expired:
+    n.peerDmPathLatencyProfiles.del(peerId)
 
 proc cachedTransportLatencyMs(n: NimNode, peerId: string): int =
   if n.isNil or peerId.len == 0:
@@ -5443,6 +5725,17 @@ proc cachedDirectAckLatencyMs(n: NimNode, peerId: string): int =
   if not n.peerLatencyProfiles.hasKey(peerId):
     return -1
   latencyMetricLastMs(n.peerLatencyProfiles.getOrDefault(peerId).dmAckRtt)
+
+proc cachedDmPathLatencyMs(n: NimNode, peerId: string, useRelay: bool): int =
+  if n.isNil or peerId.len == 0:
+    return -1
+  if not n.peerDmPathLatencyProfiles.hasKey(peerId):
+    return -1
+  let profile = n.peerDmPathLatencyProfiles.getOrDefault(peerId)
+  if useRelay:
+    latencyMetricDisplayMs(profile.relayDm)
+  else:
+    latencyMetricDisplayMs(profile.directDm)
 
 proc freshTransportLatencyMs(n: NimNode, peerId: string, maxAgeMs = PeerLatencyRefreshMs): int =
   if n.isNil or peerId.len == 0:
@@ -5466,6 +5759,13 @@ proc peerLatencyStatsJson(n: NimNode, peerId: string): JsonNode =
   if not n.peerLatencyProfiles.hasKey(peerId):
     return peerLatencyProfileJson(PeerLatencyProfile())
   peerLatencyProfileJson(n.peerLatencyProfiles.getOrDefault(peerId))
+
+proc peerDmPathLatencyStatsJson(n: NimNode, peerId: string): JsonNode =
+  if n.isNil or peerId.len == 0:
+    return peerDmPathLatencyProfileJson(PeerDmPathLatencyProfile())
+  if not n.peerDmPathLatencyProfiles.hasKey(peerId):
+    return peerDmPathLatencyProfileJson(PeerDmPathLatencyProfile())
+  peerDmPathLatencyProfileJson(n.peerDmPathLatencyProfiles.getOrDefault(peerId))
 
 proc recordTransportLatencySuccess(n: NimNode, peerId: string, latencyMs: int, atMs = nowMillis()) =
   if n.isNil or peerId.len == 0 or latencyMs < 0:
@@ -5498,6 +5798,40 @@ proc recordDirectAckLatencyFailure(n: NimNode, peerId: string, err: string, atMs
   recordLatencyMetricFailure(profile.dmAckRtt, err, atMs)
   profile.updatedAtMs = atMs
   n.peerLatencyProfiles[peerId] = profile
+
+proc recordPeerDmPathLatencySuccess(
+    n: NimNode,
+    peerId: string,
+    useRelay: bool,
+    latencyMs: int,
+    atMs = nowMillis()
+) =
+  if n.isNil or peerId.len == 0 or latencyMs < 0:
+    return
+  var profile = n.peerDmPathLatencyProfiles.getOrDefault(peerId)
+  if useRelay:
+    recordLatencyMetricSuccess(profile.relayDm, latencyMs, atMs)
+  else:
+    recordLatencyMetricSuccess(profile.directDm, latencyMs, atMs)
+  profile.updatedAtMs = atMs
+  n.peerDmPathLatencyProfiles[peerId] = profile
+
+proc recordPeerDmPathLatencyFailure(
+    n: NimNode,
+    peerId: string,
+    useRelay: bool,
+    err: string,
+    atMs = nowMillis()
+) =
+  if n.isNil or peerId.len == 0:
+    return
+  var profile = n.peerDmPathLatencyProfiles.getOrDefault(peerId)
+  if useRelay:
+    recordLatencyMetricFailure(profile.relayDm, err, atMs)
+  else:
+    recordLatencyMetricFailure(profile.directDm, err, atMs)
+  profile.updatedAtMs = atMs
+  n.peerDmPathLatencyProfiles[peerId] = profile
 
 proc nodeTelemetryPublishEnabled(cfg: NodeConfig): bool =
   result = true
@@ -5735,6 +6069,16 @@ proc bootstrapSeedConnectTaskSessionLive(
     task: BootstrapSeedConnectTask
 ): bool {.gcsafe, raises: [].}
 
+proc liveDirectRouteStatusForAddr(
+    n: NimNode,
+    addrText: string
+): tuple[ready: bool, pathKind: string] {.gcsafe, raises: [].}
+
+proc liveDirectRouteStatus(
+    n: NimNode,
+    selectedAddrs: openArray[string]
+): tuple[ready: bool, pathKind: string] {.gcsafe, raises: [].}
+
 proc copyDirectSessionTargetSpecs(
     n: NimNode
 ): seq[DirectSessionTargetSpec] {.gcsafe, raises: [].} =
@@ -5894,16 +6238,12 @@ proc liveDirectSessionTargetSnapshot(
   let safePeerId = peerId.strip()
   let taskKey = bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs)
   if n.isNil or safePeerId.len == 0 or taskKey.len == 0:
-    return DirectSessionTargetSnapshot(
-      taskKey: taskKey,
-      peerId: safePeerId,
-      status: "missing",
-      error: "missing_peerId_or_addresses",
-      ok: false,
-      taskRunning: false,
-      sessionWarmOk: false,
-      verifiedMuxer: false,
-      sessionConnKey: 0,
+    return buildDirectSessionTargetSnapshot(
+      safePeerId,
+      taskKey,
+      "missing",
+      selectedAddrs = @selectedAddrs,
+      error = "missing_peerId_or_addresses",
     )
   let spec = getOwnedDirectSessionTargetSpec(n, taskKey)
   let task = n.bootstrapSeedConnectTasks.getOrDefault(taskKey, nil)
@@ -5939,25 +6279,31 @@ proc liveDirectSessionTargetSnapshot(
   let lastReadyAtMs = spec.lastReadyAtMs
   let lastFailureAtMs = spec.lastFailureAtMs
   let lastFailureReason = spec.lastFailureReason
-  DirectSessionTargetSnapshot(
-    taskKey: taskKey,
-    peerId: safePeerId,
-    status: effectiveStatus,
-    error: effectiveError,
-    ok: ready,
-    taskRunning: running,
-    sessionWarmOk: ready or (not task.isNil and task.sessionWarmOk),
-    verifiedMuxer: not task.isNil and not task.verifiedMuxer.isNil,
-    sessionConnKey: if task.isNil: 0 else: task.sessionConnKey,
-    routeReady: routeStatus.ready,
-    routePathKind: routeStatus.pathKind,
-    attemptCount: attemptCount,
-    successCount: successCount,
-    failureCount: failureCount,
-    lastAttemptAtMs: lastAttemptAtMs,
-    lastReadyAtMs: lastReadyAtMs,
-    lastFailureAtMs: lastFailureAtMs,
-    lastFailureReason: lastFailureReason,
+  buildDirectSessionTargetSnapshot(
+    safePeerId,
+    taskKey,
+    effectiveStatus,
+    selectedAddrs = @selectedAddrs,
+    source = spec.source,
+    error = effectiveError,
+    ok = ready,
+    taskRunning = running,
+    sessionWarmOk = ready or (not task.isNil and task.sessionWarmOk),
+    verifiedMuxer = not task.isNil and not task.verifiedMuxer.isNil,
+    sessionConnKey = if task.isNil: 0 else: task.sessionConnKey,
+    routeReady = routeStatus.ready,
+    routePathKind = routeStatus.pathKind,
+    updatedAtMs = spec.updatedAtMs,
+    attemptCount = attemptCount,
+    successCount = successCount,
+    failureCount = failureCount,
+    lastAttemptAtMs = lastAttemptAtMs,
+    lastReadyAtMs = lastReadyAtMs,
+    lastFailureAtMs = lastFailureAtMs,
+    lastFailureReason = lastFailureReason,
+    taskState = if task.isNil: "" else: bootstrapSeedConnectStateLabel(task.state),
+    verifiedMuxerWaitMs = if task.isNil: 0 else: task.verifiedMuxerWaitMs,
+    attemptedAddr = if task.isNil: "" else: task.attemptedAddr,
   )
 
 proc liveDirectSessionTargetStateJson(
@@ -5966,37 +6312,8 @@ proc liveDirectSessionTargetStateJson(
     selectedAddrs: openArray[string]
 ): string {.gcsafe, raises: [].} =
   let safePeerId = peerId.strip()
-  let taskKey = bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs)
   let snapshot = liveDirectSessionTargetSnapshot(n, safePeerId, selectedAddrs)
-  let selectedAddrsSeq = @selectedAddrs
-  var payload = newJObject()
-  payload["ok"] = %snapshot.ok
-  payload["peerId"] = %safePeerId
-  payload["selectedAddrs"] = %selectedAddrsSeq
-  payload["status"] = %snapshot.status
-  payload["taskKey"] = %taskKey
-  payload["taskRunning"] = %snapshot.taskRunning
-  payload["sessionWarmOk"] = %snapshot.sessionWarmOk
-  payload["verifiedMuxer"] = %snapshot.verifiedMuxer
-  payload["sessionConnKey"] = %snapshot.sessionConnKey
-  payload["routeReady"] = %snapshot.routeReady
-  payload["routePathKind"] = %snapshot.routePathKind
-  payload["attemptCount"] = %snapshot.attemptCount
-  payload["successCount"] = %snapshot.successCount
-  payload["failureCount"] = %snapshot.failureCount
-  payload["lastAttemptAtMs"] = %snapshot.lastAttemptAtMs
-  payload["lastReadyAtMs"] = %snapshot.lastReadyAtMs
-  payload["lastFailureAtMs"] = %snapshot.lastFailureAtMs
-  payload["lastFailureReason"] = %snapshot.lastFailureReason
-  if snapshot.error.len > 0:
-    payload["error"] = %snapshot.error
-  directSessionTargetStateJson(
-    safePeerId,
-    taskKey,
-    snapshot.status,
-    payload,
-    snapshot.error,
-  )
+  directSessionTargetStateJson(snapshot)
 
 proc getLiveReadyDirectSessionTargetConnKey(
     n: NimNode,
@@ -6017,7 +6334,12 @@ proc liveDirectRouteStatusForAddr(
   let transport = n.switchInstance.tsnetTransport()
   if transport.isNil:
     return (false, "")
-  let normalizedAddr = stripPeerIdSuffixFromMultiaddr(addrText)
+  var normalizedAddr = canonicalizeMultiaddrText(addrText.strip())
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = normalizedAddr.rfind(marker)
+    if idx >= 0:
+      normalizedAddr = normalizedAddr[0 ..< idx]
+      break
   if normalizedAddr.len == 0:
     return (false, "")
   let maRes = parseDialableMultiaddr(normalizedAddr)
@@ -6028,7 +6350,7 @@ proc liveDirectRouteStatusForAddr(
     return (false, "")
   (
     true,
-    normalizeTailnetPath(directRouteRes.get().pathKind),
+    directRouteRes.get().pathKind.strip().toLowerAscii(),
   )
 
 proc liveDirectRouteStatus(
@@ -6039,8 +6361,8 @@ proc liveDirectRouteStatus(
     let routeStatus = liveDirectRouteStatusForAddr(n, addrText)
     if not routeStatus.ready:
       continue
-    if normalizeTailnetPath(routeStatus.pathKind) == TsnetPathDirect:
-      return (true, TsnetPathDirect)
+    if routeStatus.pathKind == "direct":
+      return (true, "direct")
     if not result.ready:
       result = routeStatus
 
@@ -6068,7 +6390,6 @@ proc directTargetReady(
     snapshot: DirectSessionTargetSnapshot
 ): bool {.gcsafe, raises: [].} =
   snapshot.status.toLowerAscii() == "ready" and
-    snapshot.routeReady and
     snapshot.sessionWarmOk and
     snapshot.sessionConnKey > 0
 
@@ -6102,6 +6423,9 @@ proc buildPeerPathProjection(
   let directProbing = directTargetProbing(directSnapshot)
   let relayReady = peerRouteSessionReady(relaySnapshot)
   let relayProbing = peerRouteSessionProbing(relaySnapshot)
+  let dmPathStats = peerDmPathLatencyStatsJson(n, peerIdText)
+  let directDmLatency = cachedDmPathLatencyMs(n, peerIdText, useRelay = false)
+  let relayDmLatency = cachedDmPathLatencyMs(n, peerIdText, useRelay = true)
   let directSuccessRatePct =
     if directSnapshot.attemptCount > 0:
       int((directSnapshot.successCount * 100) div directSnapshot.attemptCount)
@@ -6142,6 +6466,9 @@ proc buildPeerPathProjection(
     "directTargetLastAttemptAtMs": directSnapshot.lastAttemptAtMs,
     "directTargetLastReadyAtMs": directSnapshot.lastReadyAtMs,
     "directTargetLastFailureAtMs": directSnapshot.lastFailureAtMs,
+    "directDmLatencyMs": directDmLatency,
+    "relayDmLatencyMs": relayDmLatency,
+    "dmPathLatencyStats": dmPathStats,
     "relayTargetStatus": relaySnapshot.status,
     "relayTargetReady": relayReady,
     "relayTargetTaskRunning": relayProbing,
@@ -6762,13 +7089,16 @@ proc tailnetWarmWorker(handle: pointer) {.thread.} =
   defer:
     tearDownForeignThreadGc()
   chronos.setThreadDispatcher(newDispatcher())
-  let node = ffiNodeSafe:
+  let node {.cursor.} = ffiNodeSafe:
     nodeFromHandle(handle)
   if node.isNil:
     return
   debugLog("[nimlibp2p] tailnet warm worker start")
-  let transport = ffiNodeSafe:
-    activeTsnetTransport(node)
+  let transport {.cursor.} =
+    if node.switchInstance.isNil:
+      nil
+    else:
+      node.switchInstance.tsnetTransport()
   var warmSucceeded = false
   if transport.isNil:
     debugLog("[nimlibp2p] tailnet warm worker transport unavailable")
@@ -8061,19 +8391,20 @@ proc collectLanIpv4Addrs(preferred: string = ""): seq[string] {.gcsafe.} =
   debugLog("[nimlibp2p] collectLanIpv4Addrs -> " & filtered.join(","))
   result = filtered
 
-proc mdnsAllowedForHostStatus(hostStatus: JsonNode): bool {.gcsafe.} =
-  let networkType = jsonGetStr(hostStatus, "networkType", "").strip().toLowerAscii()
-  let transport = jsonGetStr(hostStatus, "transport", "").strip().toLowerAscii()
+proc mdnsAllowedForHostStatus(hostStatus: HostNetworkStatusSnapshot): bool {.gcsafe.} =
+  let networkType = hostStatus.networkType.strip().toLowerAscii()
+  let transport = hostStatus.transport.strip().toLowerAscii()
   if networkType in ["wifi", "ethernet"] or transport in ["wifi", "ethernet"]:
     return true
   if networkType in ["cellular", "vpn", "none"] or
       transport in ["cellular", "5g", "4g", "3g", "2g", "vpn", "none"]:
     return false
-  let preferredIpv4 = jsonGetStr(hostStatus, "preferredIpv4", jsonGetStr(hostStatus, "localIpv4", "")).strip()
+  let preferredIpv4 =
+    (if hostStatus.preferredIpv4.len > 0: hostStatus.preferredIpv4 else: hostStatus.localIpv4).strip()
   collectLanIpv4Addrs(preferredIpv4).len > 0
 
 proc mdnsAllowedForCurrentHost(n: NimNode): bool {.gcsafe.} =
-  mdnsAllowedForHostStatus(currentHostNetworkStatus(n))
+  mdnsAllowedForHostStatus(currentHostNetworkStatusSnapshot(n))
 
 proc isLanIpv6(ip: string): bool {.gcsafe.} =
   if ip.len == 0:
@@ -13041,9 +13372,16 @@ proc buildDiagnosticsSnapshotPayload(n: NimNode): JsonNode {.gcsafe, raises: [].
 
 proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []), gcsafe.} =
   try:
+    n.currentCommandKindCode.store(ord(command.kind), moRelease)
+    n.currentCommandKind = command.kind
+    n.currentCommandPeerId = command.peerId
+    n.currentCommandStreamKey = command.streamKey
+    n.currentCommandStartedAtMs = nowMillis()
     debugLog(
       "[nimlibp2p] runCommand start node=" & $cast[int](n) &
-      " kind=" & $command.kind
+      " kind=" & $command.kind &
+      (if command.peerId.len > 0: " peer=" & command.peerId else: "") &
+      (if command.streamKey.len > 0: " request=" & command.streamKey else: "")
     )
     case command.kind
     of cmdNone:
@@ -13669,9 +14007,9 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.errorMsg = "tsnet transport unavailable"
         updateTailnetStartStatus(n, "failed", false, command.errorMsg)
       else:
-        let readyPayload = ffiTsnetSafe:
-          transport.tailnetStatusPayload()
-        if readyPayload.isOk() and jsonGetBool(readyPayload.get(), "providerReady", false):
+        let providerReady = ffiTsnetSafe:
+          transport.providerReadySafe()
+        if providerReady:
           ensureTailnetControlRefreshLoop(n)
           updateTailnetStartStatus(n, "started", false)
           command.resultCode = NimResultOk
@@ -14256,6 +14594,12 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.errorMsg = "missing peer id or payload"
       else:
         let requestKey = command.streamKey.strip()
+        debugLog(
+          "[nimlibp2p] cmdSendDirectKickoff dispatch request=" & requestKey &
+          " peer=" & command.peerId &
+          " addrCount=" & $command.addresses.len &
+          " relayOnly=" & $command.boolParam
+        )
         ffiNodeSafe:
           setSendWithAckKickoffState(
             requestKey,
@@ -14408,32 +14752,28 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         recordEvent(n, command.topic, payload)
         command.resultCode = NimResultOk
     of cmdUpdateHostNetworkStatus:
-      if command.jsonString.len == 0:
+      if not command.hostNetworkStatusParamSet:
         command.resultCode = NimResultInvalidArgument
-        command.errorMsg = "missing host network status payload"
+        command.errorMsg = "missing host network status snapshot"
       else:
         try:
-          debugLog(
-            "[nimlibp2p] cmdUpdateHostNetworkStatus payload=" & command.jsonString
-          )
-          let previousHost = currentHostNetworkStatus(n)
-          let payload = parseJson(command.jsonString)
-          let normalized = applyHostNetworkStatus(n, payload)
-          let normalizedSnapshot = n.hostNetworkStatus
+          let previousHost = currentHostNetworkStatusSnapshot(n)
+          let normalizedSnapshot = applyHostNetworkStatus(n, command.hostNetworkStatusParam)
+          let normalized = hostNetworkStatusToJsonText(normalizedSnapshot)
           debugLog(
             "[nimlibp2p] cmdUpdateHostNetworkStatus applied connected=" &
-            $jsonGetBool(normalized, "isConnected", false) &
-            " networkType=" & jsonGetStr(normalized, "networkType", "none") &
-            " transport=" & jsonGetStr(normalized, "transport", "none")
+            $normalizedSnapshot.isConnected &
+            " networkType=" & normalizedSnapshot.networkType &
+            " transport=" & normalizedSnapshot.transport
           )
           let previousMdnsAllowed = mdnsAllowedForHostStatus(previousHost)
-          let currentMdnsAllowed = mdnsAllowedForHostStatus(normalized)
+          let currentMdnsAllowed = mdnsAllowedForHostStatus(normalizedSnapshot)
           let mdnsTransportChanged =
             previousMdnsAllowed != currentMdnsAllowed or
-            jsonGetStr(previousHost, "networkType", "") != jsonGetStr(normalized, "networkType", "") or
-            jsonGetStr(previousHost, "transport", "") != jsonGetStr(normalized, "transport", "") or
-            jsonGetStr(previousHost, "preferredIpv4", "") != jsonGetStr(normalized, "preferredIpv4", "") or
-            jsonGetStr(previousHost, "localIpv4", "") != jsonGetStr(normalized, "localIpv4", "")
+            previousHost.networkType != normalizedSnapshot.networkType or
+            previousHost.transport != normalizedSnapshot.transport or
+            previousHost.preferredIpv4 != normalizedSnapshot.preferredIpv4 or
+            previousHost.localIpv4 != normalizedSnapshot.localIpv4
           scheduleHostNetworkStatusSideEffects(
             n,
             normalizedSnapshot,
@@ -14441,9 +14781,8 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             currentMdnsAllowed,
             "cmd_update_host_network_status",
           )
-          let event = buildHostNetworkEvent(normalizedSnapshot)
-          recordEvent(n, "network_event", $event)
-          command.stringResult = $normalized
+          recordEvent(n, "network_event", buildHostNetworkEventText(normalizedSnapshot))
+          command.stringResult = normalized
           command.resultCode = NimResultOk
           debugLog("[nimlibp2p] cmdUpdateHostNetworkStatus done")
         except CatchableError as exc:
@@ -15235,6 +15574,11 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       " rc=" & $int(command.resultCode) &
       (if command.errorMsg.len > 0: " err=" & command.errorMsg else: "")
     )
+    n.currentCommandKindCode.store(ord(cmdNone), moRelease)
+    n.currentCommandKind = cmdNone
+    n.currentCommandPeerId = ""
+    n.currentCommandStreamKey = ""
+    n.currentCommandStartedAtMs = 0
     finalizeCommand(command)
     atomicDec(n.pendingCommands)
     info "command completed", kind = $command.kind, result = command.resultCode
@@ -15336,11 +15680,20 @@ proc idleWakeLoop(n: NimNode) {.async.} =
       let pending = n.pendingCommands.load(moAcquire)
       if pending > 0 and (lastPendingHeartbeatMs == 0 or nowMs - lastPendingHeartbeatMs >= 1_000):
         lastPendingHeartbeatMs = nowMs
+        let runningAgeMs =
+          if n.currentCommandStartedAtMs > 0:
+            max(0'i64, nowMs - n.currentCommandStartedAtMs)
+          else:
+            0'i64
         debugLog(
           "[nimlibp2p] idleWakeLoop heartbeat node=" & $cast[int](n) &
           " queued=" & $queued &
           " pending=" & $pending &
-          " drainActive=" & $n.commandDrainActive
+          " drainActive=" & $n.commandDrainActive &
+          " runningKind=" & $n.currentCommandKind &
+          (if n.currentCommandPeerId.len > 0: " runningPeer=" & n.currentCommandPeerId else: "") &
+          (if n.currentCommandStreamKey.len > 0: " runningRequest=" & n.currentCommandStreamKey else: "") &
+          " runningAgeMs=" & $runningAgeMs
         )
       if queued > 0 and (lastDrainLogMs == 0 or nowMs - lastDrainLogMs >= 2_000):
         lastDrainLogMs = nowMs
@@ -15714,6 +16067,11 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       commandDrainTask: nil,
       commandDrainWake: newAsyncEvent(),
       commandDrainActive: false,
+      currentCommandKindCode: Atomic[int](),
+      currentCommandKind: cmdNone,
+      currentCommandPeerId: "",
+      currentCommandStreamKey: "",
+      currentCommandStartedAtMs: 0,
       idleWakeTask: nil,
       readySignal: readySignalPtr,
       shutdownSignal: shutdownSignalPtr,
@@ -15762,6 +16120,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       probeInboundTraffic: initTable[string, ProbeSessionTraffic](),
       peerSystemProfiles: initTable[string, JsonNode](),
       peerLatencyProfiles: initTable[string, PeerLatencyProfile](),
+      peerDmPathLatencyProfiles: initTable[string, PeerDmPathLatencyProfile](),
       lanEndpointsCache: newJObject(),
       feedItems: @[],
       livestreams: initTable[string, LivestreamSession](),
@@ -15826,6 +16185,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
     initLock(node.tailnetStatusLock)
     initLock(node.directSessionTargetLock)
     initLock(node.peerStateLock)
+    node.currentCommandKindCode.store(ord(cmdNone), moRelease)
     let disableMdns = (not cfg.extra.isNil and cfg.extra.kind == JObject) and
       (
         jsonGetBool(cfg.extra, "disableMdns", false) or
@@ -16485,7 +16845,21 @@ proc libp2p_send_with_ack_kickoff*(
         "ackRequested": cmd.ackRequested,
       }
     )
+  debugLog(
+    "[nimlibp2p] sendWithAckKickoff enqueue request=" & safeRequestKey &
+    " peer=" & cmd.peerId &
+    " addrCount=0" &
+    " relayOnly=false" &
+    " timeoutMs=" & $cmd.timeoutMs &
+    " source="
+  )
   let ok = submitCommandNoWait(node, cmd)
+  debugLog(
+    "[nimlibp2p] sendWithAckKickoff enqueue_done request=" & safeRequestKey &
+    " ok=" & $ok &
+    " queued=" & $node.queuedCommands.load(moAcquire) &
+    " pending=" & $node.pendingCommands.load(moAcquire)
+  )
   if not ok:
     let kickoffErr =
       if cmd.errorMsg.len > 0: cmd.errorMsg
@@ -16568,9 +16942,29 @@ proc libp2p_send_with_ack_seeded_kickoff*(
         "addressCount": normalizedAddrs.len,
         "source": cmd.source,
         "ackRequested": cmd.ackRequested,
+        "enqueueTrace": "seeded_before_submit",
       }
     )
   let ok = submitCommandNoWait(node, cmd)
+  if ok:
+    ffiNodeSafe:
+      setSendWithAckKickoffState(
+        safeRequestKey,
+        "queued",
+        %*{
+          "ok": false,
+          "requestKey": safeRequestKey,
+          "peerId": cmd.peerId,
+          "stage": "queued",
+          "addressCount": normalizedAddrs.len,
+          "source": cmd.source,
+          "ackRequested": cmd.ackRequested,
+          "enqueueTrace": "seeded_submit_ok",
+          "queueQueued": node.queuedCommands.load(moAcquire),
+          "queuePending": node.pendingCommands.load(moAcquire),
+          "runningKind": currentCommandKindTextSnapshot(node),
+        }
+      )
   if not ok:
     let kickoffErr =
       if cmd.errorMsg.len > 0: cmd.errorMsg
@@ -16684,8 +17078,11 @@ proc libp2p_update_host_network_status*(
   let node = nodeFromHandle(handle)
   if node.isNil:
     return false
+  let statusSnapshot = parseHostNetworkStatusSnapshot($payloadJson).valueOr:
+    return false
   let cmd = makeCommand(cmdUpdateHostNetworkStatus)
-  cmd.jsonString = $payloadJson
+  cmd.hostNetworkStatusParam = statusSnapshot
+  cmd.hostNetworkStatusParamSet = true
   let result = submitCommand(node, cmd)
   let ok = result.resultCode == NimResultOk
   destroyCommand(cmd)
@@ -18061,6 +18458,7 @@ proc buildConnectedPeersInfoSnapshotForNode(
     return newJArray()
   prunePeerProfiles(node)
   prunePeerLatencyProfiles(node)
+  prunePeerDmPathLatencyProfiles(node)
   let connections = node.switchInstance.connManager.getConnections()
   var arr = newJArray()
   for peerId, muxers in connections.pairs:
@@ -18152,6 +18550,9 @@ proc buildConnectedPeersInfoSnapshotForNode(
       "directTargetLastFailureAtMs",
       "directTargetLastFailureReason",
       "directTargetError",
+      "directDmLatencyMs",
+      "relayDmLatencyMs",
+      "dmPathLatencyStats",
     ]:
       if pathProjection.hasKey(key):
         entry[key] = cloneJson(pathProjection.getOrDefault(key))
@@ -18202,6 +18603,7 @@ proc buildConnectedPeersInfoArrayForNode(
     return newJArray()
   prunePeerProfiles(node)
   prunePeerLatencyProfiles(node)
+  prunePeerDmPathLatencyProfiles(node)
   let connections = node.switchInstance.connManager.getConnections()
   var arr = newJArray()
   for peerId, muxers in connections.pairs:
@@ -18293,6 +18695,9 @@ proc buildConnectedPeersInfoArrayForNode(
       "directTargetLastFailureAtMs",
       "directTargetLastFailureReason",
       "directTargetError",
+      "directDmLatencyMs",
+      "relayDmLatencyMs",
+      "dmPathLatencyStats",
     ]:
       if pathProjection.hasKey(key):
         entry[key] = cloneJson(pathProjection.getOrDefault(key))
@@ -18455,12 +18860,33 @@ proc collectDiscoveredPeersForNode(node: NimNode, connectedInfo: JsonNode): Json
     let peerId = jsonGetStr(row, "peerId", jsonGetStr(row, "peer_id"))
     if peerId.len > 0:
       let directSnapshot = latestOwnedDirectSessionTargetSnapshot(node, peerId)
+      let directSuccessRatePct =
+        if directSnapshot.attemptCount > 0:
+          int((directSnapshot.successCount * 100) div directSnapshot.attemptCount)
+        else:
+          0
+      row["directTargetStatus"] = %directSnapshot.status
+      row["directTargetReady"] = %directTargetReady(directSnapshot)
+      row["directTargetTaskRunning"] = %directTargetProbing(directSnapshot)
+      row["directTargetSessionConnKey"] = %directSnapshot.sessionConnKey
+      row["directTargetAttemptCount"] = %directSnapshot.attemptCount
+      row["directTargetSuccessCount"] = %directSnapshot.successCount
+      row["directTargetFailureCount"] = %directSnapshot.failureCount
+      row["directTargetSuccessRatePct"] = %directSuccessRatePct
+      row["directTargetLastAttemptAtMs"] = %directSnapshot.lastAttemptAtMs
+      row["directTargetLastReadyAtMs"] = %directSnapshot.lastReadyAtMs
+      row["directTargetLastFailureAtMs"] = %directSnapshot.lastFailureAtMs
+      row["directDmLatencyMs"] = %cachedDmPathLatencyMs(node, peerId, useRelay = false)
+      row["relayDmLatencyMs"] = %cachedDmPathLatencyMs(node, peerId, useRelay = true)
+      row["dmPathLatencyStats"] = peerDmPathLatencyStatsJson(node, peerId)
       if directTargetProbing(directSnapshot):
         row["pathStatus"] = %"PROBING"
-        row["directTargetStatus"] = %directSnapshot.status
-        row["directTargetTaskRunning"] = %true
         if directSnapshot.error.len > 0:
           row["directTargetError"] = %directSnapshot.error
+      elif directSnapshot.error.len > 0:
+        row["directTargetError"] = %directSnapshot.error
+      if directSnapshot.lastFailureReason.len > 0:
+        row["directTargetLastFailureReason"] = %directSnapshot.lastFailureReason
     arr.add(row)
   arr
 
@@ -23567,6 +23993,30 @@ proc bootstrapSeedConnectExactPayload(
     payload["error"] = %error
   $payload
 
+proc bootstrapSeedConnectAsyncPayload(
+    seedPeerId: string,
+    source: string,
+    attemptedAddr: string,
+    attempts: seq[JsonNode],
+    ok: bool,
+    error: string,
+    bootstrapConnected = false
+): JsonNode {.gcsafe, raises: [].} =
+  result = newJObject()
+  result["ok"] = %ok
+  result["peerId"] = %seedPeerId
+  result["source"] = %source
+  result["attemptedAddr"] = %attemptedAddr
+  result["attemptCount"] = %attempts.len
+  result["bootstrapConnected"] = %bootstrapConnected
+  result["bootstrap"] = newJObject()
+  var attemptsNode = newJArray()
+  for item in attempts:
+    attemptsNode.add(item)
+  result["attempts"] = attemptsNode
+  if error.len > 0:
+    result["error"] = %error
+
 proc bootstrapSeedConnectIntentLabel(
     intent: BootstrapSeedConnectIntent
 ): string {.gcsafe, raises: [].} =
@@ -23584,6 +24034,8 @@ proc bootstrapSeedConnectStateLabel(
     "pending"
   of bscsRunning:
     "running"
+  of bscsProbing:
+    "probing"
   of bscsReady:
     "ready"
   of bscsCancelled:
@@ -23627,6 +24079,20 @@ proc bootstrapSeedConnectTaskRunning(
     not fut.isNil and
     not fut.finished()
 
+proc liveSessionConnPathKind(
+    n: NimNode,
+    connKey: int
+): string {.gcsafe, raises: [].} =
+  if n.isNil or n.dmService.isNil or connKey <= 0:
+    return ""
+  n.dmService.liveSessionConnPathKind(connKey)
+
+proc liveDirectSessionConnReady(
+    n: NimNode,
+    connKey: int
+): bool {.gcsafe, raises: [].} =
+  liveSessionConnPathKind(n, connKey) == "direct"
+
 proc sendDirectKickoffTaskRunning(
     n: NimNode,
     task: SendDirectKickoffTask
@@ -23669,6 +24135,7 @@ proc bootstrapSeedConnectTaskSessionLive(
     task.state == bscsReady and
     task.sessionWarmOk and
     task.sessionConnKey > 0 and
+    liveDirectSessionConnReady(n, task.sessionConnKey) and
     not n.dmService.isNil and
     n.dmService.hasLiveSessionConnKey(task.sessionConnKey)
 
@@ -24039,60 +24506,51 @@ proc waitForDirectOrRelaySessionReady(
       return (false, false, 0, errMsg, directSnapshot, relaySnapshot)
     await sleepAsync(chronos.milliseconds(min(100, remainingMs)))
 
-proc buildDirectSessionTargetPayload(
+proc buildPublishedDirectSessionTargetSnapshot(
     n: NimNode,
     spec: DirectSessionTargetSpec,
     task: BootstrapSeedConnectTask,
     status: string,
     error: string
-): JsonNode {.gcsafe, raises: [].} =
+): DirectSessionTargetSnapshot {.gcsafe, raises: [].} =
   let ready = bootstrapSeedConnectTaskSessionLive(n, task)
   let running = bootstrapSeedConnectTaskRunning(n, task)
   let routeStatus = liveDirectRouteStatus(n, spec.selectedAddrs)
-  let directSuccessRatePct =
-    if spec.attemptCount > 0:
-      int((spec.successCount * 100) div spec.attemptCount)
+  let effectiveError =
+    if error.len > 0:
+      error
+    elif not task.isNil and task.sessionWarmError.len > 0:
+      task.sessionWarmError
+    elif not task.isNil:
+      task.err
     else:
-      0
-  result = %*{
-    "ok": ready,
-    "peerId": spec.peerId,
-    "source": spec.source,
-    "selectedAddrs": spec.selectedAddrs,
-    "status": status,
-    "taskKey": spec.taskKey,
-    "taskRunning": running,
-    "sessionWarmOk": ready or (not task.isNil and task.sessionWarmOk),
-    "verifiedMuxer": (not task.isNil and not task.verifiedMuxer.isNil),
-    "sessionConnKey": (if task.isNil: 0 else: task.sessionConnKey),
-    "routeReady": routeStatus.ready,
-    "routePathKind": routeStatus.pathKind,
-    "updatedAtMs": spec.updatedAtMs,
-    "attemptCount": spec.attemptCount,
-    "successCount": spec.successCount,
-    "failureCount": spec.failureCount,
-    "lastAttemptAtMs": spec.lastAttemptAtMs,
-    "lastReadyAtMs": spec.lastReadyAtMs,
-    "lastFailureAtMs": spec.lastFailureAtMs,
-    "lastFailureReason": spec.lastFailureReason,
-    "successRatePct": directSuccessRatePct,
-  }
-  if not task.isNil:
-    result["taskState"] = %bootstrapSeedConnectStateLabel(task.state)
-    result["verifiedMuxerWaitMs"] = %task.verifiedMuxerWaitMs
-    if task.attemptedAddr.len > 0:
-      result["attemptedAddr"] = %task.attemptedAddr
-    let taskError =
-      if error.len > 0:
-        error
-      elif task.sessionWarmError.len > 0:
-        task.sessionWarmError
-      else:
-        task.err
-    if taskError.len > 0:
-      result["error"] = %taskError
-  elif error.len > 0:
-    result["error"] = %error
+      ""
+  buildDirectSessionTargetSnapshot(
+    spec.peerId,
+    spec.taskKey,
+    status,
+    selectedAddrs = spec.selectedAddrs,
+    source = spec.source,
+    error = effectiveError,
+    ok = ready,
+    taskRunning = running,
+    sessionWarmOk = ready or (not task.isNil and task.sessionWarmOk),
+    verifiedMuxer = (not task.isNil and not task.verifiedMuxer.isNil),
+    sessionConnKey = (if task.isNil: 0 else: task.sessionConnKey),
+    routeReady = routeStatus.ready,
+    routePathKind = routeStatus.pathKind,
+    updatedAtMs = spec.updatedAtMs,
+    attemptCount = spec.attemptCount,
+    successCount = spec.successCount,
+    failureCount = spec.failureCount,
+    lastAttemptAtMs = spec.lastAttemptAtMs,
+    lastReadyAtMs = spec.lastReadyAtMs,
+    lastFailureAtMs = spec.lastFailureAtMs,
+    lastFailureReason = spec.lastFailureReason,
+    taskState = if task.isNil: "" else: bootstrapSeedConnectStateLabel(task.state),
+    verifiedMuxerWaitMs = if task.isNil: 0 else: task.verifiedMuxerWaitMs,
+    attemptedAddr = if task.isNil: "" else: task.attemptedAddr,
+  )
 
 proc publishDirectSessionTargetSnapshot(
     n: NimNode,
@@ -24138,7 +24596,7 @@ proc publishDirectSessionTargetSnapshot(
       effectiveStatus,
       effectiveError,
     )
-  let payload = buildDirectSessionTargetPayload(
+  let snapshot = buildPublishedDirectSessionTargetSnapshot(
     n,
     publishedSpec,
     task,
@@ -24149,9 +24607,7 @@ proc publishDirectSessionTargetSnapshot(
     setDirectSessionTargetState(
       publishedSpec.peerId,
       publishedSpec.selectedAddrs,
-      effectiveStatus,
-      payload,
-      effectiveError,
+      snapshot,
     )
 
 proc reconcileDirectSessionTarget(
@@ -24159,6 +24615,10 @@ proc reconcileDirectSessionTarget(
     spec: DirectSessionTargetSpec
 ) {.gcsafe, raises: [].} =
   if n.isNil or spec.peerId.len == 0 or spec.selectedAddrs.len == 0:
+    return
+  let hintRes = registerPeerHintsInternal(n, spec.peerId, spec.selectedAddrs, spec.source)
+  if hintRes.isErr():
+    publishDirectSessionTargetSnapshot(n, spec, "failed", hintRes.error)
     return
   let existingTask = n.bootstrapSeedConnectTasks.getOrDefault(spec.taskKey, nil)
   if bootstrapSeedConnectTaskSessionLive(n, existingTask):
@@ -24221,11 +24681,6 @@ proc upsertDirectSessionTarget(
   except CatchableError as exc:
     publishDirectSessionTargetSnapshot(n, spec, "failed", exc.msg)
   ensureDirectSessionTargetReconcileLoop(n)
-  try:
-    reconcilePeerRouteSession(n, spec.peerId, spec.source)
-  except CatchableError:
-    discard
-  ensurePeerRouteSessionReconcileLoop(n)
   spec
 
 proc exactSeedConnectTotalBudgetMs(addrs: openArray[string]): int {.gcsafe, raises: [].}
@@ -25426,14 +25881,29 @@ proc executeSendDirectCommand(
     let recordAckLatency =
       opValue.toLowerAscii() notin ["ack", "bw_probe_push", "bw_probe_chunk"]
     if recordAckLatency:
+      let recordRelayDmLatency = sendPath == "relay_ready_session"
+      let recordDirectDmLatency = sendPath in [
+        "direct_ready_session",
+        "warmed_session_conn",
+        "verified_live_muxer",
+        "verified_live_connection",
+      ]
       if sendOk:
         recordDirectAckLatencySuccess(n, command.peerId, latencyMs)
+        if recordRelayDmLatency:
+          recordPeerDmPathLatencySuccess(n, command.peerId, true, latencyMs)
+        elif recordDirectDmLatency:
+          recordPeerDmPathLatencySuccess(n, command.peerId, false, latencyMs)
       else:
         let latencyErr =
           if sendErr.len > 0: sendErr
           elif errMsg.len > 0: errMsg
           else: "ack timeout"
         recordDirectAckLatencyFailure(n, command.peerId, latencyErr)
+        if recordRelayDmLatency:
+          recordPeerDmPathLatencyFailure(n, command.peerId, true, latencyErr)
+        elif recordDirectDmLatency:
+          recordPeerDmPathLatencyFailure(n, command.peerId, false, latencyErr)
 
 proc runSendDirectKickoffAsync(
     taskState: SendDirectKickoffTask,
@@ -26179,10 +26649,13 @@ proc runBootstrapSeedConnectExactAsync(
       except CatchableError as exc:
         warmDetail.sessionWarmError =
           if exc.msg.len > 0: exc.msg else: $exc.name
+      let sessionPathKind = liveSessionConnPathKind(node, warmDetail.sessionConnKey)
+      let directRouteStatus = liveDirectRouteStatusForAddr(node, addr)
       sessionReadyOk = warmDetail.sessionWarmOk and warmDetail.sessionConnKey > 0
+      let directSessionReadyOk = sessionReadyOk and sessionPathKind == "direct"
       if peerRes.isOk():
         peerConnected = peerCurrentlyConnected(node, peerRes.get())
-      attemptNode["ok"] = %sessionReadyOk
+      attemptNode["ok"] = %directSessionReadyOk
       attemptNode["peerConnected"] = %peerConnected
       attemptNode["connectOk"] = %sessionReadyOk
       attemptNode["secureOk"] = %sessionReadyOk
@@ -26191,6 +26664,9 @@ proc runBootstrapSeedConnectExactAsync(
       attemptNode["sessionConnKey"] = %warmDetail.sessionConnKey
       attemptNode["sessionWarmOk"] = %warmDetail.sessionWarmOk
       attemptNode["sessionReadyOk"] = %sessionReadyOk
+      attemptNode["sessionPathKind"] = %sessionPathKind
+      attemptNode["directRouteReady"] = %directRouteStatus.ready
+      attemptNode["directRoutePathKind"] = %directRouteStatus.pathKind
       attemptNode["identifiedOk"] = %sessionReadyOk
       if warmDetail.sessionWarmError.len > 0:
         attemptNode["error"] = %warmDetail.sessionWarmError
@@ -26206,26 +26682,25 @@ proc runBootstrapSeedConnectExactAsync(
         " addr=" & addr &
         " sessionWarmOk=" & $warmDetail.sessionWarmOk &
         " sessionConnKey=" & $warmDetail.sessionConnKey &
+        (if sessionPathKind.len > 0:
+          " sessionPath=" & sessionPathKind
+        else:
+          "") &
+        " directRouteReady=" & $directRouteStatus.ready &
+        (if directRouteStatus.pathKind.len > 0:
+          " directRoutePath=" & directRouteStatus.pathKind
+        else:
+          "") &
         (if warmDetail.sessionWarmError.len > 0:
           " err=" & warmDetail.sessionWarmError
         else:
           "")
       )
 
-      let bootstrapNode =
-        try:
-          buildBootstrapStatusNode(node)
-        except Exception:
-          newJObject()
-      let bootstrapConnected =
-        try:
-          bootstrapStatusShowsConnectedPeer(bootstrapNode, safePeerId)
-        except Exception:
-          false
-      attemptNode["bootstrapConnected"] = %bootstrapConnected
+      attemptNode["bootstrapConnected"] = %false
       attempts.add(attemptNode)
 
-      if sessionReadyOk:
+      if directSessionReadyOk:
         if not taskState.isNil:
           taskState.ok = true
           taskState.state = bscsReady
@@ -26235,26 +26710,33 @@ proc runBootstrapSeedConnectExactAsync(
           setDirectSessionTargetState(
             safePeerId,
             selectedAddrs,
-            "ready",
-            %*{
-              "ok": true,
-              "peerId": safePeerId,
-              "selectedAddrs": selectedAddrs,
-              "status": "ready",
-              "taskRunning": false,
-              "sessionWarmOk": true,
-              "verifiedMuxer": (not warmDetail.verifiedMuxer.isNil),
-              "verifiedMuxerWaitMs": warmDetail.verifiedMuxerWaitMs,
-              "sessionConnKey": warmDetail.sessionConnKey,
-            },
+            buildDirectSessionTargetSnapshot(
+              safePeerId,
+              bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs),
+              "ready",
+              selectedAddrs = selectedAddrs,
+              ok = true,
+              taskRunning = false,
+              sessionWarmOk = true,
+              verifiedMuxer = (not warmDetail.verifiedMuxer.isNil),
+              sessionConnKey = warmDetail.sessionConnKey,
+              routeReady = directRouteStatus.ready,
+              routePathKind =
+                if directRouteStatus.pathKind.len > 0:
+                  directRouteStatus.pathKind
+                else:
+                  sessionPathKind,
+              taskState = "ready",
+              verifiedMuxerWaitMs = warmDetail.verifiedMuxerWaitMs,
+              attemptedAddr = addr,
+            ),
           )
         debugLog(
           "[nimlibp2p] bootstrapSeedConnectExactAsync success peer=" & safePeerId &
           " addr=" & addr &
           " connectOk=" & $sessionReadyOk &
           " secureOk=" & $sessionReadyOk &
-          " peerConnected=" & $peerConnected &
-          " bootstrapConnected=" & $bootstrapConnected
+          " peerConnected=" & $peerConnected
         )
         asyncSpawn(promoteConnectedBootstrapPeerDetached(
           node,
@@ -26262,15 +26744,14 @@ proc runBootstrapSeedConnectExactAsync(
           selectedAddrs,
           effectiveSource,
         ))
-        let payload = parseJson(bootstrapSeedConnectExactPayload(
-          node,
+        let payload = bootstrapSeedConnectAsyncPayload(
           safePeerId,
           effectiveSource,
           attemptedAddr,
           attempts,
           true,
           "",
-        ))
+        )
         payload["connectOk"] = %sessionReadyOk
         payload["secureOk"] = %sessionReadyOk
         payload["identifiedOk"] = %sessionReadyOk
@@ -26301,6 +26782,20 @@ proc runBootstrapSeedConnectExactAsync(
             )
         return
 
+      if sessionReadyOk and not directSessionReadyOk:
+        let directSessionErr =
+          if sessionPathKind.len > 0 and sessionPathKind != "direct":
+            "direct session resolved to " & sessionPathKind & " path"
+          else:
+            "direct session path not ready"
+        if not taskState.isNil:
+          taskState.state = bscsProbing
+          taskState.updatedAtMs = nowMillis()
+          taskState.ok = false
+          taskState.err = directSessionErr
+        lastError = directSessionErr
+        continue
+
       let sessionWarmError = jsonGetStr(attemptNode, "sessionWarmError")
       if sessionWarmError.len > 0:
         lastError = sessionWarmError
@@ -26315,12 +26810,16 @@ proc runBootstrapSeedConnectExactAsync(
       " lastError=" & lastError
     )
     if not taskState.isNil:
-      taskState.state = bscsFailed
+      taskState.state =
+        if lastError == "direct session path not ready" or
+            lastError == "direct session resolved to relay path":
+          bscsProbing
+        else:
+          bscsFailed
       taskState.updatedAtMs = nowMillis()
       taskState.ok = false
       taskState.err = lastError
-    let payload = bootstrapSeedConnectExactPayload(
-      node,
+    let payload = bootstrapSeedConnectAsyncPayload(
       safePeerId,
       effectiveSource,
       attemptedAddr,
@@ -26334,7 +26833,7 @@ proc runBootstrapSeedConnectExactAsync(
           safePeerId,
           selectedAddrs,
           "done",
-          parseJson(payload),
+          payload,
           lastError,
         )
   except CancelledError as exc:
@@ -26946,16 +27445,15 @@ proc libp2p_direct_session_target_set*(
   setDirectSessionTargetState(
     safePeerId,
     selectedAddrs,
-    "pending",
-    %*{
-      "ok": false,
-      "peerId": safePeerId,
-      "selectedAddrs": selectedAddrs,
-      "status": "pending",
-    }
+    buildDirectSessionTargetSnapshot(
+      safePeerId,
+      bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs),
+      "pending",
+      selectedAddrs = selectedAddrs,
+    ),
   )
   let spec =
-    upsertDirectSessionTargetDesiredState(
+    upsertDirectSessionTarget(
       node,
       safePeerId,
       selectedAddrs,
@@ -26967,15 +27465,13 @@ proc libp2p_direct_session_target_set*(
   setDirectSessionTargetState(
     safePeerId,
     selectedAddrs,
-    "failed",
-    %*{
-      "ok": false,
-      "peerId": safePeerId,
-      "selectedAddrs": selectedAddrs,
-      "status": "failed",
-      "error": err,
-    },
-    err
+    buildDirectSessionTargetSnapshot(
+      safePeerId,
+      bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs),
+      "failed",
+      selectedAddrs = selectedAddrs,
+      error = err,
+    ),
   )
   recordRuntimeError(err)
   false
@@ -27018,23 +27514,22 @@ proc libp2p_direct_session_target_clear*(
     setDirectSessionTargetState(
       safePeerId,
       selectedAddrs,
-      "cleared",
-      %*{
-        "ok": false,
-        "peerId": safePeerId,
-        "selectedAddrs": selectedAddrs,
-        "status": "cleared",
-        "taskKey": spec.taskKey,
-        "attemptCount": spec.attemptCount,
-        "successCount": spec.successCount,
-        "failureCount": spec.failureCount,
-        "lastAttemptAtMs": spec.lastAttemptAtMs,
-        "lastReadyAtMs": spec.lastReadyAtMs,
-        "lastFailureAtMs": spec.lastFailureAtMs,
-        "lastFailureReason": spec.lastFailureReason,
-        "error": "direct_target_cleared",
-      },
-      "direct_target_cleared",
+      buildDirectSessionTargetSnapshot(
+        safePeerId,
+        spec.taskKey,
+        "cleared",
+        selectedAddrs = selectedAddrs,
+        source = spec.source,
+        error = "direct_target_cleared",
+        updatedAtMs = spec.updatedAtMs,
+        attemptCount = spec.attemptCount,
+        successCount = spec.successCount,
+        failureCount = spec.failureCount,
+        lastAttemptAtMs = spec.lastAttemptAtMs,
+        lastReadyAtMs = spec.lastReadyAtMs,
+        lastFailureAtMs = spec.lastFailureAtMs,
+        lastFailureReason = spec.lastFailureReason,
+      ),
     )
     return true
   let err = "direct_session_target_clear_failed"
@@ -27053,11 +27548,12 @@ proc libp2p_direct_session_target_status_for_addresses*(
   if safePeerId.len == 0 or safeAddressesJson.len == 0:
     return allocCString(
       directSessionTargetStateJson(
-        safePeerId,
-        "",
-        "missing",
-        newJNull(),
-        "missing_peerId_or_addresses",
+        buildDirectSessionTargetSnapshot(
+          safePeerId,
+          "",
+          "missing",
+          error = "missing_peerId_or_addresses",
+        )
       )
     )
   let parsedAddresses = parseJsonStringSeq(safeAddressesJson)
@@ -27070,11 +27566,12 @@ proc libp2p_direct_session_target_status_for_addresses*(
   if safeLimit <= 0:
     return allocCString(
       directSessionTargetStateJson(
-        safePeerId,
-        "",
-        "missing",
-        newJNull(),
-        "no_valid_addresses",
+        buildDirectSessionTargetSnapshot(
+          safePeerId,
+          "",
+          "missing",
+          error = "no_valid_addresses",
+        )
       )
     )
   allocCString(

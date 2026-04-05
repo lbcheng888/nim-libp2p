@@ -98,6 +98,7 @@ type
     when defined(libp2p_msquic_experimental):
       quicTransport: MsQuicTransport
     provider: TsnetProvider
+    providerLifecycleLock: Lock
     providerListenersActivated: bool
     acceptFuts: seq[Future[Connection]]
     acceptKinds: seq[TsnetPathKind]
@@ -353,17 +354,23 @@ proc activateProviderListeners(
 
 proc prewarmProvider*(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
   tsnetSafe:
-    result = self.provider.start()
+    if self.isNil:
+      return err("tsnet transport is nil")
+    withLock(self.providerLifecycleLock):
+      result = self.provider.start()
 
 proc providerStartSafe(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
   tsnetSafe:
-    let started = self.provider.start().valueOr:
-      return err(error)
-    if self.providerUsesProxyRouting():
-      let activated = self.activateProviderListeners()
-      if activated.isErr():
-        return err(activated.error)
-    result = ok(started)
+    if self.isNil:
+      return err("tsnet transport is nil")
+    withLock(self.providerLifecycleLock):
+      let started = self.provider.start().valueOr:
+        return err(error)
+      if self.providerUsesProxyRouting():
+        let activated = self.activateProviderListeners()
+        if activated.isErr():
+          return err(activated.error)
+      result = ok(started)
 
 proc warmProvider*(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
   self.providerStartSafe()
@@ -556,19 +563,6 @@ proc providerMarkFailedDirectUdpSafe(
   tsnetSafe:
     result = self.provider.markFailedDirectProxyRoute(advertised, rawAddress)
 
-proc lookupUdpDirectRouteTarget*(
-    self: TsnetTransport,
-    address: MultiAddress
-): Result[TsnetDirectRouteTarget, string] {.gcsafe.} =
-  if self.isNil:
-    return err("tsnet transport is nil")
-  let family = familyFromAddress(address)
-  let host = hostFromAddress(address)
-  let port = portFromAddress(address)
-  if family.len == 0 or host.len == 0 or port <= 0:
-    return err("invalid tsnet quic target")
-  self.providerLookupUdpDirectTargetSafe(family, host, port)
-
 proc providerUdpDialStateSafe(
     self: TsnetTransport,
     rawAddress: MultiAddress
@@ -591,6 +585,10 @@ proc providerResolveRemoteSafe(
 proc providerStatusPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
   tsnetSafe:
     result = self.provider.statusPayload()
+
+proc familyFromAddress(address: MultiAddress): string {.gcsafe.}
+
+proc hostFromAddress(address: MultiAddress): string {.gcsafe.}
 
 proc providerReadySafe*(self: TsnetTransport): bool {.gcsafe.} =
   tsnetSafe:
@@ -759,6 +757,19 @@ proc hostFromAddress(address: MultiAddress): string {.gcsafe.} =
   if parts.len >= baseIdx + 2 and (parts[baseIdx] == "ip4" or parts[baseIdx] == "ip6"):
     return parts[baseIdx + 1]
   ""
+
+proc lookupUdpDirectRouteTarget*(
+    self: TsnetTransport,
+    address: MultiAddress
+): Result[TsnetDirectRouteTarget, string] {.gcsafe.} =
+  if self.isNil:
+    return err("tsnet transport is nil")
+  let family = familyFromAddress(address)
+  let host = hostFromAddress(address)
+  let port = portFromAddress(address)
+  if family.len == 0 or host.len == 0 or port <= 0:
+    return err("invalid tsnet quic target")
+  self.providerLookupUdpDirectTargetSafe(family, host, port)
 
 proc quicDialHostname*(
     self: TsnetTransport,
@@ -1043,6 +1054,7 @@ proc new*(
     syntheticIPv6: syntheticTailnetIPv6(syntheticId),
     provider: TsnetProvider.new(providerConfig(cfg))
   )
+  initLock(result.providerLifecycleLock)
   result.cfg.bridgeExtraJson = ownedText(result.cfg.bridgeExtraJson)
   procCall Transport(result).initialize()
   result.tcpTransport = TcpTransport.new(flags = {ServerFlags.TcpNoDelay}, upgrade = upgrader)

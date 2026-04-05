@@ -2024,15 +2024,18 @@ proc submitTransportLane(
 proc submitTransportDispatchable(
     network: FabricNetwork, peerId: PeerId, lane: FabricSubmitLane
 ): bool {.gcsafe, raises: [].} =
-  discard lane
   if network.isNil or network.switch.isNil or peerId.data.len == 0:
     return false
   if not network.switch.isConnected(peerId):
     return false
   let state = network.submitPeerConnects.getOrDefault($peerId)
-  if not state.isNil and state.transportBlocked:
+  if state.isNil or state.transportBlocked:
     return false
-  true
+  case lane
+  of fslEvent:
+    state.transportVerified or state.submitPeerStreamReady(fsscEvent)
+  of fslAttestation, fslOther:
+    state.transportVerified
 
 proc submitTransportReady(
     network: FabricNetwork, peerId: PeerId, lane: FabricSubmitLane
@@ -2316,7 +2319,7 @@ proc runSubmitPeerActor(
 
     if network.switch.isConnected(peerId) and
         (wantWarm or
-        (submitSessionShardQueued(wantedSessionShards, fsscEvent, 0) and
+        (submitSessionShardsQueued(wantedSessionShards) and
         not state.transportVerified)):
       discard await network.probeSubmitTransport(peerId)
 
