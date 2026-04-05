@@ -88,6 +88,113 @@ proc nextRuntimeId(): int =
   inc runtimeIdCounter
   runtimeIdCounter
 
+proc new*(_: type[TsnetInAppRuntime], cfg: TsnetProviderConfig): TsnetInAppRuntime
+proc new*(
+    _: type[TsnetInAppRuntime],
+    cfg: TsnetProviderConfig,
+    controlTransport: TsnetControlTransport
+): TsnetInAppRuntime
+proc start*(runtime: TsnetInAppRuntime): Result[void, string]
+proc clearListenerRoutes(runtime: TsnetInAppRuntime) {.gcsafe.}
+
+proc statusLabel(status: TsnetInAppRuntimeStatus): string {.gcsafe.} =
+  case status
+  of TsnetInAppRuntimeStatus.Stopped:
+    "stopped"
+  of TsnetInAppRuntimeStatus.Bootstrapping:
+    "bootstrapping"
+  of TsnetInAppRuntimeStatus.Running:
+    "running"
+  of TsnetInAppRuntimeStatus.Failed:
+    "failed"
+
+proc parseRuntimeStatus(value: string): TsnetInAppRuntimeStatus {.gcsafe.} =
+  case value.strip().toLowerAscii()
+  of "running":
+    TsnetInAppRuntimeStatus.Running
+  of "failed":
+    TsnetInAppRuntimeStatus.Failed
+  of "bootstrapping":
+    TsnetInAppRuntimeStatus.Bootstrapping
+  else:
+    TsnetInAppRuntimeStatus.Stopped
+
+proc jsonField(node: JsonNode, key: string): JsonNode {.gcsafe.} =
+  if node.isNil or node.kind != JObject or not node.hasKey(key):
+    return newJNull()
+  node.getOrDefault(key)
+
+proc jsonString(node: JsonNode, key: string): string {.gcsafe.} =
+  let value = jsonField(node, key)
+  if value.kind == JString:
+    return value.getStr()
+  ""
+
+proc jsonBool(node: JsonNode, key: string): bool {.gcsafe.} =
+  let value = jsonField(node, key)
+  case value.kind
+  of JBool:
+    value.getBool()
+  of JString:
+    value.getStr().strip().toLowerAscii() in ["1", "true", "yes", "y"]
+  else:
+    false
+
+proc buildWarmSnapshotPayload(runtime: TsnetInAppRuntime): JsonNode {.gcsafe.} =
+  result = newJObject()
+  if runtime.isNil:
+    return
+  var stateCopy = runtime.state
+  result["status"] = %runtime.status.statusLabel()
+  result["lastError"] = %runtime.lastError
+  result["oracleFixturePresent"] = %runtime.oracleFixturePresent
+  result["controlProtocolRequested"] = %runtime.controlProtocolRequested
+  result["controlProtocolSelected"] = %runtime.controlProtocolSelected
+  result["controlEndpoint"] = %runtime.controlEndpoint
+  result["controlFallback"] = %runtime.controlFallback
+  result["state"] = stateCopy.toJson()
+  result["control"] = runtime.control.toJson()
+  result["session"] = runtime.session.toJson()
+
+proc bootstrapWarmSnapshotJson*(cfg: TsnetProviderConfig): Result[string, string] =
+  let runtime = TsnetInAppRuntime.new(cfg)
+  let started = runtime.start()
+  if started.isErr():
+    return err(started.error)
+  ok($buildWarmSnapshotPayload(runtime))
+
+proc applyWarmSnapshotJson*(
+    runtime: TsnetInAppRuntime,
+    payloadText: string
+): Result[void, string] =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  let payload =
+    try:
+      parseJson(payloadText)
+    except CatchableError as exc:
+      return err("invalid tsnet warm snapshot payload: " & exc.msg)
+  if payload.kind != JObject:
+    return err("tsnet warm snapshot payload must be a JSON object")
+  let parsedState = state.parseStoredState(jsonField(payload, "state")).valueOr:
+    return err(error)
+  let parsedControl = parseControlSnapshot(jsonField(payload, "control")).valueOr:
+    return err(error)
+  let parsedSession = parseSessionSnapshot(jsonField(payload, "session")).valueOr:
+    return err(error)
+  runtime.status = parseRuntimeStatus(jsonString(payload, "status"))
+  runtime.lastError = jsonString(payload, "lastError")
+  runtime.oracleFixturePresent = jsonBool(payload, "oracleFixturePresent")
+  runtime.controlProtocolRequested = normalizeControlProtocol(jsonString(payload, "controlProtocolRequested"))
+  runtime.controlProtocolSelected = normalizeControlProtocol(jsonString(payload, "controlProtocolSelected"))
+  runtime.controlEndpoint = ownedText(jsonString(payload, "controlEndpoint"))
+  runtime.controlFallback = ownedText(jsonString(payload, "controlFallback"))
+  runtime.state = parsedState
+  runtime.control = parsedControl
+  runtime.session = parsedSession
+  runtime.clearListenerRoutes()
+  ok()
+
 proc oracleEnabled(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
   not runtime.isNil and runtime.cfg.enableDebug
 

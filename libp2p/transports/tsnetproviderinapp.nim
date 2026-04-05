@@ -88,6 +88,17 @@ proc startInAppRuntime*(runtime: TsnetInAppRuntime): Result[void, string] =
     return err("tsnet in-app runtime is nil")
   tsruntime.start(runtime)
 
+proc bootstrapWarmSnapshotJson*(cfg: TsnetProviderConfig): Result[string, string] =
+  tsruntime.bootstrapWarmSnapshotJson(cfg)
+
+proc applyWarmSnapshotJson*(
+    runtime: TsnetInAppRuntime,
+    payloadText: string
+): Result[void, string] =
+  if runtime.isNil:
+    return err("tsnet in-app runtime is nil")
+  tsruntime.applyWarmSnapshotJson(runtime, payloadText)
+
 proc closeInAppRuntime*(runtime: var TsnetInAppRuntime) =
   if runtime.isNil:
     return

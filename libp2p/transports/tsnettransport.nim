@@ -375,6 +375,28 @@ proc providerStartSafe(self: TsnetTransport): Result[TsnetProviderKind, string] 
 proc warmProvider*(self: TsnetTransport): Result[TsnetProviderKind, string] {.gcsafe.} =
   self.providerStartSafe()
 
+proc warmProviderConfigJsonSafe*(self: TsnetTransport): Result[string, string] {.gcsafe.} =
+  tsnetSafe:
+    if self.isNil:
+      return err("tsnet transport is nil")
+    result = self.provider.warmConfigJson()
+
+proc applyWarmProviderSnapshotSafe*(
+    self: TsnetTransport,
+    payloadText: string
+): Result[TsnetProviderKind, string] {.gcsafe.} =
+  tsnetSafe:
+    if self.isNil:
+      return err("tsnet transport is nil")
+    withLock(self.providerLifecycleLock):
+      let started = self.provider.applyWarmSnapshot(payloadText).valueOr:
+        return err(error)
+      if self.providerUsesProxyRouting():
+        let activated = self.activateProviderListeners()
+        if activated.isErr():
+          return err(activated.error)
+      result = ok(started)
+
 proc publishLocalPeerInfo*(
     self: TsnetTransport,
     peerId: string,

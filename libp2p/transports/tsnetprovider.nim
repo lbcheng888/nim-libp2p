@@ -254,6 +254,42 @@ proc start*(provider: TsnetProvider): Result[TsnetProviderKind, string] =
     provider.kind = TsnetProviderKind.LegacyBridge
     result = ok(provider.kind)
 
+proc warmConfigJson*(provider: TsnetProvider): Result[string, string] {.gcsafe.} =
+  if provider.isNil:
+    return err("tsnet provider is nil")
+  withLock(provider.stateLock):
+    if provider.legacyBridgeRequested():
+      return err("tsnet warm snapshot does not support legacy bridge")
+    if not provider.runtimeRequested():
+      return err("tsnet warm snapshot requires a real in-app runtime")
+    result = ok($(provider.cfg.toJson()))
+
+proc applyWarmSnapshot*(
+    provider: TsnetProvider,
+    payloadText: string
+): Result[TsnetProviderKind, string] {.gcsafe.} =
+  if provider.isNil:
+    return err("tsnet provider is nil")
+  withLock(provider.stateLock):
+    if provider.legacyBridgeRequested():
+      return err("tsnet warm snapshot does not support legacy bridge")
+    if not provider.runtimeRequested():
+      provider.started = true
+      provider.kind = TsnetProviderKind.BuiltinSynthetic
+      provider.lastError = ""
+      return ok(provider.kind)
+    provider.runtime = tsnetproviderinapp.newInAppRuntime(provider.cfg)
+    let applied = tsnetproviderinapp.applyWarmSnapshotJson(provider.runtime, payloadText)
+    if applied.isErr():
+      provider.started = false
+      provider.kind = TsnetProviderKind.InAppUnavailable
+      provider.lastError = applied.error
+      return err(applied.error)
+    provider.started = true
+    provider.kind = TsnetProviderKind.InAppReal
+    provider.lastError = provider.runtime.lastError
+    result = ok(provider.kind)
+
 proc reset*(provider: TsnetProvider): Result[void, string] =
   if provider.isNil:
     return err("tsnet provider is nil")

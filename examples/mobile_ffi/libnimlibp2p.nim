@@ -36,6 +36,8 @@ when libp2pDataTransferEnabled:
 import libp2p/protocols/rendezvous/rendezvous
 import libp2p/stream/lpstream
 import libp2p/transports/tsnettransport
+import libp2p/transports/tsnetproviderinapp
+import libp2p/transports/tsnetprovidertypes
 import bearssl/[rand, hash]
 
 when defined(libp2p_msquic_experimental):
@@ -239,6 +241,8 @@ initLock(lastNodeIdentityLock)
 initLock(bootstrapSeedConnectKickoffStateLock)
 initLock(directSessionTargetStateLock)
 initLock(sendWithAckKickoffStateLock)
+
+proc allocCString(str: string): cstring {.gcsafe, raises: [].}
 
 proc bootstrapSeedConnectTaskKey(
     peerId: string,
@@ -1280,6 +1284,8 @@ type
     tailnetWarmThreadJoined: Atomic[bool]
     tailnetWarmFinalizePending: Atomic[bool]
     tailnetWarmSucceeded: Atomic[bool]
+    tailnetWarmResultJson: cstring
+    tailnetWarmErrorJson: cstring
     commandDrainActive: bool
     currentCommandKindCode: Atomic[int]
     currentCommandKind: CommandKind
@@ -1703,7 +1709,6 @@ proc updateTailnetStartStatus(
     errorMsg: string = ""
 ) {.gcsafe, raises: [].}
 proc joinTailnetWarmThreadIfNeeded(n: NimNode) {.gcsafe, raises: [].}
-proc tailnetWarmWorker(handle: pointer) {.thread.}
 proc ensureMessageId(mid: string): string {.gcsafe, raises: [].}
 proc connectedPeersArray(handle: pointer): JsonNode
 proc addPeerHintSource(n: NimNode, peerId: string, source: string) {.gcsafe.}
@@ -4486,6 +4491,7 @@ proc scheduleBackgroundTailnetWarm(
     n: NimNode,
     reason: string
 ) {.gcsafe, raises: [].}
+proc clearTailnetWarmWorkerBuffers(n: NimNode) {.gcsafe, raises: [].}
 
 proc scheduleTailnetWarmAfterStart(
     n: NimNode,
@@ -4584,12 +4590,31 @@ proc processTailnetWarmCompletion(n: NimNode) {.gcsafe, raises: [].} =
   joinTailnetWarmThreadIfNeeded(n)
   let warmSucceeded = n.tailnetWarmSucceeded.load(moAcquire)
   n.tailnetWarmSucceeded.store(false, moRelease)
-  if not warmSucceeded:
-    updateTailnetStartStatus(n, "failed", false, "tailnet warm failed")
+  var warmPayload = ""
+  var warmError = ""
+  if n.tailnetWarmResultJson != nil:
+    warmPayload = $n.tailnetWarmResultJson
+  if n.tailnetWarmErrorJson != nil:
+    warmError = $n.tailnetWarmErrorJson
+  clearTailnetWarmWorkerBuffers(n)
+  if not warmSucceeded or warmPayload.len == 0:
+    updateTailnetStartStatus(
+      n,
+      "failed",
+      false,
+      if warmError.len > 0: warmError else: "tailnet warm failed"
+    )
     return
   let transport = activeTsnetTransport(n)
   if transport.isNil:
     updateTailnetStartStatus(n, "failed", false, "tsnet transport unavailable")
+    return
+  let applied =
+    block:
+      {.cast(gcsafe).}:
+        transport.applyWarmProviderSnapshotSafe(warmPayload)
+  if applied.isErr():
+    updateTailnetStartStatus(n, "failed", false, applied.error)
     return
   discard mergeTsnetListenAddrsIntoPeerInfo(n, transport)
   publishTsnetLocalPeerInfo(n, transport)
@@ -7074,6 +7099,28 @@ proc buildTailnetStartStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].}
   result["pendingCommands"] = %n.pendingCommands.load(moAcquire)
   result["queuedCommands"] = %n.queuedCommands.load(moAcquire)
 
+type TailnetWarmWorkerArg = object
+  handle: pointer
+  providerConfigJson: cstring
+
+proc destroyTailnetWarmWorkerArg(arg: ptr TailnetWarmWorkerArg) {.gcsafe, raises: [].} =
+  if arg.isNil:
+    return
+  if arg.providerConfigJson != nil:
+    deallocShared(arg.providerConfigJson)
+    arg.providerConfigJson = nil
+  deallocShared(arg)
+
+proc clearTailnetWarmWorkerBuffers(n: NimNode) {.gcsafe, raises: [].} =
+  if n.isNil:
+    return
+  if n.tailnetWarmResultJson != nil:
+    deallocShared(n.tailnetWarmResultJson)
+    n.tailnetWarmResultJson = nil
+  if n.tailnetWarmErrorJson != nil:
+    deallocShared(n.tailnetWarmErrorJson)
+    n.tailnetWarmErrorJson = nil
+
 proc joinTailnetWarmThreadIfNeeded(n: NimNode) {.gcsafe, raises: [].} =
   if n.isNil:
     return
@@ -7084,32 +7131,51 @@ proc joinTailnetWarmThreadIfNeeded(n: NimNode) {.gcsafe, raises: [].} =
   joinThread(n.tailnetWarmThread)
   n.tailnetWarmThreadJoined.store(true, moRelease)
 
-proc tailnetWarmWorker(handle: pointer) {.thread.} =
+proc tailnetWarmWorker(arg: pointer) {.thread.} =
   setupForeignThreadGc()
   defer:
     tearDownForeignThreadGc()
   chronos.setThreadDispatcher(newDispatcher())
+  let workerArg = cast[ptr TailnetWarmWorkerArg](arg)
+  defer:
+    destroyTailnetWarmWorkerArg(workerArg)
+  if workerArg.isNil:
+    return
   let node {.cursor.} = ffiNodeSafe:
-    nodeFromHandle(handle)
+    nodeFromHandle(workerArg.handle)
   if node.isNil:
     return
   debugLog("[nimlibp2p] tailnet warm worker start")
-  let transport {.cursor.} =
-    if node.switchInstance.isNil:
-      nil
-    else:
-      node.switchInstance.tsnetTransport()
   var warmSucceeded = false
-  if transport.isNil:
-    debugLog("[nimlibp2p] tailnet warm worker transport unavailable")
+  if workerArg.providerConfigJson.isNil:
+    node.tailnetWarmErrorJson = allocCString("missing_tailnet_warm_config")
+    debugLog("[nimlibp2p] tailnet warm worker config missing")
   else:
-    let warmRes = ffiTsnetSafe:
-      transport.warmProvider()
-    if warmRes.isErr():
-      debugLog("[nimlibp2p] tailnet warm worker failed: " & warmRes.error)
+    var parsedCfg = TsnetProviderConfig.init()
+    var parsedCfgOk = false
+    var parsedCfgError = ""
+    try:
+      let parsedRes = parseProviderConfig(parseJson($workerArg.providerConfigJson))
+      if parsedRes.isErr():
+        parsedCfgError = parsedRes.error
+      else:
+        parsedCfg = parsedRes.get()
+        parsedCfgOk = true
+    except CatchableError as exc:
+      parsedCfgError = "invalid tailnet warm config: " & exc.msg
+    if not parsedCfgOk:
+      node.tailnetWarmErrorJson = allocCString(parsedCfgError)
+      debugLog("[nimlibp2p] tailnet warm worker config parse failed: " & parsedCfgError)
     else:
-      warmSucceeded = true
-      debugLog("[nimlibp2p] tailnet warm worker succeeded")
+      let warmRes = ffiTsnetSafe:
+        tsnetproviderinapp.bootstrapWarmSnapshotJson(parsedCfg)
+      if warmRes.isErr():
+        node.tailnetWarmErrorJson = allocCString(warmRes.error)
+        debugLog("[nimlibp2p] tailnet warm worker failed: " & warmRes.error)
+      else:
+        node.tailnetWarmResultJson = allocCString(warmRes.get())
+        warmSucceeded = not node.tailnetWarmResultJson.isNil
+        debugLog("[nimlibp2p] tailnet warm worker succeeded")
   node.tailnetWarmSucceeded.store(warmSucceeded, moRelease)
   node.tailnetWarmFinalizePending.store(true, moRelease)
   node.tailnetWarmThreadActive.store(false, moRelease)
@@ -12826,7 +12892,7 @@ proc initGossip(sw: Switch, cfg: NodeConfig): Result[GossipSub, string] =
 # 工具函数
 # -------------------------------------------------------------
 
-proc allocCString(str: string): cstring =
+proc allocCString(str: string): cstring {.gcsafe, raises: [].} =
   let size = str.len + 1
   let raw = cast[cstring](allocShared(size))
   if raw.isNil:
@@ -14015,17 +14081,50 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.resultCode = NimResultOk
         else:
           updateTailnetStartStatus(n, "starting", true)
-          if not n.tailnetWarmTask.isNil and not n.tailnetWarmTask.finished():
+          if n.tailnetWarmThreadActive.load(moAcquire):
             command.resultCode = NimResultOk
           else:
+            joinTailnetWarmThreadIfNeeded(n)
+            clearTailnetWarmWorkerBuffers(n)
             n.tailnetWarmFinalizePending.store(false, moRelease)
             n.tailnetWarmSucceeded.store(false, moRelease)
-            n.tailnetWarmThreadActive.store(false, moRelease)
-            n.tailnetWarmThreadJoined.store(true, moRelease)
-            n.tailnetWarmTask = runTailnetWarmAsync(n)
-            asyncSpawn n.tailnetWarmTask
-            debugLog("[nimlibp2p] tailnet warm async task created")
-            command.resultCode = NimResultOk
+            debugLog("[nimlibp2p] tailnet warm worker: publish_local_peer_info_before_snapshot")
+            publishTsnetLocalPeerInfo(n, transport)
+            let cfgJson = ffiTsnetSafe:
+              transport.warmProviderConfigJsonSafe()
+            if cfgJson.isErr():
+              command.resultCode = NimResultError
+              command.errorMsg = cfgJson.error
+              updateTailnetStartStatus(n, "failed", false, command.errorMsg)
+            else:
+              let workerArg = cast[ptr TailnetWarmWorkerArg](allocShared0(sizeof(TailnetWarmWorkerArg)))
+              if workerArg.isNil:
+                command.resultCode = NimResultError
+                command.errorMsg = "tailnet warm worker alloc failed"
+                updateTailnetStartStatus(n, "failed", false, command.errorMsg)
+              else:
+                workerArg.handle = n.selfHandle
+                workerArg.providerConfigJson = allocCString(cfgJson.get())
+                if workerArg.providerConfigJson.isNil:
+                  destroyTailnetWarmWorkerArg(workerArg)
+                  command.resultCode = NimResultError
+                  command.errorMsg = "tailnet warm config alloc failed"
+                  updateTailnetStartStatus(n, "failed", false, command.errorMsg)
+                else:
+                  n.tailnetWarmThreadJoined.store(false, moRelease)
+                  n.tailnetWarmThreadActive.store(true, moRelease)
+                  try:
+                    createThread(n.tailnetWarmThread, tailnetWarmWorker, cast[pointer](workerArg))
+                    debugLog("[nimlibp2p] tailnet warm worker created")
+                    command.resultCode = NimResultOk
+                  except CatchableError as exc:
+                    n.tailnetWarmThreadActive.store(false, moRelease)
+                    n.tailnetWarmThreadJoined.store(true, moRelease)
+                    destroyTailnetWarmWorkerArg(workerArg)
+                    command.resultCode = NimResultError
+                    command.errorMsg =
+                      if exc.msg.len > 0: exc.msg else: "tailnet warm worker createThread failed"
+                    updateTailnetStartStatus(n, "failed", false, command.errorMsg)
     of cmdTailnetWarmFinalize:
       ## 兼容旧路径；新的 tailnet warm 完成由事件循环线程读取原子状态后收尾。
       processTailnetWarmCompletion(n)
@@ -16214,6 +16313,8 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
     node.tailnetWarmThreadJoined.store(true, moRelease)
     node.tailnetWarmFinalizePending.store(false, moRelease)
     node.tailnetWarmSucceeded.store(false, moRelease)
+    node.tailnetWarmResultJson = nil
+    node.tailnetWarmErrorJson = nil
     node.queuedCommands.store(0, moRelease)
     let bootstrapAddrs = effectiveBootstrapHints(cfg)
     if bootstrapAddrs.len > 0:
@@ -16357,6 +16458,7 @@ proc libp2p_node_stop*(handle: pointer): cint {.exportc, cdecl, dynlib.} =
     return NimResultInvalidArgument
   if node.shutdownComplete.load(moAcquire):
     joinTailnetWarmThreadIfNeeded(node)
+    clearTailnetWarmWorkerBuffers(node)
     if not node.threadJoined.load(moAcquire):
       joinThread(node.thread)
       node.threadJoined.store(true, moRelease)
@@ -16365,6 +16467,7 @@ proc libp2p_node_stop*(handle: pointer): cint {.exportc, cdecl, dynlib.} =
   if node.stopRequested.load(moAcquire):
     let stopped = waitShutdown(node)
     joinTailnetWarmThreadIfNeeded(node)
+    clearTailnetWarmWorkerBuffers(node)
     if stopped and not node.threadJoined.load(moAcquire):
       joinThread(node.thread)
       node.threadJoined.store(true, moRelease)
@@ -16385,6 +16488,7 @@ proc libp2p_node_stop*(handle: pointer): cint {.exportc, cdecl, dynlib.} =
   let stopCompleted = waitCommandCompletion(cmd)
   let shutdownCompleted = waitShutdown(node)
   joinTailnetWarmThreadIfNeeded(node)
+  clearTailnetWarmWorkerBuffers(node)
   var rc = cmd.resultCode
   if rc == NimResultOk and (not stopCompleted or not shutdownCompleted):
     rc = NimResultError
@@ -16412,6 +16516,7 @@ proc libp2p_node_free*(handle: pointer) {.exportc, cdecl, dynlib.} =
     joinThread(node.thread)
     node.threadJoined.store(true, moRelease)
   joinTailnetWarmThreadIfNeeded(node)
+  clearTailnetWarmWorkerBuffers(node)
   node.running.store(false, moRelease)
   # Mobile hosts keep a singleton node for the process lifetime. Eagerly
   # tearing down the full GC-managed object graph here still races with

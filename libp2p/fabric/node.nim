@@ -4214,7 +4214,7 @@ proc registerAttestation(
       authorPeerId = authorRoute.get().peerId
     if authorPeerId.len > 0 and authorPeerId != peerIdString(node.identity.peerId):
       node.antiEntropySummaryNextRefreshAtMs[authorPeerId] = 0'i64
-      node.ensureAntiEntropySummarySync(authorPeerId)
+      node.signalAntiEntropySummarySync(authorPeerId)
   if enqueuePending and att.eventId notin node.eventCertificates and
       node.attestationRequiresRelay(event, att):
     if node.attestationNeedsRelay(event, att):

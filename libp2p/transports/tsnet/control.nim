@@ -301,7 +301,16 @@ proc toJson*(snapshot: TsnetControlSnapshot): JsonNode =
 proc parseControlSnapshot*(node: JsonNode): Result[TsnetControlSnapshot, string] =
   if node.isNil or node.kind != JObject:
     return err("tsnet control snapshot must be a JSON object")
-  let capturedAtNode = jsonField(node, "capturedAtUnixMilli")
+  let source =
+    if node.hasKey("source") and node.getOrDefault("source").kind == JString:
+      node.getOrDefault("source").getStr()
+    else:
+      ""
+  let capturedAtNode =
+    if node.hasKey("capturedAtUnixMilli"):
+      node.getOrDefault("capturedAtUnixMilli")
+    else:
+      newJNull()
   let capturedAtUnixMilli =
     case capturedAtNode.kind
     of JInt:
@@ -310,12 +319,27 @@ proc parseControlSnapshot*(node: JsonNode): Result[TsnetControlSnapshot, string]
       capturedAtNode.getFloat().int64
     else:
       0'i64
+  let probePayload =
+    if node.hasKey("probe"):
+      node.getOrDefault("probe")
+    else:
+      newJNull()
+  let registerPayload =
+    if node.hasKey("register"):
+      node.getOrDefault("register")
+    else:
+      newJNull()
+  let mapPollPayload =
+    if node.hasKey("mapPoll"):
+      node.getOrDefault("mapPoll")
+    else:
+      newJNull()
   ok(TsnetControlSnapshot.init(
-    source = jsonString(node, "source"),
+    source = source,
     capturedAtUnixMilli = capturedAtUnixMilli,
-    probePayload = jsonField(node, "probe"),
-    registerPayload = jsonField(node, "register"),
-    mapPollPayload = jsonField(node, "mapPoll")
+    probePayload = probePayload,
+    registerPayload = registerPayload,
+    mapPollPayload = mapPollPayload
   ))
 
 proc toJson*(keys: TsnetControlServerKey): JsonNode =
