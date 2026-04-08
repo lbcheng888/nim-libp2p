@@ -76,7 +76,7 @@ NIM_FLAGS=(
   "--forceBuild:on"
   "--os:android"
   "--cpu:${CPU_FLAG}"
-  "--mm:arc"
+  "--mm:orc"
   "--deepCopy:on"
   "--threads:on"
   "--cc:clang"

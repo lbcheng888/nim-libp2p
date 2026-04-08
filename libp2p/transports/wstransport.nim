@@ -120,7 +120,7 @@ method closeImpl*(s: WsStream): Future[void] {.async: (raises: []).} =
     discard
   await procCall Connection(s).closeImpl()
 
-method getWrapped*(s: WsStream): Connection =
+method getWrapped*(s: WsStream): Connection {.gcsafe.} =
   nil
 
 type WsTransport* = ref object of Transport

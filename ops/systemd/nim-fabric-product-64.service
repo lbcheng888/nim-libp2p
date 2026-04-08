@@ -1,0 +1,14 @@
+[Unit]
+Description=Nim Fabric product node (64 gateway cluster)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/nim-libp2p
+ExecStart=/root/nim-libp2p/ops/cluster/run_fabric_product_node.sh 64
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

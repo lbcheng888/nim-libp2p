@@ -7,7 +7,7 @@ void nim_bridge_emit_event(const char *topic, const char *payload) {
 }
 """.}
 
-import std/[base64, json, os, unittest]
+import std/[base64, json, os, strutils, unittest]
 from std/times import epochTime
 
 import ../libp2p/crypto/crypto
@@ -54,9 +54,9 @@ proc testIdentity(): JsonNode =
     "source": "test",
   }
 
-proc newTestNode(prefix: string, extra: JsonNode): pointer =
+proc newTestNodeWithIdentity(prefix: string, identity: JsonNode, extra: JsonNode): pointer =
   let cfg = %*{
-    "identity": testIdentity(),
+    "identity": identity,
     "dataDir": testDataDir(prefix),
     "extra": extra,
   }
@@ -66,6 +66,21 @@ proc newTestNode(prefix: string, extra: JsonNode): pointer =
     raise newException(IOError, "libp2p_node_init failed for " & prefix)
   check libp2p_mdns_set_enabled(handle, false)
   handle
+
+proc newTestNode(prefix: string, extra: JsonNode): pointer =
+  newTestNodeWithIdentity(prefix, testIdentity(), extra)
+
+proc deterministicPath(peerId: string, serveDepth: int): seq[int] =
+  let normalized = peerId.strip()
+  let suffixLen = max(0, min(8, max(1, serveDepth) - 1))
+  if normalized.len == 0 or suffixLen == 0:
+    return @[]
+  var hash = 0'i64
+  for ch in normalized:
+    hash = (hash * 131'i64 + ord(ch).int64) mod 2147483647'i64
+  for idx in 0 ..< suffixLen:
+    hash = (hash * 131'i64 + (idx + 1).int64) mod 2147483647'i64
+    result.add(int((hash mod 9'i64) + 1'i64))
 
 proc stopAndFreeNode(handle: pointer) =
   if handle.isNil:
@@ -147,6 +162,55 @@ suite "mobile ffi routing status":
       check status.hasKey("lsmrActiveCertificates")
       check status.hasKey("lsmrMigrations")
       check status.hasKey("lsmrIsolations")
+      check status.hasKey("lsmrNetworkId")
+      check status.hasKey("lsmrPath")
+      check status.hasKey("lsmrPathDerived")
+      check status.hasKey("lsmrServeDepth")
+      check status.hasKey("lsmrAnchorCount")
+
+  test "routing status derives lsmr path from stable identity and exposes lsmr metadata":
+    let identity = testIdentity()
+    let peerId = identity["peerId"].getStr()
+    let handle = newTestNodeWithIdentity(
+      "dual-lsmr-derived",
+      identity,
+      %*{
+        "disablePublicBootstrap": true,
+        "routingMode": "dualStack",
+        "primaryRoutingPlane": "lsmr",
+        "lsmrNetworkId": "mobile-ffi-routing-derived",
+        "lsmrServeDepth": 2,
+        "lsmrAnchors": [
+          {
+            "peerId": "12D3KooWMJmRGksDpUMeaDSsJikJNgBs9M5fsJihHf8kPptSaUun",
+            "addrs": [
+              "/ip6/2001:19f0:4400:7c67:5400:6ff:fe04:54f8/udp/4001/quic-v1/p2p/12D3KooWMJmRGksDpUMeaDSsJikJNgBs9M5fsJihHf8kPptSaUun"
+            ],
+            "operatorId": "unimaker-root",
+            "regionDigit": 5,
+            "attestedPrefix": [5],
+            "serveDepth": 2,
+            "directionMask": 511,
+            "canIssueRootCert": true
+          }
+        ]
+      }
+    )
+    defer:
+      stopAndFreeNode(handle)
+
+    let status = parseJson(takeCString(libp2p_get_routing_status_json(handle)))
+    check status["mode"].getStr() == "dualStack"
+    check status["primary"].getStr() == "lsmr"
+    check status["lsmrNetworkId"].getStr() == "mobile-ffi-routing-derived"
+    check status["lsmrServeDepth"].getInt() == 2
+    check status["lsmrAnchorCount"].getInt() == 1
+    check status["lsmrPathDerived"].getBool()
+    check status["lsmrPath"].kind == JArray
+    let expectedPath = deterministicPath(peerId, 2)
+    check status["lsmrPath"].len == expectedPath.len
+    for idx, digit in expectedPath:
+      check status["lsmrPath"][idx].getInt() == digit
 
   test "bootstrap status exposes routing status after node start":
     let handle = newTestNode(
@@ -156,7 +220,21 @@ suite "mobile ffi routing status":
         "routingMode": "dualStack",
         "primaryRoutingPlane": "lsmr",
         "lsmrNetworkId": "mobile-ffi-routing-bootstrap",
-        "lsmrPath": [5]
+        "lsmrServeDepth": 2,
+        "lsmrAnchors": [
+          {
+            "peerId": "12D3KooWMJmRGksDpUMeaDSsJikJNgBs9M5fsJihHf8kPptSaUun",
+            "addrs": [
+              "/ip6/2001:19f0:4400:7c67:5400:6ff:fe04:54f8/udp/4001/quic-v1/p2p/12D3KooWMJmRGksDpUMeaDSsJikJNgBs9M5fsJihHf8kPptSaUun"
+            ],
+            "operatorId": "unimaker-root",
+            "regionDigit": 5,
+            "attestedPrefix": [5],
+            "serveDepth": 2,
+            "directionMask": 511,
+            "canIssueRootCert": true
+          }
+        ]
       }
     )
     defer:
@@ -172,3 +250,9 @@ suite "mobile ffi routing status":
     check bootstrap["routingStatus"]["mode"].getStr() == "dualStack"
     check bootstrap["routingStatus"]["primary"].getStr() == "lsmr"
     check bootstrap["routingStatus"]["shadowMode"].getBool()
+    check bootstrap["routingStatus"]["lsmrNetworkId"].getStr() == "mobile-ffi-routing-bootstrap"
+    check bootstrap["routingStatus"]["lsmrServeDepth"].getInt() == 2
+    check bootstrap["routingStatus"]["lsmrAnchorCount"].getInt() == 1
+    check bootstrap["routingStatus"]["lsmrPath"].kind == JArray
+    check bootstrap["routingStatus"]["lsmrPath"].len > 0
+    check bootstrap["routingStatus"]["lsmrPathDerived"].getBool()

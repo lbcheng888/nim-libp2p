@@ -1,0 +1,14 @@
+[Unit]
+Description=Nim tsnet product node (dmit cluster)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/nim-libp2p
+ExecStart=/root/nim-libp2p/build/tsnet_product_node --label=prod-dmit --rpc-host=127.0.0.1 --rpc-port=19112 --control-protocol=nim_quic --control-endpoint=quic://64.176.84.12:9444/nim-tsnet-control-quic/v1 --relay-endpoint=quic://64.176.84.12:9446/nim-tsnet-relay-quic/v1 --hostname=prod-dmit --state-dir=/root/nim-libp2p/build/prod-dmit/node/state --data-dir=/root/nim-libp2p/build/prod-dmit/node/data --identity-path=/root/nim-libp2p/build/prod-dmit/node/identity.json --listen-port=40112 --wait-timeout-sec=120 --quic-only=true
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

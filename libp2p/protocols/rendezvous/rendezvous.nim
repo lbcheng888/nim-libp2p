@@ -459,8 +459,8 @@ proc advertise*(
   if ttl < rdv.minDuration or ttl > rdv.maxDuration:
     raise newException(AdvertiseError, "Invalid time to live: " & $ttl)
 
-  let sprBuff = rdv.switch.peerInfo.signedPeerRecord.encode().valueOr:
-    raise newException(AdvertiseError, "Wrong Signed Peer Record")
+  let sprBuff = rdv.switch.peerInfo.currentSignedPeerRecordBytes().valueOr:
+    raise newException(AdvertiseError, "Signed Peer Record encode failed: " & $error)
 
   let
     r = Register(ns: ns, signedPeerRecord: sprBuff, ttl: Opt.some(ttl.seconds.uint64))

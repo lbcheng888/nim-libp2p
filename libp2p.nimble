@@ -76,6 +76,12 @@ task testintegration, "Runs integraion tests":
 task testcoinjoin, "Runs CoinJoin prototype tests":
   runTest("coinjoin/testsuite")
 
+task testlsmr, "Runs stable LSMR tests":
+  exec "tests/run_lsmr_tests.sh fast"
+
+task testlsmrservice, "Runs stable LSMR service integration tests":
+  exec "tests/run_lsmr_tests.sh service"
+
 task test, "Runs the test suite":
   runTest("testall")
   testmultiformatextsTask()

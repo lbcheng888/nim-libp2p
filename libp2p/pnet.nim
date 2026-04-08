@@ -225,7 +225,7 @@ else:
   ): ConnectionProtector =
     ConnectionProtector(key: key, rng: rng, keyId: privateKeyId(key))
 
-  method getWrapped*(conn: ProtectedConnection): Connection =
+  method getWrapped*(conn: ProtectedConnection): Connection {.gcsafe.} =
     conn.base
 
   proc ensureReadInitialized(conn: ProtectedConnection) {.async: (raises: [CancelledError, LPStreamError]).} =
@@ -311,6 +311,7 @@ else:
       peerId: base.peerId,
       observedAddr: base.observedAddr,
       localAddr: base.localAddr,
+      relayPath: base.relayPath,
       timeout: base.timeout,
       timeoutHandler: base.timeoutHandler,
       dir: base.dir,

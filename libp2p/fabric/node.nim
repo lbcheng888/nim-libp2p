@@ -151,6 +151,7 @@ type
     causedByEventId: string
     targetPeerId: string
     clock: GanzhiClock
+    priorityClass: int
 
   EraCheckpointCandidatePhase = enum
     ecpPending
@@ -198,6 +199,9 @@ type
   AntiEntropyRootSummary = object
     domains: seq[AntiEntropyDomainRootSummary]
 
+  AntiEntropySummaryHead = object
+    version: uint64
+
   AntiEntropyEraSummary = object
     domain: string
     era: uint64
@@ -222,6 +226,50 @@ type
     witnessThreshold: int
     status: AuthorGatherStatus
 
+  CertificationTriggerKind = enum
+    ctEventInstalled
+    ctEventAck
+    ctAttInstalled
+    ctExactPullAccepted
+    ctTopologyChanged
+
+  CertificationTrigger = object
+    kind: CertificationTriggerKind
+    peerId: string
+    key: string
+
+  CertificationSnapshot = object
+    eventId: string
+    clock: GanzhiClock
+    status: AuthorGatherStatus
+    participantMissing: seq[string]
+    witnessMissing: seq[string]
+    participantPulls: seq[AntiEntropyPullWorkItem]
+    witnessPulls: seq[AntiEntropyPullWorkItem]
+    summaryPeers: seq[string]
+    certReady: bool
+
+  CertificationPendingState = enum
+    cpsKeep
+    cpsDrop
+
+  CertificationEffects = object
+    pendingState: CertificationPendingState
+    exactPulls: seq[AntiEntropyPullWorkItem]
+    summarySignals: seq[string]
+    summaryRestarts: seq[string]
+    certifyNow: bool
+    retire: bool
+
+  InboundDrainState = object
+    changed: bool
+    checkpointStateChanged: bool
+    touchedEvents: seq[string]
+    touchedRelayEvents: seq[string]
+    touchedEventScopes: Table[string, seq[LsmrPath]]
+    touchedEventSourcePeers: Table[string, seq[string]]
+    touchedAttestationKeys: seq[string]
+
   RelayPlan = tuple[route: RoutingPeer, scope: LsmrPath]
 
   ReplayStateCacheEntry = object
@@ -241,6 +289,8 @@ type
     store*: FabricStore
     network*: FabricNetwork
     running*: bool
+    stopPrepared: bool
+    submitFenceDepth: int
     events*: OrderedTable[string, FabricEvent]
     eventAttestations*: Table[string, seq[EventAttestation]]
     attestationsByKey*: Table[string, EventAttestation]
@@ -257,13 +307,23 @@ type
     inflightWitnessPullByPeer*: Table[string, AntiEntropyPullWorkItem]
     witnessPullRunners: Table[string, Future[void]]
     summaryAvailablePullKeys: HashSet[string]
+    certificationLiveAwaitPullKeys: HashSet[string]
     antiEntropySummaryRunners: Table[string, Future[void]]
     antiEntropySummaryWakeups: Table[string, AsyncEvent]
+    antiEntropySummaryRefreshGenerations: Table[string, uint64]
     antiEntropySummaryNextRefreshAtMs: Table[string, int64]
+    antiEntropySummaryPayloadCache: Table[string, seq[byte]]
+    antiEntropySummaryVersion: uint64
+    antiEntropyRemoteSummaryHeads: Table[string, AntiEntropySummaryHead]
+    antiEntropyRemoteRootSummaries: Table[string, AntiEntropyRootSummary]
+    antiEntropySummaryTickOwners: Table[string, string]
+    antiEntropySummaryHeadOwner: string
     certificationObservedOverlayDigest: string
     certificationObservedLatestCheckpointId: string
     deferredAttestations*: Table[string, seq[EventAttestation]]
     deferredEventCertificates*: Table[string, seq[EventCertificate]]
+    deferredEventCertificateSources: Table[string, string]
+    eventSourcePeersByEvent: Table[string, HashSet[string]]
     isolatedEvents*: OrderedTable[string, IsolationRecord]
     children*: Table[string, seq[string]]
     avoProposals*: OrderedTable[string, AvoProposal]
@@ -294,6 +354,8 @@ type
     maintenancePending: bool
     maintenanceImmediatePending: bool
     maintenanceRunner: Future[void]
+    eventCertPullPending: bool
+    eventCertPullRunner: Future[void]
     slowMaintenanceSliceCount: int64
     maxMaintenanceSliceElapsedMs: int64
     checkpointAdvancePending: bool
@@ -310,9 +372,14 @@ type
     forwardedAvoApprovals*: Table[string, HashSet[string]]
     pendingEvents*: HashSet[string]
     pendingEventScopes*: Table[string, seq[LsmrPath]]
+    pendingEventIndexFlushes*: HashSet[string]
     pendingAttestations*: HashSet[string]
     routeBlockedAttestations*: HashSet[string]
     pendingAttestationScopes*: Table[string, seq[LsmrPath]]
+    pendingAttestationIndexFlushes*: HashSet[string]
+    pendingEventCertificateIndexFlushes*: HashSet[string]
+    pendingCheckpointCandidateIndexFlushes*: HashSet[string]
+    pendingCheckpointVoteIndexFlushes*: HashSet[string]
     pendingEventCertificates*: HashSet[string]
     pendingEventCertificateScopes*: Table[string, seq[LsmrPath]]
     pendingEventCertificateFrontier*: HeapQueue[PendingEventCertificateTicket]
@@ -372,8 +439,32 @@ proc refreshUnsyncedRoutingSnapshots(node: FabricNode)
 proc antiEntropySummaryTask(node: FabricNode, peerIdText: string): Future[void] {.async: (raises: []).}
 proc ensureAntiEntropySummarySync(node: FabricNode, peerIdText: string) {.gcsafe, raises: [].}
 proc clearAntiEntropySummarySync(node: FabricNode, peerIdText: string) {.gcsafe, raises: [].}
+proc restartAntiEntropySummarySync(node: FabricNode, peerIdText: string) {.gcsafe, raises: [].}
 proc signalAntiEntropySummarySync(node: FabricNode, peerIdText: string) {.gcsafe, raises: [].}
 proc refreshAntiEntropySummarySync(node: FabricNode) {.gcsafe, raises: [].}
+proc invalidateAntiEntropySummaryCache(
+    node: FabricNode, domain: AntiEntropyDomain, clock: GanzhiClock
+) {.gcsafe, raises: [].}
+proc cachedAntiEntropySummaryRaw(
+    node: FabricNode, baseKey: string
+): Option[seq[byte]] {.gcsafe, raises: [].}
+proc enqueuePendingEventIndexFlush(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].}
+proc enqueuePendingAttestationIndexFlush(
+    node: FabricNode, attKey: string
+): bool {.gcsafe, raises: [].}
+proc enqueuePendingEventCertificateIndexFlush(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].}
+proc enqueuePendingCheckpointCandidateIndexFlush(
+    node: FabricNode, candidateId: string
+): bool {.gcsafe, raises: [].}
+proc enqueuePendingCheckpointVoteIndexFlush(
+    node: FabricNode, voteKey: string
+): bool {.gcsafe, raises: [].}
+proc flushPendingAntiEntropyIndexes(node: FabricNode, limit: int): int
+proc flushAllPendingAntiEntropyIndexes(node: FabricNode)
 proc connectedPeerIds(node: FabricNode): seq[string] {.gcsafe, raises: [].}
 proc routingSnapshotGateReady(node: FabricNode): bool {.gcsafe, raises: [].}
 proc latestCheckpointEra(node: FabricNode): uint64 {.gcsafe, raises: [].}
@@ -393,17 +484,21 @@ proc maintenanceLoop(node: FabricNode, initialDelayMs: int) {.async: (raises: []
 proc maintenanceStep(node: FabricNode): bool {.raises: [].}
 proc scheduleMaintenance(node: FabricNode, immediate = false) {.gcsafe, raises: [].}
 proc scheduleStateMaintenance(node: FabricNode) {.gcsafe, raises: [].}
+proc scheduleEventCertPull(node: FabricNode) {.gcsafe, raises: [].}
+proc scheduleEventCertPullRunner(node: FabricNode) {.gcsafe, raises: [].}
+proc eventCertPullLoop(node: FabricNode) {.async: (raises: []).}
 proc scheduleCertificationGather(node: FabricNode) {.gcsafe, raises: [].}
 proc scheduleCertificationGatherRunner(node: FabricNode) {.gcsafe, raises: [].}
 proc certificationGatherLoop(
     node: FabricNode
 ) {.async: (raises: [CancelledError, Exception]).}
-proc scheduleCertificationAntiEntropySync(
-    node: FabricNode, eventId: string
+proc drainInboundNow(node: FabricNode): bool {.gcsafe, raises: [].}
+proc acceptInboundNow(
+    node: FabricNode, message: InboundMessage
 ) {.gcsafe, raises: [].}
-proc signalCertificationSummaryPeers(
-    node: FabricNode, eventId: string, excludePeerId = ""
-) {.gcsafe, raises: [].}
+proc driveAuthorGather(
+    node: FabricNode, eventId: string, trigger: CertificationTrigger
+): bool {.gcsafe, raises: [].}
 proc checkpointAdvanceReady(node: FabricNode): bool {.gcsafe, raises: [].}
 proc scheduleCheckpointAdvance(node: FabricNode) {.gcsafe, raises: [].}
 proc scheduleCheckpointAdvanceRunner(node: FabricNode) {.gcsafe, raises: [].}
@@ -414,6 +509,8 @@ proc submitWarmReady(node: FabricNode): bool {.gcsafe, raises: [].}
 proc shouldPromoteLatestCheckpoint(
     node: FabricNode, checkpointId: string, snapshot: ChainStateSnapshot
 ): bool {.gcsafe, raises: [].}
+proc antiEntropyMissingEventNeeded(node: FabricNode): bool {.gcsafe, raises: [].}
+proc submitFence*(node: FabricNode): FabricQuiescenceSnapshot
 proc eventHasRunnableLsmrDelivery(
     node: FabricNode, event: FabricEvent, scopePrefixes: seq[LsmrPath]
 ): bool
@@ -421,12 +518,18 @@ proc eventDependentsMayRelay(node: FabricNode, event: FabricEvent): bool
 proc eventAuthorRoute(
     node: FabricNode, event: FabricEvent
 ): Option[RoutingPeer] {.gcsafe, raises: [].}
+proc eventCertificateTargetPaths(
+    node: FabricNode, event: FabricEvent
+): seq[LsmrPath]
+proc eventRelayTargetPaths(
+    node: FabricNode, event: FabricEvent, scopePrefixes: openArray[LsmrPath]
+): seq[LsmrPath]
 proc routingPeerForAccount(
     node: FabricNode, account: string
 ): Option[RoutingPeer]
 proc routeMatchesSelf(node: FabricNode, route: RoutingPeer): bool
 proc eventCertificateRelayPlans(
-    node: FabricNode, scopePrefixes: seq[LsmrPath] = @[]
+    node: FabricNode, event: FabricEvent, scopePrefixes: seq[LsmrPath] = @[]
 ): seq[RelayPlan]
 proc pruneCheckpointedEventCertificateDeliveries(node: FabricNode) {.gcsafe, raises: [].}
 proc disseminateEventCertificateWithRelayPlans(
@@ -468,6 +571,9 @@ proc certificationEventTracked(
 proc refreshEventCertificationProgressState(
     node: FabricNode, eventId: string
 ) {.gcsafe, raises: [].}
+proc certificationWitnessIdentity(
+    progress: EventCertificationProgress, att: EventAttestation
+): string {.gcsafe, raises: [].}
 proc refreshPendingCertificationEvents(node: FabricNode) {.gcsafe, raises: [].}
 proc prunePendingCertificationState(node: FabricNode) {.gcsafe, raises: [].}
 proc eventParticipantSatisfied(
@@ -479,6 +585,15 @@ proc certificationMissingParticipantPulls(
 proc certificationMissingWitnessPulls(
     node: FabricNode, eventId: string
 ): seq[AntiEntropyPullWorkItem] {.gcsafe, raises: [].}
+proc certificationSnapshot(
+    node: FabricNode, eventId: string
+): Option[CertificationSnapshot] {.gcsafe, raises: [].}
+proc deferredEventCertificateKnown(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].}
+proc deferredEventCertificate(
+    node: FabricNode, eventId: string
+): Option[EventCertificate] {.gcsafe, raises: [].}
 proc witnessPullStillNeeded(
     node: FabricNode, item: AntiEntropyPullWorkItem
 ): bool {.gcsafe, raises: [].}
@@ -492,6 +607,9 @@ proc ensureWitnessPullRunner(
     node: FabricNode, targetPeerId: string, domain: AntiEntropyDomain
 ) {.gcsafe, raises: [].}
 proc initEraCheckpointState(): EraCheckpointState {.gcsafe, raises: [].}
+proc certificationPullPriorityClass(
+    node: FabricNode, eventId: string, clock: GanzhiClock
+): int {.gcsafe, raises: [].}
 proc refreshEraCheckpointStates(node: FabricNode) {.gcsafe, raises: [].}
 proc checkpointEraState(
     node: FabricNode, era: uint64
@@ -709,15 +827,26 @@ proc `<`(a, b: PendingCertificationEventTicket): bool =
   a.epoch < b.epoch
 
 proc `<`(a, b: AntiEntropyPullWorkItem): bool =
+  if a.priorityClass != b.priorityClass:
+    return a.priorityClass < b.priorityClass
   let order = clockCmp(a.clock, b.clock)
   if order != 0:
+    if a.domain == b.domain and
+        (a.domain == aedAttParticipant or a.domain == aedAttWitness):
+      return order > 0
     return order < 0
   if a.causedByEventId != b.causedByEventId:
+    if a.domain == b.domain and
+        (a.domain == aedAttParticipant or a.domain == aedAttWitness):
+      return a.causedByEventId > b.causedByEventId
     return a.causedByEventId < b.causedByEventId
   if a.targetPeerId != b.targetPeerId:
     return a.targetPeerId < b.targetPeerId
   if a.domain != b.domain:
     return ord(a.domain) < ord(b.domain)
+  if a.domain == b.domain and
+      (a.domain == aedAttParticipant or a.domain == aedAttWitness):
+    return a.key > b.key
   a.key < b.key
 
 proc antiEntropyDomainLabel(
@@ -762,6 +891,112 @@ proc parseAntiEntropyDomain(
 
 proc antiEntropyDigest(parts: openArray[string]): string {.gcsafe, raises: [].} =
   hashHex(parts.join("|"))
+
+proc antiEntropyDomainEntries(
+    node: FabricNode, domain: AntiEntropyDomain
+): seq[tuple[clock: GanzhiClock, key: string]] {.gcsafe, raises: [].}
+
+proc antiEntropyStorageTier(
+    domain: AntiEntropyDomain
+): LsmrStorageTier {.gcsafe, raises: [].} =
+  case domain
+  of aedEvent, aedAttParticipant, aedAttWitness:
+    LsmrStorageTier.lstEdge
+  of aedEventCert, aedCheckpointCandidate, aedCheckpointVote:
+    LsmrStorageTier.lstFog
+  of aedCheckpointBundle:
+    LsmrStorageTier.lstGlobal
+
+proc antiEntropyObjectCoordinate(
+    key: string
+): ObjectCoordinate {.gcsafe, raises: [].} =
+  objectCoordinate(key, key, FabricAntiEntropyBaguaDepth)
+
+proc antiEntropyPayloadBytes(
+    value: string
+): seq[byte] {.gcsafe, raises: [].} =
+  result = newSeqOfCap[byte](value.len)
+  for ch in value:
+    result.add(byte(ch.ord and 0xff))
+
+proc antiEntropyPayloadString(
+    data: openArray[byte]
+): string {.gcsafe, raises: [].} =
+  result = newStringOfCap(data.len)
+  for b in data:
+    result.add(char(b))
+
+proc antiEntropyEntryVersion(
+    clock: GanzhiClock
+): uint64 {.gcsafe, raises: [].} =
+  (clock.era shl 8) or uint64(clock.tick)
+
+proc antiEntropyLeavesTree(
+    leaves: openArray[FabricAntiEntropyIndexLeaf]
+): LsmrBaguaPrefixTree {.gcsafe, raises: [].} =
+  for leaf in leaves:
+    result.put(
+      leaf.baguaKey,
+      antiEntropyPayloadBytes(leaf.payload),
+      version = antiEntropyEntryVersion(leaf.clock),
+    )
+
+proc antiEntropyLeavesDigest(
+    leaves: openArray[FabricAntiEntropyIndexLeaf]
+): string {.gcsafe, raises: [].} =
+  antiEntropyLeavesTree(leaves).rootDigest()
+
+proc antiEntropyLeavesOrderedKeys(
+    leaves: openArray[FabricAntiEntropyIndexLeaf]
+): seq[string] {.gcsafe, raises: [].} =
+  let tree = antiEntropyLeavesTree(leaves)
+  var seen = initHashSet[string]()
+  for leaf in tree.items():
+    let key = antiEntropyPayloadString(leaf.payload)
+    if key.len == 0 or key in seen:
+      continue
+    seen.incl(key)
+    result.add(key)
+
+proc antiEntropyIndexedLeaves(
+    node: FabricNode,
+    domain: AntiEntropyDomain,
+    resolution: uint8,
+    era = none(uint64),
+    tick = none(uint64),
+): seq[FabricAntiEntropyIndexLeaf] {.gcsafe, raises: [].} =
+  if not node.isNil and not node.store.isNil:
+    try:
+      let domainLabel = antiEntropyDomainLabel(domain)
+      if resolution == FabricAntiEntropyRootResolution and
+          era.isNone() and tick.isNone():
+        return node.store.loadAntiEntropyRootLeaves(domainLabel)
+      if resolution == FabricAntiEntropyEraResolution and
+          era.isSome() and tick.isNone():
+        return node.store.loadAntiEntropyEraLeaves(domainLabel, era.get())
+      if resolution == FabricAntiEntropyTickResolution and
+          era.isSome() and tick.isSome():
+        return node.store.loadAntiEntropyTickLeaves(
+          domainLabel,
+          era.get(),
+          tick.get(),
+        )
+    except CatchableError as exc:
+      raiseAssert("anti-entropy bagua index load failed: " & exc.msg)
+  let tier = antiEntropyStorageTier(domain)
+  for entry in node.antiEntropyDomainEntries(domain):
+    if era.isSome() and entry.clock.era != era.get():
+      continue
+    if tick.isSome() and uint64(entry.clock.tick) != tick.get():
+      continue
+    let coord = antiEntropyObjectCoordinate(entry.key)
+    for baguaKey in coord.baguaKeys(tier, resolution):
+      result.add(FabricAntiEntropyIndexLeaf(
+        clock: entry.clock,
+        key: entry.key,
+        payload: entry.key,
+        baguaKey: baguaKey,
+      ))
 
 const AntiEntropyFetchRequesterSuffix = "|requester:"
 
@@ -849,6 +1084,10 @@ proc antiEntropyDomainEntries(
   of aedEventCert:
     for eventId, cert in node.eventCertificates.pairs:
       result.add((cert.clock, "eventcert:" & eventId))
+    for eventId, buffered in node.deferredEventCertificates.pairs:
+      if eventId in node.eventCertificates or buffered.len == 0:
+        continue
+      result.add((buffered[0].clock, "eventcert:" & eventId))
   of aedCheckpointCandidate:
     for candidateId, candidate in node.checkpointCandidates.pairs:
       result.add((antiEntropyCandidateClock(candidate), "checkpoint-candidate:" & candidateId))
@@ -874,17 +1113,20 @@ proc antiEntropyRootSummary(
     node: FabricNode
 ): AntiEntropyRootSummary {.gcsafe, raises: [].} =
   for domain in AntiEntropyDomain:
-    let entries = node.antiEntropyDomainEntries(domain)
-    var eraParts = initTable[uint64, seq[string]]()
+    let leaves = node.antiEntropyIndexedLeaves(
+      domain,
+      FabricAntiEntropyRootResolution,
+    )
+    var eraParts = initTable[uint64, seq[FabricAntiEntropyIndexLeaf]]()
     var maxClock = GanzhiClock(era: 0, tick: 0)
-    for entry in entries:
-      maxClock = maxClock(maxClock, entry.clock)
-      eraParts.mgetOrPut(entry.clock.era, @[]).add($entry.clock.tick & ":" & entry.key)
+    for leaf in leaves:
+      maxClock = maxClock(maxClock, leaf.clock)
+      eraParts.mgetOrPut(leaf.clock.era, @[]).add(leaf)
     var eras: seq[AntiEntropyEraDigest] = @[]
     for era in eraParts.keys.toSeq().sorted(system.cmp[uint64]):
       eras.add(AntiEntropyEraDigest(
         era: era,
-        digest: antiEntropyDigest(eraParts.getOrDefault(era)),
+        digest: antiEntropyLeavesDigest(eraParts.getOrDefault(era)),
       ))
     result.domains.add(AntiEntropyDomainRootSummary(
       domain: antiEntropyDomainLabel(domain),
@@ -897,16 +1139,18 @@ proc antiEntropyEraSummary(
 ): AntiEntropyEraSummary {.gcsafe, raises: [].} =
   result.domain = antiEntropyDomainLabel(domain)
   result.era = era
-  var tickParts = initTable[uint64, seq[string]]()
-  for entry in node.antiEntropyDomainEntries(domain):
-    if entry.clock.era != era:
-      continue
-    result.maxClock = maxClock(result.maxClock, entry.clock)
-    tickParts.mgetOrPut(uint64(entry.clock.tick), @[]).add(entry.key)
+  var tickParts = initTable[uint64, seq[FabricAntiEntropyIndexLeaf]]()
+  for leaf in node.antiEntropyIndexedLeaves(
+      domain,
+      FabricAntiEntropyEraResolution,
+      some(era),
+  ):
+    result.maxClock = maxClock(result.maxClock, leaf.clock)
+    tickParts.mgetOrPut(uint64(leaf.clock.tick), @[]).add(leaf)
   for tick in tickParts.keys.toSeq().sorted(system.cmp[uint64]):
     result.ticks.add(AntiEntropyTickDigest(
       tick: tick,
-      digest: antiEntropyDigest(tickParts.getOrDefault(tick)),
+      digest: antiEntropyLeavesDigest(tickParts.getOrDefault(tick)),
     ))
 
 proc antiEntropyTickSummary(
@@ -915,10 +1159,14 @@ proc antiEntropyTickSummary(
   result.domain = antiEntropyDomainLabel(domain)
   result.era = era
   result.tick = tick
-  for entry in node.antiEntropyDomainEntries(domain):
-    if entry.clock.era == era and uint64(entry.clock.tick) == tick:
-      result.items.add(entry.key)
-  result.items.sort(system.cmp[string])
+  result.items = antiEntropyLeavesOrderedKeys(
+    node.antiEntropyIndexedLeaves(
+      domain,
+      FabricAntiEntropyTickResolution,
+      some(era),
+      some(tick),
+    ),
+  )
 
 proc antiEntropyLocalHasKey(
     node: FabricNode, domain: AntiEntropyDomain, key: string
@@ -933,7 +1181,10 @@ proc antiEntropyLocalHasKey(
     node.attestationForKey(key).isSome()
   of aedEventCert:
     let eventId = antiEntropyKeySuffix(key, "eventcert:")
-    eventId.len > 0 and eventId in node.eventCertificates
+    eventId.len > 0 and (
+      eventId in node.eventCertificates or
+      node.deferredEventCertificateKnown(eventId)
+    )
   of aedCheckpointCandidate:
     let candidateId = antiEntropyKeySuffix(key, "checkpoint-candidate:")
     candidateId.len > 0 and candidateId in node.checkpointCandidates
@@ -958,12 +1209,16 @@ proc antiEntropyPullItem(
   let clock = GanzhiClock(era: era, tick: uint8(min(tick, uint64(high(uint8)))))
   case domain
   of aedEvent:
+    let eventId = antiEntropyKeySuffix(key, "event:")
+    if eventId.len == 0:
+      return none(AntiEntropyPullWorkItem)
     some(AntiEntropyPullWorkItem(
       domain: domain,
       key: key,
-      causedByEventId: antiEntropyKeySuffix(key, "event:"),
+      causedByEventId: eventId,
       targetPeerId: targetPeerId,
       clock: clock,
+      priorityClass: node.certificationPullPriorityClass(eventId, clock),
     ))
   of aedAttParticipant, aedAttWitness:
     let parts = key.split(":")
@@ -975,6 +1230,7 @@ proc antiEntropyPullItem(
       causedByEventId: parts[1],
       targetPeerId: targetPeerId,
       clock: clock,
+      priorityClass: node.certificationPullPriorityClass(parts[1], clock),
     ))
   of aedEventCert:
     let eventId = antiEntropyKeySuffix(key, "eventcert:")
@@ -986,6 +1242,7 @@ proc antiEntropyPullItem(
       causedByEventId: eventId,
       targetPeerId: targetPeerId,
       clock: clock,
+      priorityClass: node.certificationPullPriorityClass(eventId, clock),
     ))
   of aedCheckpointCandidate, aedCheckpointVote, aedCheckpointBundle:
     some(AntiEntropyPullWorkItem(
@@ -1062,6 +1319,86 @@ proc attestationFetchKey(
   if eventId.len == 0 or signer.len == 0:
     return ""
   "attestation:" & eventId & ":" & $role & ":" & signer
+
+proc certificationLiveAwaitKey(
+    targetPeerId, key: string
+): string {.gcsafe, raises: [].} =
+  if targetPeerId.len == 0 or key.len == 0:
+    return ""
+  targetPeerId & "|" & key
+
+proc markCertificationLiveAwait(
+    node: FabricNode, targetPeerId, key: string
+) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  let awaitKey = certificationLiveAwaitKey(targetPeerId, key)
+  if awaitKey.len == 0:
+    return
+  node.certificationLiveAwaitPullKeys.incl(awaitKey)
+
+proc clearCertificationLiveAwait(
+    node: FabricNode, targetPeerId, key: string
+) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  let awaitKey = certificationLiveAwaitKey(targetPeerId, key)
+  if awaitKey.len == 0:
+    return
+  node.certificationLiveAwaitPullKeys.excl(awaitKey)
+
+proc certificationLiveAwaiting(
+    node: FabricNode, targetPeerId, key: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil:
+    return false
+  let awaitKey = certificationLiveAwaitKey(targetPeerId, key)
+  awaitKey.len > 0 and awaitKey in node.certificationLiveAwaitPullKeys
+
+proc clearCertificationLiveAwaitForEvent(
+    node: FabricNode, eventId: string
+) {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0:
+    return
+  let marker = "|attestation:" & eventId & ":"
+  for awaitKey in node.certificationLiveAwaitPullKeys.toSeq():
+    if marker in awaitKey:
+      node.certificationLiveAwaitPullKeys.excl(awaitKey)
+
+proc clearCertificationLiveAwaitForAtt(
+    node: FabricNode, att: EventAttestation
+) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  let attKey = attestationFetchKey(att.eventId, att.role, att.signer)
+  if attKey.len == 0:
+    return
+  if att.signerPeerId.len > 0:
+    node.clearCertificationLiveAwait(att.signerPeerId, attKey)
+  if att.signer.len == 0:
+    return
+  if att.signer in node.routingPeers:
+    let peerId = node.routingPeers.getOrDefault(att.signer).peerId
+    if peerId.len > 0:
+      node.clearCertificationLiveAwait(peerId, attKey)
+  if node.liveState.validators.hasKey(att.signer):
+    let peerId = node.liveState.validators.getOrDefault(att.signer).peerId
+    if peerId.len > 0:
+      node.clearCertificationLiveAwait(peerId, attKey)
+  if att.eventId notin node.events:
+    return
+  let event = node.events.getOrDefault(att.eventId)
+  case att.role
+  of arWitness:
+    for route in event.witnessRoutes:
+      if route.account == att.signer and route.peerId.len > 0:
+        node.clearCertificationLiveAwait(route.peerId, attKey)
+  of arParticipant:
+    for route in event.participantRoutes:
+      if route.account == att.signer and route.peerId.len > 0:
+        node.clearCertificationLiveAwait(route.peerId, attKey)
+  of arIsolation:
+    discard
 
 proc attestationIndexKey(
     eventId: string, role: AttestationRole, signer: string
@@ -1200,6 +1537,15 @@ proc antiEntropyPullOwnerActive(
     node.stagedWitnessPullsByPeer.getOrDefault(ownerKey).len > 0
   ) or ownerKey in node.inflightWitnessPullByPeer
 
+proc sameAntiEntropyPullItem(
+    a, b: AntiEntropyPullWorkItem
+): bool {.gcsafe, raises: [].} =
+  a.domain == b.domain and
+    a.key == b.key and
+    a.causedByEventId == b.causedByEventId and
+    a.targetPeerId == b.targetPeerId and
+    clockCmp(a.clock, b.clock) == 0
+
 proc antiEntropySummaryAvailableKey(
     targetPeerId, key: string
 ): string {.gcsafe, raises: [].} =
@@ -1234,6 +1580,16 @@ proc summaryPullAvailable(
     return false
   let availabilityKey = antiEntropySummaryAvailableKey(targetPeerId, key)
   availabilityKey.len > 0 and availabilityKey in node.summaryAvailablePullKeys
+
+proc clearStagedWitnessPullKey(
+    node: FabricNode, ownerKey, key: string
+) {.gcsafe, raises: [].}
+proc stageWitnessPullWorkItem(
+    node: FabricNode, item: AntiEntropyPullWorkItem
+): bool {.gcsafe, raises: [].}
+proc cancelWitnessPullRunner(
+    node: FabricNode, ownerKey: string
+) {.gcsafe, raises: [].}
 
 proc witnessPullQueuedForPeer(
     node: FabricNode, targetPeerId: string, domain: AntiEntropyDomain, key: string
@@ -1295,21 +1651,49 @@ proc enqueueWitnessPullWorkItem(
     return false
   if node.witnessPullActive(item.domain, item.key):
     return false
+  let ownerFrontierPreempt =
+    item.domain == aedEvent or
+    item.domain == aedEventCert or
+    item.domain == aedAttParticipant or
+    item.domain == aedAttWitness
+  if ownerFrontierPreempt and ownerKey in node.inflightWitnessPullByPeer:
+    let inflight = node.inflightWitnessPullByPeer.getOrDefault(ownerKey)
+    if inflight.domain == item.domain and item < inflight:
+      discard node.stageWitnessPullWorkItem(item)
+      node.cancelWitnessPullRunner(ownerKey)
+      return true
   if node.antiEntropyPullOwnerLoad(item.targetPeerId, item.domain) >=
       antiEntropyPullOwnerCredit(item.domain):
     var staged = node.stagedWitnessPullsByPeer.getOrDefault(
       ownerKey,
       initHeapQueue[AntiEntropyPullWorkItem](),
     )
-    staged.push(item)
-    node.stagedWitnessPullsByPeer[ownerKey] = staged
-    var stagedKeys = node.stagedWitnessPullKeysByPeer.getOrDefault(
-      ownerKey,
-      initHashSet[string](),
-    )
-    stagedKeys.incl(item.key)
+    let previousCount = staged.len
+    var previousBest = none(AntiEntropyPullWorkItem)
+    var best = item
+    if not node.witnessPullStillNeeded(best):
+      return false
+    while staged.len > 0:
+      let existing = staged.pop()
+      if previousBest.isNone():
+        previousBest = some(existing)
+      node.clearStagedWitnessPullKey(ownerKey, existing.key)
+      if not node.witnessPullStillNeeded(existing):
+        node.clearSummaryPullAvailable(existing.targetPeerId, existing.key)
+        continue
+      if existing < best:
+        node.clearSummaryPullAvailable(best.targetPeerId, best.key)
+        best = existing
+      else:
+        node.clearSummaryPullAvailable(existing.targetPeerId, existing.key)
+    var frontier = initHeapQueue[AntiEntropyPullWorkItem]()
+    frontier.push(best)
+    node.stagedWitnessPullsByPeer[ownerKey] = frontier
+    var stagedKeys = initHashSet[string]()
+    stagedKeys.incl(best.key)
     node.stagedWitnessPullKeysByPeer[ownerKey] = stagedKeys
-    return true
+    return previousCount != 1 or previousBest.isNone() or
+      not sameAntiEntropyPullItem(previousBest.get(), best)
   var queue = node.pendingWitnessPullsByPeer.getOrDefault(
     ownerKey,
     initHeapQueue[AntiEntropyPullWorkItem](),
@@ -1339,15 +1723,32 @@ proc stageWitnessPullWorkItem(
     ownerKey,
     initHeapQueue[AntiEntropyPullWorkItem](),
   )
-  staged.push(item)
-  node.stagedWitnessPullsByPeer[ownerKey] = staged
-  var stagedKeys = node.stagedWitnessPullKeysByPeer.getOrDefault(
-    ownerKey,
-    initHashSet[string](),
-  )
-  stagedKeys.incl(item.key)
+  let previousCount = staged.len
+  var previousBest = none(AntiEntropyPullWorkItem)
+  var best = item
+  if not node.witnessPullStillNeeded(best):
+    return false
+  while staged.len > 0:
+    let existing = staged.pop()
+    if previousBest.isNone():
+      previousBest = some(existing)
+    node.clearStagedWitnessPullKey(ownerKey, existing.key)
+    if not node.witnessPullStillNeeded(existing):
+      node.clearSummaryPullAvailable(existing.targetPeerId, existing.key)
+      continue
+    if existing < best:
+      node.clearSummaryPullAvailable(best.targetPeerId, best.key)
+      best = existing
+    else:
+      node.clearSummaryPullAvailable(existing.targetPeerId, existing.key)
+  var frontier = initHeapQueue[AntiEntropyPullWorkItem]()
+  frontier.push(best)
+  node.stagedWitnessPullsByPeer[ownerKey] = frontier
+  var stagedKeys = initHashSet[string]()
+  stagedKeys.incl(best.key)
   node.stagedWitnessPullKeysByPeer[ownerKey] = stagedKeys
-  true
+  previousCount != 1 or previousBest.isNone() or
+    not sameAntiEntropyPullItem(previousBest.get(), best)
 
 proc clearPendingWitnessPullKey(
     node: FabricNode, ownerKey, key: string
@@ -1555,9 +1956,42 @@ proc antiEntropyKeySuffix(key, prefix: string): string {.inline, gcsafe, raises:
   else:
     ""
 
+proc certificationPullPriorityClass(
+    node: FabricNode, eventId: string, clock: GanzhiClock
+): int {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0:
+    return 0
+  node.refreshEraCheckpointStates()
+  let checkpointEra = node.latestCheckpointEra()
+  if clock.era < checkpointEra:
+    return 0
+  let state = node.eraCheckpointStates.getOrDefault(
+    clock.era,
+    initEraCheckpointState(),
+  )
+  if state.firstMissingEventId == eventId:
+    return -1
+  0
+
 proc deliveredToPeer(
     ledgerBook: Table[string, DeliveryLedger], itemKey, targetPeerId: string
 ): bool {.gcsafe, raises: [].}
+
+proc deferredEventCertificateKnown(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].} =
+  not node.isNil and eventId.len > 0 and
+    node.deferredEventCertificates.getOrDefault(eventId, @[]).len > 0
+
+proc deferredEventCertificate(
+    node: FabricNode, eventId: string
+): Option[EventCertificate] {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0:
+    return none(EventCertificate)
+  let buffered = node.deferredEventCertificates.getOrDefault(eventId, @[])
+  if buffered.len == 0:
+    return none(EventCertificate)
+  some(buffered[0])
 
 proc witnessPullStillNeeded(
     node: FabricNode, item: AntiEntropyPullWorkItem
@@ -1599,6 +2033,7 @@ proc witnessPullStillNeeded(
   of aedEventCert:
     let eventId = antiEntropyKeySuffix(item.key, "eventcert:")
     if eventId.len == 0 or eventId in node.eventCertificates or
+        node.deferredEventCertificateKnown(eventId) or
         eventId notin node.events or eventId in node.isolatedEvents:
       return false
     let event = node.events.getOrDefault(eventId)
@@ -1639,12 +2074,21 @@ proc witnessPullFetchReady(
   if node.isNil or item.targetPeerId.len == 0:
     return false
   case item.domain
-  of aedAttParticipant, aedAttWitness:
+  of aedAttParticipant:
     item.causedByEventId.len > 0 and
       (
         deliveredToPeer(node.eventDeliveries, item.causedByEventId, item.targetPeerId) or
         node.summaryPullAvailable(item.targetPeerId, item.key)
       )
+  of aedAttWitness:
+    node.summaryPullAvailable(item.targetPeerId, item.key) or
+      (
+        item.causedByEventId.len > 0 and
+        deliveredToPeer(node.eventDeliveries, item.causedByEventId, item.targetPeerId) and
+        not node.certificationLiveAwaiting(item.targetPeerId, item.key)
+      )
+  of aedEventCert:
+    node.summaryPullAvailable(item.targetPeerId, item.key)
   else:
     true
 
@@ -1765,6 +2209,35 @@ proc deliveryTargetKey(targetPeerId: string, scopePrefix: LsmrPath = @[]): strin
   if scopePrefix.len == 0:
     return targetPeerId
   targetPeerId & "|" & scopePrefix.pathKey()
+
+proc rememberEventSourcePeer(
+    node: FabricNode, eventId, peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0 or peerIdText.len == 0:
+    return false
+  var sourcePeers = node.eventSourcePeersByEvent.getOrDefault(
+    eventId,
+    initHashSet[string](),
+  )
+  if peerIdText in sourcePeers:
+    return false
+  sourcePeers.incl(peerIdText)
+  node.eventSourcePeersByEvent[eventId] = sourcePeers
+  true
+
+proc eventSourcePeers(
+    node: FabricNode, eventId: string
+): HashSet[string] {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0:
+    return initHashSet[string]()
+  node.eventSourcePeersByEvent.getOrDefault(eventId, initHashSet[string]())
+
+proc clearEventSourcePeers(
+    node: FabricNode, eventId: string
+) {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0:
+    return
+  node.eventSourcePeersByEvent.del(eventId)
 
 proc submitAckKey(itemKey: string, scopePrefix: LsmrPath = @[]): string {.gcsafe, raises: [].} =
   if itemKey.len == 0:
@@ -2145,7 +2618,7 @@ proc outboundBatchLimit(priority: OutboundSubmitPriority): int {.gcsafe, raises:
   of ospEvent:
     8
   of ospAttestation:
-    8
+    1
   of ospOther:
     4
 
@@ -2163,7 +2636,7 @@ proc eventCertificateSubmitCreditAvailable(
 ): bool {.gcsafe, raises: [].} =
   not node.isNil and targetPeerId.len > 0 and
     inflightDeliveryCountToPeer(node.eventCertificateDeliveries, targetPeerId) <
-      outboundBatchLimit(ospOther)
+      outboundRunnerPoolSize(ospOther)
 
 proc ensureLsmrSubmitRoute(
     node: FabricNode, targetPeerId: string, priority: OutboundSubmitPriority
@@ -2411,12 +2884,24 @@ proc hasPendingLocalAsyncWork(node: FabricNode): bool {.gcsafe, raises: [].} =
   if node.inbound.len > 0 or node.inboundScheduled or node.inboundPending or
       node.maintenanceScheduled or node.maintenanceImmediateScheduled or
       node.maintenancePending or node.maintenanceImmediatePending or
-      node.checkpointAdvancePending or node.certificationGatherPending:
+      node.checkpointAdvancePending or node.certificationGatherPending or
+      node.eventCertPullPending or
+      node.pendingEventIndexFlushes.len > 0 or
+      node.pendingAttestationIndexFlushes.len > 0 or
+      node.pendingEventCertificateIndexFlushes.len > 0 or
+      node.pendingCheckpointCandidateIndexFlushes.len > 0 or
+      node.pendingCheckpointVoteIndexFlushes.len > 0:
+    return true
+  if not node.inboundRunner.isNil and not node.inboundRunner.finished():
+    return true
+  if not node.maintenanceRunner.isNil and not node.maintenanceRunner.finished():
     return true
   if not node.checkpointAdvanceRunner.isNil and not node.checkpointAdvanceRunner.finished():
     return true
   if not node.certificationGatherRunner.isNil and
       not node.certificationGatherRunner.finished():
+    return true
+  if not node.eventCertPullRunner.isNil and not node.eventCertPullRunner.finished():
     return true
   for queue in node.pendingWitnessPullsByPeer.values:
     if queue.len > 0:
@@ -2474,6 +2959,43 @@ proc otherOutboundOwnerActive(node: FabricNode): bool {.gcsafe, raises: [].} =
       return true
   false
 
+proc otherOutboundBlockedByHotLanes(
+    session: OutboundPeerSession
+): bool {.gcsafe, raises: [].} =
+  not session.isNil and (
+    session.hasPending(ospEvent) or
+    session.hasRunning(ospEvent) or
+    session.hasPending(ospAttestation) or
+    session.hasRunning(ospAttestation)
+  )
+
+proc otherQueueHeadIsEventCertificate(
+    session: OutboundPeerSession
+): bool {.gcsafe, raises: [].} =
+  not session.isNil and session.otherQueue.len > 0 and
+    session.otherQueue.peekFirst().submitKind == oskEventCertificate
+
+proc otherOutboundHotFrontierActive(node: FabricNode): bool {.gcsafe, raises: [].} =
+  if node.isNil or not node.running:
+    return false
+  for _, session in node.outboundSessions.pairs:
+    if session.hasPending(ospEvent) or session.hasRunning(ospEvent) or
+        session.hasPending(ospAttestation) or session.hasRunning(ospAttestation):
+      return true
+  if node.pendingCertificationEvents.len > 0 or node.certificationGatherPending or
+      node.inflightWitnessPullByPeer.len > 0:
+    return true
+  if not node.certificationGatherRunner.isNil and
+      not node.certificationGatherRunner.finished():
+    return true
+  for queue in node.pendingWitnessPullsByPeer.values:
+    if queue.len > 0:
+      return true
+  for queue in node.stagedWitnessPullsByPeer.values:
+    if queue.len > 0:
+      return true
+  false
+
 proc pendingOtherPeerIds(node: FabricNode): seq[string] {.gcsafe, raises: [].} =
   if node.isNil:
     return @[]
@@ -2496,6 +3018,8 @@ proc nextOtherOutboundPeer(node: FabricNode, afterPeerId = ""): string {.gcsafe,
     let peerId = peerIds[(start + offset) mod peerIds.len]
     let session = node.outboundSessions.getOrDefault(peerId)
     if session.isNil or not session.hasPending(ospOther):
+      continue
+    if session.otherOutboundBlockedByHotLanes():
       continue
     if not session.blockedOnReady[ospOther] or
         not node.usesLsmrPrimary() or
@@ -2532,8 +3056,11 @@ proc popBatch(
       return @[]
     result.add(session.otherQueue.popFirst())
     if result[0].submitKind == oskEventCertificate:
+      let eventCertificateBatchLimit =
+        if node.otherOutboundHotFrontierActive(): 1
+        else: batchLimit
       while session.otherQueue.len > 0 and
-          result.len < batchLimit and
+          result.len < eventCertificateBatchLimit and
           session.otherQueue.peekFirst().submitKind == oskEventCertificate:
         result.add(session.otherQueue.popFirst())
 
@@ -2751,6 +3278,8 @@ proc runOutboundSession(
       return
     node.scheduleOutboundSession(targetPeerId, priority)
     return
+  if node.pendingOtherPeerIds().len > 0:
+    node.scheduleNextOtherOutbound()
   if not current.hasPending() and
       not current.hasRunning(ospEvent) and
       not current.hasRunning(ospAttestation) and
@@ -2808,11 +3337,27 @@ proc bufferDeferredEventCertificate(node: FabricNode, cert: EventCertificate): b
   node.deferredEventCertificates[cert.eventId] = existing
   true
 
+proc rememberDeferredEventCertificateSource(
+    node: FabricNode, eventId, sourcePeerId: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0 or sourcePeerId.len == 0:
+    return false
+  if node.deferredEventCertificateSources.getOrDefault(eventId) == sourcePeerId:
+    return false
+  node.deferredEventCertificateSources[eventId] = sourcePeerId
+  true
+
 proc replayDeferredAttestations(node: FabricNode, eventId: string)
 proc replayDeferredEventCertificates(node: FabricNode, eventId: string)
 proc registerEventCertificate(
     node: FabricNode, cert: EventCertificate, enqueuePending = true
 ): bool
+proc disseminateAttestation(
+    node: FabricNode,
+    event: FabricEvent,
+    att: EventAttestation,
+    scopePrefixes: seq[LsmrPath] = @[],
+)
 proc activateDependentDeliveries(node: FabricNode, eventId: string) {.gcsafe, raises: [].}
 proc maybeActivateDependentDeliveries(node: FabricNode, eventId: string)
 
@@ -3088,7 +3633,7 @@ proc routeScope(node: FabricNode, event: FabricEvent, component: seq[FabricNode]
   if result.len == 0:
     result = @[node]
 
-proc selfRoutingPeer(node: FabricNode): RoutingPeer =
+proc selfRoutingPeer(node: FabricNode): RoutingPeer {.gcsafe, raises: [].} =
   var addrs: seq[string] = @[]
   if not node.network.isNil and not node.network.switch.isNil and not node.network.switch.peerInfo.isNil:
     for addr in node.network.switch.peerInfo.addrs:
@@ -3172,6 +3717,24 @@ proc routeMatchesSelf(node: FabricNode, route: RoutingPeer): bool =
 proc usesLsmrPrimary(node: FabricNode): bool {.gcsafe, raises: [].} =
   not node.isNil and node.config.primaryPlane == PrimaryRoutingPlane.lsmr
 
+proc maintenanceMustYieldToHotAccept(node: FabricNode): bool {.gcsafe, raises: [].} =
+  not node.isNil and not node.network.isNil and node.network.submitHotAcceptBusy()
+
+proc backgroundMustYieldToHotAccept(node: FabricNode): bool {.gcsafe, raises: [].} =
+  not node.isNil and node.usesLsmrPrimary() and node.maintenanceMustYieldToHotAccept()
+
+proc resumeDeferredBackground(node: FabricNode) {.gcsafe, raises: [].} =
+  if node.isNil or not node.running or node.backgroundMustYieldToHotAccept():
+    return
+  if node.maintenancePending or node.maintenanceImmediatePending:
+    node.scheduleMaintenance(immediate = node.maintenanceImmediatePending)
+  if node.eventCertPullPending:
+    node.scheduleEventCertPullRunner()
+  if node.certificationGatherPending:
+    node.scheduleCertificationGatherRunner()
+  if node.checkpointAdvancePending and node.checkpointAdvanceReady():
+    node.scheduleCheckpointAdvanceRunner()
+
 proc noteLsmrDeliveryMutation(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil or not node.usesLsmrPrimary():
     return
@@ -3180,7 +3743,63 @@ proc noteLsmrDeliveryMutation(node: FabricNode) {.gcsafe, raises: [].} =
 proc scheduleStateMaintenance(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil:
     return
-  node.scheduleMaintenance(immediate = node.usesLsmrPrimary())
+  if node.backgroundMustYieldToHotAccept():
+    node.maintenancePending = true
+    node.eventCertPullPending = true
+    return
+  let immediate =
+    node.usesLsmrPrimary() and not node.maintenanceMustYieldToHotAccept()
+  node.scheduleMaintenance(immediate = immediate)
+  node.scheduleEventCertPull()
+
+proc scheduleEventCertPull(node: FabricNode) {.gcsafe, raises: [].} =
+  if node.isNil or not node.running or not node.usesLsmrPrimary():
+    return
+  node.eventCertPullPending = true
+  node.scheduleEventCertPullRunner()
+
+proc scheduleEventCertPullRunner(node: FabricNode) {.gcsafe, raises: [].} =
+  if node.isNil or not node.running or not node.eventCertPullPending:
+    return
+  if node.backgroundMustYieldToHotAccept():
+    return
+  if not node.eventCertPullRunner.isNil and not node.eventCertPullRunner.finished():
+    return
+  proc runner() {.async, gcsafe.} =
+    try:
+      await node.eventCertPullLoop()
+    except CancelledError:
+      discard
+  node.eventCertPullRunner = runner()
+  asyncSpawn node.eventCertPullRunner
+
+proc eventCertPullLoop(node: FabricNode) {.async: (raises: []).} =
+  if node.isNil:
+    return
+  try:
+    await sleepAsync(FabricMaintenanceYield)
+    while node.running and node.eventCertPullPending:
+      node.eventCertPullPending = false
+      if not node.antiEntropyMissingEventNeeded():
+        continue
+      let items = node.missingEventCertificatePulls()
+      for idx, item in items:
+        if idx > 0:
+          await sleepAsync(FabricMaintenanceYield)
+        if not node.running:
+          break
+        if node.witnessPullStillNeeded(item):
+          discard node.enqueueWitnessPullWorkItem(item)
+          node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
+      if node.eventCertPullPending:
+        await sleepAsync(FabricMaintenanceYield)
+  except CancelledError:
+    discard
+  finally:
+    if not node.isNil:
+      node.eventCertPullRunner = nil
+      if node.running and node.eventCertPullPending:
+        node.scheduleEventCertPullRunner()
 
 proc scheduleCertificationGather(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil or not node.usesLsmrPrimary():
@@ -3194,6 +3813,8 @@ proc scheduleCertificationGather(node: FabricNode) {.gcsafe, raises: [].} =
 
 proc scheduleCertificationGatherRunner(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil or not node.running or not node.certificationGatherPending:
+    return
+  if node.backgroundMustYieldToHotAccept():
     return
   if not node.certificationGatherRunner.isNil and
       not node.certificationGatherRunner.finished():
@@ -3227,22 +3848,10 @@ proc certificationGatherLoop(
           await sleepAsync(FabricMaintenanceYield)
         if not node.running:
           break
-        if not node.certificationEventTracked(eventId):
-          node.clearCertificationEventState(eventId)
-          continue
-        let event = node.events.getOrDefault(eventId)
-        if not node.eventParticipantSatisfied(event):
-          node.scheduleCertificationAntiEntropySync(eventId)
-        else:
-          let witnessInfo = node.witnessCount(event, @[node])
-          if witnessInfo.signed >= witnessInfo.threshold:
-            var certified = false
-            {.cast(gcsafe).}:
-              certified = node.maybeCertifyEvent(event, @[node])
-            if certified:
-              node.clearCertificationEventState(eventId)
-          else:
-            node.scheduleCertificationAntiEntropySync(eventId)
+        discard node.driveAuthorGather(
+          eventId,
+          CertificationTrigger(kind: ctTopologyChanged),
+        )
       if node.certificationGatherPending:
         await sleepAsync(FabricMaintenanceYield)
   except CancelledError:
@@ -3261,11 +3870,15 @@ proc scheduleCheckpointAdvance(node: FabricNode) {.gcsafe, raises: [].} =
   when defined(fabric_submit_diag):
     if not wasPending:
       echo "checkpoint-advance pending account=", node.identity.account
-  node.scheduleCheckpointAdvanceRunner()
   node.scheduleStateMaintenance()
+  if node.backgroundMustYieldToHotAccept():
+    return
+  node.scheduleCheckpointAdvanceRunner()
 
 proc scheduleCheckpointAdvanceRunner(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil or not node.running or not node.checkpointAdvancePending:
+    return
+  if node.backgroundMustYieldToHotAccept():
     return
   if not node.checkpointAdvanceRunner.isNil and not node.checkpointAdvanceRunner.finished():
     return
@@ -3283,6 +3896,8 @@ proc checkpointAdvanceLoop(node: FabricNode) {.async: (raises: []).} =
   try:
     await sleepAsync(FabricMaintenanceYield)
     while node.running and node.checkpointAdvancePending:
+      if node.backgroundMustYieldToHotAccept():
+        break
       if not node.checkpointAdvanceReady():
         break
       node.checkpointAdvancePending = false
@@ -3299,6 +3914,9 @@ proc checkpointAdvanceLoop(node: FabricNode) {.async: (raises: []).} =
         if idx > 0:
           await sleepAsync(FabricMaintenanceYield)
         if not node.running:
+          break
+        if node.backgroundMustYieldToHotAccept():
+          node.checkpointAdvancePending = true
           break
         if not node.checkpointAdvanceReady():
           node.checkpointAdvancePending = true
@@ -3773,25 +4391,69 @@ proc ensureEventCertificationProgress(
 
 proc certificationCheckpointEra(node: FabricNode): uint64 {.gcsafe, raises: [].}
 
+proc certificationRouteForWitness(
+    node: FabricNode, progress: EventCertificationProgress, account: string
+): Option[RoutingPeer] {.gcsafe, raises: [].} =
+  if node.isNil or account.len == 0:
+    return none(RoutingPeer)
+  if account in progress.witnessRoutes:
+    let route = progress.witnessRoutes.getOrDefault(account)
+    if route.peerId.len > 0:
+      return some(route)
+  try:
+    let route = node.routingPeerForAccount(account)
+    if route.isSome() and route.get().peerId.len > 0:
+      return route
+  except CatchableError:
+    discard
+  if node.liveState.validators.hasKey(account):
+    let validator = node.liveState.validators.getOrDefault(account)
+    if validator.peerId.len > 0:
+      return some(RoutingPeer(
+        account: account,
+        peerId: validator.peerId,
+        path: @[],
+        addrs: @[],
+      ))
+  none(RoutingPeer)
+
 proc refreshEventCertificationProgressState(
     node: FabricNode, eventId: string
 ) {.gcsafe, raises: [].} =
   if node.isNil or eventId.len == 0 or eventId notin node.events:
     return
-  node.ensureEventCertificationProgress(eventId)
-  if eventId notin node.eventCertificationProgress:
-    return
   let event = node.events.getOrDefault(eventId)
-  var progress = node.eventCertificationProgress.getOrDefault(eventId)
+  var progress = initEventCertificationProgress(event)
+  for att in node.eventAttestations.getOrDefault(eventId, @[]):
+    case att.role
+    of arParticipant:
+      if att.signer in event.participants and
+          att.signer notin progress.participantAttestations:
+        progress.participantAttestations[att.signer] = att
+    of arWitness:
+      let witnessId = certificationWitnessIdentity(progress, att)
+      if witnessId.len > 0 and witnessId notin progress.witnessAttestations:
+        progress.witnessAttestations[witnessId] = att
+    of arIsolation:
+      discard
   progress.clock = event.clock
+  progress.witnessPeerIds = initHashSet[string]()
+  for account in progress.witnessAccounts.toSeq().sorted(system.cmp[string]):
+    let route = node.certificationRouteForWitness(progress, account)
+    if route.isSome():
+      progress.witnessRoutes[account] = route.get()
+      if route.get().peerId.len > 0:
+        progress.witnessPeerIds.incl(route.get().peerId)
+  let configuredWitnesses = max(progress.witnessAccounts.len, event.eventWitnessRoutes().len)
+  progress.reachableWitnesses = max(configuredWitnesses, progress.witnessRoutes.len)
+  progress.witnessThreshold = max(1, (progress.reachableWitnesses + 1) div 2)
   progress.missingWitnessAccounts = initHashSet[string]()
+  var witnessedAccounts = initHashSet[string]()
+  for _, att in progress.witnessAttestations.pairs:
+    if att.signer.len > 0:
+      witnessedAccounts.incl(att.signer)
   for account in progress.witnessAccounts:
-    var witnessed = false
-    for _, att in progress.witnessAttestations.pairs:
-      if att.signer == account:
-        witnessed = true
-        break
-    if not witnessed:
+    if account notin witnessedAccounts:
       progress.missingWitnessAccounts.incl(account)
   let checkpointEra = node.certificationCheckpointEra()
   if eventId in node.isolatedEvents or
@@ -3808,15 +4470,11 @@ proc refreshEventCertificationProgressState(
   node.eventCertificationProgress[eventId] = progress
 
 proc certificationWitnessIdentity(
-    node: FabricNode, eventId: string, att: EventAttestation
-): string =
-  if node.isNil or eventId.len == 0 or eventId notin node.eventCertificationProgress:
-    return ""
-  if att.signer.len > 0 and
-      att.signer in node.eventCertificationProgress[eventId].witnessAccounts:
+    progress: EventCertificationProgress, att: EventAttestation
+): string {.gcsafe, raises: [].} =
+  if att.signer.len > 0 and att.signer in progress.witnessAccounts:
     return "a:" & att.signer
-  if att.signerPeerId.len > 0 and
-      att.signerPeerId in node.eventCertificationProgress[eventId].witnessPeerIds:
+  if att.signerPeerId.len > 0 and att.signerPeerId in progress.witnessPeerIds:
     return "p:" & att.signerPeerId
   ""
 
@@ -3825,20 +4483,6 @@ proc noteEventCertificationAttestation(
 ) =
   if node.isNil or att.eventId.len == 0 or att.eventId notin node.events:
     return
-  node.ensureEventCertificationProgress(att.eventId)
-  if att.eventId notin node.eventCertificationProgress:
-    return
-  case att.role
-  of arParticipant:
-    if att.signer in node.events[att.eventId].participants:
-      node.eventCertificationProgress[att.eventId].participantAttestations[att.signer] = att
-  of arWitness:
-    let witnessId = node.certificationWitnessIdentity(att.eventId, att)
-    if witnessId.len > 0 and
-        witnessId notin node.eventCertificationProgress[att.eventId].witnessAttestations:
-      node.eventCertificationProgress[att.eventId].witnessAttestations[witnessId] = att
-  of arIsolation:
-    discard
   node.refreshEventCertificationProgressState(att.eventId)
 
 proc maxKnownClock(node: FabricNode): GanzhiClock =
@@ -3872,6 +4516,25 @@ proc pendingEventKeys(node: FabricNode): seq[string] =
       result = cmp(a, b)
   )
 
+proc pendingEventIndexFlushKeys(node: FabricNode): seq[string] =
+  result = node.pendingEventIndexFlushes.toSeq()
+  result.sort(proc(a, b: string): int =
+    let aKnown = a in node.events
+    let bKnown = b in node.events
+    if aKnown and bKnown:
+      let aEvent = node.events.getOrDefault(a)
+      let bEvent = node.events.getOrDefault(b)
+      result = eventOrder(bEvent, aEvent)
+      if result == 0:
+        result = cmp(a, b)
+    elif aKnown:
+      result = -1
+    elif bKnown:
+      result = 1
+    else:
+      result = cmp(a, b)
+  )
+
 proc pendingAttestationKeys(node: FabricNode): seq[string] =
   result = node.pendingAttestations.toSeq()
   result.sort(proc(a, b: string): int =
@@ -3889,6 +4552,93 @@ proc pendingAttestationKeys(node: FabricNode): seq[string] =
     elif aAtt.isSome():
       result = -1
     elif bAtt.isSome():
+      result = 1
+    else:
+      result = cmp(a, b)
+  )
+
+proc pendingAttestationIndexFlushKeys(node: FabricNode): seq[string] =
+  result = node.pendingAttestationIndexFlushes.toSeq()
+  result.sort(proc(a, b: string): int =
+    let aAtt = node.attestationForKey(a)
+    let bAtt = node.attestationForKey(b)
+    if aAtt.isSome() and bAtt.isSome() and
+        aAtt.get().eventId in node.events and bAtt.get().eventId in node.events:
+      let aEvent = node.events.getOrDefault(aAtt.get().eventId)
+      let bEvent = node.events.getOrDefault(bAtt.get().eventId)
+      result = eventOrder(bEvent, aEvent)
+      if result == 0:
+        result = cmp(ord(aAtt.get().role), ord(bAtt.get().role))
+      if result == 0:
+        result = cmp(aAtt.get().signer, bAtt.get().signer)
+      if result == 0:
+        result = cmp(a, b)
+    elif aAtt.isSome():
+      result = -1
+    elif bAtt.isSome():
+      result = 1
+    else:
+      result = cmp(a, b)
+  )
+
+proc pendingEventCertificateIndexFlushKeys(node: FabricNode): seq[string] =
+  result = node.pendingEventCertificateIndexFlushes.toSeq()
+  result.sort(proc(a, b: string): int =
+    let aKnown = a in node.eventCertificates
+    let bKnown = b in node.eventCertificates
+    if aKnown and bKnown:
+      let aCert = node.eventCertificates.getOrDefault(a)
+      let bCert = node.eventCertificates.getOrDefault(b)
+      result = clockCmp(bCert.clock, aCert.clock)
+      if result == 0:
+        result = cmp(a, b)
+    elif aKnown:
+      result = -1
+    elif bKnown:
+      result = 1
+    else:
+      result = cmp(a, b)
+  )
+
+proc pendingCheckpointCandidateIndexFlushKeys(node: FabricNode): seq[string] =
+  result = node.pendingCheckpointCandidateIndexFlushes.toSeq()
+  result.sort(proc(a, b: string): int =
+    let aKnown = a in node.checkpointCandidates
+    let bKnown = b in node.checkpointCandidates
+    if aKnown and bKnown:
+      let aCandidate = node.checkpointCandidates.getOrDefault(a)
+      let bCandidate = node.checkpointCandidates.getOrDefault(b)
+      result = cmp(bCandidate.era, aCandidate.era)
+      if result == 0:
+        result = cmp(aCandidate.createdAt, bCandidate.createdAt)
+      if result == 0:
+        result = cmp(a, b)
+    elif aKnown:
+      result = -1
+    elif bKnown:
+      result = 1
+    else:
+      result = cmp(a, b)
+  )
+
+proc pendingCheckpointVoteIndexFlushKeys(node: FabricNode): seq[string] =
+  result = node.pendingCheckpointVoteIndexFlushes.toSeq()
+  result.sort(proc(a, b: string): int =
+    let aVote = node.checkpointVoteForKey(a)
+    let bVote = node.checkpointVoteForKey(b)
+    if aVote.isSome() and bVote.isSome():
+      let aCandidate = node.checkpointCandidates.getOrDefault(aVote.get().candidateId)
+      let bCandidate = node.checkpointCandidates.getOrDefault(bVote.get().candidateId)
+      result = cmp(bCandidate.era, aCandidate.era)
+      if result == 0:
+        result = cmp(aVote.get().candidateId, bVote.get().candidateId)
+      if result == 0:
+        result = cmp(aVote.get().validator, bVote.get().validator)
+      if result == 0:
+        result = cmp(a, b)
+    elif aVote.isSome():
+      result = -1
+    elif bVote.isSome():
       result = 1
     else:
       result = cmp(a, b)
@@ -4185,6 +4935,7 @@ proc registerAttestation(
   node.eventAttestations[att.eventId] = existing
   node.attestationsByKey[att.attestationKey()] = att
   node.noteEventCertificationAttestation(att)
+  let event = node.events[att.eventId]
   if (att.role == arParticipant or att.role == arWitness) and
       att.signerPeerId.len > 0:
     let observed = observeTrackedPeerDelivery(
@@ -4198,23 +4949,14 @@ proc registerAttestation(
         node.pendingEvents.excl(att.eventId)
         node.pendingEventScopes.clearPendingScopePrefixes(att.eventId)
   if not node.store.isNil:
-    node.store.persistAttestation(att)
+    node.store.persistAttestationRaw(event.clock, att)
+    discard node.enqueuePendingAttestationIndexFlush(att.attestationKey())
   when defined(fabric_submit_diag):
     echo "att-stage install account=", node.identity.account,
       " event=", att.eventId,
       " role=", ord(att.role),
       " signer=", att.signer,
       " total=", existing.len
-  let event = node.events[att.eventId]
-  if (att.role == arParticipant or att.role == arWitness) and
-      att.signer == node.identity.account:
-    var authorPeerId = event.authorPeerId
-    let authorRoute = node.eventAuthorRoute(event)
-    if authorRoute.isSome() and authorRoute.get().peerId.len > 0:
-      authorPeerId = authorRoute.get().peerId
-    if authorPeerId.len > 0 and authorPeerId != peerIdString(node.identity.peerId):
-      node.antiEntropySummaryNextRefreshAtMs[authorPeerId] = 0'i64
-      node.signalAntiEntropySummarySync(authorPeerId)
   if enqueuePending and att.eventId notin node.eventCertificates and
       node.attestationRequiresRelay(event, att):
     if node.attestationNeedsRelay(event, att):
@@ -4227,13 +4969,26 @@ proc registerAttestation(
         " role=", ord(att.role),
         " signer=", att.signer,
         " pending=", node.pendingAttestations.len
-  let certifiedNow =
-    if node.usesLsmrPrimary() and event.author == node.identity.account:
-      node.maybeCertifyEvent(event, @[node])
-    else:
-      false
-  if not certifiedNow:
-    discard node.refreshCertificationEvent(att.eventId, force = true)
+  if enqueuePending and att.eventId notin node.eventCertificates and
+      att.signer == node.identity.account and
+      (att.role == arParticipant or att.role == arWitness) and
+      node.attestationHasRunnableLsmrDelivery(event, att):
+    node.disseminateAttestation(event, att)
+  if node.store.isNil:
+    if att.role == arParticipant:
+      node.invalidateAntiEntropySummaryCache(aedAttParticipant, event.clock)
+    elif att.role == arWitness:
+      node.invalidateAntiEntropySummaryCache(aedAttWitness, event.clock)
+  if node.usesLsmrPrimary() and event.author == node.identity.account and
+      (att.role == arParticipant or att.role == arWitness):
+    node.clearCertificationLiveAwaitForAtt(att)
+    discard node.driveAuthorGather(
+      att.eventId,
+      CertificationTrigger(
+        kind: ctAttInstalled,
+        key: att.attestationKey(),
+      ),
+    )
   node.scheduleStateMaintenance()
   true
 
@@ -4246,7 +5001,12 @@ proc registerCandidate(node: FabricNode, candidate: CheckpointCandidate): bool =
       " id=", candidate.candidateId
   node.checkpointCandidates[candidate.candidateId] = candidate
   if not node.store.isNil:
-    node.store.persistCheckpointCandidate(candidate)
+    discard node.enqueuePendingCheckpointCandidateIndexFlush(candidate.candidateId)
+  else:
+    node.invalidateAntiEntropySummaryCache(
+      aedCheckpointCandidate,
+      GanzhiClock(era: candidate.era, tick: 0),
+    )
   discard node.pendingCheckpointCandidates.enqueuePending(candidate.candidateId)
   node.scheduleCheckpointAdvance()
   true
@@ -4254,6 +5014,7 @@ proc registerCandidate(node: FabricNode, candidate: CheckpointCandidate): bool =
 proc registerCheckpointVote(node: FabricNode, vote: CheckpointVote): bool =
   if vote.candidateId notin node.checkpointCandidates:
     return false
+  let candidate = node.checkpointCandidates.getOrDefault(vote.candidateId)
   if not verifyCheckpointVote(vote):
     return false
   if node.voteBy(vote.candidateId, vote.validator):
@@ -4267,7 +5028,12 @@ proc registerCheckpointVote(node: FabricNode, vote: CheckpointVote): bool =
   existing.add(vote)
   node.checkpointVotes[vote.candidateId] = existing
   if not node.store.isNil:
-    node.store.persistCheckpointVote(vote)
+    discard node.enqueuePendingCheckpointVoteIndexFlush(vote.checkpointVoteKey())
+  else:
+    node.invalidateAntiEntropySummaryCache(
+      aedCheckpointVote,
+      GanzhiClock(era: candidate.era, tick: 0),
+    )
   discard node.pendingCheckpointVotes.enqueuePending(vote.checkpointVoteKey())
   node.scheduleCheckpointAdvance()
   true
@@ -4289,6 +5055,10 @@ proc registerCheckpoint(node: FabricNode, cert: CheckpointCertificate, snapshot:
   node.pruneSupersededCheckpointBundles(node.latestCheckpointId)
   if not node.store.isNil:
     node.store.persistCheckpointRaw(cert, checkpointRaw(cert), bundle.snapshot)
+  node.invalidateAntiEntropySummaryCache(
+    aedCheckpointBundle,
+    GanzhiClock(era: cert.candidate.era, tick: 0),
+  )
   node.pendingCheckpointCandidates.excl(cert.candidate.candidateId)
   node.completeCheckpointCandidateDelivery(cert.candidate.candidateId)
   node.clearCheckpointVotePending(cert.candidate.candidateId)
@@ -4302,6 +5072,7 @@ proc registerCheckpoint(node: FabricNode, cert: CheckpointCertificate, snapshot:
       node.clearEventAttestationDeliveries(eventId)
       if eventId in node.eventCertificates:
         node.completeEventCertificateDelivery(eventId)
+      node.clearEventSourcePeers(eventId)
   for proposalId in cert.candidate.adoptedProposalIds:
     if not node.avoAdoptions.hasKey(proposalId):
       let adoption = AvoAdoptionRecord(
@@ -4335,6 +5106,10 @@ proc registerCheckpointFetched(
   node.pruneSupersededCheckpointBundles(node.latestCheckpointId)
   if not node.store.isNil:
     node.store.persistCheckpointRaw(cert, checkpointRaw, snapshotRaw)
+  node.invalidateAntiEntropySummaryCache(
+    aedCheckpointBundle,
+    GanzhiClock(era: cert.candidate.era, tick: 0),
+  )
   node.pendingCheckpointCandidates.excl(cert.candidate.candidateId)
   node.completeCheckpointCandidateDelivery(cert.candidate.candidateId)
   node.clearCheckpointVotePending(cert.candidate.candidateId)
@@ -4348,6 +5123,7 @@ proc registerCheckpointFetched(
       node.clearEventAttestationDeliveries(eventId)
       if eventId in node.eventCertificates:
         node.completeEventCertificateDelivery(eventId)
+      node.clearEventSourcePeers(eventId)
   for proposalId in cert.candidate.adoptedProposalIds:
     if not node.avoAdoptions.hasKey(proposalId):
       node.avoAdoptions[proposalId] = AvoAdoptionRecord(
@@ -4561,6 +5337,8 @@ proc registerIsolation(node: FabricNode, record: IsolationRecord): bool =
   node.completeEventCertificateDelivery(record.eventId)
   node.deferredAttestations.del(record.eventId)
   node.deferredEventCertificates.del(record.eventId)
+  node.deferredEventCertificateSources.del(record.eventId)
+  node.clearEventSourcePeers(record.eventId)
   node.clearCertificationEventState(record.eventId)
   true
 
@@ -4571,14 +5349,6 @@ proc replayDeferredAttestations(node: FabricNode, eventId: string) =
   node.deferredAttestations.del(eventId)
   for att in buffered:
     discard node.registerAttestation(att, enqueuePending = false)
-
-proc replayDeferredEventCertificates(node: FabricNode, eventId: string) =
-  if node.isNil or eventId.len == 0 or eventId notin node.deferredEventCertificates:
-    return
-  let buffered = node.deferredEventCertificates.getOrDefault(eventId, @[])
-  node.deferredEventCertificates.del(eventId)
-  for cert in buffered:
-    discard node.registerEventCertificate(cert, enqueuePending = false)
 
 proc registerEvent(
     node: FabricNode, event: FabricEvent, enqueuePending = true
@@ -4612,7 +5382,10 @@ proc registerEvent(
   when defined(fabric_submit_diag):
     echo "register-stage persist account=", node.identity.account, " event=", event.eventId
   if not node.store.isNil:
-    node.store.persistEvent(event)
+    node.store.persistEventRaw(event)
+    discard node.enqueuePendingEventIndexFlush(event.eventId)
+  else:
+    node.invalidateAntiEntropySummaryCache(aedEvent, event.clock)
   when defined(fabric_submit_diag):
     echo "register-stage children account=", node.identity.account, " event=", event.eventId
   for parent in event.parents:
@@ -4624,7 +5397,11 @@ proc registerEvent(
   node.replayDeferredEventCertificates(event.eventId)
   if enqueuePending:
     discard node.pendingEvents.enqueuePending(event.eventId)
-  discard node.refreshCertificationEvent(event.eventId, force = true)
+  if node.usesLsmrPrimary() and event.author == node.identity.account:
+    discard node.driveAuthorGather(
+      event.eventId,
+      CertificationTrigger(kind: ctEventInstalled),
+    )
   node.scheduleStateMaintenance()
   when defined(fabric_submit_diag):
     echo "register-stage done account=", node.identity.account, " event=", event.eventId
@@ -4671,12 +5448,15 @@ proc scheduleMissingParentEventCertificatePull(
   let parentId = node.missingParentEventCertificate(cert)
   if parentId.len == 0 or parentId notin node.events:
     return false
+  node.refreshEraCheckpointStates()
+  let parentClock = node.events.getOrDefault(parentId).clock
   let item = AntiEntropyPullWorkItem(
     domain: aedEventCert,
     key: "eventcert:" & parentId,
     causedByEventId: cert.eventId,
     targetPeerId: targetPeerId,
-    clock: node.events.getOrDefault(parentId).clock,
+    clock: parentClock,
+    priorityClass: node.certificationPullPriorityClass(parentId, parentClock),
   )
   if not node.witnessPullStillNeeded(item):
     return false
@@ -4684,6 +5464,19 @@ proc scheduleMissingParentEventCertificatePull(
   node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
   if result:
     node.scheduleStateMaintenance()
+
+proc replayDeferredEventCertificates(node: FabricNode, eventId: string) =
+  if node.isNil or eventId.len == 0 or eventId notin node.deferredEventCertificates:
+    return
+  let sourcePeerId = node.deferredEventCertificateSources.getOrDefault(eventId)
+  let buffered = node.deferredEventCertificates.getOrDefault(eventId, @[])
+  node.deferredEventCertificates.del(eventId)
+  for cert in buffered:
+    let registered = node.registerEventCertificate(cert, enqueuePending = false)
+    if not registered and sourcePeerId.len > 0:
+      discard node.scheduleMissingParentEventCertificatePull(cert, sourcePeerId)
+  if eventId notin node.deferredEventCertificates:
+    node.deferredEventCertificateSources.del(eventId)
 
 proc maybeActivateDependentDeliveries(node: FabricNode, eventId: string) =
   if node.isNil or eventId.len == 0 or eventId notin node.events or eventId in node.isolatedEvents:
@@ -4707,6 +5500,7 @@ proc registerEventCertificate(
         " event=", cert.eventId
     return node.bufferDeferredEventCertificate(cert)
   if node.eventCertificates.hasKey(cert.eventId):
+    node.deferredEventCertificateSources.del(cert.eventId)
     when defined(fabric_diag):
       echo "register-cert-skip ", node.identity.account, " event=", cert.eventId
     when defined(fabric_submit_diag):
@@ -4724,6 +5518,7 @@ proc registerEventCertificate(
         " parent=", missingParentId
     return node.bufferDeferredEventCertificate(cert)
   node.eventCertificates[cert.eventId] = cert
+  node.deferredEventCertificateSources.del(cert.eventId)
   when defined(fabric_submit_diag):
     echo "cert-stage installed account=", node.identity.account,
       " event=", cert.eventId,
@@ -4740,7 +5535,10 @@ proc registerEventCertificate(
   when defined(fabric_diag):
     echo "register-cert-after-live ", node.identity.account, " event=", cert.eventId
   if not node.store.isNil:
-    node.store.persistEventCertificate(cert)
+    node.store.persistEventCertificateRaw(cert)
+    discard node.enqueuePendingEventCertificateIndexFlush(cert.eventId)
+  else:
+    node.invalidateAntiEntropySummaryCache(aedEventCert, cert.clock)
   for childEventId in node.children.getOrDefault(cert.eventId, @[]):
     node.replayDeferredEventCertificates(childEventId)
   when defined(fabric_submit_diag):
@@ -4765,7 +5563,7 @@ proc registerEventCertificate(
   true
 
 proc eventParticipantSatisfied(node: FabricNode, event: FabricEvent): bool =
-  node.ensureEventCertificationProgress(event.eventId)
+  node.refreshEventCertificationProgressState(event.eventId)
   if event.eventId notin node.eventCertificationProgress:
     return false
   let progress = node.eventCertificationProgress.getOrDefault(event.eventId)
@@ -4776,7 +5574,7 @@ proc eventParticipantSatisfied(node: FabricNode, event: FabricEvent): bool =
 
 proc witnessCount(node: FabricNode, event: FabricEvent, component: seq[FabricNode]): tuple[reachable: int, threshold: int, signed: int, witnessAtts: seq[EventAttestation]] {.gcsafe, raises: [].} =
   discard component
-  node.ensureEventCertificationProgress(event.eventId)
+  node.refreshEventCertificationProgressState(event.eventId)
   if event.eventId notin node.eventCertificationProgress:
     return
   let progress = node.eventCertificationProgress.getOrDefault(event.eventId)
@@ -4821,133 +5619,237 @@ proc clearCertificationEventState(
   if node.isNil or eventId.len == 0:
     return
   node.dropPendingCertificationEvent(eventId)
+  node.clearCertificationLiveAwaitForEvent(eventId)
   node.clearQueuedWitnessPullsForEvent(eventId)
   node.clearInflightWitnessPullsForEvent(eventId)
 
-proc signalCertificationSummaryPeers(
-    node: FabricNode, eventId: string, excludePeerId = ""
-) {.gcsafe, raises: [].} =
-  if node.isNil or eventId.len == 0 or not node.certificationEventTracked(eventId):
-    return
-  let event = node.events.getOrDefault(eventId)
-  node.refreshEventCertificationProgressState(eventId)
-  if eventId notin node.eventCertificationProgress:
-    return
-  let progress = node.eventCertificationProgress.getOrDefault(eventId)
-  let selfPeerId = peerIdString(node.identity.peerId)
-  var targetPeers = initHashSet[string]()
-  if progress.status == agsWaitingParticipants:
-    for participant in event.participants.sorted(system.cmp[string]):
-      if participant.len == 0 or participant == node.identity.account or
-          participant in progress.participantAttestations:
-        continue
-      var targetPeerId = ""
-      if participant in node.routingPeers:
-        targetPeerId = node.routingPeers.getOrDefault(participant).peerId
-      if targetPeerId.len == 0 and node.liveState.validators.hasKey(participant):
-        targetPeerId = node.liveState.validators.getOrDefault(participant).peerId
-      if targetPeerId.len == 0 or targetPeerId == selfPeerId or
-          targetPeerId == excludePeerId:
-        continue
-      targetPeers.incl(targetPeerId)
-  if progress.status == agsWaitingWitnesses or progress.status == agsCertReady:
-    for witnessAccount in progress.missingWitnessAccounts.toSeq().sorted(system.cmp[string]):
-      if witnessAccount.len == 0 or witnessAccount == node.identity.account:
-        continue
-      var targetPeerId = ""
-      if witnessAccount in progress.witnessRoutes:
-        targetPeerId = progress.witnessRoutes.getOrDefault(witnessAccount).peerId
-      if targetPeerId.len == 0 and witnessAccount in node.routingPeers:
-        targetPeerId = node.routingPeers.getOrDefault(witnessAccount).peerId
-      if targetPeerId.len == 0 and node.liveState.validators.hasKey(witnessAccount):
-        targetPeerId = node.liveState.validators.getOrDefault(witnessAccount).peerId
-      if targetPeerId.len == 0 or targetPeerId == selfPeerId or
-          targetPeerId == excludePeerId:
-        continue
-      targetPeers.incl(targetPeerId)
-  for targetPeerId in targetPeers:
-    node.signalAntiEntropySummarySync(targetPeerId)
+proc certificationPeerIdForAccount(
+    node: FabricNode,
+    progress: EventCertificationProgress,
+    account: string,
+    preferWitnessRoute: bool,
+): string {.gcsafe, raises: [].} =
+  if node.isNil or account.len == 0:
+    return ""
+  if preferWitnessRoute:
+    let witnessRoute = node.certificationRouteForWitness(progress, account)
+    if witnessRoute.isSome():
+      return witnessRoute.get().peerId
+  if account in node.routingPeers:
+    let routingPeer = node.routingPeers.getOrDefault(account)
+    if routingPeer.peerId.len > 0:
+      return routingPeer.peerId
+  try:
+    let route = node.routingPeerForAccount(account)
+    if route.isSome() and route.get().peerId.len > 0:
+      return route.get().peerId
+  except CatchableError:
+    discard
+  if node.liveState.validators.hasKey(account):
+    return node.liveState.validators.getOrDefault(account).peerId
+  ""
 
-proc scheduleCertificationAntiEntropySync(
+proc appendCertificationPeer(
+    peers: var seq[string], seen: var HashSet[string], peerId: string
+) {.gcsafe, raises: [].} =
+  if peerId.len == 0 or peerId in seen:
+    return
+  seen.incl(peerId)
+  peers.add(peerId)
+
+proc appendCertificationPull(
+    pulls: var seq[AntiEntropyPullWorkItem],
+    seen: var HashSet[string],
+    item: AntiEntropyPullWorkItem,
+) {.gcsafe, raises: [].} =
+  if item.key.len == 0 or item.targetPeerId.len == 0:
+    return
+  let uniqueKey =
+    antiEntropyPullOwnerKey(item.targetPeerId, item.domain) & "|" & item.key
+  if uniqueKey in seen:
+    return
+  seen.incl(uniqueKey)
+  pulls.add(item)
+
+proc certificationSnapshot(
     node: FabricNode, eventId: string
-) {.gcsafe, raises: [].} =
+): Option[CertificationSnapshot] {.gcsafe, raises: [].} =
   if node.isNil or eventId.len == 0 or not node.certificationEventTracked(eventId):
-    return
-  let participantPulls = node.certificationMissingParticipantPulls(eventId)
-  let witnessPulls = node.certificationMissingWitnessPulls(eventId)
-  var enqueuedPull = false
-  let event = node.events.getOrDefault(eventId)
+    return none(CertificationSnapshot)
   node.refreshEventCertificationProgressState(eventId)
   if eventId notin node.eventCertificationProgress:
-    return
+    return none(CertificationSnapshot)
+  let event = node.events.getOrDefault(eventId)
   let progress = node.eventCertificationProgress.getOrDefault(eventId)
+  result = some(CertificationSnapshot(
+    eventId: eventId,
+    clock: event.clock,
+    status: progress.status,
+    participantMissing: @[],
+    witnessMissing: @[],
+    participantPulls: node.certificationMissingParticipantPulls(eventId),
+    witnessPulls: node.certificationMissingWitnessPulls(eventId),
+    summaryPeers: @[],
+    certReady: progress.status == agsCertReady,
+  ))
+  var snapshot = result.get()
   let selfPeerId = peerIdString(node.identity.peerId)
-  var targetPeers = initHashSet[string]()
-  for item in participantPulls:
-    if node.enqueueWitnessPullWorkItem(item):
-      enqueuedPull = true
-    node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
-    if item.targetPeerId.len > 0:
-      targetPeers.incl(item.targetPeerId)
-  for item in witnessPulls:
-    if node.enqueueWitnessPullWorkItem(item):
-      enqueuedPull = true
-    node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
-    if item.targetPeerId.len > 0:
-      targetPeers.incl(item.targetPeerId)
-  if progress.status == agsWaitingParticipants:
-    for participant in event.participants.sorted(system.cmp[string]):
-      if participant.len == 0 or participant == node.identity.account or
-          participant in progress.participantAttestations:
-        continue
-      var targetPeerId = ""
-      if participant in node.routingPeers:
-        targetPeerId = node.routingPeers.getOrDefault(participant).peerId
-      if targetPeerId.len == 0 and node.liveState.validators.hasKey(participant):
-        targetPeerId = node.liveState.validators.getOrDefault(participant).peerId
-      if targetPeerId.len == 0 or targetPeerId == selfPeerId:
-        continue
-      targetPeers.incl(targetPeerId)
-  if progress.status == agsWaitingWitnesses or progress.status == agsCertReady:
-    for witnessAccount in progress.missingWitnessAccounts.toSeq().sorted(system.cmp[string]):
-      if witnessAccount.len == 0 or witnessAccount == node.identity.account:
-        continue
-      var targetPeerId = ""
-      if witnessAccount in progress.witnessRoutes:
-        targetPeerId = progress.witnessRoutes.getOrDefault(witnessAccount).peerId
-      if targetPeerId.len == 0 and witnessAccount in node.routingPeers:
-        targetPeerId = node.routingPeers.getOrDefault(witnessAccount).peerId
-      if targetPeerId.len == 0 and node.liveState.validators.hasKey(witnessAccount):
-        targetPeerId = node.liveState.validators.getOrDefault(witnessAccount).peerId
-      if targetPeerId.len == 0 or targetPeerId == selfPeerId:
-        continue
-      targetPeers.incl(targetPeerId)
-  if enqueuedPull:
-    node.scheduleStateMaintenance()
-  for targetPeerId in targetPeers:
-    node.ensureAntiEntropySummarySync(targetPeerId)
+  var seenSummaryPeers = initHashSet[string]()
+  for participant in event.participants.sorted(system.cmp[string]):
+    if participant.len == 0 or participant == node.identity.account or
+        participant in progress.participantAttestations:
+      continue
+    snapshot.participantMissing.add(participant)
+    let targetPeerId =
+      node.certificationPeerIdForAccount(progress, participant, preferWitnessRoute = false)
+    if targetPeerId.len > 0 and targetPeerId != selfPeerId:
+      snapshot.summaryPeers.appendCertificationPeer(seenSummaryPeers, targetPeerId)
+  for witnessAccount in progress.missingWitnessAccounts.toSeq().sorted(system.cmp[string]):
+    if witnessAccount.len == 0 or witnessAccount == node.identity.account:
+      continue
+    snapshot.witnessMissing.add(witnessAccount)
+    let targetPeerId =
+      node.certificationPeerIdForAccount(progress, witnessAccount, preferWitnessRoute = true)
+    if targetPeerId.len > 0 and targetPeerId != selfPeerId:
+      snapshot.summaryPeers.appendCertificationPeer(seenSummaryPeers, targetPeerId)
+  result = some(snapshot)
 
-proc scheduleDeliveredCertificationPulls(
-    node: FabricNode, eventId, targetPeerId: string
-) {.gcsafe, raises: [].} =
-  if node.isNil or eventId.len == 0 or targetPeerId.len == 0 or
-      not node.certificationEventTracked(eventId):
+proc certificationEffectsForTrigger(
+    snapshot: CertificationSnapshot, trigger: CertificationTrigger
+): CertificationEffects {.gcsafe, raises: [].} =
+  var exactPulls: seq[AntiEntropyPullWorkItem] = @[]
+  var summarySignals: seq[string] = @[]
+  var summaryRestarts: seq[string] = @[]
+  result = CertificationEffects(
+    pendingState: cpsKeep,
+    exactPulls: exactPulls,
+    summarySignals: summarySignals,
+    summaryRestarts: summaryRestarts,
+    certifyNow: snapshot.certReady,
+    retire: false,
+  )
+  if snapshot.status == agsRetired or snapshot.status == agsCertified:
+    result.pendingState = cpsDrop
+    result.retire = true
+    result.certifyNow = false
     return
+  var seenPulls = initHashSet[string]()
+
+  case trigger.kind
+  of ctEventInstalled:
+    for item in snapshot.participantPulls:
+      exactPulls.appendCertificationPull(seenPulls, item)
+    for item in snapshot.witnessPulls:
+      exactPulls.appendCertificationPull(seenPulls, item)
+  of ctEventAck:
+    for item in snapshot.participantPulls:
+      if item.targetPeerId == trigger.peerId:
+        exactPulls.appendCertificationPull(seenPulls, item)
+    var restartAckWitnessSummary = false
+    for item in snapshot.witnessPulls:
+      if item.targetPeerId == trigger.peerId:
+        restartAckWitnessSummary = true
+        exactPulls.appendCertificationPull(seenPulls, item)
+    for peerId in snapshot.summaryPeers:
+      if peerId.len == 0 or peerId == trigger.peerId:
+        continue
+      summaryRestarts.add(peerId)
+    if restartAckWitnessSummary and trigger.peerId.len > 0:
+      summaryRestarts.add(trigger.peerId)
+  of ctAttInstalled, ctTopologyChanged:
+    for item in snapshot.participantPulls:
+      exactPulls.appendCertificationPull(seenPulls, item)
+    for item in snapshot.witnessPulls:
+      exactPulls.appendCertificationPull(seenPulls, item)
+    for peerId in snapshot.summaryPeers:
+      summarySignals.add(peerId)
+  of ctExactPullAccepted:
+    for item in snapshot.participantPulls:
+      exactPulls.appendCertificationPull(seenPulls, item)
+    for item in snapshot.witnessPulls:
+      exactPulls.appendCertificationPull(seenPulls, item)
+    if trigger.peerId.len > 0:
+      summarySignals.add(trigger.peerId)
+
+  var seenSignals = initHashSet[string]()
+  var dedupSignals: seq[string] = @[]
+  for peerId in summarySignals:
+    if peerId.len == 0 or peerId in seenSignals:
+      continue
+    seenSignals.incl(peerId)
+    dedupSignals.add(peerId)
+  var seenRestarts = initHashSet[string]()
+  var dedupRestarts: seq[string] = @[]
+  for peerId in summaryRestarts:
+    if peerId.len == 0 or peerId in seenRestarts:
+      continue
+    seenRestarts.incl(peerId)
+    dedupRestarts.add(peerId)
+  result.exactPulls = exactPulls
+  result.summaryRestarts = dedupRestarts
+  result.summarySignals = dedupSignals.filterIt(it notin seenRestarts)
+
+proc driveAuthorGather(
+    node: FabricNode, eventId: string, trigger: CertificationTrigger
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0:
+    return false
+  let snapshotOpt = node.certificationSnapshot(eventId)
+  if snapshotOpt.isNone():
+    let hadState =
+      eventId in node.pendingCertificationEvents or
+      eventId in node.pendingCertificationEventEpochs or
+      eventId in node.eventCertificationProgress
+    let shouldDropProgress =
+      eventId in node.eventCertificates or
+      eventId in node.isolatedEvents or
+      (eventId in node.events and
+        node.events.getOrDefault(eventId).author == node.identity.account)
+    node.clearCertificationEventState(eventId)
+    if shouldDropProgress and eventId in node.eventCertificationProgress:
+      node.eventCertificationProgress.del(eventId)
+    return hadState
+  let snapshot = snapshotOpt.get()
+  let effects = certificationEffectsForTrigger(snapshot, trigger)
+  if effects.pendingState == cpsDrop or effects.retire:
+    let hadState =
+      eventId in node.pendingCertificationEvents or
+      eventId in node.pendingCertificationEventEpochs
+    node.clearCertificationEventState(eventId)
+    return hadState
+  result = node.markPendingCertificationEvent(eventId)
+  if effects.certifyNow and eventId in node.events:
+    var certified = false
+    try:
+      {.cast(gcsafe).}:
+        certified = node.maybeCertifyEvent(node.events.getOrDefault(eventId), @[node])
+    except Exception as exc:
+      raiseAssert("driveAuthorGather maybeCertifyEvent failed: " & exc.msg)
+    if certified:
+      return true
   var enqueuedPull = false
-  for item in node.certificationMissingParticipantPulls(eventId):
-    if item.targetPeerId != targetPeerId:
+  for item in effects.exactPulls:
+    if item.domain == aedAttWitness and
+        not node.summaryPullAvailable(item.targetPeerId, item.key):
+      if trigger.kind == ctEventAck and item.targetPeerId == trigger.peerId:
+        node.markCertificationLiveAwait(item.targetPeerId, item.key)
+        result = true
       continue
+    if trigger.kind == ctEventAck and item.domain == aedAttWitness and
+        item.targetPeerId == trigger.peerId:
+      node.clearCertificationLiveAwait(item.targetPeerId, item.key)
     if node.enqueueWitnessPullWorkItem(item):
       enqueuedPull = true
-    node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
-  for item in node.certificationMissingWitnessPulls(eventId):
-    if item.targetPeerId != targetPeerId:
-      continue
-    if node.enqueueWitnessPullWorkItem(item):
-      enqueuedPull = true
+      result = true
     node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
   if enqueuedPull:
     node.scheduleStateMaintenance()
+  for peerId in effects.summaryRestarts:
+    node.restartAntiEntropySummarySync(peerId)
+  for peerId in effects.summarySignals:
+    node.signalAntiEntropySummarySync(peerId)
+  if effects.summaryRestarts.len > 0 or effects.summarySignals.len > 0:
+    result = true
 
 proc refreshCertificationEvent(
     node: FabricNode, eventId: string, force = false
@@ -4960,7 +5862,10 @@ proc refreshCertificationEvent(
   result = node.touchPendingCertificationEvent(eventId, force = force)
   if result:
     node.scheduleCertificationGather()
-    node.scheduleCertificationAntiEntropySync(eventId)
+  result = node.driveAuthorGather(
+    eventId,
+    CertificationTrigger(kind: ctTopologyChanged),
+  ) or result
 
 proc refreshPendingCertificationEvents(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil or not node.usesLsmrPrimary():
@@ -5062,12 +5967,14 @@ proc certificationMissingWitnessPulls(
       continue
     if not node.certificationPullSourceReady(eventId, target.peerId):
       continue
+    let attKey = attestationFetchKey(eventId, arWitness, witnessAccount)
     result.add(AntiEntropyPullWorkItem(
       domain: aedAttWitness,
-      key: attestationFetchKey(eventId, arWitness, witnessAccount),
+      key: attKey,
       causedByEventId: eventId,
       targetPeerId: target.peerId,
       clock: event.clock,
+      priorityClass: node.certificationPullPriorityClass(eventId, event.clock),
     ))
 
 proc certificationMissingParticipantPulls(
@@ -5104,6 +6011,7 @@ proc certificationMissingParticipantPulls(
       causedByEventId: eventId,
       targetPeerId: target.peerId,
       clock: event.clock,
+      priorityClass: node.certificationPullPriorityClass(eventId, event.clock),
     ))
 
 proc scheduleCertificationDependentPulls(
@@ -5118,6 +6026,7 @@ proc missingEventCertificatePulls(
 ): seq[AntiEntropyPullWorkItem] {.gcsafe, raises: [].} =
   if node.isNil:
     return @[]
+  node.refreshEraCheckpointStates()
   let checkpointKnown =
     node.latestCheckpointId.len > 0 and node.latestCheckpointId in node.checkpoints
   let checkpointEra =
@@ -5125,10 +6034,11 @@ proc missingEventCertificatePulls(
       node.latestCheckpointEra()
     else:
       0'u64
-  var perPeerQueued = initTable[string, int]()
-  let queueWindow = antiEntropyPullOwnerCredit(aedEventCert)
+  var perPeerBest = initTable[string, AntiEntropyPullWorkItem]()
   for event in node.knownEvents():
-    if event.eventId in node.eventCertificates or event.eventId in node.isolatedEvents:
+    if event.eventId in node.eventCertificates or
+        node.deferredEventCertificateKnown(event.eventId) or
+        event.eventId in node.isolatedEvents:
       continue
     if checkpointKnown and event.clock.era < checkpointEra:
       continue
@@ -5138,22 +6048,22 @@ proc missingEventCertificatePulls(
     let target = authorRoute.get()
     if target.peerId.len == 0 or node.routeMatchesSelf(target):
       continue
-    let ownerLoad = perPeerQueued.getOrDefault(
-      target.peerId,
-      node.antiEntropyPullOwnerLoad(target.peerId, aedEventCert),
-    )
-    if ownerLoad >= queueWindow:
-      continue
-    result.add(AntiEntropyPullWorkItem(
+    let item = AntiEntropyPullWorkItem(
       domain: aedEventCert,
       key: "eventcert:" & event.eventId,
       causedByEventId: event.eventId,
       targetPeerId: target.peerId,
       clock: event.clock,
-    ))
-    perPeerQueued[target.peerId] = ownerLoad + 1
+      priorityClass: node.certificationPullPriorityClass(event.eventId, event.clock),
+    )
+    let existing = perPeerBest.getOrDefault(target.peerId)
+    if target.peerId notin perPeerBest or item < existing:
+      perPeerBest[target.peerId] = item
+  result = perPeerBest.values.toSeq()
   result.sort(proc(a, b: AntiEntropyPullWorkItem): int =
-    result = clockCmp(a.clock, b.clock)
+    result = cmp(a.priorityClass, b.priorityClass)
+    if result == 0:
+      result = clockCmp(a.clock, b.clock)
     if result == 0:
       result = cmp(a.causedByEventId, b.causedByEventId)
       if result == 0:
@@ -5176,19 +6086,19 @@ proc scheduleNextMissingEventCertificatePull(
   if result:
     node.scheduleStateMaintenance()
 
-proc scheduleExactEventCertificatePull(
-    node: FabricNode, eventId, targetPeerId: string
+proc scheduleExactMissingEventPull(
+    node: FabricNode, eventId, targetPeerId: string, clock: GanzhiClock
 ): bool {.gcsafe, raises: [].} =
   if node.isNil or eventId.len == 0 or targetPeerId.len == 0 or
-      eventId in node.eventCertificates or eventId in node.isolatedEvents or
-      eventId notin node.events:
+      eventId in node.events or eventId in node.isolatedEvents:
     return false
   let item = AntiEntropyPullWorkItem(
-    domain: aedEventCert,
-    key: "eventcert:" & eventId,
+    domain: aedEvent,
+    key: "event:" & eventId,
     causedByEventId: eventId,
     targetPeerId: targetPeerId,
-    clock: node.events.getOrDefault(eventId).clock,
+    clock: clock,
+    priorityClass: node.certificationPullPriorityClass(eventId, clock),
   )
   if not node.witnessPullStillNeeded(item):
     return false
@@ -5196,6 +6106,46 @@ proc scheduleExactEventCertificatePull(
   node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
   if result:
     node.scheduleStateMaintenance()
+
+proc scheduleExactEventCertificatePull(
+    node: FabricNode, eventId, targetPeerId: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0 or targetPeerId.len == 0 or
+      eventId in node.eventCertificates or eventId in node.isolatedEvents or
+      eventId notin node.events:
+    return false
+  let eventClock = node.events.getOrDefault(eventId).clock
+  let item = AntiEntropyPullWorkItem(
+    domain: aedEventCert,
+    key: "eventcert:" & eventId,
+    causedByEventId: eventId,
+    targetPeerId: targetPeerId,
+    clock: eventClock,
+    priorityClass: node.certificationPullPriorityClass(eventId, eventClock),
+  )
+  if not node.witnessPullStillNeeded(item):
+    return false
+  result = node.enqueueWitnessPullWorkItem(item)
+  node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
+  if result:
+    node.scheduleStateMaintenance()
+
+proc scheduleExactEventCertificatePullForEvent(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0 or eventId notin node.events or
+      eventId in node.eventCertificates or
+      node.deferredEventCertificateKnown(eventId) or
+      eventId in node.isolatedEvents:
+    return false
+  let event = node.events.getOrDefault(eventId)
+  let authorRoute = node.eventAuthorRoute(event)
+  if authorRoute.isNone():
+    return false
+  let route = authorRoute.get()
+  if route.peerId.len == 0 or node.routeMatchesSelf(route):
+    return false
+  node.scheduleExactEventCertificatePull(eventId, route.peerId)
 
 proc witnessPullFetchKey(
     item: AntiEntropyPullWorkItem
@@ -5216,26 +6166,39 @@ proc applyAntiEntropyPullPayload(
         return
       result.accepted = true
       result.installed = node.registerEvent(event, enqueuePending = false)
+      if result.installed:
+        discard node.scheduleExactEventCertificatePullForEvent(event.eventId)
     of aedAttParticipant, aedAttWitness:
       let att = decodeObj[EventAttestation](text)
       if attestationFetchKey(att.eventId, att.role, att.signer) != item.key:
         return
       result.accepted = true
       result.installed = node.registerAttestation(att, enqueuePending = false)
-      if result.installed:
-        discard node.scheduleCertificationDependentPulls(att.eventId)
     of aedEventCert:
       let cert = decodeObj[EventCertificate](text)
       if "eventcert:" & cert.eventId != item.key:
         return
       result.accepted = true
+      discard node.rememberDeferredEventCertificateSource(
+        cert.eventId,
+        item.targetPeerId,
+      )
       result.installed = node.registerEventCertificate(
         cert,
         enqueuePending = false,
       )
-      if result.installed:
+      let certSatisfied =
+        cert.eventId in node.eventCertificates or
+        node.deferredEventCertificateKnown(cert.eventId)
+      if cert.eventId notin node.events:
+        discard node.scheduleExactMissingEventPull(
+          cert.eventId,
+          item.targetPeerId,
+          cert.clock,
+        )
+      if certSatisfied:
         discard node.scheduleNextMissingEventCertificatePull(item.targetPeerId)
-      else:
+      if not result.installed:
         discard node.scheduleMissingParentEventCertificatePull(
           cert,
           item.targetPeerId,
@@ -5277,6 +6240,7 @@ proc observeAcceptedAntiEntropyPull(
   proc observeEventDelivery(eventId: string) {.gcsafe, raises: [].} =
     if eventId.len == 0:
       return
+    discard node.rememberEventSourcePeer(eventId, item.targetPeerId)
     let observed = observeInboundPeerDelivery(
       node.eventDeliveries,
       eventId,
@@ -5289,7 +6253,13 @@ proc observeAcceptedAntiEntropyPull(
     if observed.settledOutstanding:
       node.pendingEvents.excl(eventId)
       node.pendingEventScopes.clearPendingScopePrefixes(eventId)
-    discard node.refreshCertificationEvent(eventId, force = true)
+    discard node.driveAuthorGather(
+      eventId,
+      CertificationTrigger(
+        kind: ctEventAck,
+        peerId: item.targetPeerId,
+      ),
+    )
 
   case item.domain
   of aedEvent:
@@ -5381,6 +6351,7 @@ proc witnessPullTask(node: FabricNode, ownerKey: string): Future[void] {.async: 
       node.clearPendingWitnessPullKey(ownerKey, item.key)
       node.inflightWitnessPullByPeer[ownerKey] = item
       var stagedUntilDelivered = false
+
       try:
         if node.witnessPullStillNeeded(item):
           if not node.witnessPullFetchReady(item):
@@ -5417,7 +6388,10 @@ proc witnessPullTask(node: FabricNode, ownerKey: string): Future[void] {.async: 
         if not stagedUntilDelivered:
           discard node.promoteStagedWitnessPulls(item.targetPeerId, item.domain)
         if not stagedUntilDelivered and item.causedByEventId.len > 0 and
-            node.refreshCertificationEvent(item.causedByEventId, force = true):
+            node.driveAuthorGather(
+              item.causedByEventId,
+              CertificationTrigger(kind: ctTopologyChanged),
+            ):
           node.scheduleStateMaintenance()
   except CancelledError:
     discard
@@ -5540,7 +6514,10 @@ proc advanceSingleEvent(
       if node.registerAttestation(att, enqueuePending = false):
         if node.attestationRequiresRelay(event, att):
           if node.attestationNeedsRelay(event, att):
-            touchedAttestationKeys.appendUnique(att.attestationKey())
+            if node.attestationHasRunnableLsmrDelivery(event, att):
+              node.disseminateAttestation(event, att)
+            else:
+              touchedAttestationKeys.appendUnique(att.attestationKey())
           else:
             discard node.routeBlockedAttestations.enqueuePending(att.attestationKey())
 
@@ -5850,10 +6827,13 @@ template queueScopedEventSubmit(
         pendingBook.excl(itemKey)
         clearPendingScopePrefixes(scopeBook, itemKey)
         node.scheduleStateMaintenance()
-      discard node.refreshCertificationEvent(itemKey, force = true)
-      node.signalAntiEntropySummarySync(targetPeerId)
-      node.signalCertificationSummaryPeers(itemKey, excludePeerId = targetPeerId)
-      node.scheduleDeliveredCertificationPulls(itemKey, targetPeerId)
+      discard node.driveAuthorGather(
+        itemKey,
+        CertificationTrigger(
+          kind: ctEventAck,
+          peerId: targetPeerId,
+        ),
+      )
       node.activateDependentDeliveries(itemKey)
     proc handleFailure() {.gcsafe, raises: [].} =
       clearForwarded(forwardedBook, itemKey, targetKey)
@@ -6079,15 +7059,20 @@ proc uniqueRelayRoutesByPeer(
     result.add((route: item.route, scope: @[]))
 
 proc eventCertificateRelayPlans(
-    node: FabricNode, scopePrefixes: seq[LsmrPath] = @[]
+    node: FabricNode, event: FabricEvent, scopePrefixes: seq[LsmrPath] = @[]
 ): seq[RelayPlan] =
   if node.isNil:
     return @[]
   if node.usesLsmrPrimary():
-    return node.lsmrRelayRoutes(
-      relayTargetPaths(node.allRoutingPaths(), scopePrefixes),
+    let sourcePeers = node.eventSourcePeers(event.eventId)
+    for route in node.lsmrRelayRoutes(
+      relayTargetPaths(node.eventCertificateTargetPaths(event), scopePrefixes),
       scopePrefixes,
-    )
+    ):
+      if route.route.peerId.len == 0 or route.route.peerId in sourcePeers:
+        continue
+      result.add(route)
+    return result
   @[]
 
 proc eventLiveWitnessRoutes(
@@ -6119,6 +7104,16 @@ proc eventLiveWitnessRoutes(
 proc eventTargetPaths(node: FabricNode, event: FabricEvent): seq[LsmrPath] =
   result = routingPaths(event.participantRoutes)
   for path in routingPaths(node.eventLiveWitnessRoutes(event)):
+    if path notin result:
+      result.add(path)
+  result = uniqueTargetPaths(result)
+
+proc eventCertificateTargetPaths(
+    node: FabricNode, event: FabricEvent
+): seq[LsmrPath] =
+  discard node
+  result = routingPaths(event.participantRoutes)
+  for path in routingPaths(event.eventWitnessRoutes()):
     if path notin result:
       result.add(path)
   result = uniqueTargetPaths(result)
@@ -6351,6 +7346,7 @@ proc eventCertificateHasRunnableLsmrDelivery(
 ): bool =
   let relayPlans =
     node.eventCertificateRelayPlans(
+      event,
       node.pendingEventCertificateScopes.pendingScopePrefixes(cert.eventId)
     )
   node.eventCertificateHasRunnableLsmrDelivery(event, cert, relayPlans)
@@ -6365,18 +7361,17 @@ proc eventCertificateHasRunnableLsmrDelivery(
     return false
   if not node.usesLsmrPrimary():
     return true
-  if not node.eventDependentsMayRelay(event):
-    return false
-  let requireEventDeliveryGate = node.eventDeliveries.hasOutstandingDelivery(event.eventId)
+  let relayNeeded = node.eventDependentsMayRelay(event)
   var keepTargets = initHashSet[string]()
-  for route in relayPlans:
-    if route.route.account == node.identity.account or route.route.peerId.len == 0:
-      continue
-    let targetPeerId = route.route.peerId
-    if requireEventDeliveryGate and
-        not deliveredToPeer(node.eventDeliveries, event.eventId, targetPeerId):
-      continue
-    keepTargets.incl(deliveryTargetKey(targetPeerId, route.scope))
+  if relayNeeded:
+    for route in relayPlans:
+      if route.route.account == node.identity.account or route.route.peerId.len == 0:
+        continue
+      let targetPeerId = route.route.peerId
+      if not deliveredToPeer(node.eventDeliveries, event.eventId, targetPeerId) and
+          targetPeerId notin node.eventSourcePeers(event.eventId):
+        continue
+      keepTargets.incl(deliveryTargetKey(targetPeerId, route.scope))
   let pruned = pruneObsoleteDeliveryTargets(node.eventCertificateDeliveries, cert.eventId, keepTargets)
   if pruned > 0:
     node.noteLsmrDeliveryMutation()
@@ -6386,12 +7381,14 @@ proc eventCertificateHasRunnableLsmrDelivery(
         " kind=event-certificate item=", cert.eventId,
         " pruned=", pruned,
         " keep=", keepTargets.len
+  if not relayNeeded:
+    return false
   for route in relayPlans:
     if route.route.account == node.identity.account or route.route.peerId.len == 0:
       continue
     let targetPeerId = route.route.peerId
-    if requireEventDeliveryGate and
-        not deliveredToPeer(node.eventDeliveries, event.eventId, targetPeerId):
+    if not deliveredToPeer(node.eventDeliveries, event.eventId, targetPeerId) and
+        targetPeerId notin node.eventSourcePeers(event.eventId):
       continue
     let targetKey = deliveryTargetKey(targetPeerId, route.scope)
     if not deliveryNeedsAttempt(node.eventCertificateDeliveries, cert.eventId, targetKey):
@@ -6660,12 +7657,10 @@ proc checkpointOwnerFrontierClear(
   let outstanding = node.checkpointOwnerOutstanding()
   outstanding.pendingEvents == 0 and
     outstanding.pendingAttestations == 0 and
-    outstanding.pendingEventCerts == 0 and
     outstanding.pendingCertificationEvents == 0 and
     outstanding.pendingWitnessPulls == 0 and
     outstanding.liveEvents == 0 and
-    outstanding.liveAttestations == 0 and
-    outstanding.liveCertificates == 0
+    outstanding.liveAttestations == 0
 
 proc checkpointAdvanceReady(node: FabricNode): bool {.gcsafe, raises: [].} =
   not node.isNil and node.checkpointOwnerFrontierClear()
@@ -6757,19 +7752,22 @@ proc disseminateAttestation(
           let targetKey = deliveryTargetKey(targetPeerId)
           if registerDeliveryTarget(node.attestationDeliveries, att.attestationKey(), targetKey):
             node.noteLsmrDeliveryMutation()
-          block:
-            let submitTargetPeerId = targetPeerId
-            let submitAtt = att
-            node.queueScopedAttestationSubmit(
-              node.forwardedAttestations,
-              node.attestationDeliveries,
-              node.pendingAttestations,
-              node.pendingAttestationScopes,
-              submitAtt.attestationKey(),
-              submitTargetPeerId,
-              newSeq[uint8](),
-              submitAtt,
-            )
+          if node.lsmrSubmitRouteReady(targetPeerId, ospAttestation):
+            block:
+              let submitTargetPeerId = targetPeerId
+              let submitAtt = att
+              node.queueScopedAttestationSubmit(
+                node.forwardedAttestations,
+                node.attestationDeliveries,
+                node.pendingAttestations,
+                node.pendingAttestationScopes,
+                submitAtt.attestationKey(),
+                submitTargetPeerId,
+                newSeq[uint8](),
+                submitAtt,
+              )
+          else:
+            discard node.pendingAttestations.enqueuePending(att.attestationKey())
         else:
           node.submitFuture(node.network.submitAttestation(route.route.peerId, att))
     if node.usesLsmrPrimary() and
@@ -6800,8 +7798,6 @@ proc disseminateEventCertificateWithRelayPlans(
       echo "cert-route account=", node.identity.account,
         " event=", cert.eventId,
         " routes=", routes.mapIt(it.route.peerId & "@" & $it.scope).join(",")
-    let requireEventDeliveryGate = node.eventDeliveries.hasOutstandingDelivery(cert.eventId)
-    var deferred = false
     for route in routes:
       if route.route.account != node.identity.account:
         let targetPeerId = route.route.peerId
@@ -6809,24 +7805,31 @@ proc disseminateEventCertificateWithRelayPlans(
         if node.usesLsmrPrimary():
           if targetPeerId.len == 0:
             continue
-          if requireEventDeliveryGate and
-              not deliveredToPeer(node.eventDeliveries, cert.eventId, targetPeerId):
-            deferred = true
+          if not deliveredToPeer(node.eventDeliveries, cert.eventId, targetPeerId) and
+              targetPeerId notin node.eventSourcePeers(cert.eventId):
             continue
-          node.queueScopedEventCertificateSubmit(
-            node.forwardedEventCertificates,
-            node.eventCertificateDeliveries,
-            node.pendingEventCertificates,
-            node.pendingEventCertificateScopes,
-            cert.eventId,
-            targetPeerId,
-            routeScope,
-            cert,
-          )
+          if node.lsmrSubmitRouteReady(targetPeerId, ospOther):
+            node.queueScopedEventCertificateSubmit(
+              node.forwardedEventCertificates,
+              node.eventCertificateDeliveries,
+              node.pendingEventCertificates,
+              node.pendingEventCertificateScopes,
+              cert.eventId,
+              targetPeerId,
+              routeScope,
+              cert,
+            )
+          else:
+            discard node.markPendingEventCertificate(cert.eventId)
+            discard mergeScopePrefixes(
+              node.pendingEventCertificateScopes,
+              cert.eventId,
+              @[routeScope],
+            )
         else:
           node.submitFuture(node.network.submitEventCertificate(targetPeerId, cert))
     if node.usesLsmrPrimary():
-      if not deferred and not node.eventCertificateDeliveries.hasOutstandingDelivery(cert.eventId):
+      if not node.eventCertificateDeliveries.hasOutstandingDelivery(cert.eventId):
         node.completeEventCertificateDelivery(cert.eventId)
 
 proc disseminateEventCertificate(
@@ -6840,7 +7843,7 @@ proc disseminateEventCertificate(
     certScopes.appendUniquePath(scopePrefix)
   let relayPlans =
     if node.usesLsmrPrimary():
-      node.eventCertificateRelayPlans(certScopes)
+      node.eventCertificateRelayPlans(event, certScopes)
     else:
       @[]
   node.disseminateEventCertificateWithRelayPlans(
@@ -7349,6 +8352,425 @@ proc enqueueInbound(node: FabricNode, message: sink InboundMessage) {.gcsafe, ra
   node.inbound.addLast(message)
   node.scheduleInboundDrain()
 
+proc initInboundDrainState(): InboundDrainState =
+  InboundDrainState(
+    changed: false,
+    checkpointStateChanged: false,
+    touchedEvents: @[],
+    touchedRelayEvents: @[],
+    touchedEventScopes: initTable[string, seq[LsmrPath]](),
+    touchedEventSourcePeers: initTable[string, seq[string]](),
+    touchedAttestationKeys: @[],
+  )
+
+proc finishInboundAccepted(
+    node: FabricNode,
+    state: var InboundDrainState,
+    flushRelayEvents: bool,
+) {.gcsafe, raises: [].} =
+  if node.isNil or not state.changed:
+    return
+  try:
+    if node.usesLsmrPrimary():
+      when defined(fabric_lsmr_diag):
+        echo "drain-stage advance-local account=", node.identity.account,
+          " touched=", state.touchedEvents.len,
+          " inboundRemain=", node.inbound.len
+      {.cast(gcsafe).}:
+        node.advanceTouchedInbound(
+          state.touchedEvents,
+          state.touchedAttestationKeys,
+        )
+      var relayEventIds: seq[string] = @[]
+      var relayEventScopes = initTable[string, seq[LsmrPath]]()
+      var relayEventSourcePeers = initTable[string, seq[string]]()
+      if flushRelayEvents:
+        relayEventIds = state.touchedRelayEvents
+        relayEventScopes = state.touchedEventScopes
+        relayEventSourcePeers = state.touchedEventSourcePeers
+      {.cast(gcsafe).}:
+        node.flushTouchedLsmr(
+          relayEventIds,
+          relayEventScopes,
+          relayEventSourcePeers,
+          state.touchedAttestationKeys,
+        )
+      if state.checkpointStateChanged:
+        node.scheduleCheckpointAdvance()
+    else:
+      when defined(fabric_diag):
+        echo "converge-start ", node.identity.account
+      {.cast(gcsafe).}:
+        node.converge()
+      when defined(fabric_diag):
+        echo "converge-done ", node.identity.account
+  except Exception:
+    discard
+
+proc processInboundMessage(
+    node: FabricNode,
+    message: InboundMessage,
+    state: var InboundDrainState,
+) {.raises: [].} =
+  if node.isNil:
+    return
+  when defined(fabric_diag):
+    echo "drain ", node.identity.account, " kind=", ord(message.kind), " remain=", len(node.inbound)
+  try:
+    case message.kind
+    of imPeerAnnouncement:
+      var item = message.peerAnnouncement
+      item.addrs = normalizeRoutingAddrs(item.addrs)
+      if item.account.len == 0 or item.peerId.len == 0 or
+          item.publicKey.len == 0 or item.signature.len == 0 or
+          item.account == node.identity.account:
+        return
+      let publicKey = PublicKey.init(item.publicKey).valueOr:
+        return
+      if accountFromPublicKey(publicKey) != item.account:
+        return
+      let announcedPeerId = PeerId.init(item.peerId).valueOr:
+        return
+      if not announcedPeerId.match(publicKey):
+        return
+      if not verifyBytes(publicKey, item.peerAnnouncementSigningBytes(), item.signature):
+        return
+      let existing = node.routingAnnouncements.getOrDefault(item.account, PeerAnnouncement())
+      if existing.account.len > 0 and
+          item.peerAnnouncementVersion() <= existing.peerAnnouncementVersion():
+        return
+      node.routingAnnouncements[item.account] = item
+      node.routingPeers[item.account] = item.routingPeerFromAnnouncement()
+      if not node.network.isNil and not node.network.switch.isNil:
+        var addrs: seq[MultiAddress] = @[]
+        for raw in item.addrs:
+          let parsed = MultiAddress.init(raw)
+          if parsed.isOk():
+            addrs.add(parsed.get())
+        if addrs.len > 0:
+          node.network.switch.peerStore.setAddresses(announcedPeerId, addrs)
+          node.network.rememberSubmitPeerAddrs(announcedPeerId, addrs)
+    of imEvent:
+      let registered = node.registerEvent(message.event, enqueuePending = false)
+      if registered:
+        discard node.scheduleExactEventCertificatePullForEvent(
+          message.event.eventId,
+        )
+      let eventCertified = message.event.eventId in node.eventCertificates
+      var deliveryObserved = false
+      if message.sourcePeerId.len > 0:
+        discard node.rememberEventSourcePeer(
+          message.event.eventId,
+          message.sourcePeerId,
+        )
+        clearForwardedPeer(node.forwardedEvents, message.event.eventId, message.sourcePeerId)
+        let deliveryObservation = observeInboundPeerDelivery(
+          node.eventDeliveries,
+          message.event.eventId,
+          message.sourcePeerId,
+        )
+        if deliveryObservation.observed:
+          node.noteLsmrDeliveryMutation()
+          deliveryObserved = true
+          if deliveryObservation.settledOutstanding:
+            node.pendingEvents.excl(message.event.eventId)
+            node.pendingEventScopes.clearPendingScopePrefixes(message.event.eventId)
+          when defined(fabric_submit_diag):
+            echo "delivery-observed account=", node.identity.account,
+              " kind=event item=", message.event.eventId,
+              " source=", message.sourcePeerId
+      let scopeChanged =
+        if message.relayScope.len > 0 and not eventCertified:
+          discard node.pendingEvents.enqueuePending(message.event.eventId)
+          let changed =
+            node.pendingEventScopes.mergeScopePrefixes(
+              message.event.eventId,
+              @[message.relayScope],
+            )
+          if changed:
+            discard state.touchedEventScopes.mergeScopePrefixes(
+              message.event.eventId,
+              @[message.relayScope],
+            )
+          changed
+        else:
+          false
+      if message.sourcePeerId.len > 0:
+        var sources = state.touchedEventSourcePeers.getOrDefault(message.event.eventId, @[])
+        sources.appendUniqueText(message.sourcePeerId)
+        state.touchedEventSourcePeers[message.event.eventId] = sources
+      state.changed = registered or scopeChanged or deliveryObserved or state.changed
+      if not eventCertified:
+        state.touchedEvents.appendUnique(message.event.eventId)
+      if not eventCertified and (registered or scopeChanged):
+        state.touchedRelayEvents.appendUnique(message.event.eventId)
+    of imAttestation:
+      let registered = node.registerAttestation(message.attestation, enqueuePending = false)
+      let eventCertified = message.attestation.eventId in node.eventCertificates
+      var deliveryObserved = false
+      if message.sourcePeerId.len > 0:
+        node.clearSummaryPullAvailable(
+          message.sourcePeerId,
+          attestationFetchKey(
+            message.attestation.eventId,
+            message.attestation.role,
+            message.attestation.signer,
+          ),
+        )
+        let attKey = message.attestation.attestationKey()
+        clearForwardedPeer(node.forwardedAttestations, attKey, message.sourcePeerId)
+        let attObservation = observeInboundPeerDelivery(
+          node.attestationDeliveries,
+          attKey,
+          message.sourcePeerId,
+        )
+        if attObservation.observed:
+          node.noteLsmrDeliveryMutation()
+          deliveryObserved = true
+          if attObservation.settledOutstanding:
+            node.pendingAttestations.excl(attKey)
+            node.pendingAttestationScopes.clearPendingScopePrefixes(attKey)
+          when defined(fabric_submit_diag):
+            echo "delivery-observed account=", node.identity.account,
+                " kind=attestation item=", attKey,
+                " source=", message.sourcePeerId
+        clearForwardedPeer(node.forwardedEvents, message.attestation.eventId, message.sourcePeerId)
+        let eventObservation = observeInboundPeerDelivery(
+          node.eventDeliveries,
+          message.attestation.eventId,
+          message.sourcePeerId,
+        )
+        if eventObservation.observed:
+          node.noteLsmrDeliveryMutation()
+          deliveryObserved = true
+          if eventObservation.settledOutstanding:
+            node.pendingEvents.excl(message.attestation.eventId)
+            node.pendingEventScopes.clearPendingScopePrefixes(message.attestation.eventId)
+          when defined(fabric_submit_diag):
+            echo "delivery-observed account=", node.identity.account,
+              " kind=event-from-att item=", message.attestation.eventId,
+              " source=", message.sourcePeerId
+      state.changed = registered or deliveryObserved or state.changed
+      if not eventCertified:
+        state.touchedEvents.appendUnique(message.attestation.eventId)
+    of imAntiEntropyPull:
+      let applyResult = node.applyAntiEntropyPullPayload(
+        message.antiEntropyPullItem,
+        message.antiEntropyPullPayload,
+      )
+      if applyResult.accepted:
+        node.observeAcceptedAntiEntropyPull(message.antiEntropyPullItem)
+        if message.antiEntropyPullItem.targetPeerId.len > 0:
+          node.ensureAntiEntropySummarySync(message.antiEntropyPullItem.targetPeerId)
+        if message.antiEntropyPullItem.causedByEventId.len > 0:
+          discard node.driveAuthorGather(
+            message.antiEntropyPullItem.causedByEventId,
+            CertificationTrigger(
+              kind: ctExactPullAccepted,
+              peerId: message.antiEntropyPullItem.targetPeerId,
+              key: message.antiEntropyPullItem.key,
+            ),
+          )
+      when defined(fabric_submit_diag):
+        echo "anti-entropy exact-apply account=", node.identity.account,
+          " domain=", antiEntropyDomainLabel(message.antiEntropyPullItem.domain),
+          " key=", message.antiEntropyPullItem.key,
+          " accepted=", applyResult.accepted,
+          " installed=", applyResult.installed
+      state.changed = applyResult.installed or state.changed
+      if applyResult.accepted and message.antiEntropyPullItem.causedByEventId.len > 0:
+        state.touchedEvents.appendUnique(message.antiEntropyPullItem.causedByEventId)
+    of imEventCertificate:
+      let missingParentId =
+        node.missingParentEventCertificate(message.eventCertificate)
+      if message.sourcePeerId.len > 0:
+        discard node.rememberEventSourcePeer(
+          message.eventCertificate.eventId,
+          message.sourcePeerId,
+        )
+        discard node.rememberDeferredEventCertificateSource(
+          message.eventCertificate.eventId,
+          message.sourcePeerId,
+        )
+      let registered = node.registerEventCertificate(
+        message.eventCertificate,
+        enqueuePending = false,
+      )
+      if not registered and missingParentId.len > 0 and
+          message.sourcePeerId.len > 0:
+        discard node.scheduleMissingParentEventCertificatePull(
+          message.eventCertificate,
+          message.sourcePeerId,
+        )
+      if not registered and message.eventCertificate.eventId notin node.events and
+          message.sourcePeerId.len > 0:
+        discard node.scheduleExactMissingEventPull(
+          message.eventCertificate.eventId,
+          message.sourcePeerId,
+          message.eventCertificate.clock,
+        )
+      let scopeChanged =
+        if message.relayScope.len > 0:
+          discard node.markPendingEventCertificate(message.eventCertificate.eventId)
+          node.pendingEventCertificateScopes.mergeScopePrefixes(
+            message.eventCertificate.eventId,
+            @[message.relayScope],
+          )
+        else:
+          false
+      var deliveryObserved = false
+      if message.sourcePeerId.len > 0:
+        let certTargetKey =
+          deliveryTargetKey(message.sourcePeerId, message.relayScope)
+        let certObservation =
+          if message.relayScope.len > 0:
+            clearForwarded(
+              node.forwardedEventCertificates,
+              message.eventCertificate.eventId,
+              certTargetKey,
+            )
+            observeInboundTargetDelivery(
+              node.eventCertificateDeliveries,
+              message.eventCertificate.eventId,
+              certTargetKey,
+            )
+          else:
+            clearForwardedPeer(
+              node.forwardedEventCertificates,
+              message.eventCertificate.eventId,
+              message.sourcePeerId,
+            )
+            observeInboundPeerDelivery(
+              node.eventCertificateDeliveries,
+              message.eventCertificate.eventId,
+              message.sourcePeerId,
+            )
+        if certObservation.observed:
+          node.noteLsmrDeliveryMutation()
+          deliveryObserved = true
+          if certObservation.settledOutstanding:
+            node.completeEventCertificateDelivery(
+              message.eventCertificate.eventId,
+            )
+          when defined(fabric_submit_diag):
+            echo "delivery-observed account=", node.identity.account,
+                " kind=event-certificate item=", message.eventCertificate.eventId,
+                " source=", message.sourcePeerId
+        clearForwardedPeer(node.forwardedEvents, message.eventCertificate.eventId, message.sourcePeerId)
+        let eventObservation = observeInboundPeerDelivery(
+          node.eventDeliveries,
+          message.eventCertificate.eventId,
+          message.sourcePeerId,
+        )
+        if eventObservation.observed:
+          node.noteLsmrDeliveryMutation()
+          deliveryObserved = true
+          if eventObservation.settledOutstanding:
+            node.pendingEvents.excl(message.eventCertificate.eventId)
+            node.pendingEventScopes.clearPendingScopePrefixes(message.eventCertificate.eventId)
+          when defined(fabric_submit_diag):
+            echo "delivery-observed account=", node.identity.account,
+              " kind=event-from-cert item=", message.eventCertificate.eventId,
+              " source=", message.sourcePeerId
+      state.changed = registered or scopeChanged or deliveryObserved or state.changed
+    of imCheckpointCandidate:
+      let candidateId = message.checkpointCandidate.candidateId
+      let registered = node.registerCandidate(message.checkpointCandidate)
+      var deliveryObserved = false
+      if message.sourcePeerId.len > 0:
+        clearForwardedPeer(
+          node.forwardedCheckpointCandidates,
+          candidateId,
+          message.sourcePeerId,
+        )
+        deliveryObserved = observeGlobalPeerDelivery(
+          node.checkpointCandidateDeliveries,
+          candidateId,
+          message.sourcePeerId,
+        ) or deliveryObserved
+        if not node.checkpointCandidateDeliveries.hasOutstandingDelivery(candidateId):
+          node.completeCheckpointCandidateDelivery(candidateId)
+        when defined(fabric_submit_diag):
+          if deliveryObserved:
+            echo "delivery-observed account=", node.identity.account,
+              " kind=checkpoint-candidate item=", candidateId,
+              " source=", message.sourcePeerId
+      state.changed = registered or deliveryObserved or state.changed
+      state.checkpointStateChanged = true
+    of imCheckpointVote:
+      let voteKey = message.checkpointVote.checkpointVoteKey()
+      let registered = node.registerCheckpointVote(message.checkpointVote)
+      var deliveryObserved = false
+      if message.sourcePeerId.len > 0:
+        clearForwardedPeer(node.forwardedCheckpointVotes, voteKey, message.sourcePeerId)
+        deliveryObserved = observeGlobalPeerDelivery(
+          node.checkpointVoteDeliveries,
+          voteKey,
+          message.sourcePeerId,
+        ) or deliveryObserved
+        if not node.checkpointVoteDeliveries.hasOutstandingDelivery(voteKey):
+          node.completeCheckpointVoteDelivery(voteKey)
+        when defined(fabric_submit_diag):
+          if deliveryObserved:
+            echo "delivery-observed account=", node.identity.account,
+              " kind=checkpoint-vote item=", voteKey,
+              " source=", message.sourcePeerId
+      state.changed = registered or deliveryObserved or state.changed
+      state.checkpointStateChanged = true
+    of imCheckpointBundle:
+      let bundle = message.checkpointBundle
+      var deliveryObserved = false
+      if message.sourcePeerId.len > 0:
+        let checkpointId = bundle.certificate.checkpointId
+        clearForwardedPeer(node.forwardedCheckpointBundles, checkpointId, message.sourcePeerId)
+        deliveryObserved = observeGlobalPeerDelivery(
+          node.checkpointBundleDeliveries,
+          checkpointId,
+          message.sourcePeerId,
+        ) or deliveryObserved
+        if not node.checkpointBundleDeliveries.hasOutstandingDelivery(checkpointId):
+          node.completeCheckpointBundleDelivery(checkpointId)
+        when defined(fabric_submit_diag):
+          if deliveryObserved:
+            echo "delivery-observed account=", node.identity.account,
+              " kind=checkpoint-bundle item=", checkpointId,
+              " source=", message.sourcePeerId
+      if bundle.snapshot.len > 0 and bundle.certificate.checkpointId notin node.checkpoints:
+        node.checkpointBundleCache[bundle.certificate.checkpointId] = bundle
+        let registered = node.registerCheckpoint(
+          bundle.certificate,
+          decodePolarSnapshot(bundle.snapshot),
+        )
+        state.changed = registered or deliveryObserved or state.changed
+        state.checkpointStateChanged = registered or state.checkpointStateChanged
+      else:
+        state.changed = deliveryObserved or state.changed
+      state.checkpointStateChanged = true
+    of imAvoProposal:
+      state.changed = node.registerAvoProposal(message.avoProposal) or state.changed
+      state.checkpointStateChanged = true
+    of imAvoApproval:
+      state.changed = node.registerAvoApproval(message.proposalId, message.validator) or state.changed
+      state.checkpointStateChanged = true
+  except Exception:
+    discard
+
+proc drainInboundNow(node: FabricNode): bool {.gcsafe, raises: [].} =
+  if node.isNil or not node.running:
+    return false
+  try:
+    {.cast(gcsafe).}:
+      node.drainInbound()
+  except Exception:
+    false
+
+proc acceptInboundNow(
+    node: FabricNode, message: InboundMessage
+) {.gcsafe, raises: [].} =
+  if node.isNil or not node.running:
+    return
+  node.enqueueInbound(message)
+
 proc selfAnnouncement(node: FabricNode): PeerAnnouncement =
   let route = node.selfRoutingPeer()
   let publicKey = encodePublicKeyHex(node.identity.publicKey)
@@ -7409,7 +8831,13 @@ proc observeAntiEntropyFetchDelivery(
       node.noteLsmrDeliveryMutation()
       if observed.settledOutstanding:
         node.completeEventDelivery(eventId)
-      discard node.refreshCertificationEvent(eventId, force = true)
+      discard node.driveAuthorGather(
+        eventId,
+        CertificationTrigger(
+          kind: ctEventAck,
+          peerId: requesterPeerId,
+        ),
+      )
       node.scheduleStateMaintenance()
     return
   if baseKey.startsWith("attestation:"):
@@ -7444,7 +8872,13 @@ proc observeAntiEntropyFetchDelivery(
       if eventObserved.settledOutstanding:
         node.pendingEvents.excl(eventId)
         node.pendingEventScopes.clearPendingScopePrefixes(eventId)
-      discard node.refreshCertificationEvent(eventId, force = true)
+      discard node.driveAuthorGather(
+        eventId,
+        CertificationTrigger(
+          kind: ctEventAck,
+          peerId: requesterPeerId,
+        ),
+      )
     if observed.settledOutstanding or
         attKey in node.pendingAttestations or attKey in node.routeBlockedAttestations:
       node.completeAttestationDelivery(attKey)
@@ -7468,10 +8902,16 @@ proc observeAntiEntropyFetchDelivery(
       )
       if eventObserved.observed:
         node.noteLsmrDeliveryMutation()
-        if eventObserved.settledOutstanding:
-          node.pendingEvents.excl(eventId)
-          node.pendingEventScopes.clearPendingScopePrefixes(eventId)
-        discard node.refreshCertificationEvent(eventId, force = true)
+        discard node.driveAuthorGather(
+          eventId,
+          CertificationTrigger(
+            kind: ctEventAck,
+            peerId: requesterPeerId,
+          ),
+        )
+      if eventObserved.settledOutstanding:
+        node.pendingEvents.excl(eventId)
+        node.pendingEventScopes.clearPendingScopePrefixes(eventId)
       if observed.settledOutstanding:
         node.completeEventCertificateDelivery(eventId)
       node.scheduleStateMaintenance()
@@ -7525,29 +8965,9 @@ proc fetchLookupRaw(node: FabricNode, key: string): Option[seq[byte]] {.gcsafe, 
       return some(bytesOf(encodeObj(node.selfAnnouncement())))
     if baseKey == "peer:table":
       return some(bytesOf(encodeObj(node.knownPeerAnnouncements())))
-    if baseKey == "summary:root":
-      return some(bytesOf(encodeObj(node.antiEntropyRootSummary())))
-    if baseKey.startsWith("summary:era:"):
-      let parts = baseKey.split(":")
-      if parts.len != 4:
-        return none(seq[byte])
-      let domain = parseAntiEntropyDomain(parts[2])
-      if domain.isNone():
-        return none(seq[byte])
-      let era = parseUInt(parts[3])
-      return some(bytesOf(encodeObj(node.antiEntropyEraSummary(domain.get(), era))))
-    if baseKey.startsWith("summary:tick:"):
-      let parts = baseKey.split(":")
-      if parts.len != 5:
-        return none(seq[byte])
-      let domain = parseAntiEntropyDomain(parts[2])
-      if domain.isNone():
-        return none(seq[byte])
-      let era = parseUInt(parts[3])
-      let tick = parseUInt(parts[4])
-      return some(bytesOf(encodeObj(
-        node.antiEntropyTickSummary(domain.get(), era, tick)
-      )))
+    let summaryPayload = node.cachedAntiEntropySummaryRaw(baseKey)
+    if summaryPayload.isSome():
+      return summaryPayload
     if node.store.isNil:
       return none(seq[byte])
     if baseKey == "checkpoint:latest":
@@ -7573,7 +8993,12 @@ proc fetchLookupRaw(node: FabricNode, key: string): Option[seq[byte]] {.gcsafe, 
         node.observeAntiEntropyFetchDelivery(baseKey, requesterPeerId)
       return payload
     if baseKey.startsWith("eventcert:"):
-      let payload = node.store.loadEventCertificateRaw(baseKey["eventcert:".len .. ^1])
+      let eventId = baseKey["eventcert:".len .. ^1]
+      var payload = node.store.loadEventCertificateRaw(eventId)
+      if payload.isNone():
+        let buffered = node.deferredEventCertificate(eventId)
+        if buffered.isSome():
+          payload = some(bytesOf(encodeObj(buffered.get())))
       if payload.isSome():
         node.observeAntiEntropyFetchDelivery(baseKey, requesterPeerId)
       return payload
@@ -7602,367 +9027,22 @@ proc fetchLookupRaw(node: FabricNode, key: string): Option[seq[byte]] {.gcsafe, 
 proc drainInbound(node: FabricNode): bool {.raises: [].} =
   if node.isNil or not node.running:
     return false
-  var changed = false
-  var checkpointStateChanged = false
-  var touchedEvents: seq[string] = @[]
-  var touchedRelayEvents: seq[string] = @[]
-  var touchedEventScopes = initTable[string, seq[LsmrPath]]()
-  var touchedEventSourcePeers = initTable[string, seq[string]]()
-  var touchedAttestationKeys: seq[string] = @[]
+  var state = initInboundDrainState()
   let sliceStartedAtMs = diagNowMs()
   var processed = 0
   while processed < FabricInboundDrainBatchLimit:
-    if node.inbound.len == 0:
-      break
     if processed > 0 and diagNowMs() - sliceStartedAtMs >= FabricInboundSliceBudgetMs:
       when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
         echo "fabric-inbound slice-yield account=", node.identity.account,
           " processed=", processed,
           " remain=", node.inbound.len
       break
+    if node.inbound.len == 0:
+      break
     let message = node.inbound.popFirst()
     inc processed
-    when defined(fabric_diag):
-      echo "drain ", node.identity.account, " kind=", ord(message.kind), " remain=", len(node.inbound)
-    try:
-      case message.kind
-      of imPeerAnnouncement:
-        var item = message.peerAnnouncement
-        item.addrs = normalizeRoutingAddrs(item.addrs)
-        if item.account.len == 0 or item.peerId.len == 0 or
-            item.publicKey.len == 0 or item.signature.len == 0 or
-            item.account == node.identity.account:
-          continue
-        let publicKey = PublicKey.init(item.publicKey).valueOr:
-          continue
-        if accountFromPublicKey(publicKey) != item.account:
-          continue
-        let announcedPeerId = PeerId.init(item.peerId).valueOr:
-          continue
-        if not announcedPeerId.match(publicKey):
-          continue
-        if not verifyBytes(publicKey, item.peerAnnouncementSigningBytes(), item.signature):
-          continue
-        let existing = node.routingAnnouncements.getOrDefault(item.account, PeerAnnouncement())
-        if existing.account.len > 0 and
-            item.peerAnnouncementVersion() <= existing.peerAnnouncementVersion():
-          continue
-        node.routingAnnouncements[item.account] = item
-        node.routingPeers[item.account] = item.routingPeerFromAnnouncement()
-        if not node.network.isNil and not node.network.switch.isNil:
-          var addrs: seq[MultiAddress] = @[]
-          for raw in item.addrs:
-            let parsed = MultiAddress.init(raw)
-            if parsed.isOk():
-              addrs.add(parsed.get())
-          if addrs.len > 0:
-            node.network.switch.peerStore.setAddresses(announcedPeerId, addrs)
-            node.network.rememberSubmitPeerAddrs(announcedPeerId, addrs)
-      of imEvent:
-        let registered = node.registerEvent(message.event, enqueuePending = false)
-        let eventCertified = message.event.eventId in node.eventCertificates
-        var deliveryObserved = false
-        if message.sourcePeerId.len > 0:
-          clearForwardedPeer(node.forwardedEvents, message.event.eventId, message.sourcePeerId)
-          let deliveryObservation = observeInboundPeerDelivery(
-            node.eventDeliveries,
-            message.event.eventId,
-            message.sourcePeerId,
-          )
-          if deliveryObservation.observed:
-            node.noteLsmrDeliveryMutation()
-            deliveryObserved = true
-            if deliveryObservation.settledOutstanding:
-              node.pendingEvents.excl(message.event.eventId)
-              node.pendingEventScopes.clearPendingScopePrefixes(message.event.eventId)
-            when defined(fabric_submit_diag):
-              echo "delivery-observed account=", node.identity.account,
-                " kind=event item=", message.event.eventId,
-                " source=", message.sourcePeerId
-        let scopeChanged =
-          if message.relayScope.len > 0 and not eventCertified:
-            discard node.pendingEvents.enqueuePending(message.event.eventId)
-            let changed =
-              node.pendingEventScopes.mergeScopePrefixes(
-                message.event.eventId,
-                @[message.relayScope],
-              )
-            if changed:
-              discard touchedEventScopes.mergeScopePrefixes(
-                message.event.eventId,
-                @[message.relayScope],
-              )
-            changed
-          else:
-            false
-        if message.sourcePeerId.len > 0:
-          var sources = touchedEventSourcePeers.getOrDefault(message.event.eventId, @[])
-          sources.appendUniqueText(message.sourcePeerId)
-          touchedEventSourcePeers[message.event.eventId] = sources
-        changed = registered or scopeChanged or deliveryObserved or changed
-        if not eventCertified:
-          touchedEvents.appendUnique(message.event.eventId)
-        if not eventCertified and (registered or scopeChanged):
-          touchedRelayEvents.appendUnique(message.event.eventId)
-      of imAttestation:
-        let registered = node.registerAttestation(message.attestation, enqueuePending = false)
-        let eventCertified = message.attestation.eventId in node.eventCertificates
-        var deliveryObserved = false
-        if message.sourcePeerId.len > 0:
-          node.clearSummaryPullAvailable(
-            message.sourcePeerId,
-            attestationFetchKey(
-              message.attestation.eventId,
-              message.attestation.role,
-              message.attestation.signer,
-            ),
-          )
-          let attKey = message.attestation.attestationKey()
-          clearForwardedPeer(node.forwardedAttestations, attKey, message.sourcePeerId)
-          let attObservation = observeInboundPeerDelivery(
-            node.attestationDeliveries,
-            attKey,
-            message.sourcePeerId,
-          )
-          if attObservation.observed:
-            node.noteLsmrDeliveryMutation()
-            deliveryObserved = true
-            if attObservation.settledOutstanding:
-              node.pendingAttestations.excl(attKey)
-              node.pendingAttestationScopes.clearPendingScopePrefixes(attKey)
-            when defined(fabric_submit_diag):
-              echo "delivery-observed account=", node.identity.account,
-                  " kind=attestation item=", attKey,
-                  " source=", message.sourcePeerId
-          clearForwardedPeer(node.forwardedEvents, message.attestation.eventId, message.sourcePeerId)
-          let eventObservation = observeInboundPeerDelivery(
-            node.eventDeliveries,
-            message.attestation.eventId,
-            message.sourcePeerId,
-          )
-          if eventObservation.observed:
-            node.noteLsmrDeliveryMutation()
-            deliveryObserved = true
-            if eventObservation.settledOutstanding:
-              node.pendingEvents.excl(message.attestation.eventId)
-              node.pendingEventScopes.clearPendingScopePrefixes(message.attestation.eventId)
-            when defined(fabric_submit_diag):
-              echo "delivery-observed account=", node.identity.account,
-                " kind=event-from-att item=", message.attestation.eventId,
-                " source=", message.sourcePeerId
-        changed = registered or deliveryObserved or changed
-        if not eventCertified:
-          touchedEvents.appendUnique(message.attestation.eventId)
-      of imAntiEntropyPull:
-        let applyResult = node.applyAntiEntropyPullPayload(
-          message.antiEntropyPullItem,
-          message.antiEntropyPullPayload,
-        )
-        if applyResult.accepted:
-          node.observeAcceptedAntiEntropyPull(message.antiEntropyPullItem)
-          if message.antiEntropyPullItem.targetPeerId.len > 0:
-            node.ensureAntiEntropySummarySync(message.antiEntropyPullItem.targetPeerId)
-        when defined(fabric_submit_diag):
-          echo "anti-entropy exact-apply account=", node.identity.account,
-            " domain=", antiEntropyDomainLabel(message.antiEntropyPullItem.domain),
-            " key=", message.antiEntropyPullItem.key,
-            " accepted=", applyResult.accepted,
-            " installed=", applyResult.installed
-        changed = applyResult.installed or changed
-        if applyResult.accepted and message.antiEntropyPullItem.causedByEventId.len > 0:
-          touchedEvents.appendUnique(message.antiEntropyPullItem.causedByEventId)
-      of imEventCertificate:
-        let missingParentId =
-          node.missingParentEventCertificate(message.eventCertificate)
-        let registered = node.registerEventCertificate(
-          message.eventCertificate,
-          enqueuePending = false,
-        )
-        if not registered and missingParentId.len > 0 and
-            message.sourcePeerId.len > 0:
-          discard node.scheduleMissingParentEventCertificatePull(
-            message.eventCertificate,
-            message.sourcePeerId,
-          )
-        let scopeChanged =
-          if message.relayScope.len > 0:
-            discard node.markPendingEventCertificate(message.eventCertificate.eventId)
-            node.pendingEventCertificateScopes.mergeScopePrefixes(
-              message.eventCertificate.eventId,
-              @[message.relayScope],
-            )
-          else:
-            false
-        var deliveryObserved = false
-        if message.sourcePeerId.len > 0:
-          let certTargetKey =
-            deliveryTargetKey(message.sourcePeerId, message.relayScope)
-          let certObservation =
-            if message.relayScope.len > 0:
-              clearForwarded(
-                node.forwardedEventCertificates,
-                message.eventCertificate.eventId,
-                certTargetKey,
-              )
-              observeInboundTargetDelivery(
-                node.eventCertificateDeliveries,
-                message.eventCertificate.eventId,
-                certTargetKey,
-              )
-            else:
-              clearForwardedPeer(
-                node.forwardedEventCertificates,
-                message.eventCertificate.eventId,
-                message.sourcePeerId,
-              )
-              observeInboundPeerDelivery(
-                node.eventCertificateDeliveries,
-                message.eventCertificate.eventId,
-                message.sourcePeerId,
-              )
-          if certObservation.observed:
-            node.noteLsmrDeliveryMutation()
-            deliveryObserved = true
-            if certObservation.settledOutstanding:
-              node.completeEventCertificateDelivery(
-                message.eventCertificate.eventId,
-              )
-            when defined(fabric_submit_diag):
-              echo "delivery-observed account=", node.identity.account,
-                  " kind=event-certificate item=", message.eventCertificate.eventId,
-                  " source=", message.sourcePeerId
-          clearForwardedPeer(node.forwardedEvents, message.eventCertificate.eventId, message.sourcePeerId)
-          let eventObservation = observeInboundPeerDelivery(
-            node.eventDeliveries,
-            message.eventCertificate.eventId,
-            message.sourcePeerId,
-          )
-          if eventObservation.observed:
-            node.noteLsmrDeliveryMutation()
-            deliveryObserved = true
-            if eventObservation.settledOutstanding:
-              node.pendingEvents.excl(message.eventCertificate.eventId)
-              node.pendingEventScopes.clearPendingScopePrefixes(message.eventCertificate.eventId)
-            when defined(fabric_submit_diag):
-              echo "delivery-observed account=", node.identity.account,
-                " kind=event-from-cert item=", message.eventCertificate.eventId,
-                " source=", message.sourcePeerId
-        changed = registered or scopeChanged or deliveryObserved or changed
-      of imCheckpointCandidate:
-        let candidateId = message.checkpointCandidate.candidateId
-        let registered = node.registerCandidate(message.checkpointCandidate)
-        var deliveryObserved = false
-        if message.sourcePeerId.len > 0:
-          clearForwardedPeer(
-            node.forwardedCheckpointCandidates,
-            candidateId,
-            message.sourcePeerId,
-          )
-          deliveryObserved = observeGlobalPeerDelivery(
-            node.checkpointCandidateDeliveries,
-            candidateId,
-            message.sourcePeerId,
-          ) or deliveryObserved
-          if not node.checkpointCandidateDeliveries.hasOutstandingDelivery(candidateId):
-            node.completeCheckpointCandidateDelivery(candidateId)
-          when defined(fabric_submit_diag):
-            if deliveryObserved:
-              echo "delivery-observed account=", node.identity.account,
-                " kind=checkpoint-candidate item=", candidateId,
-                " source=", message.sourcePeerId
-        changed = registered or deliveryObserved or changed
-        checkpointStateChanged = true
-      of imCheckpointVote:
-        let voteKey = message.checkpointVote.checkpointVoteKey()
-        let registered = node.registerCheckpointVote(message.checkpointVote)
-        var deliveryObserved = false
-        if message.sourcePeerId.len > 0:
-          clearForwardedPeer(
-            node.forwardedCheckpointVotes,
-            voteKey,
-            message.sourcePeerId,
-          )
-          deliveryObserved = observeGlobalPeerDelivery(
-            node.checkpointVoteDeliveries,
-            voteKey,
-            message.sourcePeerId,
-          ) or deliveryObserved
-          if not node.checkpointVoteDeliveries.hasOutstandingDelivery(voteKey):
-            node.completeCheckpointVoteDelivery(voteKey)
-          when defined(fabric_submit_diag):
-            if deliveryObserved:
-              echo "delivery-observed account=", node.identity.account,
-                " kind=checkpoint-vote item=", voteKey,
-                " source=", message.sourcePeerId
-        changed = registered or deliveryObserved or changed
-        checkpointStateChanged = true
-      of imCheckpointBundle:
-        let bundle = message.checkpointBundle
-        var deliveryObserved = false
-        if message.sourcePeerId.len > 0:
-          clearForwardedPeer(
-            node.forwardedCheckpointBundles,
-            bundle.certificate.checkpointId,
-            message.sourcePeerId,
-          )
-          deliveryObserved = observeGlobalPeerDelivery(
-            node.checkpointBundleDeliveries,
-            bundle.certificate.checkpointId,
-            message.sourcePeerId,
-          ) or deliveryObserved
-          if not node.checkpointBundleDeliveries.hasOutstandingDelivery(bundle.certificate.checkpointId):
-            node.completeCheckpointBundleDelivery(bundle.certificate.checkpointId)
-          when defined(fabric_submit_diag):
-            if deliveryObserved:
-              echo "delivery-observed account=", node.identity.account,
-                " kind=checkpoint-bundle item=", bundle.certificate.checkpointId,
-                " source=", message.sourcePeerId
-        if bundle.snapshot.len > 0 and bundle.certificate.checkpointId notin node.checkpoints:
-          node.checkpointBundleCache[bundle.certificate.checkpointId] = bundle
-          let registered = node.registerCheckpoint(
-            bundle.certificate,
-            decodePolarSnapshot(bundle.snapshot),
-          )
-          changed = registered or deliveryObserved or changed
-          checkpointStateChanged = registered or checkpointStateChanged
-        else:
-          changed = deliveryObserved or changed
-        checkpointStateChanged = true
-      of imAvoProposal:
-        changed = node.registerAvoProposal(message.avoProposal) or changed
-        checkpointStateChanged = true
-      of imAvoApproval:
-        changed = node.registerAvoApproval(message.proposalId, message.validator) or changed
-        checkpointStateChanged = true
-    except Exception:
-      discard
-  if changed:
-    try:
-      if node.usesLsmrPrimary():
-        when defined(fabric_lsmr_diag):
-          echo "drain-stage advance-local account=", node.identity.account,
-            " touched=", touchedEvents.len,
-            " inboundRemain=", node.inbound.len
-        node.advanceTouchedInbound(
-          touchedEvents,
-          touchedAttestationKeys,
-        )
-        node.flushTouchedLsmr(
-          touchedRelayEvents,
-          touchedEventScopes,
-          touchedEventSourcePeers,
-          touchedAttestationKeys,
-        )
-        if checkpointStateChanged:
-          node.scheduleCheckpointAdvance()
-      else:
-        when defined(fabric_diag):
-          echo "converge-start ", node.identity.account
-        node.converge()
-        when defined(fabric_diag):
-          echo "converge-done ", node.identity.account
-    except Exception:
-      discard
+    node.processInboundMessage(message, state)
+  node.finishInboundAccepted(state, flushRelayEvents = true)
   node.inbound.len > 0
 
 
@@ -8086,8 +9166,6 @@ proc antiEntropyNeedsSync(node: FabricNode): bool {.gcsafe, raises: [].} =
       return true
     if node.certificationMissingWitnessPulls(eventId).len > 0:
       return true
-  if node.missingEventCertificatePulls().len > 0:
-    return true
   if node.antiEntropyCheckpointCandidateNeeded():
     return true
   if node.antiEntropyCheckpointVoteNeeded():
@@ -8117,7 +9195,8 @@ proc antiEntropyDomainNeeded(
       if item.domain == domain:
         return true
     if domain == aedEventCert:
-      return node.missingEventCertificatePulls().len > 0
+      return node.antiEntropyMissingEventNeeded() and
+        node.missingEventCertificatePulls().len > 0
     for eventId in node.pendingCertificationEvents:
       if not node.certificationEventTracked(eventId):
         continue
@@ -8148,6 +9227,54 @@ proc antiEntropySummaryTargetPeers(node: FabricNode): seq[string] {.gcsafe, rais
     result.add(peerIdText)
   result.sort(system.cmp[string])
 
+proc antiEntropySummaryRefreshSlotOffsetMs(
+    node: FabricNode, peerIdText: string
+): int64 {.gcsafe, raises: [].} =
+  if node.isNil or peerIdText.len == 0 or FabricAntiEntropySummaryResyncMs <= 1'i64:
+    return 0'i64
+  let targetPeers = node.antiEntropySummaryTargetPeers()
+  if targetPeers.len <= 1:
+    return 0'i64
+  var peerIdx = -1
+  for idx, candidate in targetPeers:
+    if candidate == peerIdText:
+      peerIdx = idx
+      break
+  if peerIdx < 0:
+    return 0'i64
+  let peerCount = int64(targetPeers.len)
+  let slotSpan = max(1'i64, FabricAntiEntropySummaryResyncMs div peerCount)
+  min(
+    int64(peerIdx) * slotSpan,
+    FabricAntiEntropySummaryResyncMs - 1'i64,
+  )
+
+proc antiEntropySummaryNextRefreshDueAtMs(
+    node: FabricNode, peerIdText: string, nowMs: int64
+): int64 {.gcsafe, raises: [].} =
+  if FabricAntiEntropySummaryResyncMs <= 0'i64:
+    return nowMs
+  let interval = FabricAntiEntropySummaryResyncMs
+  let slotOffset = node.antiEntropySummaryRefreshSlotOffsetMs(peerIdText) mod interval
+  let slotBase = nowMs - (nowMs mod interval)
+  result = slotBase + slotOffset
+  if result <= nowMs:
+    result += interval
+
+proc antiEntropySummaryMustYieldToLive(
+    node: FabricNode, peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or node.network.isNil or peerIdText.len == 0:
+    return false
+  if not node.network.controlFetchPeerMustYield(peerIdText):
+    return false
+  node.antiEntropySummaryNextRefreshAtMs[peerIdText] =
+    node.antiEntropySummaryNextRefreshDueAtMs(peerIdText, diagNowMs())
+  when defined(fabric_lsmr_diag):
+    echo "anti-entropy summary-yield account=", node.identity.account,
+      " peer=", peerIdText
+  true
+
 proc clearAntiEntropySummarySync(
     node: FabricNode, peerIdText: string
 ) {.gcsafe, raises: [].} =
@@ -8158,6 +9285,16 @@ proc clearAntiEntropySummarySync(
     if not runner.isNil and not runner.finished():
       runner.cancelSoon()
     node.antiEntropySummaryRunners.del(peerIdText)
+
+proc restartAntiEntropySummarySync(
+    node: FabricNode, peerIdText: string
+) {.gcsafe, raises: [].} =
+  if node.isNil or peerIdText.len == 0:
+    return
+  node.antiEntropySummaryNextRefreshAtMs[peerIdText] = 0'i64
+  node.antiEntropySummaryRefreshGenerations[peerIdText] =
+    node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) + 1'u64
+  node.signalAntiEntropySummarySync(peerIdText)
 
 proc antiEntropySummaryWakeEvent(
     node: FabricNode, peerIdText: string
@@ -8203,146 +9340,349 @@ proc antiEntropySummaryRequestKey(
 ): string {.gcsafe, raises: [].} =
   node.antiEntropyFetchRequestKey(key)
 
+proc antiEntropySummaryTickOwnerKey(
+    baseKey: string
+): string {.gcsafe, raises: [].} =
+  if baseKey.startsWith("summary:tick:att_witness:"):
+    return baseKey
+  ""
+
+proc acquireAntiEntropySummaryTickOwner(
+    node: FabricNode, peerIdText: string, baseKey: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or peerIdText.len == 0:
+    return false
+  let ownerKey = antiEntropySummaryTickOwnerKey(baseKey)
+  if ownerKey.len == 0:
+    return true
+  let currentOwner = node.antiEntropySummaryTickOwners.getOrDefault(ownerKey)
+  if currentOwner.len > 0 and currentOwner != peerIdText:
+    return false
+  node.antiEntropySummaryTickOwners[ownerKey] = peerIdText
+  true
+
+proc releaseAntiEntropySummaryTickOwner(
+    node: FabricNode, peerIdText: string, baseKey: string
+) {.gcsafe, raises: [].} =
+  if node.isNil or peerIdText.len == 0:
+    return
+  let ownerKey = antiEntropySummaryTickOwnerKey(baseKey)
+  if ownerKey.len == 0:
+    return
+  if node.antiEntropySummaryTickOwners.getOrDefault(ownerKey) == peerIdText:
+    node.antiEntropySummaryTickOwners.del(ownerKey)
+
+proc acquireAntiEntropySummaryHeadOwner(
+    node: FabricNode, peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or peerIdText.len == 0:
+    return false
+  if node.antiEntropySummaryHeadOwner.len > 0 and
+      node.antiEntropySummaryHeadOwner != peerIdText:
+    return false
+  node.antiEntropySummaryHeadOwner = peerIdText
+  true
+
+proc releaseAntiEntropySummaryHeadOwner(
+    node: FabricNode, peerIdText: string
+) {.gcsafe, raises: [].} =
+  if node.isNil or peerIdText.len == 0:
+    return
+  if node.antiEntropySummaryHeadOwner == peerIdText:
+    node.antiEntropySummaryHeadOwner.setLen(0)
+
+proc antiEntropySummaryCacheKey(
+    domain: AntiEntropyDomain, era = none(uint64), tick = none(uint64)
+): string {.gcsafe, raises: [].} =
+  if era.isNone():
+    return "summary:root"
+  if tick.isNone():
+    return "summary:era:" & antiEntropyDomainLabel(domain) & ":" & $era.get()
+  "summary:tick:" & antiEntropyDomainLabel(domain) & ":" & $era.get() & ":" & $tick.get()
+
+proc antiEntropySummaryHead(
+    node: FabricNode
+): AntiEntropySummaryHead {.gcsafe, raises: [].} =
+  if node.isNil:
+    return AntiEntropySummaryHead(version: 0'u64)
+  AntiEntropySummaryHead(version: node.antiEntropySummaryVersion)
+
+proc invalidateAntiEntropySummaryCache(
+    node: FabricNode, domain: AntiEntropyDomain, clock: GanzhiClock
+) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  node.antiEntropySummaryVersion = node.antiEntropySummaryVersion + 1'u64
+  node.antiEntropySummaryPayloadCache.del("summary:head")
+  node.antiEntropySummaryPayloadCache.del("summary:root")
+  node.antiEntropySummaryPayloadCache.del(
+    antiEntropySummaryCacheKey(domain, some(clock.era))
+  )
+  node.antiEntropySummaryPayloadCache.del(
+    antiEntropySummaryCacheKey(domain, some(clock.era), some(uint64(clock.tick)))
+  )
+
+proc cachedAntiEntropySummaryRaw(
+    node: FabricNode, baseKey: string
+): Option[seq[byte]] {.gcsafe, raises: [].} =
+  if node.isNil or baseKey.len == 0:
+    return none(seq[byte])
+  if baseKey in node.antiEntropySummaryPayloadCache:
+    return some(node.antiEntropySummaryPayloadCache.getOrDefault(baseKey))
+  if baseKey == "summary:head":
+    let payload = bytesOf(encodeObj(node.antiEntropySummaryHead()))
+    node.antiEntropySummaryPayloadCache[baseKey] = payload
+    return some(payload)
+  if baseKey == "summary:root":
+    let payload = bytesOf(encodeObj(node.antiEntropyRootSummary()))
+    node.antiEntropySummaryPayloadCache[baseKey] = payload
+    return some(payload)
+  if baseKey.startsWith("summary:era:"):
+    try:
+      let parts = baseKey.split(":")
+      if parts.len != 4:
+        return none(seq[byte])
+      let domain = parseAntiEntropyDomain(parts[2])
+      if domain.isNone():
+        return none(seq[byte])
+      let era = parseUInt(parts[3])
+      let payload = bytesOf(encodeObj(node.antiEntropyEraSummary(domain.get(), era)))
+      node.antiEntropySummaryPayloadCache[baseKey] = payload
+      return some(payload)
+    except ValueError:
+      return none(seq[byte])
+  if baseKey.startsWith("summary:tick:"):
+    try:
+      let parts = baseKey.split(":")
+      if parts.len != 5:
+        return none(seq[byte])
+      let domain = parseAntiEntropyDomain(parts[2])
+      if domain.isNone():
+        return none(seq[byte])
+      let era = parseUInt(parts[3])
+      let tick = parseUInt(parts[4])
+      let payload = bytesOf(encodeObj(node.antiEntropyTickSummary(domain.get(), era, tick)))
+      node.antiEntropySummaryPayloadCache[baseKey] = payload
+      return some(payload)
+    except ValueError:
+      return none(seq[byte])
+  none(seq[byte])
+
 proc antiEntropySummaryTask(
     node: FabricNode, peerIdText: string
 ): Future[void] {.async: (raises: []).} =
   try:
     while not node.isNil and not node.network.isNil and node.running and peerIdText.len > 0:
+      let refreshGeneration =
+        node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64)
       let wakeEvent = node.antiEntropySummaryWakeEvent(peerIdText)
       if not wakeEvent.isNil:
         wakeEvent.clear()
       var enqueuedAny = false
-      let rootPayload = await node.network.fetchRaw(
-        peerIdText,
-        node.antiEntropySummaryRequestKey("summary:root"),
-        timeout = 1.seconds,
-        maxAttempts = 1,
-      )
-      if rootPayload.isSome():
-        let remoteRoot = decodeObj[AntiEntropyRootSummary](stringOf(rootPayload.get()))
+      var restartRequested = false
+      if node.antiEntropySummaryMustYieldToLive(peerIdText):
+        break
+      if not node.acquireAntiEntropySummaryHeadOwner(peerIdText):
+        node.antiEntropySummaryNextRefreshAtMs[peerIdText] =
+          node.antiEntropySummaryNextRefreshDueAtMs(peerIdText, diagNowMs())
+        break
+      let headPayload =
+        try:
+          await node.network.fetchRaw(
+            peerIdText,
+            node.antiEntropySummaryRequestKey("summary:head"),
+            timeout = 1.seconds,
+            maxAttempts = 1,
+          )
+        finally:
+          node.releaseAntiEntropySummaryHeadOwner(peerIdText)
+      if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+          refreshGeneration:
+        continue
+      if headPayload.isSome():
+        let remoteHead = decodeObj[AntiEntropySummaryHead](stringOf(headPayload.get()))
+        var remoteRoot = node.antiEntropyRemoteRootSummaries.getOrDefault(
+          peerIdText,
+          AntiEntropyRootSummary(domains: @[]),
+        )
+        let cachedHead = node.antiEntropyRemoteSummaryHeads.getOrDefault(
+          peerIdText,
+          AntiEntropySummaryHead(version: high(uint64)),
+        )
+        if cachedHead.version != remoteHead.version or
+            peerIdText notin node.antiEntropyRemoteRootSummaries:
+          if node.antiEntropySummaryMustYieldToLive(peerIdText):
+            break
+          let rootPayload = await node.network.fetchRaw(
+            peerIdText,
+            node.antiEntropySummaryRequestKey("summary:root"),
+            timeout = 1.seconds,
+            maxAttempts = 1,
+          )
+          if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+              refreshGeneration:
+            continue
+          if rootPayload.isNone():
+            continue
+          remoteRoot = decodeObj[AntiEntropyRootSummary](stringOf(rootPayload.get()))
+          node.antiEntropyRemoteRootSummaries[peerIdText] = remoteRoot
+        node.antiEntropyRemoteSummaryHeads[peerIdText] = remoteHead
         let localRoot = node.antiEntropyRootSummary()
         var localDomainByName = initTable[string, AntiEntropyDomainRootSummary]()
         for item in localRoot.domains:
           localDomainByName[item.domain] = item
-        for remoteDomain in remoteRoot.domains:
-          let domainOpt = parseAntiEntropyDomain(remoteDomain.domain)
-          if domainOpt.isNone():
-            continue
-          let domain = domainOpt.get()
-          if not node.antiEntropyDomainNeeded(domain):
-            continue
-          let prioritizeNewest =
-            (domain == aedAttParticipant or domain == aedAttWitness) and
-            node.antiEntropyPullOwnerActive(peerIdText, domain)
-          let localDomain = localDomainByName.getOrDefault(
-            remoteDomain.domain,
-            AntiEntropyDomainRootSummary(
-              domain: remoteDomain.domain,
-              maxClock: GanzhiClock(era: 0, tick: 0),
-              eras: @[],
-            ),
-          )
-          var localEraDigests = initTable[uint64, string]()
-          for item in localDomain.eras:
-            localEraDigests[item.era] = item.digest
-          var remoteEras = remoteDomain.eras
-          if prioritizeNewest:
-            remoteEras.sort(
-              proc(a, b: AntiEntropyEraDigest): int = system.cmp(b.era, a.era)
+        block remoteSyncLoop:
+          for remoteDomain in remoteRoot.domains:
+            if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+                refreshGeneration:
+              restartRequested = true
+              break remoteSyncLoop
+            let domainOpt = parseAntiEntropyDomain(remoteDomain.domain)
+            if domainOpt.isNone():
+              continue
+            let domain = domainOpt.get()
+            if not node.antiEntropyDomainNeeded(domain):
+              continue
+            let prioritizeNewest =
+              (domain == aedAttParticipant or domain == aedAttWitness) and
+              node.antiEntropyPullOwnerActive(peerIdText, domain)
+            let localDomain = localDomainByName.getOrDefault(
+              remoteDomain.domain,
+              AntiEntropyDomainRootSummary(
+                domain: remoteDomain.domain,
+                maxClock: GanzhiClock(era: 0, tick: 0),
+                eras: @[],
+              ),
             )
-          block domainLoop:
-            for remoteEra in remoteEras:
-              if localEraDigests.getOrDefault(remoteEra.era) == remoteEra.digest:
-                continue
-              when defined(fabric_submit_diag):
-                echo "anti-entropy summary-mismatch account=", node.identity.account,
-                  " peer=", peerIdText,
-                  " domain=", remoteDomain.domain,
-                  " era=", remoteEra.era,
-                  " domain=", remoteDomain.domain,
-                  " era=", remoteEra.era
-              let eraPayload = await node.network.fetchRaw(
-                peerIdText,
-                node.antiEntropySummaryRequestKey(
-                  "summary:era:" & remoteDomain.domain & ":" & $remoteEra.era
-                ),
-                timeout = 1.seconds,
-                maxAttempts = 1,
+            var localEraDigests = initTable[uint64, string]()
+            for item in localDomain.eras:
+              localEraDigests[item.era] = item.digest
+            var remoteEras = remoteDomain.eras
+            if prioritizeNewest:
+              remoteEras.sort(
+                proc(a, b: AntiEntropyEraDigest): int = system.cmp(b.era, a.era)
               )
-              if eraPayload.isNone():
-                continue
-              let remoteEraSummary = decodeObj[AntiEntropyEraSummary](stringOf(eraPayload.get()))
-              let localEraSummary = node.antiEntropyEraSummary(domain, remoteEra.era)
-              var localTickDigests = initTable[uint64, string]()
-              for item in localEraSummary.ticks:
-                localTickDigests[item.tick] = item.digest
-              var remoteTicks = remoteEraSummary.ticks
-              if prioritizeNewest:
-                remoteTicks.sort(
-                  proc(a, b: AntiEntropyTickDigest): int = system.cmp(b.tick, a.tick)
+            var domainActivated = false
+            block domainLoop:
+              for remoteEra in remoteEras:
+                if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+                    refreshGeneration:
+                  restartRequested = true
+                  break remoteSyncLoop
+                if localEraDigests.getOrDefault(remoteEra.era) == remoteEra.digest:
+                  continue
+                when defined(fabric_submit_diag):
+                  echo "anti-entropy summary-mismatch account=", node.identity.account,
+                    " peer=", peerIdText,
+                    " domain=", remoteDomain.domain,
+                    " era=", remoteEra.era,
+                    " domain=", remoteDomain.domain,
+                    " era=", remoteEra.era
+                if node.antiEntropySummaryMustYieldToLive(peerIdText):
+                  break remoteSyncLoop
+                let eraPayload = await node.network.fetchRaw(
+                  peerIdText,
+                  node.antiEntropySummaryRequestKey(
+                    "summary:era:" & remoteDomain.domain & ":" & $remoteEra.era
+                  ),
+                  timeout = 1.seconds,
+                  maxAttempts = 1,
                 )
-              block eraLoop:
-                for remoteTick in remoteTicks:
-                  if localTickDigests.getOrDefault(remoteTick.tick) == remoteTick.digest:
-                    continue
-                  let tickPayload = await node.network.fetchRaw(
-                    peerIdText,
-                    node.antiEntropySummaryRequestKey(
+                if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+                    refreshGeneration:
+                  restartRequested = true
+                  break remoteSyncLoop
+                if eraPayload.isNone():
+                  continue
+                let remoteEraSummary = decodeObj[AntiEntropyEraSummary](stringOf(eraPayload.get()))
+                let localEraSummary = node.antiEntropyEraSummary(domain, remoteEra.era)
+                var localTickDigests = initTable[uint64, string]()
+                for item in localEraSummary.ticks:
+                  localTickDigests[item.tick] = item.digest
+                var remoteTicks = remoteEraSummary.ticks
+                if prioritizeNewest:
+                  remoteTicks.sort(
+                    proc(a, b: AntiEntropyTickDigest): int = system.cmp(b.tick, a.tick)
+                  )
+                block eraLoop:
+                  for remoteTick in remoteTicks:
+                    var frontierActivated = false
+                    if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+                        refreshGeneration:
+                      restartRequested = true
+                      break remoteSyncLoop
+                    if localTickDigests.getOrDefault(remoteTick.tick) == remoteTick.digest:
+                      continue
+                    let tickBaseKey =
                       "summary:tick:" & remoteDomain.domain & ":" & $remoteEra.era & ":" &
                         $remoteTick.tick
-                    ),
-                    timeout = 1.seconds,
-                    maxAttempts = 1,
-                  )
-                  if tickPayload.isNone():
-                    continue
-                  let remoteTickSummary = decodeObj[AntiEntropyTickSummary](stringOf(tickPayload.get()))
-                  when defined(fabric_submit_diag):
-                    echo "anti-entropy tick-diff account=", node.identity.account,
-                      " peer=", peerIdText,
-                      " domain=", remoteDomain.domain,
-                      " era=", remoteEra.era,
-                      " tick=", remoteTick.tick,
-                      " items=", remoteTickSummary.items.len
-                  var frontierActivated = false
-                  for key in remoteTickSummary.items:
-                    if node.antiEntropyLocalHasKey(domain, key):
-                      node.clearSummaryPullAvailable(peerIdText, key)
-                      continue
-                    let item = node.antiEntropyPullItem(
-                      peerIdText,
-                      domain,
-                      key,
-                      remoteEra.era,
-                      remoteTick.tick,
-                    )
-                    if item.isNone():
-                      continue
-                    node.markSummaryPullAvailable(peerIdText, key)
-                    if node.witnessPullActive(domain, key):
-                      node.ensureWitnessPullRunner(item.get().targetPeerId, item.get().domain)
+                    if node.antiEntropySummaryMustYieldToLive(peerIdText):
+                      break remoteSyncLoop
+                    if not node.acquireAntiEntropySummaryTickOwner(peerIdText, tickBaseKey):
                       frontierActivated = true
-                      break
-                    if not node.witnessPullStillNeeded(item.get()):
-                      node.clearSummaryPullAvailable(peerIdText, key)
+                      break eraLoop
+                    let tickPayload =
+                      try:
+                        await node.network.fetchRaw(
+                          peerIdText,
+                          node.antiEntropySummaryRequestKey(tickBaseKey),
+                          timeout = 1.seconds,
+                          maxAttempts = 1,
+                        )
+                      finally:
+                        node.releaseAntiEntropySummaryTickOwner(peerIdText, tickBaseKey)
+                    if node.antiEntropySummaryRefreshGenerations.getOrDefault(peerIdText, 0'u64) !=
+                        refreshGeneration:
+                      restartRequested = true
+                      break remoteSyncLoop
+                    if tickPayload.isNone():
                       continue
-                    if node.enqueueWitnessPullWorkItem(item.get()):
-                      enqueuedAny = true
-                    node.ensureWitnessPullRunner(item.get().targetPeerId, item.get().domain)
-                    frontierActivated = true
+                    let remoteTickSummary = decodeObj[AntiEntropyTickSummary](stringOf(tickPayload.get()))
                     when defined(fabric_submit_diag):
-                      echo "anti-entropy exact-pull account=", node.identity.account,
+                      echo "anti-entropy tick-diff account=", node.identity.account,
                         " peer=", peerIdText,
                         " domain=", remoteDomain.domain,
-                        " key=", key
-                    break
-                  if prioritizeNewest and frontierActivated:
-                    enqueuedAny = true
-                    break eraLoop
-            if prioritizeNewest and enqueuedAny:
-              break domainLoop
-          if enqueuedAny:
-            break
+                        " era=", remoteEra.era,
+                        " tick=", remoteTick.tick,
+                        " items=", remoteTickSummary.items.len
+                    for key in remoteTickSummary.items:
+                      if node.antiEntropyLocalHasKey(domain, key):
+                        node.clearSummaryPullAvailable(peerIdText, key)
+                        continue
+                      let item = node.antiEntropyPullItem(
+                        peerIdText,
+                        domain,
+                        key,
+                        remoteEra.era,
+                        remoteTick.tick,
+                      )
+                      if item.isNone():
+                        continue
+                      node.markSummaryPullAvailable(peerIdText, key)
+                      if node.witnessPullActive(domain, key):
+                        node.ensureWitnessPullRunner(item.get().targetPeerId, item.get().domain)
+                        frontierActivated = true
+                        break
+                      if not node.witnessPullStillNeeded(item.get()):
+                        node.clearSummaryPullAvailable(peerIdText, key)
+                        continue
+                      if node.enqueueWitnessPullWorkItem(item.get()):
+                        enqueuedAny = true
+                      node.ensureWitnessPullRunner(item.get().targetPeerId, item.get().domain)
+                      frontierActivated = true
+                      when defined(fabric_submit_diag):
+                        echo "anti-entropy exact-pull account=", node.identity.account,
+                          " peer=", peerIdText,
+                          " domain=", remoteDomain.domain,
+                          " key=", key
+                      break
+                    if frontierActivated:
+                      domainActivated = true
+                      break eraLoop
+              if domainActivated:
+                break domainLoop
+      if restartRequested:
+        continue
       if enqueuedAny:
         node.scheduleStateMaintenance()
         break
@@ -8350,18 +9690,15 @@ proc antiEntropySummaryTask(
         break
       if peerIdText notin node.antiEntropySummaryTargetPeers():
         break
-      if wakeEvent.isNil:
-        await sleepAsync(FabricAntiEntropySummaryResyncMs.milliseconds)
-      else:
-        await sleepAsync(FabricAntiEntropySummaryResyncMs.milliseconds) or
-          wakeEvent.wait()
+      node.antiEntropySummaryNextRefreshAtMs[peerIdText] =
+        node.antiEntropySummaryNextRefreshDueAtMs(peerIdText, diagNowMs())
+      break
   except CancelledError:
     discard
   except CatchableError:
     discard
   finally:
     if not node.isNil:
-      node.antiEntropySummaryNextRefreshAtMs[peerIdText] = 0'i64
       node.antiEntropySummaryRunners.del(peerIdText)
 
 proc refreshAntiEntropySummarySync(node: FabricNode) {.gcsafe, raises: [].} =
@@ -8419,6 +9756,145 @@ proc connectedPeerIds(node: FabricNode): seq[string] {.gcsafe, raises: [].} =
     seen.incl(peerIdText)
     result.add(peerIdText)
 
+proc enqueuePendingEventIndexFlush(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0 or eventId in node.pendingEventIndexFlushes:
+    return false
+  node.pendingEventIndexFlushes.incl(eventId)
+  true
+
+proc enqueuePendingAttestationIndexFlush(
+    node: FabricNode, attKey: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or attKey.len == 0 or attKey in node.pendingAttestationIndexFlushes:
+    return false
+  node.pendingAttestationIndexFlushes.incl(attKey)
+  true
+
+proc enqueuePendingEventCertificateIndexFlush(
+    node: FabricNode, eventId: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or eventId.len == 0 or eventId in node.pendingEventCertificateIndexFlushes:
+    return false
+  node.pendingEventCertificateIndexFlushes.incl(eventId)
+  true
+
+proc enqueuePendingCheckpointCandidateIndexFlush(
+    node: FabricNode, candidateId: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or candidateId.len == 0 or
+      candidateId in node.pendingCheckpointCandidateIndexFlushes:
+    return false
+  node.pendingCheckpointCandidateIndexFlushes.incl(candidateId)
+  true
+
+proc enqueuePendingCheckpointVoteIndexFlush(
+    node: FabricNode, voteKey: string
+): bool {.gcsafe, raises: [].} =
+  if node.isNil or voteKey.len == 0 or voteKey in node.pendingCheckpointVoteIndexFlushes:
+    return false
+  node.pendingCheckpointVoteIndexFlushes.incl(voteKey)
+  true
+
+proc pendingCheckpointIndexFlushCount(node: FabricNode): int {.gcsafe, raises: [].} =
+  if node.isNil:
+    return 0
+  node.pendingEventCertificateIndexFlushes.len +
+    node.pendingCheckpointCandidateIndexFlushes.len +
+    node.pendingCheckpointVoteIndexFlushes.len
+
+proc flushPendingAntiEntropyIndexes(node: FabricNode, limit: int): int =
+  if node.isNil or node.store.isNil or limit <= 0:
+    return 0
+  for eventId in node.pendingEventIndexFlushKeys():
+    if not node.network.isNil and node.network.submitHasLiveInflight():
+      return result
+    if result >= limit:
+      break
+    node.pendingEventIndexFlushes.excl(eventId)
+    if eventId notin node.events:
+      continue
+    let event = node.events.getOrDefault(eventId)
+    if event.eventId.len == 0:
+      continue
+    node.store.persistEventIndex(event)
+    node.invalidateAntiEntropySummaryCache(aedEvent, event.clock)
+    inc result
+  if result >= limit:
+    return result
+  for attKey in node.pendingAttestationIndexFlushKeys():
+    if not node.network.isNil and node.network.submitHasLiveInflight():
+      return result
+    if result >= limit:
+      break
+    node.pendingAttestationIndexFlushes.excl(attKey)
+    let att = node.attestationForKey(attKey)
+    if att.isNone() or att.get().eventId notin node.events:
+      continue
+    let eventClock = node.events.getOrDefault(att.get().eventId).clock
+    node.store.persistAttestationIndex(eventClock, att.get())
+    if att.get().role == arParticipant:
+      node.invalidateAntiEntropySummaryCache(aedAttParticipant, eventClock)
+    elif att.get().role == arWitness:
+      node.invalidateAntiEntropySummaryCache(aedAttWitness, eventClock)
+    inc result
+  if result >= limit:
+    return result
+  for eventId in node.pendingEventCertificateIndexFlushKeys():
+    if not node.network.isNil and node.network.submitHasLiveInflight():
+      return result
+    if result >= limit:
+      break
+    node.pendingEventCertificateIndexFlushes.excl(eventId)
+    if eventId notin node.eventCertificates:
+      continue
+    let cert = node.eventCertificates.getOrDefault(eventId)
+    if cert.eventId.len == 0:
+      continue
+    node.store.persistEventCertificateIndex(cert)
+    node.invalidateAntiEntropySummaryCache(aedEventCert, cert.clock)
+    inc result
+  if result >= limit:
+    return result
+  for candidateId in node.pendingCheckpointCandidateIndexFlushKeys():
+    if not node.network.isNil and node.network.submitHasLiveInflight():
+      return result
+    if result >= limit:
+      break
+    node.pendingCheckpointCandidateIndexFlushes.excl(candidateId)
+    if candidateId notin node.checkpointCandidates:
+      continue
+    let candidate = node.checkpointCandidates.getOrDefault(candidateId)
+    if candidate.candidateId.len == 0:
+      continue
+    node.store.persistCheckpointCandidate(candidate)
+    inc result
+  if result >= limit:
+    return result
+  for voteKey in node.pendingCheckpointVoteIndexFlushKeys():
+    if not node.network.isNil and node.network.submitHasLiveInflight():
+      return result
+    if result >= limit:
+      break
+    node.pendingCheckpointVoteIndexFlushes.excl(voteKey)
+    let vote = node.checkpointVoteForKey(voteKey)
+    if vote.isNone() or vote.get().candidateId notin node.checkpointCandidates:
+      continue
+    let candidate = node.checkpointCandidates.getOrDefault(vote.get().candidateId)
+    node.store.persistCheckpointVote(candidate.era, vote.get())
+    inc result
+
+proc flushAllPendingAntiEntropyIndexes(node: FabricNode) =
+  while not node.isNil and
+      (node.pendingEventIndexFlushes.len > 0 or
+      node.pendingAttestationIndexFlushes.len > 0 or
+      node.pendingEventCertificateIndexFlushes.len > 0 or
+      node.pendingCheckpointCandidateIndexFlushes.len > 0 or
+      node.pendingCheckpointVoteIndexFlushes.len > 0):
+    if node.flushPendingAntiEntropyIndexes(high(int)) == 0:
+      break
+
 proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
   if node.isNil or not node.running:
     return false
@@ -8428,8 +9904,19 @@ proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
       result = true
     if node.maintenanceShouldYield(stepStartedAtMs, "drain-inbound"):
       return true
-    node.refreshUnsyncedRoutingSnapshots()
-    node.refreshAntiEntropySummarySync()
+    if node.maintenanceMustYieldToHotAccept():
+      when defined(fabric_submit_diag):
+        echo "maintenance-defer-hot-accept account=", node.identity.account,
+          " pendingEvents=", node.pendingEvents.len,
+          " pendingAttestations=", node.pendingAttestations.len,
+          " pendingEventCerts=", node.pendingEventCertificates.len,
+          " pendingCandidates=", node.pendingCheckpointCandidates.len,
+          " pendingVotes=", node.pendingCheckpointVotes.len,
+          " pendingBundles=", node.pendingCheckpointBundles.len,
+          " pendingIndexFlushes=",
+          node.pendingEventIndexFlushes.len + node.pendingAttestationIndexFlushes.len +
+          node.pendingCheckpointIndexFlushCount()
+      return true
     node.pruneStaleLsmrDeliveries()
     node.refreshLsmrPending()
     node.refreshPendingCertificationEvents()
@@ -8480,12 +9967,6 @@ proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
         node.logMaintenanceError("event", eventId, exc)
       if node.maintenanceShouldYield(stepStartedAtMs, "event", eventId):
         return true
-    for item in node.missingEventCertificatePulls():
-      if node.witnessPullStillNeeded(item):
-        discard node.enqueueWitnessPullWorkItem(item)
-        node.ensureWitnessPullRunner(item.targetPeerId, item.domain)
-    if node.maintenanceShouldYield(stepStartedAtMs, "eventcert-pull"):
-      return true
     let pendingAttestationKeys = node.pendingAttestationKeys()
     let pendingAttestationCount = pendingAttestationKeys.len
     let attestationKeys = rotatePendingKeys(
@@ -8540,6 +10021,22 @@ proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
         return true
     node.pruneLsmrPending()
     node.pruneStaleLsmrDeliveries()
+    if node.maintenanceMustYieldToHotAccept():
+      when defined(fabric_submit_diag):
+        echo "maintenance-defer-hot-accept account=", node.identity.account,
+          " pendingEvents=", node.pendingEvents.len,
+          " pendingAttestations=", node.pendingAttestations.len,
+          " pendingEventCerts=", node.pendingEventCertificates.len,
+          " pendingCandidates=", node.pendingCheckpointCandidates.len,
+          " pendingVotes=", node.pendingCheckpointVotes.len,
+          " pendingBundles=", node.pendingCheckpointBundles.len,
+          " pendingIndexFlushes=",
+          node.pendingEventIndexFlushes.len + node.pendingAttestationIndexFlushes.len +
+          node.pendingCheckpointIndexFlushCount()
+      return true
+    if node.usesLsmrPrimary() and not node.network.isNil and
+        node.network.submitHasLiveInflight():
+      return true
     let checkpointOwnerOutstanding = node.checkpointOwnerOutstanding()
     let checkpointBlocking = node.checkpointFrontierBlockingEra()
     let checkpointReady = node.checkpointAdvanceReady()
@@ -8614,6 +10111,8 @@ proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
           node.disseminateCheckpointCandidate(node.checkpointCandidates[candidateId])
         except Exception as exc:
           node.logMaintenanceError("checkpoint-candidate", candidateId, exc)
+        if node.maintenanceShouldYield(stepStartedAtMs, "checkpoint-candidate", candidateId):
+          return true
       let checkpointVoteKeys = node.pendingCheckpointVotes.sortedKeys()
       if checkpointVoteKeys.len > FabricMaintenanceBatchLimit:
         budgetExhausted = true
@@ -8630,6 +10129,8 @@ proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
           node.disseminateCheckpointVote(vote.get())
         except Exception as exc:
           node.logMaintenanceError("checkpoint-vote", key, exc)
+        if node.maintenanceShouldYield(stepStartedAtMs, "checkpoint-vote", key):
+          return true
       let checkpointBundleKeys = node.pendingCheckpointBundles.sortedKeys()
       if checkpointBundleKeys.len > FabricMaintenanceBatchLimit:
         budgetExhausted = true
@@ -8683,6 +10184,20 @@ proc maintenanceStep(node: FabricNode): bool {.raises: [].} =
           node.logMaintenanceError("avo-approval", key, exc)
         if node.maintenanceShouldYield(stepStartedAtMs, "avo-approval", key):
           return true
+    if node.usesLsmrPrimary() and not node.network.isNil and
+        node.network.submitHasLiveInflight():
+      return true
+    let pendingIndexFlushes =
+      node.pendingEventIndexFlushes.len + node.pendingAttestationIndexFlushes.len +
+      node.pendingCheckpointIndexFlushCount()
+    let flushedIndexes = node.flushPendingAntiEntropyIndexes(FabricMaintenanceBatchLimit)
+    if pendingIndexFlushes > flushedIndexes:
+      budgetExhausted = true
+    if flushedIndexes > 0 and node.maintenanceShouldYield(stepStartedAtMs, "index-flush"):
+      return true
+    # Background summary sync must yield to live relay/frontier work in the same slice.
+    node.refreshUnsyncedRoutingSnapshots()
+    node.refreshAntiEntropySummarySync()
     if budgetExhausted and node.running:
       when defined(fabric_submit_diag):
         echo "maintenance-continue account=", node.identity.account,
@@ -8745,6 +10260,8 @@ proc scheduleMaintenance(node: FabricNode, immediate = false) {.gcsafe, raises: 
   if immediate:
     node.maintenanceImmediatePending = true
   node.maintenancePending = true
+  if node.backgroundMustYieldToHotAccept():
+    return
   if not node.maintenanceRunner.isNil and not node.maintenanceRunner.finished():
     return
   node.maintenanceScheduled = true
@@ -8784,6 +10301,8 @@ proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: Lsmr
     store: nil,
     network: nil,
     running: false,
+    stopPrepared: false,
+    submitFenceDepth: 0,
     events: initOrderedTable[string, FabricEvent](),
     eventAttestations: initTable[string, seq[EventAttestation]](),
     attestationsByKey: initTable[string, EventAttestation](),
@@ -8800,13 +10319,23 @@ proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: Lsmr
     inflightWitnessPullByPeer: initTable[string, AntiEntropyPullWorkItem](),
     witnessPullRunners: initTable[string, Future[void]](),
     summaryAvailablePullKeys: initHashSet[string](),
+    certificationLiveAwaitPullKeys: initHashSet[string](),
     antiEntropySummaryRunners: initTable[string, Future[void]](),
     antiEntropySummaryWakeups: initTable[string, AsyncEvent](),
+    antiEntropySummaryRefreshGenerations: initTable[string, uint64](),
     antiEntropySummaryNextRefreshAtMs: initTable[string, int64](),
+    antiEntropySummaryPayloadCache: initTable[string, seq[byte]](),
+    antiEntropySummaryVersion: 0'u64,
+    antiEntropyRemoteSummaryHeads: initTable[string, AntiEntropySummaryHead](),
+    antiEntropyRemoteRootSummaries: initTable[string, AntiEntropyRootSummary](),
+    antiEntropySummaryTickOwners: initTable[string, string](),
+    antiEntropySummaryHeadOwner: "",
     certificationObservedOverlayDigest: "",
     certificationObservedLatestCheckpointId: "",
     deferredAttestations: initTable[string, seq[EventAttestation]](),
     deferredEventCertificates: initTable[string, seq[EventCertificate]](),
+    deferredEventCertificateSources: initTable[string, string](),
+    eventSourcePeersByEvent: initTable[string, HashSet[string]](),
     isolatedEvents: initOrderedTable[string, IsolationRecord](),
     children: initTable[string, seq[string]](),
     avoProposals: initOrderedTable[string, AvoProposal](),
@@ -8836,6 +10365,8 @@ proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: Lsmr
     maintenancePending: false,
     maintenanceImmediatePending: false,
     maintenanceRunner: nil,
+    eventCertPullPending: false,
+    eventCertPullRunner: nil,
     slowMaintenanceSliceCount: 0,
     maxMaintenanceSliceElapsedMs: 0,
     checkpointAdvancePending: false,
@@ -8850,9 +10381,14 @@ proc newFabricNode*(identity: NodeIdentity, genesis: GenesisSpec, lsmrPath: Lsmr
     forwardedAvoApprovals: initTable[string, HashSet[string]](),
     pendingEvents: initHashSet[string](),
     pendingEventScopes: initTable[string, seq[LsmrPath]](),
+    pendingEventIndexFlushes: initHashSet[string](),
     pendingAttestations: initHashSet[string](),
     routeBlockedAttestations: initHashSet[string](),
     pendingAttestationScopes: initTable[string, seq[LsmrPath]](),
+    pendingAttestationIndexFlushes: initHashSet[string](),
+    pendingEventCertificateIndexFlushes: initHashSet[string](),
+    pendingCheckpointCandidateIndexFlushes: initHashSet[string](),
+    pendingCheckpointVoteIndexFlushes: initHashSet[string](),
     pendingEventCertificates: initHashSet[string](),
     pendingEventCertificateScopes: initTable[string, seq[LsmrPath]](),
     pendingEventCertificateFrontier: initHeapQueue[PendingEventCertificateTicket](),
@@ -8932,7 +10468,7 @@ proc newFabricNode*(config: FabricNodeConfig): FabricNode =
             echo "fabric-node enqueue-event self=", node.identity.account,
               " event=", item.eventId,
               " scope=", $scopePrefix
-          node.enqueueInbound(InboundMessage(
+          node.acceptInboundNow(InboundMessage(
             kind: imEvent,
             relayScope: scopePrefix,
             sourcePeerId: sourcePeerId,
@@ -8944,7 +10480,7 @@ proc newFabricNode*(config: FabricNodeConfig): FabricNode =
       ): Future[void] {.gcsafe, raises: [].} =
         proc handle() {.async, gcsafe.} =
           discard network
-          node.enqueueInbound(InboundMessage(
+          node.acceptInboundNow(InboundMessage(
             kind: imAttestation,
             relayScope: scopePrefix,
             sourcePeerId: sourcePeerId,
@@ -9010,6 +10546,8 @@ proc newFabricNode*(config: FabricNodeConfig): FabricNode =
             validator: validator,
           ))
         handle(),
+      submitHotAcceptIdleHook = proc() {.gcsafe, raises: [].} =
+        node.resumeDeferredBackground(),
     )
 
 proc start*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
@@ -9058,7 +10596,18 @@ proc start*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
     node.scheduleCertificationGather()
   node.scheduleMaintenance(immediate = true)
 
-proc stop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
+proc prepareStop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
+  if node.isNil:
+    return
+  if node.stopPrepared:
+    return
+  if node.running:
+    try:
+      {.cast(gcsafe).}:
+        discard node.submitFence()
+    except Exception as exc:
+      raiseAssert("fabric prepareStop fence failed: " & exc.msg)
+  node.stopPrepared = true
   node.running = false
   node.maintenanceScheduled = false
   node.maintenanceImmediateScheduled = false
@@ -9066,6 +10615,7 @@ proc stop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
   node.certificationGatherPending = false
   node.maintenancePending = false
   node.maintenanceImmediatePending = false
+  node.eventCertPullPending = false
   node.checkpointAdvancePending = false
   if not node.inboundRunner.isNil and not node.inboundRunner.finished():
     node.inboundRunner.cancelSoon()
@@ -9074,6 +10624,8 @@ proc stop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
     node.certificationGatherRunner.cancelSoon()
   if not node.maintenanceRunner.isNil and not node.maintenanceRunner.finished():
     node.maintenanceRunner.cancelSoon()
+  if not node.eventCertPullRunner.isNil and not node.eventCertPullRunner.finished():
+    node.eventCertPullRunner.cancelSoon()
   if not node.checkpointAdvanceRunner.isNil and not node.checkpointAdvanceRunner.finished():
     node.checkpointAdvanceRunner.cancelSoon()
   for runner in node.witnessPullRunners.values:
@@ -9089,6 +10641,16 @@ proc stop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
     node.network.switch.setTopologyChangedHook(nil)
   if not node.network.isNil:
     node.network.setSubmitReadyHook(nil)
+  if not node.network.isNil:
+    try:
+      await node.network.prepareStop()
+    except CatchableError:
+      discard
+
+proc stop*(node: FabricNode) {.async: (raises: [], gcsafe: false).} =
+  if node.isNil:
+    return
+  await node.prepareStop()
   if not node.network.isNil:
     try:
       await node.network.stop()
@@ -9158,6 +10720,7 @@ proc restoreFromStore(node: FabricNode) =
     let snapshot = node.store.loadCheckpointSnapshot(checkpoint.checkpointId)
     if snapshot.isSome():
       discard node.registerCheckpoint(checkpoint, snapshot.get())
+  node.flushAllPendingAntiEntropyIndexes()
 
 proc checkpointStateSnapshot(node: FabricNode, checkpointId = ""): Option[ChainStateSnapshot] =
   let targetId =
@@ -9304,9 +10867,208 @@ proc localAuthorEventSettled(
     return false
   true
 
+proc committedNonce(
+    node: FabricNode, account: string
+): uint64 {.gcsafe, raises: [].} =
+  if node.isNil or account.len == 0:
+    return 0'u64
+  node.liveState.nonceOf(account)
+
+proc offeredNonce(
+    node: FabricNode, account: string
+): uint64 {.gcsafe, raises: [].} =
+  if node.isNil or account.len == 0:
+    return 0'u64
+  result = node.committedNonce(account)
+  for _, event in node.events.pairs:
+    if event.author != account:
+      continue
+    if event.legacyTx.nonce > result:
+      result = event.legacyTx.nonce
+
+proc pendingAttestationDebtCount(node: FabricNode): int {.gcsafe, raises: [].} =
+  if node.isNil:
+    return 0
+  var seen = initHashSet[string]()
+  for key in node.pendingAttestations:
+    if key.len > 0:
+      seen.incl(key)
+  for key in node.routeBlockedAttestations:
+    if key.len > 0:
+      seen.incl(key)
+  seen.len
+
+proc pendingWitnessPullCount(node: FabricNode): int {.gcsafe, raises: [].} =
+  if node.isNil:
+    return 0
+  for queue in node.pendingWitnessPullsByPeer.values:
+    result += queue.len
+  for queue in node.stagedWitnessPullsByPeer.values:
+    result += queue.len
+  result += node.inflightWitnessPullByPeer.len
+
+proc outstandingDeliveryCount(
+    ledgerBook: Table[string, DeliveryLedger]
+): int {.gcsafe, raises: [].} =
+  for _, ledger in ledgerBook.pairs:
+    if ledger.remainingTargets.len > 0 or ledger.inflightTargets.len > 0:
+      inc result
+
+proc quiescenceSnapshot*(
+    node: FabricNode
+): FabricQuiescenceSnapshot {.gcsafe, raises: [].} =
+  if node.isNil:
+    return FabricQuiescenceSnapshot()
+  if node.running:
+    discard node.drainInboundNow()
+  if node.usesLsmrPrimary():
+    node.refreshPendingCertificationEvents()
+    node.prunePendingCertificationState()
+  FabricQuiescenceSnapshot(
+    pendingInbound: node.inbound.len,
+    localOfferedNonce: node.offeredNonce(node.identity.account),
+    localCommittedNonce: node.committedNonce(node.identity.account),
+    pendingEvents: node.pendingEvents.len,
+    pendingAttestations: node.pendingAttestationDebtCount(),
+    pendingEventCertificates: node.pendingEventCertificates.len,
+    pendingCertificationEvents: node.pendingCertificationEvents.len,
+    pendingWitnessPulls: node.pendingWitnessPullCount(),
+    pendingIndexFlushes:
+      node.pendingEventIndexFlushes.len + node.pendingAttestationIndexFlushes.len +
+      node.pendingCheckpointIndexFlushCount(),
+    eventOutstanding: outstandingDeliveryCount(node.eventDeliveries),
+    attOutstanding: outstandingDeliveryCount(node.attestationDeliveries),
+    certOutstanding: outstandingDeliveryCount(node.eventCertificateDeliveries),
+  )
+
+proc quiescenceReached(
+    snapshot: FabricQuiescenceSnapshot
+): bool {.gcsafe, raises: [].} =
+  snapshot.pendingInbound == 0 and
+    snapshot.localOfferedNonce == snapshot.localCommittedNonce and
+    snapshot.pendingEvents == 0 and
+    snapshot.pendingAttestations == 0 and
+    snapshot.pendingEventCertificates == 0 and
+    snapshot.pendingCertificationEvents == 0 and
+    snapshot.pendingWitnessPulls == 0 and
+    snapshot.pendingIndexFlushes == 0 and
+    snapshot.eventOutstanding == 0 and
+    snapshot.attOutstanding == 0 and
+    snapshot.certOutstanding == 0
+
+proc formatQuiescenceSnapshot(
+    snapshot: FabricQuiescenceSnapshot
+): string {.gcsafe, raises: [].} =
+  "pendingInbound=" & $snapshot.pendingInbound &
+    " localOfferedNonce=" & $snapshot.localOfferedNonce &
+    " localCommittedNonce=" & $snapshot.localCommittedNonce &
+    " pendingEvents=" & $snapshot.pendingEvents &
+    " pendingAttestations=" & $snapshot.pendingAttestations &
+    " pendingEventCertificates=" & $snapshot.pendingEventCertificates &
+    " pendingCertificationEvents=" & $snapshot.pendingCertificationEvents &
+    " pendingWitnessPulls=" & $snapshot.pendingWitnessPulls &
+    " pendingIndexFlushes=" & $snapshot.pendingIndexFlushes &
+    " eventOutstanding=" & $snapshot.eventOutstanding &
+    " attOutstanding=" & $snapshot.attOutstanding &
+    " certOutstanding=" & $snapshot.certOutstanding
+
+proc refreshSubmitFenceWork(node: FabricNode) =
+  if node.isNil:
+    return
+  if node.usesLsmrPrimary():
+    node.refreshPendingCertificationEvents()
+    node.prunePendingCertificationState()
+  if not node.running:
+    if node.pendingEventIndexFlushes.len > 0 or
+        node.pendingAttestationIndexFlushes.len > 0 or
+        node.pendingEventCertificateIndexFlushes.len > 0 or
+        node.pendingCheckpointCandidateIndexFlushes.len > 0 or
+        node.pendingCheckpointVoteIndexFlushes.len > 0:
+      try:
+        node.flushAllPendingAntiEntropyIndexes()
+      except Exception as exc:
+        raiseAssert("submit fence index flush failed: " & exc.msg)
+    return
+  if node.inbound.len > 0:
+    node.scheduleInboundDrain()
+  if not node.usesLsmrPrimary():
+    return
+  node.enableLsmrDataPlane()
+  node.scheduleReadyOutboundSessions()
+  node.scheduleCertificationGather()
+  node.scheduleStateMaintenance()
+
+proc submitFence*(node: FabricNode): FabricQuiescenceSnapshot =
+  if node.isNil:
+    raise newException(ValueError, "fabric node missing")
+  if node.submitFenceDepth > 0:
+    raise newException(ValueError, "submit fence reentry")
+  inc node.submitFenceDepth
+  try:
+    while true:
+      node.refreshSubmitFenceWork()
+      result = node.quiescenceSnapshot()
+      if result.quiescenceReached():
+        break
+      doAssert node.running and node.hasPendingLocalAsyncWork(),
+        "submit fence stalled " & result.formatQuiescenceSnapshot()
+      poll()
+  finally:
+    dec node.submitFenceDepth
+
+proc expectedCommittedNonce(
+    node: FabricNode, account: string
+): uint64 {.gcsafe, raises: [].} =
+  node.committedNonce(account) + 1'u64
+
+proc nextLocalNonce*(
+    node: FabricNode
+): uint64 {.gcsafe, raises: [].} =
+  if node.isNil:
+    return 1'u64
+  node.expectedCommittedNonce(node.identity.account)
+
+proc prepareLocalTx*(
+    node: FabricNode,
+    kind: TxKind,
+    payload: JsonNode,
+    epoch = 0'u64,
+    timestamp = 0'i64,
+): Tx =
+  if node.isNil:
+    raise newException(ValueError, "fabric node missing")
+  result = Tx(
+    txId: "",
+    kind: kind,
+    sender: "",
+    senderPublicKey: "",
+    nonce: node.nextLocalNonce(),
+    epoch: epoch,
+    timestamp: if timestamp != 0: timestamp else: int64(epochTime() * 1000),
+    payload: payload,
+    signature: "",
+  )
+  signTx(node.identity, result)
+
 proc submitTx*(node: FabricNode, tx: Tx): SubmitEventResult =
+  if node.isNil:
+    raise newException(ValueError, "fabric node missing")
+  if node.submitFenceDepth > 0:
+    raise newException(ValueError, "submit fence active")
+  let committed = node.committedNonce(tx.sender)
+  let expected = node.expectedCommittedNonce(tx.sender)
   when defined(fabric_submit_diag):
-    echo "submit-stage start sender=", tx.sender, " nonce=", tx.nonce
+    echo "submit-stage start sender=", tx.sender,
+      " offeredNonce=", tx.nonce,
+      " committedNonce=", committed,
+      " expectedNonce=", expected
+  if tx.nonce != expected:
+    raise newException(
+      ValueError,
+      "submit nonce mismatch for " & tx.sender &
+        ": expected committed nonce " & $expected &
+        " got " & $tx.nonce,
+    )
   if node.usesLsmrPrimary():
     node.enableLsmrDataPlane()
   if node.usesLsmrPrimary():
@@ -9315,23 +11077,33 @@ proc submitTx*(node: FabricNode, tx: Tx): SubmitEventResult =
   else:
     discard node.drainInbound()
   when defined(fabric_submit_diag):
-    echo "submit-stage drained sender=", tx.sender, " nonce=", tx.nonce
+    echo "submit-stage drained sender=", tx.sender,
+      " offeredNonce=", tx.nonce,
+      " committedNonce=", committed,
+      " expectedNonce=", expected
   let event = node.buildEvent(tx)
   result.eventId = event.eventId
   result.accepted = node.registerEvent(event)
   when defined(fabric_submit_diag):
-    echo "submit-stage registered sender=", tx.sender, " nonce=", tx.nonce,
-      " accepted=", result.accepted, " event=", result.eventId
+    echo "submit-stage registered sender=", tx.sender,
+      " offeredNonce=", tx.nonce,
+      " committedNonce=", node.committedNonce(tx.sender),
+      " accepted=", result.accepted,
+      " event=", result.eventId
   if result.accepted:
     if node.usesLsmrPrimary():
       node.advanceLocalAcceptedEvent(event.eventId)
       when defined(fabric_submit_diag):
-        echo "submit-stage converged sender=", tx.sender, " nonce=", tx.nonce,
+        echo "submit-stage converged sender=", tx.sender,
+          " offeredNonce=", tx.nonce,
+          " committedNonce=", node.committedNonce(tx.sender),
           " mode=local"
   else:
     node.converge()
     when defined(fabric_submit_diag):
-      echo "submit-stage converged sender=", tx.sender, " nonce=", tx.nonce
+      echo "submit-stage converged sender=", tx.sender,
+        " offeredNonce=", tx.nonce,
+        " committedNonce=", node.committedNonce(tx.sender)
   if node.usesLsmrPrimary():
     # `submitTx()` is synchronous but it schedules real network/inbound work.
     # Pump multiple turns so `callSoon` outbound launch, batch ack resume,
@@ -9346,9 +11118,24 @@ proc submitTx*(node: FabricNode, tx: Tx): SubmitEventResult =
           "author event stalled before settle: " & event.eventId
         poll()
   result.certified = event.eventId in node.eventCertificates
+  result.committedNonce = node.committedNonce(tx.sender)
+  when defined(fabric_submit_diag):
+    echo "submit-stage committed sender=", tx.sender,
+      " nonce=", result.committedNonce,
+      " certified=", result.certified,
+      " event=", result.eventId
   for checkpointId, checkpoint in node.checkpoints.pairs:
     if checkpoint.candidate.era >= event.clock.era:
       result.checkpointIds.add(checkpointId)
+
+proc submitLocalTx*(
+    node: FabricNode,
+    kind: TxKind,
+    payload: JsonNode,
+    epoch = 0'u64,
+    timestamp = 0'i64,
+): SubmitEventResult =
+  node.submitTx(node.prepareLocalTx(kind, payload, epoch, timestamp))
 
 proc fabricStatus*(node: FabricNode): FabricStatusSnapshot =
   when defined(fabric_diag):
@@ -9367,6 +11154,8 @@ proc fabricStatus*(node: FabricNode): FabricStatusSnapshot =
     routingStatus: node.routingPlaneStatus(),
     eventCount: node.events.len,
     certifiedEventCount: node.eventCertificates.len,
+    localOfferedNonce: node.offeredNonce(node.identity.account),
+    localCommittedNonce: node.committedNonce(node.identity.account),
     checkpointCount: node.checkpoints.len,
     latestCheckpointId: node.latestCheckpointId,
     latestCheckpointEra:

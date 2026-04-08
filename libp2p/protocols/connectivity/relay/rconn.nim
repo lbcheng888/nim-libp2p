@@ -39,7 +39,7 @@ method closeImpl*(self: RelayConnection): Future[void] {.async: (raises: []).} =
   await self.conn.close()
   await procCall Connection(self).closeImpl()
 
-method getWrapped*(self: RelayConnection): Connection =
+method getWrapped*(self: RelayConnection): Connection {.gcsafe.} =
   self.conn
 
 proc new*(

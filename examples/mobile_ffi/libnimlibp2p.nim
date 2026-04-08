@@ -1,5 +1,5 @@
 import std/[algorithm, atomics, base64, json, math, options, sequtils, sets, strformat,
-            strutils, tables, times, locks, random]
+            strutils, tables, times, locks, random, uri]
 import std/os
 import chronos
 import chronos/apps/http/httpclient
@@ -77,12 +77,11 @@ proc nim_thread_detach*() {.exportc, cdecl, dynlib.} =
   tearDownForeignThreadGc()
 
 proc canonicalizeMultiaddrText(text: string): string {.gcsafe, raises: [].} =
-  if text.len == 0:
-    return text
-  let maRes = MultiAddress.init(text)
-  if maRes.isOk():
-    return $maRes.get()
-  result = text
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    return trimmed
+  discard MultiAddress.init(trimmed)
+  trimmed
 
 const LegacyPublicWanBootstrapFallbackAddrs = [
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -167,6 +166,11 @@ const
   UdpEchoProbePort = 4002
   UdpEchoProbeTimeoutDefaultMs = 2_500
   UdpEchoProbeMagic = "um_udp_echo_v1:"
+  PeerRouteSessionRetryDelayMs = 750'i64
+  PeerRouteSessionWarmAttemptMs = 8_000
+  PeerRouteSessionWarmWorkerMs = 30_000
+  PeerRouteSessionRetainMs = 120_000'i64
+  TailnetProviderWarmPendingErr = "local tailnet provider pending"
   PublicIpProbeRefreshMs = 60_000'i64
   PublicIpProbeRetryMs = 15_000'i64
   PublicIpProbeTimeoutMs = 2_500
@@ -188,13 +192,50 @@ var messageIdCounter: int64 = 0
 var messageIdLock: Lock
 var lastNodeIdentityLock: Lock
 type
+  DirectPeerPathState = object
+    desired: bool
+    routeStage: string
+    routePathKind: string
+    sessionStage: string
+    sessionConnKey: int
+    lastDialStage: string
+    lastError: string
+    updatedAtMs: int64
+    attemptCount: int
+    successCount: int
+    failureCount: int
+    lastAttemptAtMs: int64
+    lastReadyAtMs: int64
+    lastFailureAtMs: int64
+
+  DirectPeerPathSnapshot = object
+    desired: bool
+    routeStage: string
+    routePathKind: string
+    sessionStage: string
+    sessionConnKey: int
+    lastDialStage: string
+    lastError: string
+    updatedAtMs: int64
+    attemptCount: int
+    successCount: int
+    failureCount: int
+    lastAttemptAtMs: int64
+    lastReadyAtMs: int64
+    lastFailureAtMs: int64
+
   DirectSessionTargetSnapshot = object
     taskKey: string
     peerId: string
     source: string
     selectedAddrs: seq[string]
+    desired: bool
     status: string
     error: string
+    routeStage: string
+    sessionStage: string
+    lastDialStage: string
+    lastError: string
     ok: bool
     taskRunning: bool
     sessionWarmOk: bool
@@ -211,17 +252,76 @@ type
     lastFailureAtMs: int64
     lastFailureReason: string
     successRatePct: int
+    directDmLatencyMs: int
+    relayDmLatencyMs: int
     taskState: string
     verifiedMuxerWaitMs: int
     attemptedAddr: string
+
+  PeerPathPolicy = enum
+    ppDirectOnly
+    ppRelayOnly
+    ppDirectThenRelay
+
+  RouteTransportIntent = object
+    routeKey: string
+    peerId: string
+    seedAddrs: seq[string]
+    source: string
+    policy: PeerPathPolicy
+    updatedAtMs: int64
+
+  ConversationTransportSnapshot = object
+    routeKey: string
+    peerId: string
+    source: string
+    policy: string
+    selectedAddrs: seq[string]
+    status: string
+    directStage: string
+    directConnKey: int
+    directTaskRunning: bool
+    directLastDialStage: string
+    directError: string
+    directPathKind: string
+    relayStage: string
+    relayConnKey: int
+    relayTaskRunning: bool
+    relayLastDialStage: string
+    relayError: string
+    directAttemptCount: int
+    directSuccessCount: int
+    directSuccessRatePct: int
+    directDmLatencyMs: int
+    relayDmLatencyMs: int
+    selectedPath: string
+    selectedConnKey: int
+    ready: bool
+    lastError: string
+    updatedAtMs: int64
+
   PeerRouteSessionSnapshot = object
     peerId: string
     status: string
     error: string
+    lastDialStage: string
     ok: bool
     taskRunning: bool
     sessionWarmOk: bool
     sessionConnKey: int
+
+  SendWithAckKickoffStatusSnapshot = ptr SendWithAckKickoffStatusSnapshotObj
+  SendWithAckKickoffStatusSnapshotObj = object
+    statusText: cstring
+    errorText: cstring
+    payloadText: cstring
+    updatedAtMs: int64
+
+  SendWithAckKickoffStatusSlot = ptr SendWithAckKickoffStatusSlotObj
+  SendWithAckKickoffStatusSlotObj = object
+    next: Atomic[SendWithAckKickoffStatusSlot]
+    requestKey: cstring
+    latest: Atomic[SendWithAckKickoffStatusSnapshot]
 
 var bootstrapSeedConnectKickoffState {.global.}: Table[string, string] = initTable[string, string]()
 var bootstrapSeedConnectKickoffLatestTaskKey {.global.}: Table[string, string] = initTable[string, string]()
@@ -230,9 +330,7 @@ var directSessionTargetSnapshots {.global.}: Table[string, DirectSessionTargetSn
   initTable[string, DirectSessionTargetSnapshot]()
 var directSessionTargetLatestTaskKey {.global.}: Table[string, string] = initTable[string, string]()
 var directSessionTargetStateLock {.global.}: Lock
-var sendWithAckKickoffState {.global.}: Table[string, string] = initTable[string, string]()
-var sendWithAckKickoffProgressStage {.global.}: Table[string, string] = initTable[string, string]()
-var sendWithAckKickoffStateLock {.global.}: Lock
+var sendWithAckKickoffStatusSlotsHead {.global.}: Atomic[SendWithAckKickoffStatusSlot]
 var lastNodeHandle: pointer = nil
 var lastNodePeerIdCache = ""
 
@@ -240,7 +338,6 @@ initLock(messageIdLock)
 initLock(lastNodeIdentityLock)
 initLock(bootstrapSeedConnectKickoffStateLock)
 initLock(directSessionTargetStateLock)
-initLock(sendWithAckKickoffStateLock)
 
 proc allocCString(str: string): cstring {.gcsafe, raises: [].}
 
@@ -296,8 +393,13 @@ proc directSessionTargetStateJson(
     appendStringField("peerId", snapshot.peerId)
     appendStringField("source", snapshot.source)
     appendStringSeqField("selectedAddrs", snapshot.selectedAddrs)
+    appendBoolField("desired", snapshot.desired)
     appendStringField("status", snapshot.status)
     appendStringField("taskKey", snapshot.taskKey)
+    appendStringField("routeStage", snapshot.routeStage)
+    appendStringField("sessionStage", snapshot.sessionStage)
+    appendStringField("lastDialStage", snapshot.lastDialStage)
+    appendStringField("lastError", snapshot.lastError)
     appendBoolField("taskRunning", snapshot.taskRunning)
     appendBoolField("sessionWarmOk", snapshot.sessionWarmOk)
     appendBoolField("verifiedMuxer", snapshot.verifiedMuxer)
@@ -313,6 +415,8 @@ proc directSessionTargetStateJson(
     appendIntField("lastFailureAtMs", snapshot.lastFailureAtMs)
     appendStringField("lastFailureReason", snapshot.lastFailureReason)
     appendIntField("successRatePct", snapshot.successRatePct)
+    appendIntField("directDmLatencyMs", snapshot.directDmLatencyMs)
+    appendIntField("relayDmLatencyMs", snapshot.relayDmLatencyMs)
     if snapshot.taskState.len > 0:
       appendStringField("taskState", snapshot.taskState)
       appendIntField("verifiedMuxerWaitMs", snapshot.verifiedMuxerWaitMs)
@@ -345,13 +449,221 @@ proc directSessionTargetStateJson(
   result.add(payloadJson(snapshot))
   result.add('}')
 
+proc peerRouteSessionSnapshotJson(
+    snapshot: PeerRouteSessionSnapshot
+): string {.raises: [].} =
+  result = newStringOfCap(256)
+  result.add('{')
+
+  template appendFieldSep() =
+    if result.len > 1:
+      result.add(',')
+
+  template appendStringField(key: string, value: string) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(escapeJson(value))
+
+  template appendBoolField(key: string, value: bool) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(if value: "true" else: "false")
+
+  template appendIntField(key: string, value: SomeInteger) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add($value)
+
+  appendBoolField("ok", snapshot.ok)
+  appendStringField("peerId", snapshot.peerId)
+  appendStringField("status", snapshot.status)
+  appendStringField("error", snapshot.error)
+  appendStringField("lastDialStage", snapshot.lastDialStage)
+  appendBoolField("taskRunning", snapshot.taskRunning)
+  appendBoolField("sessionWarmOk", snapshot.sessionWarmOk)
+  appendIntField("sessionConnKey", snapshot.sessionConnKey)
+  result.add('}')
+
+proc peerPathPolicyText(
+    policy: PeerPathPolicy
+): string {.gcsafe, raises: [].} =
+  case policy
+  of ppDirectOnly:
+    "direct_only"
+  of ppRelayOnly:
+    "relay_only"
+  of ppDirectThenRelay:
+    "direct_then_relay"
+
+proc parsePeerPathPolicy(
+    text: string
+): PeerPathPolicy {.gcsafe, raises: [].} =
+  case text.strip().toLowerAscii()
+  of "direct_only", "direct":
+    ppDirectOnly
+  of "relay_only", "relay":
+    ppRelayOnly
+  else:
+    ppDirectThenRelay
+
+proc peerPathPolicyUsesDirect(
+    policy: PeerPathPolicy
+): bool {.gcsafe, raises: [].} =
+  policy != ppRelayOnly
+
+proc peerPathPolicyUsesRelay(
+    policy: PeerPathPolicy
+): bool {.gcsafe, raises: [].} =
+  policy != ppDirectOnly
+
+proc conversationTransportSnapshotJson(
+    snapshot: ConversationTransportSnapshot
+): string {.raises: [].} =
+  result = newStringOfCap(768)
+  result.add('{')
+
+  template appendFieldSep() =
+    if result.len > 1:
+      result.add(',')
+
+  template appendStringField(key: string, value: string) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(escapeJson(value))
+
+  template appendBoolField(key: string, value: bool) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add(if value: "true" else: "false")
+
+  template appendIntField(key: string, value: SomeInteger) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":")
+    result.add($value)
+
+  template appendStringSeqField(key: string, values: seq[string]) =
+    appendFieldSep()
+    result.add('"')
+    result.add(key)
+    result.add("\":[")
+    for idx, value in values:
+      if idx > 0:
+        result.add(',')
+      result.add(escapeJson(value))
+    result.add(']')
+
+  appendStringField("routeKey", snapshot.routeKey)
+  appendStringField("peerId", snapshot.peerId)
+  appendStringField("source", snapshot.source)
+  appendStringField("policy", snapshot.policy)
+  appendStringSeqField("selectedAddrs", snapshot.selectedAddrs)
+  appendStringField("status", snapshot.status)
+  appendStringField("directStage", snapshot.directStage)
+  appendIntField("directConnKey", snapshot.directConnKey)
+  appendBoolField("directTaskRunning", snapshot.directTaskRunning)
+  appendStringField("directLastDialStage", snapshot.directLastDialStage)
+  appendStringField("directError", snapshot.directError)
+  appendStringField("directPathKind", snapshot.directPathKind)
+  appendStringField("relayStage", snapshot.relayStage)
+  appendIntField("relayConnKey", snapshot.relayConnKey)
+  appendBoolField("relayTaskRunning", snapshot.relayTaskRunning)
+  appendStringField("relayLastDialStage", snapshot.relayLastDialStage)
+  appendStringField("relayError", snapshot.relayError)
+  appendIntField("directAttemptCount", snapshot.directAttemptCount)
+  appendIntField("directSuccessCount", snapshot.directSuccessCount)
+  appendIntField("directSuccessRatePct", snapshot.directSuccessRatePct)
+  appendIntField("directDmLatencyMs", snapshot.directDmLatencyMs)
+  appendIntField("relayDmLatencyMs", snapshot.relayDmLatencyMs)
+  appendStringField("selectedPath", snapshot.selectedPath)
+  appendIntField("selectedConnKey", snapshot.selectedConnKey)
+  appendBoolField("ready", snapshot.ready)
+  appendStringField("lastError", snapshot.lastError)
+  appendIntField("updatedAtMs", snapshot.updatedAtMs)
+  result.add('}')
+
+proc buildConversationTransportSnapshot(
+    routeKey: string,
+    peerId: string,
+    source: string = "",
+    policy: string = "direct_then_relay",
+    selectedAddrs: seq[string] = @[],
+    status: string = "missing",
+    directStage: string = "",
+    directConnKey = 0,
+    directTaskRunning = false,
+    directLastDialStage = "",
+    directError = "",
+    directPathKind = "",
+    relayStage: string = "",
+    relayConnKey = 0,
+    relayTaskRunning = false,
+    relayLastDialStage = "",
+    relayError = "",
+    directAttemptCount = 0,
+    directSuccessCount = 0,
+    directSuccessRatePct = 0,
+    directDmLatencyMs = -1,
+    relayDmLatencyMs = -1,
+    selectedPath = "",
+    selectedConnKey = 0,
+    ready = false,
+    lastError = "",
+    updatedAtMs = 0'i64,
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  ConversationTransportSnapshot(
+    routeKey: routeKey,
+    peerId: peerId,
+    source: source,
+    policy: policy,
+    selectedAddrs: selectedAddrs,
+    status: status,
+    directStage: directStage,
+    directConnKey: directConnKey,
+    directTaskRunning: directTaskRunning,
+    directLastDialStage: directLastDialStage,
+    directError: directError,
+    directPathKind: directPathKind,
+    relayStage: relayStage,
+    relayConnKey: relayConnKey,
+    relayTaskRunning: relayTaskRunning,
+    relayLastDialStage: relayLastDialStage,
+    relayError: relayError,
+    directAttemptCount: directAttemptCount,
+    directSuccessCount: directSuccessCount,
+    directSuccessRatePct: directSuccessRatePct,
+    directDmLatencyMs: directDmLatencyMs,
+    relayDmLatencyMs: relayDmLatencyMs,
+    selectedPath: selectedPath,
+    selectedConnKey: selectedConnKey,
+    ready: ready,
+    lastError: lastError,
+    updatedAtMs: updatedAtMs,
+  )
+
 proc buildDirectSessionTargetSnapshot(
     peerId: string,
     taskKey: string,
     status: string,
     selectedAddrs: seq[string] = @[],
     source = "",
+    desired = false,
     error = "",
+    routeStage = "",
+    sessionStage = "",
+    lastDialStage = "",
+    lastError = "",
     ok = false,
     taskRunning = false,
     sessionWarmOk = false,
@@ -367,6 +679,8 @@ proc buildDirectSessionTargetSnapshot(
     lastReadyAtMs = 0'i64,
     lastFailureAtMs = 0'i64,
     lastFailureReason = "",
+    directDmLatencyMs = -1,
+    relayDmLatencyMs = -1,
     taskState = "",
     verifiedMuxerWaitMs = 0,
     attemptedAddr = ""
@@ -381,8 +695,31 @@ proc buildDirectSessionTargetSnapshot(
     peerId: peerId,
     source: source,
     selectedAddrs: selectedAddrs,
-    status: status,
-    error: error,
+    desired: desired,
+    status:
+      if status.len > 0:
+        status
+      elif sessionStage.len > 0:
+        sessionStage
+      else:
+        "missing",
+    error:
+      if error.len > 0:
+        error
+      else:
+        lastError,
+    routeStage: routeStage,
+    sessionStage:
+      if sessionStage.len > 0:
+        sessionStage
+      else:
+        status,
+    lastDialStage: lastDialStage,
+    lastError:
+      if lastError.len > 0:
+        lastError
+      else:
+        error,
     ok: ok,
     taskRunning: taskRunning,
     sessionWarmOk: sessionWarmOk,
@@ -399,6 +736,8 @@ proc buildDirectSessionTargetSnapshot(
     lastFailureAtMs: lastFailureAtMs,
     lastFailureReason: lastFailureReason,
     successRatePct: successRatePct,
+    directDmLatencyMs: directDmLatencyMs,
+    relayDmLatencyMs: relayDmLatencyMs,
     taskState: taskState,
     verifiedMuxerWaitMs: verifiedMuxerWaitMs,
     attemptedAddr: attemptedAddr,
@@ -704,6 +1043,146 @@ proc sendWithAckKickoffStateJson(
     obj["payload"] = payload
   $obj
 
+proc cstringToString(value: cstring): string {.gcsafe, raises: [].} =
+  if value.isNil:
+    return ""
+  $value
+
+proc cstringMatches(value: cstring, expected: string): bool {.gcsafe, raises: [].} =
+  if value.isNil:
+    return expected.len == 0
+  cstringToString(value) == expected
+
+proc findSendWithAckKickoffStatusSlot(
+    requestKey: string
+): SendWithAckKickoffStatusSlot {.gcsafe, raises: [].} =
+  if requestKey.len == 0:
+    return nil
+  var current = sendWithAckKickoffStatusSlotsHead.load(moAcquire)
+  while not current.isNil:
+    if cstringMatches(current.requestKey, requestKey):
+      return current
+    current = current.next.load(moAcquire)
+
+proc ensureSendWithAckKickoffStatusSlot(
+    requestKey: string
+): SendWithAckKickoffStatusSlot {.gcsafe, raises: [].} =
+  let safeRequestKey = requestKey.strip()
+  if safeRequestKey.len == 0:
+    return nil
+  let existing = findSendWithAckKickoffStatusSlot(safeRequestKey)
+  if not existing.isNil:
+    return existing
+  let slot = cast[SendWithAckKickoffStatusSlot](allocShared0(sizeof(SendWithAckKickoffStatusSlotObj)))
+  if slot.isNil:
+    return nil
+  slot.requestKey = allocCString(safeRequestKey)
+  while true:
+    let head = sendWithAckKickoffStatusSlotsHead.load(moAcquire)
+    slot.next.store(head, moRelease)
+    var expected = head
+    if sendWithAckKickoffStatusSlotsHead.compareExchange(
+      expected,
+      slot,
+      moAcquireRelease,
+      moAcquire,
+    ):
+      return slot
+    let current = findSendWithAckKickoffStatusSlot(safeRequestKey)
+    if not current.isNil:
+      return current
+
+proc newSendWithAckKickoffStatusSnapshot(
+    status: string,
+    payload: JsonNode,
+    error: string
+): SendWithAckKickoffStatusSnapshot {.gcsafe, raises: [].} =
+  result = cast[SendWithAckKickoffStatusSnapshot](allocShared0(sizeof(SendWithAckKickoffStatusSnapshotObj)))
+  if result.isNil:
+    return nil
+  result.statusText = allocCString(status)
+  result.errorText = allocCString(error)
+  if payload.kind != JNull:
+    result.payloadText = allocCString($payload)
+  result.updatedAtMs = nowMillis()
+
+proc publishSendWithAckKickoffStatusSnapshot(
+    slot: SendWithAckKickoffStatusSlot,
+    snapshot: SendWithAckKickoffStatusSnapshot
+) {.gcsafe, raises: [].} =
+  if slot.isNil or snapshot.isNil:
+    return
+  while true:
+    let current = slot.latest.load(moAcquire)
+    if not current.isNil and current.updatedAtMs > snapshot.updatedAtMs:
+      return
+    var expected = current
+    if slot.latest.compareExchange(
+      expected,
+      snapshot,
+      moAcquireRelease,
+      moAcquire,
+    ):
+      return
+    if not expected.isNil and expected.updatedAtMs > snapshot.updatedAtMs:
+      return
+
+proc sendWithAckKickoffStateJson(
+    requestKey: string,
+    snapshot: SendWithAckKickoffStatusSnapshot
+): string {.gcsafe, raises: [].} =
+  let statusText =
+    if snapshot.isNil:
+      "missing"
+    else:
+      cstringToString(snapshot.statusText)
+  let errorText =
+    if snapshot.isNil:
+      ""
+    else:
+      cstringToString(snapshot.errorText)
+  let payloadText =
+    if snapshot.isNil:
+      ""
+    else:
+      cstringToString(snapshot.payloadText)
+  let updatedAtMs =
+    if snapshot.isNil:
+      0'i64
+    else:
+      snapshot.updatedAtMs
+  result = newStringOfCap(max(payloadText.len + requestKey.len + statusText.len + errorText.len + 96, 128))
+  result.add("{\"status\":")
+  result.add(escapeJson(statusText))
+  result.add(",\"requestKey\":")
+  result.add(escapeJson(requestKey))
+  result.add(",\"error\":")
+  result.add(escapeJson(errorText))
+  result.add(",\"updatedAtMs\":")
+  result.add($updatedAtMs)
+  if payloadText.len > 0:
+    result.add(",\"payload\":")
+    result.add(payloadText)
+  result.add("}")
+
+proc buildTailnetListenerEventText(
+    stage: string,
+    providerReady: bool,
+    updatedAtMs: int64,
+    err = "",
+): string {.gcsafe, raises: [].} =
+  result = newStringOfCap(max(stage.len + err.len + 96, 128))
+  result.add("{\"entity\":\"tailnet_listener\",\"stage\":")
+  result.add(escapeJson(stage))
+  if err.len > 0:
+    result.add(",\"error\":")
+    result.add(escapeJson(err))
+  result.add(",\"updatedAtMs\":")
+  result.add($updatedAtMs)
+  result.add(",\"providerReady\":")
+  result.add(if providerReady: "true" else: "false")
+  result.add("}")
+
 proc setSendWithAckKickoffState(
     requestKey: string,
     status: string,
@@ -720,13 +1199,10 @@ proc setSendWithAckKickoffState(
       stageText = payload["stage"].getStr("").strip()
     if payload.hasKey("peerId") and payload["peerId"].kind == JString:
       peerText = payload["peerId"].getStr("").strip()
-  withLock(sendWithAckKickoffStateLock):
-    if payload.kind == JObject and payload.hasKey("stage"):
-      let stage = payload["stage"].getStr("").strip()
-      if stage.len > 0:
-        sendWithAckKickoffProgressStage[safeRequestKey] = stage
-    sendWithAckKickoffState[safeRequestKey] =
-      sendWithAckKickoffStateJson(safeRequestKey, status, payload, error)
+  let slot = ensureSendWithAckKickoffStatusSlot(safeRequestKey)
+  if not slot.isNil:
+    let snapshot = newSendWithAckKickoffStatusSnapshot(status, payload, error)
+    publishSendWithAckKickoffStatusSnapshot(slot, snapshot)
   try:
     stderr.writeLine(
       "[nimlibp2p] sendWithAckKickoff state request=" &
@@ -743,10 +1219,10 @@ proc getSendWithAckKickoffState(requestKey: string): string =
   let safeRequestKey = requestKey.strip()
   if safeRequestKey.len == 0:
     return sendWithAckKickoffStateJson("", "missing", newJNull(), "missing_request_key")
-  withLock(sendWithAckKickoffStateLock):
-    if sendWithAckKickoffState.hasKey(safeRequestKey):
-      return sendWithAckKickoffState[safeRequestKey]
-  sendWithAckKickoffStateJson(safeRequestKey, "missing")
+  let slot = findSendWithAckKickoffStatusSlot(safeRequestKey)
+  if slot.isNil:
+    return sendWithAckKickoffStateJson(safeRequestKey, nil)
+  sendWithAckKickoffStateJson(safeRequestKey, slot.latest.load(moAcquire))
 
 proc mergeJsonObjectFields(target: var JsonNode, extra: JsonNode) =
   if target.kind != JObject or extra.kind != JObject:
@@ -758,15 +1234,14 @@ proc getSendWithAckKickoffPayloadSnapshot(requestKey: string): JsonNode =
   let safeRequestKey = requestKey.strip()
   if safeRequestKey.len == 0:
     return newJNull()
-  var rawState = ""
-  withLock(sendWithAckKickoffStateLock):
-    rawState = sendWithAckKickoffState.getOrDefault(safeRequestKey, "")
-  if rawState.len == 0:
+  let slot = findSendWithAckKickoffStatusSlot(safeRequestKey)
+  if slot.isNil:
+    return newJNull()
+  let snapshot = slot.latest.load(moAcquire)
+  if snapshot.isNil or snapshot.payloadText.isNil:
     return newJNull()
   try:
-    let node = parseJson(rawState)
-    if node.kind == JObject and node.hasKey("payload"):
-      return cloneJson(node["payload"])
+    return cloneJson(parseJson(cstringToString(snapshot.payloadText)))
   except CatchableError:
     discard
   newJNull()
@@ -998,13 +1473,19 @@ type
     cmdConnectedPeers,
     cmdPeerMultiaddrs,
     cmdDiagnostics,
+    cmdSocialStateFlush,
     cmdTailnetWarm,
     cmdTailnetWarmFinalize,
     cmdTailnetStatus,
     cmdTailnetPing,
     cmdTailnetDerpMap,
     cmdConnectedPeersInfo,
+    cmdPathIntentUpsert,
+    cmdPathIntentClear,
+    cmdPathSnapshot,
     cmdRegisterPeerHints,
+    cmdPrepareRelaySession,
+    cmdRelaySessionStatus,
     cmdAddExternalAddress,
     cmdCheckPeerConnected,
     cmdSyncPeerstore,
@@ -1089,6 +1570,7 @@ type
     target: string
     jsonString: string
     textPayload: string
+    policyText: string
     hostNetworkStatusParam: HostNetworkStatusSnapshot
     hostNetworkStatusParamSet: bool
     streamKey: string
@@ -1150,6 +1632,7 @@ type
     updatedAtMs: int64
     deadlineAtMs: int64
     err: string
+    lastDialStage: string
     sessionConnKey: int
 
   SendDirectKickoffTask = ref object
@@ -1157,6 +1640,7 @@ type
     peerId: string
     source: string
     forceRelayConnectivity: bool
+    preferredSessionConnKey: int
     updatedAtMs: int64
     completedAtMs: int64
     running: bool
@@ -1167,14 +1651,14 @@ type
     source: string
     selectedAddrs: seq[string]
     updatedAtMs: int64
-    lastPublishedStatus: string
-    attemptCount: int
-    successCount: int
-    failureCount: int
-    lastAttemptAtMs: int64
-    lastReadyAtMs: int64
-    lastFailureAtMs: int64
-    lastFailureReason: string
+
+  RelaySessionTargetSpec = object
+    peerId: string
+    source: string
+    selectedAddrs: seq[string]
+    updatedAtMs: int64
+    sticky: bool
+    retainedUntilAtMs: int64
 
   HostNetworkStatusSnapshot = object
     networkType: string
@@ -1245,6 +1729,8 @@ type
     peerHintSources: Table[string, seq[string]]
     authoritativeBootstrapPeerIds: seq[string]
     lastAuthoritativeBootstrapKickMs: int64
+    bootstrapRefreshTask: Future[void]
+    bootstrapRefreshPending: Atomic[bool]
     bootstrapLastSeen: Table[string, int64]
     mdnsEnabled: bool
     mdnsIntervalSeconds: int
@@ -1275,8 +1761,16 @@ type
     bootstrapSeedConnectFutures: Table[string, Future[void]]
     directSessionTargetLock: Lock
     directSessionTargets: Table[string, DirectSessionTargetSpec]
+    relaySessionTargets: Table[string, RelaySessionTargetSpec]
+    routeTransportIntents: Table[string, RouteTransportIntent]
+    routeTransportSnapshots: Table[string, ConversationTransportSnapshot]
+    routeTransportWakeups: Table[string, AsyncEvent]
+    peerTransportRoutes: Table[string, seq[string]]
+    directPeerPathStates: Table[string, DirectPeerPathState]
+    directPeerPathFutures: Table[string, Future[void]]
     peerRouteSessionTasks: Table[string, PeerRouteSessionTask]
     peerRouteSessionFutures: Table[string, Future[void]]
+    peerRouteSessionReconcileWake: AsyncEvent
     sendDirectKickoffTasks: Table[string, SendDirectKickoffTask]
     sendDirectKickoffFutures: Table[string, Future[void]]
     tailnetWarmThread: Thread[pointer]
@@ -1314,6 +1808,7 @@ type
     relayReservationLoop: Future[void]
     relayReservationCycle: Future[int]
     tailnetControlRefreshLoop: Future[void]
+    tailnetListenerRepairTask: Future[void]
     directSessionTargetReconcileLoop: Future[void]
     peerRouteSessionReconcileLoop: Future[void]
     tailnetAdvertisedPeerSyncTask: Future[void]
@@ -1330,10 +1825,15 @@ type
     receivedDmLog: seq[ReceivedDmSnapshot]
     receivedDmLogLock: Lock
     receivedDmLogLimit: int
+    socialStatePathText: string
     socialStateSnapshot: string
-    socialStateParsedSnapshot: JsonNode
+    socialStateOwner: JsonNode
+    socialStateDirtyVersion: int64
+    socialStatePersistedVersion: int64
+    socialStateFlushEnqueued: bool
     localSystemProfile: JsonNode
     localSystemProfileUpdatedAt: int64
+    hostNetworkStatusLock: Lock
     hostNetworkStatus: HostNetworkStatusSnapshot
     hostNetworkStatusUpdatedAt: int64
     lastTailnetPing: JsonNode
@@ -1396,13 +1896,16 @@ const
 
 proc publishDirectSessionTargetSnapshot(
     n: NimNode,
-    spec: DirectSessionTargetSpec,
-    forcedStatus = "",
-    forcedError = ""
+    spec: DirectSessionTargetSpec
 ) {.gcsafe, raises: [].}
 proc reconcileDirectSessionTarget(
     n: NimNode,
     spec: DirectSessionTargetSpec
+) {.gcsafe, raises: [].}
+proc reconcilePeerRouteSession(
+    n: NimNode,
+    peerIdText: string,
+    source: string
 ) {.gcsafe, raises: [].}
 proc ensureDirectSessionTargetReconcileLoop(n: NimNode) {.gcsafe, raises: [].}
 proc ensurePeerRouteSessionReconcileLoop(n: NimNode) {.gcsafe, raises: [].}
@@ -1413,12 +1916,43 @@ proc upsertDirectSessionTarget(
     n: NimNode,
     peerIdText: string,
     addresses: seq[string],
+    source: string,
+    reconcileRelay = true
+): DirectSessionTargetSpec {.gcsafe, raises: [].}
+proc liveDirectSessionTargetSnapshot(
+    n: NimNode,
+    peerId: string,
+    selectedAddrs: openArray[string]
+): DirectSessionTargetSnapshot {.gcsafe, raises: [].}
+proc getLiveReadyDirectSessionTargetConnKey(
+    n: NimNode,
+    peerId: string,
+    selectedAddrs: openArray[string]
+): int {.gcsafe, raises: [].}
+proc clearDirectSessionTargetDesiredState(
+    n: NimNode,
+    peerIdText: string,
+    addresses: seq[string],
     source: string
 ): DirectSessionTargetSpec {.gcsafe, raises: [].}
 proc latestPeerRouteSessionSnapshot(
     n: NimNode,
     peerIdText: string
 ): PeerRouteSessionSnapshot {.gcsafe, raises: [].}
+proc latestConversationTransportSnapshot(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: openArray[string]
+): ConversationTransportSnapshot {.gcsafe, raises: [].}
+proc publishRouteTransportSnapshot(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: openArray[string]
+): ConversationTransportSnapshot {.gcsafe, raises: [].}
+proc publishPeerRouteTransportSnapshots(
+    n: NimNode,
+    peerIdText: string
+) {.gcsafe, raises: [].}
 proc peerRouteSessionReady(
     snapshot: PeerRouteSessionSnapshot
 ): bool {.gcsafe, raises: [].}
@@ -1527,7 +2061,6 @@ proc acquireCommand(kind: CommandKind): Command =
   result.kind = kind
   result.completion = nil
   result.next.store(nil, moRelease)
-  debugLog("[nimlibp2p] makeCommand kind=" & $kind)
 
 proc makeCommand(kind: CommandKind): Command =
   acquireCommand(kind)
@@ -1606,6 +2139,15 @@ proc currentCommandKindTextSnapshot(node: NimNode): string {.gcsafe, raises: [].
   if kindCode < ord(low(CommandKind)) or kindCode > ord(high(CommandKind)):
     return "unknown"
   $CommandKind(kindCode)
+
+proc commandQueueSnapshot(node: NimNode): JsonNode {.gcsafe, raises: [].} =
+  if node.isNil:
+    return newJNull()
+  %*{
+    "queueQueued": node.queuedCommands.load(moAcquire),
+    "queuePending": node.pendingCommands.load(moAcquire),
+    "runningKind": currentCommandKindTextSnapshot(node),
+  }
 
 proc classifyDirectCommandOp(cmd: Command): string =
   if cmd.isNil:
@@ -1712,15 +2254,17 @@ proc joinTailnetWarmThreadIfNeeded(n: NimNode) {.gcsafe, raises: [].}
 proc ensureMessageId(mid: string): string {.gcsafe, raises: [].}
 proc connectedPeersArray(handle: pointer): JsonNode
 proc addPeerHintSource(n: NimNode, peerId: string, source: string) {.gcsafe.}
-proc loadSocialStateUnsafe(node: NimNode): JsonNode
-proc persistSocialStateUnsafe(node: NimNode, state: JsonNode)
+proc loadSocialStateUnsafe(node: NimNode): JsonNode {.gcsafe, raises: [].}
+proc loadSocialStateOnOwnerThread(node: NimNode): JsonNode {.gcsafe, raises: [].}
+proc persistSocialStateUnsafe(node: NimNode, state: JsonNode) {.gcsafe, raises: [].}
+proc persistSocialStateOnOwnerThread(node: NimNode, state: JsonNode) {.gcsafe, raises: [].}
 proc makeNotificationNoLock(
     state: JsonNode, kind: string, title: string, body: string, payload: JsonNode = newJObject()
  )
 proc appendConversationMessageNoLock(
     state: JsonNode, conversationId: string, peerId: string, message: JsonNode
  )
-proc socialStatsNode(state: JsonNode): JsonNode
+proc socialStatsNode(state: JsonNode): JsonNode {.gcsafe, raises: [].}
 proc findConnectedPeerInfoRow(entries: JsonNode, peerId: string): JsonNode {.gcsafe.}
 proc sendProbeDirectMessage(
     n: NimNode,
@@ -2441,6 +2985,8 @@ proc executeGameResultOutboundQueued(node: NimNode, opResult: var GameOperationR
       " sources=" & failedSources.join(",")
     )
 
+proc synthesizedWanDirectSeedAddrs(node: NimNode): seq[string] {.gcsafe.}
+
 proc collectLocalGameSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
@@ -2469,6 +3015,9 @@ proc collectLocalGameSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   except CatchableError:
     discard
   result = preferStableAddrStrings(addrs)
+  let synthesized = synthesizedWanDirectSeedAddrs(node)
+  if synthesized.len > 0:
+    result = prioritizeGameSeedAddrs(result & synthesized)
 
 proc multiaddrIpComponent(text: string, marker: string): string {.gcsafe.} =
   let lower = text.toLowerAscii()
@@ -2501,6 +3050,8 @@ proc isProviderPublicIpv4Text(ip: string): bool {.gcsafe.} =
   let normalized = ip.strip()
   if normalized.len == 0:
     return false
+  if normalized == "0.0.0.0":
+    return false
   if normalized.startsWith("10.") or normalized.startsWith("127.") or normalized.startsWith("192.168.") or
      normalized.startsWith("169.254."):
     return false
@@ -2514,6 +3065,35 @@ proc isProviderPublicIpv4Text(ip: string): bool {.gcsafe.} =
           -1
       if second >= 16 and second <= 31:
         return false
+  if normalized.startsWith("100."):
+    let parts = normalized.split('.')
+    if parts.len >= 2:
+      let second =
+        try:
+          parseInt(parts[1])
+        except CatchableError:
+          -1
+      if second >= 64 and second <= 127:
+        return false
+  if normalized.startsWith("198."):
+    let parts = normalized.split('.')
+    if parts.len >= 2:
+      let second =
+        try:
+          parseInt(parts[1])
+        except CatchableError:
+          -1
+      if second == 18 or second == 19:
+        return false
+  let parts = normalized.split('.')
+  if parts.len >= 1:
+    let first =
+      try:
+        parseInt(parts[0])
+      except CatchableError:
+        -1
+    if first <= 0 or first >= 224:
+      return false
   true
 
 proc isWanProviderIpv6QuicAddr(addrText: string): bool {.gcsafe.} =
@@ -2544,6 +3124,45 @@ proc isWanProviderIpv4Addr(addrText: string): bool {.gcsafe.} =
   let ip = multiaddrIpComponent(lower, "/ip4/")
   isProviderPublicIpv4Text(ip)
 
+proc hostGlobalIpv6Text(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  let observed = status.publicIpv6.strip()
+  if isProviderGlobalIpv6Text(observed):
+    return observed
+  let preferred = status.preferredIpv6.strip()
+  if isProviderGlobalIpv6Text(preferred):
+    return preferred
+  let local = status.localIpv6.strip()
+  if isProviderGlobalIpv6Text(local):
+    return local
+  ""
+
+proc hostLocalIpv4Text(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  let preferred = status.preferredIpv4.strip()
+  if preferred.len > 0 and preferred != "0.0.0.0" and preferred != "127.0.0.1":
+    return preferred
+  let local = status.localIpv4.strip()
+  if local.len > 0 and local != "0.0.0.0" and local != "127.0.0.1":
+    return local
+  ""
+
+proc hostPublicIpv4CapabilityText(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  let localIpv4 = hostLocalIpv4Text(status)
+  if isProviderPublicIpv4Text(localIpv4):
+    return localIpv4
+  ""
+
+proc observedPublicIpv4Text(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  let observed = status.publicIpv4.strip()
+  if isProviderPublicIpv4Text(observed):
+    return observed
+  ""
+
+proc observedPublicIpv6Text(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  let observed = status.publicIpv6.strip()
+  if isProviderGlobalIpv6Text(observed):
+    return observed
+  ""
+
 proc isRelayBackedWanSeedAddr(addrText: string): bool {.gcsafe.} =
   let lower = addrText.toLowerAscii()
   if "/p2p-circuit" notin lower or "/quic-v1" notin lower:
@@ -2552,11 +3171,54 @@ proc isRelayBackedWanSeedAddr(addrText: string): bool {.gcsafe.} =
 
 proc replaceIpv4(addrStr: string, ip: string): Option[string] {.gcsafe.}
 proc replaceIpv6(addrStr: string, ip: string): Option[string] {.gcsafe.}
+proc hostNetworkStatusToJson(status: HostNetworkStatusSnapshot): JsonNode {.gcsafe.}
 proc currentHostNetworkStatusSnapshot(
     n: NimNode
 ): HostNetworkStatusSnapshot {.gcsafe.}
 proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.}
 proc dedupeLocalMultiaddrs(addrs: openArray[MultiAddress]): seq[MultiAddress] {.gcsafe.}
+proc isLanIpv4(ip: string): bool {.gcsafe.}
+proc isLanIpv6(ip: string): bool {.gcsafe.}
+
+proc hostPublicIpv4SeedText(status: HostNetworkStatusSnapshot): string {.gcsafe.} =
+  let directIpv4 = hostPublicIpv4CapabilityText(status)
+  if directIpv4.len == 0:
+    return ""
+  let observed = observedPublicIpv4Text(status)
+  if observed.len > 0:
+    return observed
+  directIpv4
+
+proc synthesizedWanDirectSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
+  if node.isNil:
+    return @[]
+  let hostStatus = currentHostNetworkStatusSnapshot(node)
+  let listenPort = max(0, hostStatus.listenPort)
+  if listenPort <= 0:
+    return @[]
+  let peerId = localPeerId(node).strip()
+  var candidates: seq[string] = @[]
+  var seen = initHashSet[string]()
+
+  proc addCandidate(family: string, ip: string) =
+    let normalizedIp = ip.strip()
+    if normalizedIp.len == 0:
+      return
+    var candidate = "/" & family & "/" & normalizedIp & "/udp/" & $listenPort & "/quic-v1"
+    if peerId.len > 0:
+      candidate.add("/p2p/" & peerId)
+    let parsed = MultiAddress.init(candidate)
+    if parsed.isErr():
+      return
+    let canonical = $parsed.get()
+    if canonical in seen:
+      return
+    seen.incl(canonical)
+    candidates.add(canonical)
+
+  addCandidate("ip6", hostGlobalIpv6Text(hostStatus))
+  addCandidate("ip4", hostPublicIpv4SeedText(hostStatus))
+  result = prioritizeGameSeedAddrs(candidates)
 
 proc extraMultiaddrTexts(extra: JsonNode, keys: openArray[string]): seq[string] {.gcsafe.} =
   if extra.isNil or extra.kind != JObject:
@@ -2587,17 +3249,24 @@ proc canonicalizeWanProviderAddr(
     preferredIpv6: string
 ): string {.gcsafe.} =
   let lower = addrText.toLowerAscii()
-  if hasPhysicalTransportPrefix(lower) or "/quic-v1" notin lower:
+  if hasPhysicalTransportPrefix(lower) or "/quic-v1" notin lower or
+      "/p2p-circuit" in lower or "/tsnet" in lower:
     return ""
+  let parsed = MultiAddress.init(addrText)
+  if parsed.isErr():
+    return ""
+  let canonical = $parsed.get()
+  if isWanProviderIpv6QuicAddr(canonical) or isWanProviderIpv4QuicAddr(canonical):
+    return canonical
   if "/ip6/" in lower:
     let ipv6 = preferredIpv6.strip()
     if not isProviderGlobalIpv6Text(ipv6):
       return ""
     let rewritten = replaceIpv6(addrText, ipv6)
     if rewritten.isSome():
-      let parsed = MultiAddress.init(rewritten.get())
-      if parsed.isOk():
-        return $parsed.get()
+      let rewrittenParsed = MultiAddress.init(rewritten.get())
+      if rewrittenParsed.isOk():
+        return $rewrittenParsed.get()
     return ""
   if "/ip4/" in lower:
     let ipv4 = preferredIpv4.strip()
@@ -2605,41 +3274,22 @@ proc canonicalizeWanProviderAddr(
       return ""
     let rewritten = replaceIpv4(addrText, ipv4)
     if rewritten.isSome():
-      let parsed = MultiAddress.init(rewritten.get())
-      if parsed.isOk():
-        return $parsed.get()
+      let rewrittenParsed = MultiAddress.init(rewritten.get())
+      if rewrittenParsed.isOk():
+        return $rewrittenParsed.get()
     return ""
   ""
 
 proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
-  if wantsTsnetTransport(node.cfg):
-    return @[]
-  let hostNetwork = currentHostNetworkStatus(node)
-  let observedPublicIpv6 =
-    if hostNetwork.kind == JObject and hostNetwork.hasKey("publicIpv6") and hostNetwork["publicIpv6"].kind == JString:
-      hostNetwork["publicIpv6"].getStr().strip()
-    else:
-      ""
-  let observedPublicIpv4 =
-    if hostNetwork.kind == JObject and hostNetwork.hasKey("publicIpv4") and hostNetwork["publicIpv4"].kind == JString:
-      hostNetwork["publicIpv4"].getStr().strip()
-    else:
-      ""
-  # WAN provider publication must be keyed off reflected public endpoints.
-  # Falling back to preferred/local interface addresses mis-publishes
-  # unverified home-broadband or cellular locators as direct seeds.
-  let preferredIpv6 =
-    if isProviderGlobalIpv6Text(observedPublicIpv6):
-      observedPublicIpv6
-    else:
-      ""
-  let preferredIpv4 =
-    if isProviderPublicIpv4Text(observedPublicIpv4):
-      observedPublicIpv4
-    else:
-      ""
+  let hostStatus = currentHostNetworkStatusSnapshot(node)
+  # Global IPv6 is already the true routable locator; it does not need an
+  # extra public-IP reflection round-trip before publication.
+  let preferredIpv6 = hostGlobalIpv6Text(hostStatus)
+  # Public IPv4 still needs reflected truth to avoid publishing a LAN or CGNAT
+  # address as a direct WAN seed.
+  let preferredIpv4 = observedPublicIpv4Text(hostStatus)
   var localSeedAddrs = prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node))
   if localSeedAddrs.len == 0:
     localSeedAddrs = prioritizeGameSeedAddrs(
@@ -2656,6 +3306,11 @@ proc collectWanProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
       continue
     seen.incl(canonical)
     result.add(canonical)
+  for addr in synthesizedWanDirectSeedAddrs(node):
+    if addr in seen:
+      continue
+    seen.incl(addr)
+    result.add(addr)
 
 proc configuredRelayReservationAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
@@ -2682,6 +3337,18 @@ proc configuredRelayReservationAddrs(node: NimNode): seq[string] {.gcsafe.} =
   )
   addrs
 
+proc configuredRelayBootstrapSeedAddrs(cfg: NodeConfig): seq[string] {.gcsafe.} =
+  var addrs = extraMultiaddrTexts(
+    cfg.extra,
+    [
+      "relayBootstrapMultiaddrs",
+      "relay_bootstrap_multiaddrs",
+    ],
+  )
+  if addrs.len == 0:
+    addrs = extraMultiaddrTexts(cfg.extra, ["relayMultiaddrs"])
+  prioritizeGameSeedAddrs(addrs)
+
 proc configuredAnchorSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
   if node.isNil:
     return @[]
@@ -2695,14 +3362,22 @@ proc configuredAnchorSeedAddrs(node: NimNode): seq[string] {.gcsafe.} =
       "bootstrap_nodes",
     ],
   )
+  addrs.add(configuredRelayBootstrapSeedAddrs(node.cfg))
   addrs = addrs.filterIt(
-    isWanProviderIpv6QuicAddr(it) or isWanProviderIpv4QuicAddr(it)
+    isWanProviderIpv6QuicAddr(it) or
+      isWanProviderIpv4QuicAddr(it) or
+      isRelayBackedWanSeedAddr(it)
   )
   prioritizeGameSeedAddrs(addrs)
 
 proc configuredRelayReservationTargets(
     node: NimNode
 ): seq[RelayReservationTarget] {.gcsafe.}
+proc currentTsnetPublishedAddrTexts(node: NimNode): seq[string] {.gcsafe, raises: [].}
+proc filterPublishableTsnetAddrTexts(
+    node: NimNode,
+    addrs: seq[string]
+): seq[string] {.gcsafe, raises: [].}
 
 proc activeRelayReservationAddrs(node: NimNode): seq[MultiAddress] {.gcsafe, raises: [].} =
   if node.isNil:
@@ -2763,7 +3438,9 @@ proc collectRelayBackedProviderSeedAddrs(node: NimNode): seq[string] {.gcsafe.} 
   if node.isNil:
     return @[]
   if wantsTsnetTransport(node.cfg):
-    return @[]
+    return prioritizeGameSeedAddrs(
+      filterPublishableTsnetAddrTexts(node, currentTsnetPublishedAddrTexts(node))
+    )
   var localSeedAddrs = activeRelayReservationSeedAddrs(node)
   localSeedAddrs.add(prioritizeGameSeedAddrs(collectLocalGameSeedAddrs(node)))
   var seen = initHashSet[string]()
@@ -2791,7 +3468,11 @@ proc tsnetPublicationReady(node: NimNode): bool {.gcsafe, raises: [].} =
       node.switchInstance.tsnetTransport()
   if transport.isNil:
     return true
-  transport.providerReadySafe() and transport.proxyListenersReadySafe()
+  if not transport.providerReadySafe():
+    return false
+  let publishedAddrTexts = currentTsnetPublishedAddrTexts(node)
+  transport.proxyListenersReadySafe() or
+    publishedAddrTexts.anyIt(isTsnetPublishAddr(it))
 
 proc filterPublishableTsnetAddrs(
     node: NimNode,
@@ -2897,19 +3578,6 @@ proc parseMultiaddrsFromTexts(
   except Exception:
     result = @[]
 
-proc currentTsnetPublishedAddrs(node: NimNode): seq[MultiAddress] {.gcsafe, raises: [].} =
-  if node.isNil or node.switchInstance.isNil:
-    return @[]
-  let transport = node.switchInstance.tsnetTransport()
-  if transport.isNil:
-    return @[]
-  try:
-    return dedupeLocalMultiaddrs(cloneMultiaddrs(transport.publishedAddrs()))
-  except CatchableError:
-    return @[]
-  except Defect:
-    return @[]
-
 proc currentTsnetPublishedAddrTexts(node: NimNode): seq[string] {.gcsafe, raises: [].} =
   if node.isNil or node.switchInstance.isNil:
     return @[]
@@ -2967,12 +3635,12 @@ proc syncAdvertisedPeerInfo(
   let peerInfo = node.switchInstance.peerInfo
   let tsnetOnly = wantsTsnetTransport(node.cfg)
   let previousListen =
-    if tsnetOnly:
+    if node.peerInfoListenAddrTexts.len > 0:
       node.peerInfoListenAddrTexts
     else:
       peerInfo.listenAddrs.mapIt(safeMultiaddrText(it)).filterIt(it.len > 0)
   let previousAddrs =
-    if tsnetOnly:
+    if node.peerInfoAddrTexts.len > 0:
       node.peerInfoAddrTexts
     else:
       peerInfo.addrs.mapIt(safeMultiaddrText(it)).filterIt(it.len > 0)
@@ -2994,9 +3662,10 @@ proc syncAdvertisedPeerInfo(
     if refreshed.len > 0:
       dedupeLocalMultiaddrs(cloneMultiaddrs(refreshed))
     elif tsnetOnly:
-      currentTsnetPublishedAddrs(node)
+      parseMultiaddrsFromTexts(currentTsnetPublishedAddrTexts(node))
     else:
       dedupeLocalMultiaddrs(peerInfo.listenAddrs)
+  appendParsedUniqueAddrs(nextListen, currentTsnetPublishedAddrTexts(node))
   if nextListen.len == 0 and not tsnetOnly:
     nextListen = dedupeLocalMultiaddrs(peerInfo.addrs)
 
@@ -3007,35 +3676,34 @@ proc syncAdvertisedPeerInfo(
       dedupeLocalMultiaddrs(peerInfo.addrs)
     else:
       dedupeLocalMultiaddrs(nextListen)
-  if not tsnetOnly:
-    let directSeedAddrs = try:
-        collectWanProviderSeedAddrs(node)
-      except CatchableError as exc:
-        debugLog(
-          "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason &
-          " err=" & exc.msg
-        )
-        @[]
-      except Exception:
-        debugLog(
-          "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason
-        )
-        @[]
-    let relaySeedAddrs = try:
-        collectRelayBackedProviderSeedAddrs(node)
-      except CatchableError as exc:
-        debugLog(
-          "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason &
-          " err=" & exc.msg
-        )
-        @[]
-      except Exception:
-        debugLog(
-          "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason
-        )
-        @[]
-    appendParsedUniqueAddrs(nextAddrs, directSeedAddrs)
-    appendParsedUniqueAddrs(nextAddrs, relaySeedAddrs)
+  let directSeedAddrs = try:
+      collectWanProviderSeedAddrs(node)
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason &
+        " err=" & exc.msg
+      )
+      @[]
+    except Exception:
+      debugLog(
+        "[nimlibp2p] syncAdvertisedPeerInfo direct_seed_failed reason=" & reason
+      )
+      @[]
+  let relaySeedAddrs = try:
+      collectRelayBackedProviderSeedAddrs(node)
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason &
+        " err=" & exc.msg
+      )
+      @[]
+    except Exception:
+      debugLog(
+        "[nimlibp2p] syncAdvertisedPeerInfo relay_seed_failed reason=" & reason
+      )
+      @[]
+  appendParsedUniqueAddrs(nextAddrs, directSeedAddrs)
+  appendParsedUniqueAddrs(nextAddrs, relaySeedAddrs)
   if nextAddrs.len == 0:
     nextAddrs = dedupeLocalMultiaddrs(nextListen)
   if nextListen.len == 0 and nextAddrs.len > 0:
@@ -3060,9 +3728,7 @@ proc syncAdvertisedPeerInfo(
   let nextAddrsText = nextAddrs.mapIt(safeMultiaddrText(it)).filterIt(it.len > 0)
   let changed = previousListen != nextListenText or previousAddrs != nextAddrsText
 
-  let sprRes = SignedPeerRecord.init(
-    peerInfo.privateKey, PeerRecord.init(peerInfo.peerId, nextAddrs)
-  )
+  let sprRes = peerInfo.currentSignedPeerRecord()
   if sprRes.isErr():
     debugLog(
       "[nimlibp2p] syncAdvertisedPeerInfo spr_failed reason=" & reason
@@ -3183,7 +3849,9 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
   var payload = newJObject()
   let running = not node.isNil and node.started
   let switchReady = not node.isNil and not node.switchInstance.isNil
-  let hostNetwork = currentHostNetworkStatus(node)
+  let tsnetOnly = not node.isNil and wantsTsnetTransport(node.cfg)
+  let hostStatus = currentHostNetworkStatusSnapshot(node)
+  let hostNetwork = hostNetworkStatusToJson(hostStatus)
   let localSeedAddrs =
     if node.isNil:
       @[]
@@ -3218,40 +3886,29 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       @[]
     else:
       node.authoritativeBootstrapPeerIds
+  let localProviderCapabilitySeedAddrs =
+    prioritizeGameSeedAddrs(
+      localSeedAddrs &
+      directProviderSeedAddrs &
+      relayProviderSeedAddrs
+    )
   let localHintPeerIds =
     if node.isNil:
       @[]
     else:
       toSeq(node.peerHints.keys).sorted(system.cmp[string])
-  let localHasGlobalIpv6 = localSeedAddrs.anyIt(isWanProviderIpv6Addr(it))
-  let localHasPublicIpv4 = localSeedAddrs.anyIt(isWanProviderIpv4Addr(it))
-  let localHasQuic = localSeedAddrs.anyIt("/quic-v1" in it.toLowerAscii())
-  let observedPublicIpv6 =
-    if hostNetwork.kind == JObject and hostNetwork.hasKey("publicIpv6") and hostNetwork["publicIpv6"].kind == JString:
-      hostNetwork["publicIpv6"].getStr().strip()
-    else:
-      ""
-  let observedPublicIpv4 =
-    if hostNetwork.kind == JObject and hostNetwork.hasKey("publicIpv4") and hostNetwork["publicIpv4"].kind == JString:
-      hostNetwork["publicIpv4"].getStr().strip()
-    else:
-      ""
-  let preferredIpv6 =
-    if isProviderGlobalIpv6Text(observedPublicIpv6):
-      observedPublicIpv6
-    elif hostNetwork.kind == JObject and hostNetwork.hasKey("preferredIpv6") and hostNetwork["preferredIpv6"].kind == JString:
-      hostNetwork["preferredIpv6"].getStr()
-    elif hostNetwork.kind == JObject and hostNetwork.hasKey("localIpv6") and hostNetwork["localIpv6"].kind == JString:
-      hostNetwork["localIpv6"].getStr()
-    else:
-      ""
-  let directPreferredIpv4 =
-    if hostNetwork.kind == JObject and hostNetwork.hasKey("preferredIpv4") and hostNetwork["preferredIpv4"].kind == JString:
-      hostNetwork["preferredIpv4"].getStr()
-    elif hostNetwork.kind == JObject and hostNetwork.hasKey("localIpv4") and hostNetwork["localIpv4"].kind == JString:
-      hostNetwork["localIpv4"].getStr()
-    else:
-      ""
+  let localHasGlobalIpv6 =
+    hostGlobalIpv6Text(hostStatus).len > 0 or
+      localProviderCapabilitySeedAddrs.anyIt(isWanProviderIpv6Addr(it))
+  let localHasPublicIpv4 =
+    hostPublicIpv4CapabilityText(hostStatus).len > 0 or
+      localProviderCapabilitySeedAddrs.anyIt(isWanProviderIpv4Addr(it))
+  let localHasQuic =
+    localProviderCapabilitySeedAddrs.anyIt("/quic-v1" in it.toLowerAscii())
+  let observedPublicIpv6 = observedPublicIpv6Text(hostStatus)
+  let observedPublicIpv4 = observedPublicIpv4Text(hostStatus)
+  let preferredIpv6 = hostGlobalIpv6Text(hostStatus)
+  let directPreferredIpv4 = hostLocalIpv4Text(hostStatus)
   let preferredIpv4 =
     if isProviderPublicIpv4Text(directPreferredIpv4):
       if isProviderPublicIpv4Text(observedPublicIpv4):
@@ -3274,7 +3931,11 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       providerConnectedPeerCount > 0 or
         providerReachabilityEvidence.value == autonat_types.NetworkReachability.Reachable
     )
-  let providerRelayVerifiedReachable = hasRelayBackedSeed
+  let providerRelayVerifiedReachable =
+    if tsnetOnly:
+      running and switchReady and tsnetPublicationReady(node) and hasRelayBackedSeed
+    else:
+      hasRelayBackedSeed
   let providerAnchorVerifiedReachable =
     hasAnchorSeed and anyConfiguredAnchorConnected(anchorSeedAddrs, connectedPeerIds)
   let providerVerifiedReachable =
@@ -3283,7 +3944,9 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       providerAnchorVerifiedReachable
   let publicIpv4RequiresHolePunching = observedPublicIpv4.len > 0 and not localHasPublicIpv4
   let providerPublicationMode =
-    if providerDirectVerifiedReachable and hasDirectPublicWanQuicSeed:
+    if tsnetOnly and hasRelayBackedSeed:
+      "tsnet_published"
+    elif providerDirectVerifiedReachable and hasDirectPublicWanQuicSeed:
       "direct_verified"
     elif hasRelayBackedSeed:
       "relay_reserved"
@@ -3297,6 +3960,8 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       "unpublished"
   let providerSeedAddrs =
     case providerPublicationMode
+    of "tsnet_published":
+      relayProviderSeedAddrs
     of "direct_verified":
       directProviderSeedAddrs
     of "relay_reserved":
@@ -3312,7 +3977,12 @@ proc buildWanProviderPayload(node: NimNode): JsonNode {.gcsafe.} =
       "node_not_started"
     elif not switchReady:
       "switch_not_initialized"
-    elif localSeedAddrs.len == 0:
+    elif tsnetOnly and providerPublicationMode == "tsnet_published" and
+        not tsnetPublicationReady(node):
+      "tsnet_publication_not_ready"
+    elif tsnetOnly and providerPublicationMode == "tsnet_published":
+      "tsnet_published_ready"
+    elif localProviderCapabilitySeedAddrs.len == 0 and not hasAnchorSeed:
       "no_seed_addrs"
     elif not localHasGlobalIpv6 and not localHasPublicIpv4:
       if publicIpv4RequiresHolePunching:
@@ -3623,6 +4293,219 @@ proc jsonGetInt64(node: JsonNode, key: string, defaultValue: int64 = 0): int64 =
     else:
       discard
   defaultValue
+
+const
+  DefaultFabricClusterGateway* = "64.176.84.12"
+  DefaultFabricClusterProductRpcBaseUrl* = "http://64.176.84.12:19111"
+  DefaultFabricClusterProductRpcPort* = 19111
+  DefaultFabricClusterControlEndpoint* = "quic://64.176.84.12:9444/nim-tsnet-control-quic/v1"
+  DefaultFabricClusterRelayEndpoint* = "quic://64.176.84.12:9446/nim-tsnet-relay-quic/v1"
+  MobileFabricRpcTimeout = chronos.seconds(5)
+
+proc jsonGetObj(node: JsonNode, key: string): JsonNode {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject or not node.hasKey(key):
+    return newJNull()
+  let value = node.getOrDefault(key)
+  if value.kind == JObject:
+    value
+  else:
+    newJNull()
+
+proc jsonPutIfNotEmpty(node: JsonNode, key: string, value: string) {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject:
+    return
+  let safeValue = value.strip()
+  if safeValue.len > 0:
+    node[key] = %safeValue
+
+proc jsonPutIfPositive(node: JsonNode, key: string, value: int64) {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject or value <= 0:
+    return
+  node[key] = %value
+
+proc configuredFabricClusterNode(cfg: NodeConfig): JsonNode {.gcsafe, raises: [].} =
+  if cfg.extra.kind != JObject:
+    return newJNull()
+  result = jsonGetObj(cfg.extra, "fabricCluster")
+  if result.kind != JObject:
+    result = jsonGetObj(cfg.extra, "fabric_cluster")
+
+proc configuredFabricClusterGateway(cfg: NodeConfig): string {.gcsafe, raises: [].}
+
+proc configuredFabricClusterRpcBaseUrl(cfg: NodeConfig): string {.gcsafe, raises: [].} =
+  let cluster = configuredFabricClusterNode(cfg)
+  for key in [
+    "productRpcBaseUrl",
+    "productRpcUrl",
+    "rpcBaseUrl",
+    "rpcUrl",
+    "baseUrl",
+    "endpoint",
+  ]:
+    let value = jsonGetStr(cluster, key).strip()
+    if value.len > 0:
+      return value
+  "http://" & configuredFabricClusterGateway(cfg) & ":" & $DefaultFabricClusterProductRpcPort
+
+proc configuredFabricClusterRpcHostPort(cfg: NodeConfig): tuple[host: string, port: int] {.gcsafe, raises: [].} =
+  let cluster = configuredFabricClusterNode(cfg)
+  let configuredHost =
+    jsonGetStr(
+      cluster,
+      "productRpcHost",
+      jsonGetStr(cluster, "rpcHost", configuredFabricClusterGateway(cfg))
+    ).strip()
+  let configuredPort =
+    int(
+      max(
+        0'i64,
+        jsonGetInt64(
+          cluster,
+          "productRpcPort",
+          jsonGetInt64(cluster, "rpcPort", int64(DefaultFabricClusterProductRpcPort))
+        )
+      )
+    )
+  if configuredHost.len > 0 and configuredPort > 0:
+    return (configuredHost, configuredPort)
+
+  let endpoint = configuredFabricClusterRpcBaseUrl(cfg).strip()
+  if endpoint.len > 0:
+    try:
+      let parsed =
+        if "://" in endpoint:
+          parseUri(endpoint)
+        else:
+          parseUri("http://" & endpoint)
+      let parsedHost = parsed.hostname.strip()
+      if parsedHost.len > 0 and parsed.port.len > 0:
+        return (parsedHost, max(1, parseInt(parsed.port)))
+    except CatchableError:
+      discard
+
+  (configuredFabricClusterGateway(cfg), DefaultFabricClusterProductRpcPort)
+
+proc configuredFabricClusterGateway(cfg: NodeConfig): string {.gcsafe, raises: [].} =
+  let cluster = configuredFabricClusterNode(cfg)
+  let value = jsonGetStr(cluster, "gatewayHost", jsonGetStr(cluster, "gateway", "")).strip()
+  if value.len > 0: value else: DefaultFabricClusterGateway
+
+proc configuredFabricClusterControlEndpoint(cfg: NodeConfig): string {.gcsafe, raises: [].} =
+  let cluster = configuredFabricClusterNode(cfg)
+  let value = jsonGetStr(cluster, "controlEndpoint").strip()
+  if value.len > 0: value else: DefaultFabricClusterControlEndpoint
+
+proc configuredFabricClusterRelayEndpoint(cfg: NodeConfig): string {.gcsafe, raises: [].} =
+  let cluster = configuredFabricClusterNode(cfg)
+  let value = jsonGetStr(cluster, "relayEndpoint").strip()
+  if value.len > 0: value else: DefaultFabricClusterRelayEndpoint
+
+proc buildFabricBridgeError(
+    methodName: string,
+    error: string,
+    detail = ""
+): string {.gcsafe, raises: [].} =
+  var payload = newJObject()
+  payload["ok"] = %false
+  payload["method"] = %methodName
+  payload["error"] = %error
+  if detail.strip().len > 0:
+    payload["detail"] = %detail.strip()
+  $payload
+
+proc stringOf(data: openArray[byte]): string {.gcsafe, raises: [].} =
+  result = newString(data.len)
+  if data.len > 0:
+    copyMem(addr result[0], unsafeAddr data[0], data.len)
+
+proc buildFabricClusterSnapshot(cfg: NodeConfig): JsonNode {.gcsafe, raises: [].} =
+  let (rpcHost, rpcPort) = configuredFabricClusterRpcHostPort(cfg)
+  result = newJObject()
+  result["gatewayHost"] = %configuredFabricClusterGateway(cfg)
+  result["controlEndpoint"] = %configuredFabricClusterControlEndpoint(cfg)
+  result["relayEndpoint"] = %configuredFabricClusterRelayEndpoint(cfg)
+  result["productRpcHost"] = %rpcHost
+  result["productRpcPort"] = %rpcPort
+  result["productRpcBaseUrl"] = %("http://" & rpcHost & ":" & $rpcPort)
+
+proc invokeFabricClusterRpc(
+    node: NimNode,
+    methodName: string,
+    params: JsonNode
+): Future[string] {.async.} =
+  if node.isNil:
+    return buildFabricBridgeError(methodName, "node_nil")
+  let endpoint = configuredFabricClusterRpcBaseUrl(node.cfg).strip()
+  if endpoint.len == 0:
+    return buildFabricBridgeError(methodName, "fabric_cluster_rpc_endpoint_missing")
+
+  var payload = newJObject()
+  payload["jsonrpc"] = %"2.0"
+  payload["id"] = %"mobile"
+  payload["method"] = %methodName
+  if not params.isNil and params.kind == JObject:
+    payload["params"] = cloneJson(params)
+  else:
+    payload["params"] = newJObject()
+
+  let timeout = chronos.milliseconds(max(1_000, int(MobileFabricRpcTimeout.milliseconds)))
+  let session = HttpSessionRef.new()
+  try:
+    let request = HttpClientRequestRef.post(
+      session,
+      endpoint,
+      headers = [
+        ("User-Agent", "nim-libp2p/mobile_ffi"),
+        ("Content-Type", "application/json")
+      ],
+      body = $payload
+    ).valueOr:
+      return buildFabricBridgeError(methodName, "create_request_failed", error)
+    let responseFuture = request.send()
+    let responseReady = await withTimeout(responseFuture, timeout)
+    if not responseReady:
+      responseFuture.cancelSoon()
+      return buildFabricBridgeError(methodName, "rpc_send_timeout", endpoint)
+    let response = responseFuture.read()
+    if response.status != 200:
+      return buildFabricBridgeError(methodName, "rpc_http_status", endpoint & " " & $response.status)
+    let bodyFuture = response.getBodyBytes()
+    let bodyReady = await withTimeout(bodyFuture, timeout)
+    if not bodyReady:
+      bodyFuture.cancelSoon()
+      return buildFabricBridgeError(methodName, "rpc_body_timeout", endpoint)
+    let rawBody = stringOf(bodyFuture.read())
+    let rpcNode = parseJson(rawBody)
+    if rpcNode.kind != JObject:
+      return buildFabricBridgeError(methodName, "rpc_response_invalid", rawBody)
+    if rpcNode.hasKey("error"):
+      return buildFabricBridgeError(methodName, "fabric_rpc_error", $rpcNode["error"])
+    if rpcNode.hasKey("result"):
+      return $rpcNode["result"]
+    buildFabricBridgeError(methodName, "rpc_result_missing", rawBody)
+  except CancelledError:
+    buildFabricBridgeError(methodName, "rpc_cancelled", endpoint)
+  except HttpError as exc:
+    buildFabricBridgeError(methodName, "rpc_http_error", endpoint & " " & exc.msg)
+  except CatchableError as exc:
+    buildFabricBridgeError(
+      methodName,
+      "rpc_request_failed",
+      endpoint & " " & exc.msg
+    )
+
+proc invokeFabricClusterRpcSync(
+    handle: pointer,
+    methodName: string,
+    params: JsonNode = nil
+): cstring =
+  try:
+    let node = nodeFromHandle(handle)
+    allocCString(waitFor invokeFabricClusterRpc(node, methodName, params))
+  except CatchableError as exc:
+    allocCString(buildFabricBridgeError(methodName, $exc.name, exc.msg))
+  except Defect as exc:
+    allocCString(buildFabricBridgeError(methodName, $exc.name, exc.msg))
 
 proc finiteFloat(value: float, defaultValue = 0.0): float =
   case classify(value)
@@ -4265,6 +5148,11 @@ proc probePublicIp(url: string, family: int): Future[(string, string)] {.async.}
   except CatchableError as exc:
     return ("", "request_failed:" & exc.msg)
 
+proc publishTsnetLocalPeerInfo(
+    node: NimNode,
+    transport: TsnetTransport
+) {.gcsafe, raises: [].}
+
 proc refreshPublicIpProbeAsync(
     n: NimNode,
     hostStatus: HostNetworkStatusSnapshot,
@@ -4291,6 +5179,9 @@ proc refreshPublicIpProbeAsync(
   except CatchableError as exc:
     ipv6Error = "probe_failed:" & exc.msg
   updatePublicIpProbeState(n, ipv4, ipv6, ipv4Error, ipv6Error, nowMillis(), false)
+  let transport = activeTsnetTransport(n)
+  if not transport.isNil:
+    publishTsnetLocalPeerInfo(n, transport)
 
 proc restartMdnsSafe(n: NimNode, reason: string): Future[void] {.async.}
 proc stopMdns(n: NimNode): Future[void] {.async.}
@@ -4346,12 +5237,10 @@ proc mergeTsnetListenAddrsIntoPeerInfo(
     let previousListenTexts = node.peerInfoListenAddrTexts
     let previousAddrsTexts = node.peerInfoAddrTexts
     let mergedListenTexts = currentTsnetPublishedAddrTexts(node)
-    let mergedAddrsTexts = dedupeAddrTexts(mergedListenTexts)
+    let mergedAddrsTexts = mergedListenTexts
     result =
       mergedListenTexts != previousListenTexts or
       mergedAddrsTexts != previousAddrsTexts
-    node.switchInstance.peerInfo.listenAddrs = parseMultiaddrsFromTexts(mergedListenTexts)
-    node.switchInstance.peerInfo.addrs = parseMultiaddrsFromTexts(mergedAddrsTexts)
     rememberPeerInfoAddrTexts(node, mergedListenTexts, mergedAddrsTexts)
     return
   let previousListenTexts =
@@ -4399,6 +5288,115 @@ proc mergeTsnetListenAddrsIntoPeerInfo(
   node.switchInstance.peerInfo.addrs = mergedAddrs
   rememberPeerInfoAddrTexts(node, mergedListen, mergedAddrs)
 
+proc extractMultiaddrProtocolValue(
+    addrText: string,
+    proto: string
+): string {.gcsafe, raises: [].} =
+  let marker = "/" & proto.strip().toLowerAscii() & "/"
+  let lower = addrText.toLowerAscii()
+  let idx = lower.find(marker)
+  if idx < 0:
+    return ""
+  let startIdx = idx + marker.len
+  var endIdx = lower.find('/', startIdx)
+  if endIdx < 0:
+    endIdx = addrText.len
+  addrText[startIdx ..< endIdx].strip()
+
+proc extractUdpQuicPort(addrText: string): int {.gcsafe, raises: [].} =
+  let lower = addrText.toLowerAscii()
+  if "/udp/" notin lower or "/quic-v1" notin lower:
+    return 0
+  let portText = extractMultiaddrProtocolValue(addrText, "udp")
+  if portText.len == 0:
+    return 0
+  try:
+    max(0, parseInt(portText))
+  except CatchableError:
+    0
+
+proc appendUniqueDirectCandidateText(
+    candidates: var seq[string],
+    seen: var HashSet[string],
+    candidateText: string
+) {.gcsafe, raises: [].} =
+  let normalized = candidateText.strip()
+  if normalized.len == 0:
+    return
+  let parsed = MultiAddress.init(normalized)
+  if parsed.isErr():
+    return
+  if normalized in seen:
+    return
+  seen.incl(normalized)
+  candidates.add(normalized)
+
+proc appendTsnetBridgeCandidateForIp(
+    candidates: var seq[string],
+    seen: var HashSet[string],
+    family: string,
+    ip: string,
+    port: int,
+    peerId: string
+) {.gcsafe, raises: [].} =
+  let normalizedIp = ip.strip()
+  if normalizedIp.len == 0 or port <= 0:
+    return
+  var candidate = "/" & family & "/" & normalizedIp & "/udp/" & $port & "/quic-v1"
+  let normalizedPeerId = peerId.strip()
+  if normalizedPeerId.len > 0:
+    candidate.add("/p2p/" & normalizedPeerId)
+  appendUniqueDirectCandidateText(candidates, seen, candidate)
+
+proc bridgeHostPublicIpv6(hostStatus: HostNetworkStatusSnapshot): string {.gcsafe, raises: [].} =
+  let observed = sanitizeHostIpv6(hostStatus.publicIpv6)
+  if isProviderGlobalIpv6Text(observed):
+    return observed
+  let preferred = sanitizeHostIpv6(hostStatus.preferredIpv6)
+  if isProviderGlobalIpv6Text(preferred):
+    return preferred
+  let local = sanitizeHostIpv6(hostStatus.localIpv6)
+  if isProviderGlobalIpv6Text(local):
+    return local
+  ""
+
+proc buildTsnetBridgeDirectCandidates(
+    peerId: string,
+    listenAddrs: openArray[string],
+    hostStatus: HostNetworkStatusSnapshot
+): seq[string] {.gcsafe, raises: [].} =
+  var seen = initHashSet[string]()
+  let publicIpv6 = bridgeHostPublicIpv6(hostStatus)
+  if publicIpv6.len == 0:
+    return @[]
+  for addrText in listenAddrs:
+    let port = extractUdpQuicPort(addrText)
+    if port <= 0:
+      continue
+    let candidatePeerId = extractMultiaddrProtocolValue(addrText, "p2p")
+    let exportPeerId =
+      if candidatePeerId.len > 0:
+        candidatePeerId
+      else:
+        peerId
+    appendTsnetBridgeCandidateForIp(result, seen, "ip6", publicIpv6, port, exportPeerId)
+
+proc buildTsnetBridgeExtraPayload(
+    node: NimNode,
+    peerId: string,
+    listenAddrs: openArray[string]
+): TsnetBridgeExtraPayload {.gcsafe, raises: [].} =
+  let hostStatus =
+    try:
+      currentHostNetworkStatusSnapshot(node)
+    except Exception:
+      defaultHostNetworkStatusSnapshot()
+  result = TsnetBridgeExtraPayload(
+    updatedAtMs: nowMillis(),
+    publicIpv6: bridgeHostPublicIpv6(hostStatus),
+    directCandidates: buildTsnetBridgeDirectCandidates(peerId, listenAddrs, hostStatus)
+  )
+
 proc publishTsnetLocalPeerInfo(
     node: NimNode,
     transport: TsnetTransport
@@ -4416,7 +5414,11 @@ proc publishTsnetLocalPeerInfo(
       let text = safeMultiaddrText(addr)
       if text.len > 0 and text notin listenAddrs:
         listenAddrs.add(text)
-  transport.publishLocalPeerInfo(peerId, listenAddrs)
+  transport.publishLocalPeerInfo(
+    peerId,
+    listenAddrs,
+    buildTsnetBridgeExtraPayload(node, peerId, listenAddrs)
+  )
 
 proc syncTailnetWarmAdvertisedPeerInfo(n: NimNode): Future[bool] {.async.} =
   return await syncAdvertisedPeerInfo(
@@ -4445,6 +5447,47 @@ proc spawnTailnetWarmAdvertisedPeerInfo(n: NimNode) {.gcsafe, raises: [].} =
   n.tailnetAdvertisedPeerSyncTask = fut
   asyncSpawn fut
 
+proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.}
+
+proc tailnetListenerRepairTaskRunning(n: NimNode): bool {.gcsafe, raises: [].} =
+  not n.isNil and
+    not n.tailnetListenerRepairTask.isNil and
+    not n.tailnetListenerRepairTask.finished()
+
+proc ensureTailnetListenerRepairTask(
+    n: NimNode,
+    reason: string
+) {.gcsafe, raises: [].} =
+  if n.isNil or not n.started:
+    return
+  if tailnetListenerRepairTaskRunning(n):
+    return
+  let transport = activeTsnetTransport(n)
+  if transport.isNil or not transport.listenerNeedsRepair():
+    return
+  let safeReason =
+    if reason.strip().len > 0:
+      reason.strip()
+    else:
+      "unspecified"
+  debugLog(
+    "[nimlibp2p] tailnet listener repair schedule reason=" & safeReason
+  )
+  let task = proc(): Future[void] {.async.} =
+    try:
+      await reconcileTailnetRelayListeners(n)
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] tailnet listener repair task failed reason=" & safeReason &
+        " err=" & exc.msg
+      )
+    finally:
+      if not n.isNil:
+        n.tailnetListenerRepairTask = nil
+  let fut = task()
+  n.tailnetListenerRepairTask = fut
+  asyncSpawn fut
+
 proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
   if n.isNil or not n.started:
     return
@@ -4454,21 +5497,27 @@ proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
   if not transport.listenerNeedsRepair():
     return
   let nowMs = nowMillis()
-  recordEvent(n, "system_status", $(%*{
-    "entity": "tailnet_listener",
-    "stage": "restarting",
-    "updatedAtMs": nowMs,
-    "providerReady": transport.providerReadySafe(),
-  }))
+  recordEvent(
+    n,
+    "system_status",
+    buildTailnetListenerEventText(
+      stage = "restarting",
+      providerReady = transport.providerReadySafe(),
+      updatedAtMs = nowMs,
+    )
+  )
   let repaired = await reconcileProviderListeners(transport)
   if repaired.isErr():
-    recordEvent(n, "system_status", $(%*{
-      "entity": "tailnet_listener",
-      "stage": "failed",
-      "error": repaired.error,
-      "updatedAtMs": nowMillis(),
-      "providerReady": transport.providerReadySafe(),
-    }))
+    recordEvent(
+      n,
+      "system_status",
+      buildTailnetListenerEventText(
+        stage = "failed",
+        providerReady = transport.providerReadySafe(),
+        updatedAtMs = nowMillis(),
+        err = repaired.error,
+      )
+    )
     return
   discard mergeTsnetListenAddrsIntoPeerInfo(n, transport)
   publishTsnetLocalPeerInfo(n, transport)
@@ -4477,16 +5526,23 @@ proc reconcileTailnetRelayListeners(n: NimNode): Future[void] {.async.} =
     reason = "tailnet_listener_reconcile",
     reannounce = false,
   )
-  recordEvent(n, "system_status", $(%*{
-    "entity": "tailnet_listener",
-    "stage": (if transport.providerReadySafe(): "ready" else: "repair_started"),
-    "updatedAtMs": nowMillis(),
-    "providerReady": transport.providerReadySafe(),
-  }))
+  recordEvent(
+    n,
+    "system_status",
+    buildTailnetListenerEventText(
+      stage = (if transport.providerReadySafe(): "ready" else: "repair_started"),
+      providerReady = transport.providerReadySafe(),
+      updatedAtMs = nowMillis(),
+    )
+  )
 
 proc ensureTailnetControlRefreshLoop(n: NimNode) {.gcsafe, raises: [].}
+proc reconcileDesiredRouteSessionsNow(n: NimNode, source: string) {.gcsafe, raises: [].}
 
 proc runTailnetWarmAsync(n: NimNode) {.async.}
+proc kickTailnetWarmOnOwnerThread(
+    n: NimNode
+): tuple[ok: bool, err: string] {.gcsafe, raises: [].}
 proc scheduleBackgroundTailnetWarm(
     n: NimNode,
     reason: string
@@ -4622,6 +5678,7 @@ proc processTailnetWarmCompletion(n: NimNode) {.gcsafe, raises: [].} =
   ensureTailnetControlRefreshLoop(n)
   spawnTailnetWarmAdvertisedPeerInfo(n)
   updateTailnetStartStatus(n, "started", false)
+  reconcileDesiredRouteSessionsNow(n, "tailnet_warm_completion")
 
 proc scheduleHostNetworkStatusSideEffects(
     n: NimNode,
@@ -4729,6 +5786,11 @@ proc runHostNetworkStatusSideEffects(
       if n.mdnsEnabled and n.started and mdnsTransportChanged:
         debugLog("[nimlibp2p] cmdUpdateHostNetworkStatus mdns_update:deferred_on_ohos")
     else:
+      let transport = activeTsnetTransport(n)
+      if not transport.isNil:
+        debugLog("[nimlibp2p] cmdUpdateHostNetworkStatus publish_local_peer_info:start")
+        publishTsnetLocalPeerInfo(n, transport)
+        debugLog("[nimlibp2p] cmdUpdateHostNetworkStatus publish_local_peer_info:done")
       if hostStatus.isConnected:
         debugLog("[nimlibp2p] cmdUpdateHostNetworkStatus public_ip_probe:start")
         await refreshPublicIpProbeAsync(n, hostStatus)
@@ -4914,10 +5976,44 @@ proc currentHostNetworkStatusSnapshot(
     if n.isNil:
       defaultHostNetworkStatusSnapshot()
     else:
-      n.hostNetworkStatus
+      block:
+        acquire(n.hostNetworkStatusLock)
+        try:
+          n.hostNetworkStatus
+        finally:
+          release(n.hostNetworkStatusLock)
   var status = base
   attachPublicIpProbeFields(status, currentPublicIpProbeState(n))
   status
+
+proc storeHostNetworkStatusSnapshot(
+    n: NimNode,
+    status: HostNetworkStatusSnapshot
+): HostNetworkStatusSnapshot {.gcsafe, raises: [].} =
+  result = sanitizeHostNetworkStatusSnapshot(status)
+  if n.isNil:
+    return
+  acquire(n.hostNetworkStatusLock)
+  try:
+    n.hostNetworkStatus = result
+    n.hostNetworkStatusUpdatedAt = result.timestampMs
+  finally:
+    release(n.hostNetworkStatusLock)
+
+proc currentOwnedHostNetworkStatusSnapshot(
+    n: NimNode
+): HostNetworkStatusSnapshot {.gcsafe.} =
+  let base =
+    if n.isNil:
+      defaultHostNetworkStatusSnapshot()
+    else:
+      block:
+        acquire(n.hostNetworkStatusLock)
+        try:
+          n.hostNetworkStatus
+        finally:
+          release(n.hostNetworkStatusLock)
+  base
 
 proc currentHostNetworkStatus(n: NimNode): JsonNode {.gcsafe.} =
   hostNetworkStatusToJson(currentHostNetworkStatusSnapshot(n))
@@ -4935,14 +6031,8 @@ proc applyHostNetworkStatus(
     n: NimNode,
     status: HostNetworkStatusSnapshot
 ): HostNetworkStatusSnapshot =
-  let previous =
-    if n.isNil:
-      defaultHostNetworkStatusSnapshot()
-    else:
-      n.hostNetworkStatus
-  let normalized = sanitizeHostNetworkStatusSnapshot(status)
-  n.hostNetworkStatus = normalized
-  n.hostNetworkStatusUpdatedAt = normalized.timestampMs
+  let previous = currentOwnedHostNetworkStatusSnapshot(n)
+  let normalized = storeHostNetworkStatusSnapshot(n, status)
   let preferredIpv4 =
     (if normalized.preferredIpv4.len > 0: normalized.preferredIpv4 else: normalized.localIpv4).strip()
   if preferredIpv4.len > 0 and preferredIpv4 != n.mdnsPreferredIpv4:
@@ -5467,26 +6557,16 @@ proc emptyTailnetStatusPayload(
 
 proc buildTailnetStartStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].}
 
-proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
-  let transport = activeTsnetTransport(n)
-  if transport.isNil:
-    return emptyTailnetStatusPayload(n, enabled = false)
-  let tailnetStart = buildTailnetStartStatusPayload(n)
-  if jsonGetBool(tailnetStart, "inFlight", false):
-    result = emptyTailnetStatusPayload(n, enabled = true)
-    result["deferred"] = %true
-    result["providerStage"] = %jsonGetStr(tailnetStart, "stage", "starting")
-    result["reason"] = %"provider_start_inflight"
-    return
-  let payloadRes = ffiTsnetSafe:
-    transport.tailnetStatusPayload()
-  if payloadRes.isErr:
-    return emptyTailnetStatusPayload(n, enabled = true, error = payloadRes.error)
+proc enrichTailnetStatusPayload(
+    n: NimNode,
+    payload: JsonNode,
+    tailnetStart: JsonNode
+): JsonNode {.gcsafe, raises: [].} =
   result =
-    if payloadRes.get().kind == JObject:
-      cloneJson(payloadRes.get())
-    else:
+    if payload.isNil or payload.kind != JObject:
       newJObject()
+    else:
+      payload
   if not result.hasKey("ok"):
     result["ok"] = %true
   result["enabled"] = %true
@@ -5563,6 +6643,48 @@ proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
     result["tailnetPing"] = cloneJson(n.lastTailnetPing)
   if not n.isNil and n.lastTailnetPingUpdatedAt > 0:
     result["tailnetPingUpdatedAtMs"] = %n.lastTailnetPingUpdatedAt
+  let bridgeExport = buildTsnetBridgeExtraPayload(
+    n,
+    localPeerId(n),
+    currentTsnetPublishedAddrTexts(n)
+  )
+  if bridgeExport.publicIpv6.len > 0:
+    result["bridgePublicIpv6"] = %bridgeExport.publicIpv6
+  if bridgeExport.directCandidates.len > 0:
+    result["bridgeDirectCandidates"] = %bridgeExport.directCandidates
+
+proc buildTailnetStatusQuickPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    return emptyTailnetStatusPayload(n, enabled = false)
+  let tailnetStart = buildTailnetStartStatusPayload(n)
+  var payload = transport.tailnetStatusQuickPayload()
+  if payload.kind != JObject:
+    payload = newJObject()
+  if jsonGetBool(tailnetStart, "inFlight", false):
+    payload["deferred"] = %true
+    payload["providerStage"] = %jsonGetStr(tailnetStart, "stage", "starting")
+    if not payload.hasKey("reason"):
+      payload["reason"] = %"provider_start_inflight"
+  result = enrichTailnetStatusPayload(n, payload, tailnetStart)
+
+proc buildTailnetStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    return emptyTailnetStatusPayload(n, enabled = false)
+  let tailnetStart = buildTailnetStartStatusPayload(n)
+  if jsonGetBool(tailnetStart, "inFlight", false):
+    return buildTailnetStatusQuickPayload(n)
+  let payloadRes = ffiTsnetSafe:
+    transport.tailnetStatusPayload()
+  if payloadRes.isErr:
+    return emptyTailnetStatusPayload(n, enabled = true, error = payloadRes.error)
+  let payload =
+    if payloadRes.get().kind == JObject:
+      cloneJson(payloadRes.get())
+    else:
+      newJObject()
+  result = enrichTailnetStatusPayload(n, payload, tailnetStart)
 
 proc overlayTailnetFields(target: var JsonNode, tailnet: JsonNode) {.gcsafe, raises: [].} =
   if target.isNil or target.kind != JObject or tailnet.isNil or tailnet.kind != JObject:
@@ -6116,6 +7238,664 @@ proc copyDirectSessionTargetSpecs(
   finally:
     n.directSessionTargetLock.release()
 
+proc copyRelaySessionTargetSpecs(
+    n: NimNode
+): seq[RelaySessionTargetSpec] {.gcsafe, raises: [].} =
+  if n.isNil:
+    return @[]
+  for spec in n.relaySessionTargets.values:
+    result.add(spec)
+
+proc peerRouteSessionTaskRunning(
+    n: NimNode,
+    task: PeerRouteSessionTask
+): bool {.gcsafe, raises: [].}
+
+proc ownedPeerRouteSessionConnKey(
+    n: NimNode,
+    peerIdText: string
+): int {.gcsafe, raises: [].}
+
+proc routeTransportTaskKey(
+    peerIdText: string,
+    selectedAddrs: openArray[string]
+): string {.gcsafe, raises: [].} =
+  bootstrapSeedConnectTaskKey(peerIdText.strip(), selectedAddrs)
+
+proc missingConversationTransportSnapshot(
+    peerIdText: string,
+    selectedAddrs: seq[string] = @[],
+    source = "",
+    policy = "direct_then_relay",
+    status = "missing",
+    err = "",
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  let routeKey = routeTransportTaskKey(safePeerId, selectedAddrs)
+  buildConversationTransportSnapshot(
+    routeKey = routeKey,
+    peerId = safePeerId,
+    source = source,
+    policy = policy,
+    selectedAddrs = selectedAddrs,
+    status = status,
+    lastError = err,
+    updatedAtMs = nowMillis(),
+  )
+
+proc ensureRouteTransportWakeup(
+    n: NimNode,
+    routeKey: string
+): AsyncEvent {.gcsafe, raises: [].} =
+  if n.isNil or routeKey.len == 0:
+    return nil
+  result = n.routeTransportWakeups.getOrDefault(routeKey, nil)
+  if result.isNil:
+    result = newAsyncEvent()
+    n.routeTransportWakeups[routeKey] = result
+
+proc fireRouteTransportWakeup(
+    n: NimNode,
+    routeKey: string
+) {.gcsafe, raises: [].} =
+  if n.isNil or routeKey.len == 0:
+    return
+  let wakeup = n.routeTransportWakeups.getOrDefault(routeKey, nil)
+  if wakeup.isNil:
+    return
+  wakeup.fire()
+
+proc firePeerRouteSessionReconcileWake(n: NimNode) {.gcsafe, raises: [].} =
+  if n.isNil or n.peerRouteSessionReconcileWake.isNil:
+    return
+  n.peerRouteSessionReconcileWake.fire()
+
+proc copyDesiredPeerRouteSessionSpecs(
+    n: NimNode
+): Table[string, RelaySessionTargetSpec] {.gcsafe, raises: [].} =
+  result = initTable[string, RelaySessionTargetSpec]()
+  if n.isNil:
+    return
+  for spec in copyDirectSessionTargetSpecs(n):
+    let peerId = spec.peerId.strip()
+    if peerId.len == 0:
+      continue
+    let desiredSpec = RelaySessionTargetSpec(
+      peerId: peerId,
+      source: spec.source,
+      selectedAddrs: spec.selectedAddrs,
+      updatedAtMs: spec.updatedAtMs,
+      sticky: false,
+    )
+    let existing = result.getOrDefault(peerId, RelaySessionTargetSpec())
+    if existing.peerId.len == 0 or desiredSpec.updatedAtMs >= existing.updatedAtMs:
+      result[peerId] = desiredSpec
+  for spec in copyRelaySessionTargetSpecs(n):
+    let peerId = spec.peerId.strip()
+    if peerId.len == 0:
+      continue
+    let existing = result.getOrDefault(peerId, RelaySessionTargetSpec())
+    if existing.peerId.len == 0 or spec.updatedAtMs >= existing.updatedAtMs:
+      result[peerId] = spec
+
+proc cancelStalePeerRouteSessionTask(
+    n: NimNode,
+    peerIdText: string
+) {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0:
+    return
+  let fut = n.peerRouteSessionFutures.getOrDefault(safePeerId, nil)
+  if not fut.isNil and not fut.finished():
+    fut.cancelSoon()
+  if safePeerId in n.peerRouteSessionFutures:
+    n.peerRouteSessionFutures.del(safePeerId)
+  if safePeerId in n.peerRouteSessionTasks:
+    n.peerRouteSessionTasks.del(safePeerId)
+  publishPeerRouteTransportSnapshots(n, safePeerId)
+
+proc nextPeerRouteSessionReconcileDelayMs(
+    n: NimNode,
+    desired: Table[string, RelaySessionTargetSpec]
+): int {.gcsafe, raises: [].} =
+  if n.isNil or desired.len == 0:
+    return -1
+  let nowAtMs = nowMillis()
+  var bestDelayMs = high(int)
+  for peerId in desired.keys:
+    let task = n.peerRouteSessionTasks.getOrDefault(peerId, nil)
+    if task.isNil or task.state notin [prssFailed, prssCancelled]:
+      continue
+    if task.deadlineAtMs <= nowAtMs:
+      return 0
+    let remainingMs = int(task.deadlineAtMs - nowAtMs)
+    if remainingMs < bestDelayMs:
+      bestDelayMs = remainingMs
+  if bestDelayMs == high(int):
+    return -1
+  max(bestDelayMs, 1)
+
+proc addPeerTransportRoute(
+    n: NimNode,
+    peerIdText: string,
+    routeKey: string
+) {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0 or routeKey.len == 0:
+    return
+  var current = n.peerTransportRoutes.getOrDefault(safePeerId, @[])
+  if routeKey notin current:
+    current.add(routeKey)
+    n.peerTransportRoutes[safePeerId] = current
+
+proc removePeerTransportRoute(
+    n: NimNode,
+    peerIdText: string,
+    routeKey: string
+) {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0 or routeKey.len == 0:
+    return
+  if safePeerId notin n.peerTransportRoutes:
+    return
+  var remaining: seq[string] = @[]
+  for existing in n.peerTransportRoutes.getOrDefault(safePeerId, @[]):
+    if existing != routeKey:
+      remaining.add(existing)
+  if remaining.len == 0:
+    n.peerTransportRoutes.del(safePeerId)
+  else:
+    n.peerTransportRoutes[safePeerId] = remaining
+
+proc peerHasRouteTransportIntentUsingRelay(
+    n: NimNode,
+    peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0:
+    return false
+  for routeKey in n.peerTransportRoutes.getOrDefault(safePeerId, @[]):
+    let intent = n.routeTransportIntents.getOrDefault(routeKey, RouteTransportIntent())
+    if intent.routeKey.len == 0:
+      continue
+    if peerPathPolicyUsesRelay(intent.policy):
+      return true
+  false
+
+proc stickyRelaySessionTargetDesired(
+    n: NimNode,
+    peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0:
+    return false
+  let relaySpec = n.relaySessionTargets.getOrDefault(safePeerId, RelaySessionTargetSpec())
+  relaySpec.peerId.len > 0 and relaySpec.sticky
+
+proc peerRouteSessionRetainDeadlineAtMs(
+    sticky: bool,
+    updatedAtMs: int64
+): int64 {.gcsafe, raises: [].} =
+  if sticky:
+    return high(int64)
+  max(updatedAtMs, nowMillis()) + PeerRouteSessionRetainMs
+
+proc relaySessionTargetRetained(
+    spec: RelaySessionTargetSpec
+): bool {.gcsafe, raises: [].} =
+  spec.peerId.len > 0 and
+    (
+      spec.sticky or
+        spec.retainedUntilAtMs > nowMillis()
+    )
+
+proc relayWarmSelectedAddrs(
+    n: NimNode,
+    peerIdText: string
+): seq[string] {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0:
+    return @[]
+  var bestUpdatedAtMs = low(int64)
+  let relaySpec = n.relaySessionTargets.getOrDefault(safePeerId, RelaySessionTargetSpec())
+  if relaySpec.peerId.len > 0 and relaySpec.selectedAddrs.len > 0:
+    result = relaySpec.selectedAddrs
+    bestUpdatedAtMs = relaySpec.updatedAtMs
+  for routeKey in n.peerTransportRoutes.getOrDefault(safePeerId, @[]):
+    let intent = n.routeTransportIntents.getOrDefault(routeKey, RouteTransportIntent())
+    if intent.routeKey.len == 0 or not peerPathPolicyUsesRelay(intent.policy):
+      continue
+    if intent.seedAddrs.len == 0:
+      continue
+    if result.len == 0 or intent.updatedAtMs >= bestUpdatedAtMs:
+      result = intent.seedAddrs
+      bestUpdatedAtMs = intent.updatedAtMs
+  if result.len == 0:
+    for spec in copyDirectSessionTargetSpecs(n):
+      if spec.peerId != safePeerId or spec.selectedAddrs.len == 0:
+        continue
+      if result.len == 0 or spec.updatedAtMs >= bestUpdatedAtMs:
+        result = spec.selectedAddrs
+        bestUpdatedAtMs = spec.updatedAtMs
+  try:
+    result = prioritizeGameSeedAddrs(preferStableAddrStrings(result))
+  except Exception:
+    discard
+
+proc routeTransportDirectTerminalFailure(
+    snapshot: ConversationTransportSnapshot
+): string {.gcsafe, raises: [].} =
+  let directStage = snapshot.directStage.strip().toLowerAscii()
+  if directStage notin ["failed", "cleared"]:
+    return ""
+  if snapshot.directLastDialStage.len > 0:
+    return snapshot.directLastDialStage
+  if snapshot.directError.len > 0:
+    return snapshot.directError
+  "direct_session_unavailable"
+
+proc routeTransportRelayTerminalFailure(
+    snapshot: ConversationTransportSnapshot
+): string {.gcsafe, raises: [].} =
+  let relayStage = snapshot.relayStage.strip().toLowerAscii()
+  if relayStage notin ["failed", "cleared"]:
+    return ""
+  if snapshot.relayLastDialStage.len > 0:
+    return snapshot.relayLastDialStage
+  if snapshot.relayError.len > 0:
+    return snapshot.relayError
+  "relay_session_unavailable"
+
+proc routeTransportDirectProviderPending(
+    snapshot: ConversationTransportSnapshot
+): bool {.gcsafe, raises: [].} =
+  let directStage = snapshot.directStage.strip().toLowerAscii()
+  snapshot.status.strip().toLowerAscii() in ["pending", "running"] and
+    directStage in ["pending", "warming", "route_wait"] and
+    (
+      snapshot.directLastDialStage.strip().toLowerAscii() == "provider_wait" or
+        snapshot.directError.strip() == TailnetProviderWarmPendingErr
+    )
+
+proc routeTransportRelayProviderPending(
+    snapshot: ConversationTransportSnapshot
+): bool {.gcsafe, raises: [].} =
+  let relayStage = snapshot.relayStage.strip().toLowerAscii()
+  snapshot.status.strip().toLowerAscii() in ["pending", "running"] and
+    relayStage in ["pending", "running"] and
+    (
+      snapshot.relayLastDialStage.strip().toLowerAscii() == "provider_wait" or
+        snapshot.relayError.strip() == TailnetProviderWarmPendingErr
+    )
+
+proc setConversationTransportSnapshot(
+    n: NimNode,
+    snapshot: ConversationTransportSnapshot
+) {.gcsafe, raises: [].} =
+  if n.isNil or snapshot.routeKey.len == 0:
+    return
+  n.routeTransportSnapshots[snapshot.routeKey] = snapshot
+  discard ensureRouteTransportWakeup(n, snapshot.routeKey)
+  fireRouteTransportWakeup(n, snapshot.routeKey)
+
+proc buildConversationTransportSnapshotFromIntent(
+    n: NimNode,
+    intent: RouteTransportIntent
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  if n.isNil or intent.routeKey.len == 0 or intent.peerId.len == 0:
+    return missingConversationTransportSnapshot(
+      intent.peerId,
+      intent.seedAddrs,
+      source = intent.source,
+      policy = peerPathPolicyText(intent.policy),
+      err = "missing_route_intent",
+    )
+  let directSnapshot =
+    if intent.seedAddrs.len > 0:
+      liveDirectSessionTargetSnapshot(n, intent.peerId, intent.seedAddrs)
+    else:
+      buildDirectSessionTargetSnapshot(
+        intent.peerId,
+        intent.routeKey,
+        "missing",
+      )
+  let relaySnapshot = latestPeerRouteSessionSnapshot(n, intent.peerId)
+  let directReady =
+    directSnapshot.sessionConnKey > 0 and
+      directSnapshot.sessionStage.strip().toLowerAscii() == "ready"
+  let relayReady = peerRouteSessionReady(relaySnapshot)
+  var selectedPath = ""
+  var selectedConnKey = 0
+  if peerPathPolicyUsesDirect(intent.policy) and directReady:
+    selectedPath = "direct"
+    selectedConnKey = directSnapshot.sessionConnKey
+  elif peerPathPolicyUsesRelay(intent.policy) and relayReady:
+    selectedPath = "relay"
+    selectedConnKey = relaySnapshot.sessionConnKey
+  let directTerminal = routeTransportDirectTerminalFailure(
+    buildConversationTransportSnapshot(
+      routeKey = intent.routeKey,
+      peerId = intent.peerId,
+      directStage = directSnapshot.sessionStage,
+      directConnKey = directSnapshot.sessionConnKey,
+      directTaskRunning = directSnapshot.taskRunning,
+      directLastDialStage = directSnapshot.lastDialStage,
+      directError = directSnapshot.error,
+    )
+  )
+  let relayTerminal = routeTransportRelayTerminalFailure(
+    buildConversationTransportSnapshot(
+      routeKey = intent.routeKey,
+      peerId = intent.peerId,
+      relayStage = relaySnapshot.status,
+      relayConnKey = relaySnapshot.sessionConnKey,
+      relayTaskRunning = relaySnapshot.taskRunning,
+      relayLastDialStage = relaySnapshot.lastDialStage,
+      relayError = relaySnapshot.error,
+    )
+  )
+  let status =
+    if selectedConnKey > 0:
+      "ready"
+    elif directSnapshot.taskRunning or relaySnapshot.taskRunning or
+        directSnapshot.sessionStage.strip().toLowerAscii() in ["pending", "warming", "route_wait"] or
+        relaySnapshot.status.strip().toLowerAscii() in ["pending", "running"]:
+      "running"
+    elif (not peerPathPolicyUsesDirect(intent.policy) or directTerminal.len > 0) and
+        (not peerPathPolicyUsesRelay(intent.policy) or relayTerminal.len > 0):
+      "failed"
+    else:
+      "pending"
+  let lastError =
+    if selectedConnKey > 0:
+      ""
+    elif intent.policy == ppDirectOnly:
+      if directTerminal.len > 0: directTerminal else: directSnapshot.error
+    elif intent.policy == ppRelayOnly:
+      if relayTerminal.len > 0: relayTerminal else: relaySnapshot.error
+    elif relayTerminal.len > 0:
+      relayTerminal
+    elif directTerminal.len > 0:
+      directTerminal
+    elif relaySnapshot.error.len > 0:
+      relaySnapshot.error
+    else:
+      directSnapshot.error
+  buildConversationTransportSnapshot(
+    routeKey = intent.routeKey,
+    peerId = intent.peerId,
+    source = intent.source,
+    policy = peerPathPolicyText(intent.policy),
+    selectedAddrs = intent.seedAddrs,
+    status = status,
+    directStage = directSnapshot.sessionStage,
+    directConnKey = directSnapshot.sessionConnKey,
+    directTaskRunning = directSnapshot.taskRunning,
+    directLastDialStage = directSnapshot.lastDialStage,
+    directError = directSnapshot.error,
+    directPathKind = directSnapshot.routePathKind,
+    relayStage = relaySnapshot.status,
+    relayConnKey = relaySnapshot.sessionConnKey,
+    relayTaskRunning = relaySnapshot.taskRunning,
+    relayLastDialStage = relaySnapshot.lastDialStage,
+    relayError = relaySnapshot.error,
+    directAttemptCount = directSnapshot.attemptCount,
+    directSuccessCount = directSnapshot.successCount,
+    directSuccessRatePct = directSnapshot.successRatePct,
+    directDmLatencyMs = directSnapshot.directDmLatencyMs,
+    relayDmLatencyMs = directSnapshot.relayDmLatencyMs,
+    selectedPath = selectedPath,
+    selectedConnKey = selectedConnKey,
+    ready = selectedConnKey > 0,
+    lastError = lastError,
+    updatedAtMs = max(intent.updatedAtMs, directSnapshot.updatedAtMs),
+  )
+
+proc latestConversationTransportSnapshot(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: openArray[string]
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  let routeKey = routeTransportTaskKey(safePeerId, selectedAddrs)
+  if n.isNil or safePeerId.len == 0 or routeKey.len == 0:
+    return missingConversationTransportSnapshot(
+      safePeerId,
+      @selectedAddrs,
+      err = "missing_peerId_or_addresses",
+    )
+  let intent = n.routeTransportIntents.getOrDefault(routeKey, RouteTransportIntent())
+  if intent.routeKey.len > 0:
+    let fresh = buildConversationTransportSnapshotFromIntent(n, intent)
+    n.routeTransportSnapshots[routeKey] = fresh
+    return fresh
+  n.routeTransportSnapshots.getOrDefault(
+    routeKey,
+    missingConversationTransportSnapshot(
+      safePeerId,
+      @selectedAddrs,
+      status = "missing",
+      err = "missing_route_intent",
+    ),
+  )
+
+proc publishRouteTransportSnapshot(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: openArray[string]
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  result = latestConversationTransportSnapshot(n, peerIdText, selectedAddrs)
+  if n.isNil or result.routeKey.len == 0:
+    return
+  setConversationTransportSnapshot(n, result)
+
+proc publishPeerRouteTransportSnapshots(
+    n: NimNode,
+    peerIdText: string
+) {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  if n.isNil or safePeerId.len == 0:
+    return
+  for routeKey in n.peerTransportRoutes.getOrDefault(safePeerId, @[]):
+    let intent = n.routeTransportIntents.getOrDefault(routeKey, RouteTransportIntent())
+    if intent.routeKey.len == 0:
+      continue
+    discard publishRouteTransportSnapshot(n, intent.peerId, intent.seedAddrs)
+
+proc upsertRouteTransportIntent(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: seq[string],
+    source: string,
+    policy: PeerPathPolicy,
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  let routeKey = routeTransportTaskKey(safePeerId, selectedAddrs)
+  let safeSource =
+    if source.strip().len > 0:
+      source.strip()
+    else:
+      "path_intent"
+  if n.isNil or safePeerId.len == 0 or routeKey.len == 0:
+    return missingConversationTransportSnapshot(
+      safePeerId,
+      selectedAddrs,
+      source = safeSource,
+      policy = peerPathPolicyText(policy),
+      err = "missing_peerId_or_addresses",
+    )
+  let intent = RouteTransportIntent(
+    routeKey: routeKey,
+    peerId: safePeerId,
+    seedAddrs: selectedAddrs,
+    source: safeSource,
+    policy: policy,
+    updatedAtMs: nowMillis(),
+  )
+  n.routeTransportIntents[routeKey] = intent
+  addPeerTransportRoute(n, safePeerId, routeKey)
+  discard ensureRouteTransportWakeup(n, routeKey)
+  if peerPathPolicyUsesDirect(policy):
+    discard upsertDirectSessionTarget(
+      n,
+      safePeerId,
+      selectedAddrs,
+      safeSource,
+      reconcileRelay = false,
+    )
+  else:
+    let directSpec = clearDirectSessionTargetDesiredState(
+      n,
+      safePeerId,
+      selectedAddrs,
+      safeSource,
+    )
+    if directSpec.taskKey.len > 0:
+      publishDirectSessionTargetSnapshot(n, directSpec)
+  if peerPathPolicyUsesRelay(policy):
+    let updatedAtMs = nowMillis()
+    n.relaySessionTargets[safePeerId] = RelaySessionTargetSpec(
+      peerId: safePeerId,
+      source: safeSource,
+      selectedAddrs: selectedAddrs,
+      updatedAtMs: updatedAtMs,
+      sticky: false,
+      retainedUntilAtMs: peerRouteSessionRetainDeadlineAtMs(false, updatedAtMs),
+    )
+    reconcilePeerRouteSession(n, safePeerId, safeSource)
+  elif not peerHasRouteTransportIntentUsingRelay(n, safePeerId) and
+      not stickyRelaySessionTargetDesired(n, safePeerId):
+    let existingRelaySpec =
+      n.relaySessionTargets.getOrDefault(safePeerId, RelaySessionTargetSpec())
+    if existingRelaySpec.peerId.len > 0:
+      let updatedAtMs = nowMillis()
+      let retainedAddrs =
+        block:
+          let warmAddrs = relayWarmSelectedAddrs(n, safePeerId)
+          if warmAddrs.len > 0:
+            warmAddrs
+          else:
+            existingRelaySpec.selectedAddrs
+      n.relaySessionTargets[safePeerId] = RelaySessionTargetSpec(
+        peerId: safePeerId,
+        source:
+          if existingRelaySpec.source.len > 0:
+            existingRelaySpec.source
+          else:
+            safeSource,
+        selectedAddrs: retainedAddrs,
+        updatedAtMs: updatedAtMs,
+        sticky: existingRelaySpec.sticky,
+        retainedUntilAtMs: peerRouteSessionRetainDeadlineAtMs(
+          existingRelaySpec.sticky,
+          updatedAtMs,
+        ),
+      )
+    else:
+      n.relaySessionTargets.del(safePeerId)
+  ensureDirectSessionTargetReconcileLoop(n)
+  ensurePeerRouteSessionReconcileLoop(n)
+  firePeerRouteSessionReconcileWake(n)
+  publishRouteTransportSnapshot(n, safePeerId, selectedAddrs)
+
+proc clearRouteTransportIntent(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: seq[string],
+    source: string,
+): ConversationTransportSnapshot {.gcsafe, raises: [].} =
+  let safePeerId = peerIdText.strip()
+  let routeKey = routeTransportTaskKey(safePeerId, selectedAddrs)
+  let safeSource =
+    if source.strip().len > 0:
+      source.strip()
+    else:
+      "path_intent"
+  if n.isNil or safePeerId.len == 0 or routeKey.len == 0:
+    return missingConversationTransportSnapshot(
+      safePeerId,
+      selectedAddrs,
+      source = safeSource,
+      status = "cleared",
+      err = "missing_peerId_or_addresses",
+    )
+  if routeKey in n.routeTransportIntents:
+    n.routeTransportIntents.del(routeKey)
+  removePeerTransportRoute(n, safePeerId, routeKey)
+  let existingTask = n.bootstrapSeedConnectTasks.getOrDefault(routeKey, nil)
+  let taskHasLiveSession =
+    not existingTask.isNil and
+      existingTask.sessionConnKey > 0 and
+      not n.dmService.isNil and
+      n.dmService.hasLiveSessionConnKey(existingTask.sessionConnKey)
+  let shouldCancelBackgroundWarm =
+    not existingTask.isNil and
+      existingTask.intent == bsciBackgroundWarm and
+      not taskHasLiveSession
+  if shouldCancelBackgroundWarm:
+    existingTask.state = bscsCancelled
+    existingTask.updatedAtMs = nowMillis()
+    existingTask.ok = false
+    existingTask.err = "direct_target_cleared"
+    existingTask.sessionWarmOk = false
+    existingTask.sessionWarmError = "direct_target_cleared"
+    existingTask.sessionConnKey = 0
+    existingTask.verifiedMuxer = nil
+    let existingFuture = n.bootstrapSeedConnectFutures.getOrDefault(routeKey, nil)
+    if not existingFuture.isNil and not existingFuture.finished():
+      existingFuture.cancelSoon()
+    if routeKey in n.bootstrapSeedConnectFutures:
+      n.bootstrapSeedConnectFutures.del(routeKey)
+    n.bootstrapSeedConnectTasks.del(routeKey)
+  let directSpec = clearDirectSessionTargetDesiredState(
+    n,
+    safePeerId,
+    selectedAddrs,
+    safeSource,
+  )
+  if directSpec.taskKey.len > 0:
+    publishDirectSessionTargetSnapshot(n, directSpec)
+  if not peerHasRouteTransportIntentUsingRelay(n, safePeerId):
+    let existingRelaySpec =
+      n.relaySessionTargets.getOrDefault(safePeerId, RelaySessionTargetSpec())
+    if existingRelaySpec.peerId.len > 0:
+      let updatedAtMs = nowMillis()
+      let retainedAddrs =
+        block:
+          let warmAddrs = relayWarmSelectedAddrs(n, safePeerId)
+          if warmAddrs.len > 0:
+            warmAddrs
+          else:
+            selectedAddrs
+      n.relaySessionTargets[safePeerId] = RelaySessionTargetSpec(
+        peerId: safePeerId,
+        source:
+          if existingRelaySpec.source.len > 0:
+            existingRelaySpec.source
+          else:
+            safeSource,
+        selectedAddrs: retainedAddrs,
+        updatedAtMs: updatedAtMs,
+        sticky: existingRelaySpec.sticky,
+        retainedUntilAtMs: peerRouteSessionRetainDeadlineAtMs(
+          existingRelaySpec.sticky,
+          updatedAtMs,
+        ),
+      )
+    else:
+      n.relaySessionTargets.del(safePeerId)
+  if routeKey in n.routeTransportSnapshots:
+    n.routeTransportSnapshots.del(routeKey)
+  fireRouteTransportWakeup(n, routeKey)
+  firePeerRouteSessionReconcileWake(n)
+  missingConversationTransportSnapshot(
+    safePeerId,
+    selectedAddrs,
+    source = safeSource,
+    status = "cleared",
+    err = "path_intent_cleared",
+  )
+
 proc getOwnedDirectSessionTargetSpec(
     n: NimNode,
     taskKey: string
@@ -6128,53 +7908,171 @@ proc getOwnedDirectSessionTargetSpec(
   finally:
     n.directSessionTargetLock.release()
 
-proc updatePublishedDirectSessionTargetSpec(
+proc initDirectPeerPathState(desired = false): DirectPeerPathState {.gcsafe, raises: [].} =
+  DirectPeerPathState(
+    desired: desired,
+    routeStage: "",
+    routePathKind: "",
+    sessionStage: if desired: "pending" else: "missing",
+    sessionConnKey: 0,
+    lastDialStage: "",
+    lastError: "",
+    updatedAtMs: 0,
+    attemptCount: 0,
+    successCount: 0,
+    failureCount: 0,
+    lastAttemptAtMs: 0,
+    lastReadyAtMs: 0,
+    lastFailureAtMs: 0,
+  )
+
+proc getOwnedDirectPeerPathState(
     n: NimNode,
-    spec: DirectSessionTargetSpec,
-    publishedStatus: string,
-    publishedError: string
-): DirectSessionTargetSpec {.gcsafe, raises: [].} =
-  result = spec
-  if n.isNil or spec.taskKey.len == 0:
-    return
-  let normalizedStatus = publishedStatus.strip().toLowerAscii()
-  let normalizedError = publishedError.strip()
-  let updatedAtMs = nowMillis()
+    taskKey: string
+): DirectPeerPathState {.gcsafe, raises: [].} =
+  if n.isNil or taskKey.len == 0:
+    return initDirectPeerPathState()
   n.directSessionTargetLock.acquire()
   try:
-    if spec.taskKey in n.directSessionTargets:
-      result = n.directSessionTargets.getOrDefault(spec.taskKey, spec)
-    if result.taskKey.len == 0:
-      result = spec
-    result.updatedAtMs = max(result.updatedAtMs, updatedAtMs)
-    if normalizedStatus.len > 0 and normalizedStatus != result.lastPublishedStatus:
-      case normalizedStatus
-      of "running":
-        inc result.attemptCount
-        result.lastAttemptAtMs = updatedAtMs
-      of "ready":
-        inc result.successCount
-        result.lastReadyAtMs = updatedAtMs
-      of "failed":
-        inc result.failureCount
-        result.lastFailureAtMs = updatedAtMs
-        result.lastFailureReason = normalizedError
-      else:
-        discard
-    elif normalizedStatus == "failed" and normalizedError.len > 0:
-      result.lastFailureReason = normalizedError
-    if normalizedStatus.len > 0:
-      result.lastPublishedStatus = normalizedStatus
-    if spec.peerId.len > 0:
-      result.peerId = spec.peerId
-    if spec.source.len > 0:
-      result.source = spec.source
-    if spec.selectedAddrs.len > 0:
-      result.selectedAddrs = spec.selectedAddrs
-    if spec.taskKey in n.directSessionTargets:
-      n.directSessionTargets[spec.taskKey] = result
+    result = n.directPeerPathStates.getOrDefault(taskKey, initDirectPeerPathState())
   finally:
     n.directSessionTargetLock.release()
+
+proc setOwnedDirectPeerPathState(
+    n: NimNode,
+    taskKey: string,
+    state: DirectPeerPathState
+) {.gcsafe, raises: [].} =
+  if n.isNil or taskKey.len == 0:
+    return
+  n.directSessionTargetLock.acquire()
+  try:
+    n.directPeerPathStates[taskKey] = state
+  finally:
+    n.directSessionTargetLock.release()
+
+proc directReadyRouteStage(pathKind: string): string {.gcsafe, raises: [].} =
+  case pathKind.strip().toLowerAscii()
+  of "local":
+    "local_ready"
+  of "direct", "punched_direct":
+    "direct_route_ready"
+  else:
+    "direct_route_ready"
+
+proc markDirectPeerPathStateReady(
+    state: var DirectPeerPathState,
+    sessionConnKey: int,
+    pathKind: string,
+    routeStage = "",
+) {.gcsafe, raises: [].} =
+  let normalizedPathKind = pathKind.strip().toLowerAscii()
+  let nextRouteStage =
+    if routeStage.strip().len > 0:
+      routeStage.strip()
+    else:
+      directReadyRouteStage(normalizedPathKind)
+  let transitionedToReady =
+    state.sessionStage.strip().toLowerAscii() != "ready" or
+    state.sessionConnKey != sessionConnKey
+  state.routeStage = nextRouteStage
+  state.routePathKind = normalizedPathKind
+  state.sessionStage = "ready"
+  state.sessionConnKey = sessionConnKey
+  state.lastDialStage = "session_ready"
+  state.lastError = ""
+  state.updatedAtMs = nowMillis()
+  if transitionedToReady:
+    let hasOutstandingAttempt = state.attemptCount > (state.successCount + state.failureCount)
+    if hasOutstandingAttempt:
+      inc state.successCount
+    else:
+      inc state.attemptCount
+      inc state.successCount
+    state.lastReadyAtMs = state.updatedAtMs
+
+proc directPeerPathTaskRunning(
+    n: NimNode,
+    taskKey: string
+): bool {.gcsafe, raises: [].} =
+  if n.isNil or taskKey.len == 0:
+    return false
+  n.directSessionTargetLock.acquire()
+  try:
+    let fut = n.directPeerPathFutures.getOrDefault(taskKey, nil)
+    return not fut.isNil and not fut.finished()
+  finally:
+    n.directSessionTargetLock.release()
+
+proc latestDesiredRelayRouteTargets(
+    n: NimNode
+): seq[DirectSessionTargetSpec] {.gcsafe, raises: [].} =
+  if n.isNil:
+    return @[]
+  var desired = initTable[string, DirectSessionTargetSpec]()
+  for spec in copyDirectSessionTargetSpecs(n):
+    let peerId = spec.peerId.strip()
+    if peerId.len == 0:
+      continue
+    let existing = desired.getOrDefault(peerId, DirectSessionTargetSpec())
+    if existing.taskKey.len == 0 or spec.updatedAtMs >= existing.updatedAtMs:
+      desired[peerId] = spec
+  for spec in desired.values:
+    result.add(spec)
+
+proc directPeerPathPlanForAddr(
+    n: NimNode,
+    addrText: string
+): TsnetUdpExactDialPlan {.gcsafe, raises: [].} =
+  if n.isNil or n.switchInstance.isNil:
+    return TsnetUdpExactDialPlan(
+      mode: TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: "node_unavailable",
+      updatedUnixMilli: 0,
+    )
+  let transport = n.switchInstance.tsnetTransport()
+  if transport.isNil:
+    return TsnetUdpExactDialPlan(
+      mode: TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: "tsnet_transport_unavailable",
+      updatedUnixMilli: 0,
+    )
+  var normalizedAddr = canonicalizeMultiaddrText(addrText.strip())
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = normalizedAddr.rfind(marker)
+    if idx >= 0:
+      normalizedAddr = normalizedAddr[0 ..< idx]
+      break
+  if normalizedAddr.len == 0:
+    return TsnetUdpExactDialPlan(
+      mode: TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: "invalid_tsnet_target",
+      updatedUnixMilli: 0,
+    )
+  let maRes = parseDialableMultiaddr(normalizedAddr)
+  if maRes.isErr():
+    return TsnetUdpExactDialPlan(
+      mode: TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: maRes.error,
+      updatedUnixMilli: 0,
+    )
+  transport.planUdpExactDialTarget(maRes.get(), relayAllowed = false)
 
 proc upsertDirectSessionTargetDesiredState(
     n: NimNode,
@@ -6217,6 +8115,12 @@ proc upsertDirectSessionTargetDesiredState(
       result.selectedAddrs = selectedAddrs
       result.updatedAtMs = nowMillis()
     n.directSessionTargets[taskKey] = result
+    var state = n.directPeerPathStates.getOrDefault(taskKey, initDirectPeerPathState(true))
+    state.desired = true
+    state.updatedAtMs = max(state.updatedAtMs, result.updatedAtMs)
+    if state.sessionStage.len == 0 or state.sessionStage == "missing":
+      state.sessionStage = "pending"
+    n.directPeerPathStates[taskKey] = state
   finally:
     n.directSessionTargetLock.release()
 
@@ -6244,6 +8148,13 @@ proc clearDirectSessionTargetDesiredState(
     result = n.directSessionTargets.getOrDefault(taskKey, DirectSessionTargetSpec())
     if taskKey in n.directSessionTargets:
       n.directSessionTargets.del(taskKey)
+    var state = n.directPeerPathStates.getOrDefault(taskKey, initDirectPeerPathState())
+    state.desired = false
+    state.sessionStage = "cleared"
+    state.sessionConnKey = 0
+    state.lastError = ""
+    state.updatedAtMs = nowMillis()
+    n.directPeerPathStates[taskKey] = state
   finally:
     n.directSessionTargetLock.release()
   if result.taskKey.len == 0:
@@ -6254,6 +8165,19 @@ proc clearDirectSessionTargetDesiredState(
       selectedAddrs: selectedAddrs,
       updatedAtMs: nowMillis(),
     )
+
+proc liveDirectSessionConnPathKind(
+    n: NimNode,
+    connKey: int
+): string {.gcsafe, raises: [].} =
+  if n.isNil or n.dmService.isNil or connKey <= 0:
+    return ""
+  n.dmService.liveSessionConnPathKind(connKey)
+proc directSessionConnPathReady(pathKind: string): bool {.gcsafe, raises: [].}
+proc livePeerDirectSessionConnKey(
+    n: NimNode,
+    peerIdText: string
+): int {.gcsafe, raises: [].}
 
 proc liveDirectSessionTargetSnapshot(
     n: NimNode,
@@ -6271,64 +8195,86 @@ proc liveDirectSessionTargetSnapshot(
       error = "missing_peerId_or_addresses",
     )
   let spec = getOwnedDirectSessionTargetSpec(n, taskKey)
-  let task = n.bootstrapSeedConnectTasks.getOrDefault(taskKey, nil)
-  let ready = bootstrapSeedConnectTaskSessionLive(n, task)
-  let running = bootstrapSeedConnectTaskRunning(n, task)
-  let routeStatus = liveDirectRouteStatus(n, selectedAddrs)
+  let state = getOwnedDirectPeerPathState(n, taskKey)
+  let running = directPeerPathTaskRunning(n, taskKey)
+  let taskConnKey =
+    if state.sessionConnKey > 0 and not n.isNil and not n.dmService.isNil and
+        n.dmService.hasLiveSessionConnKey(state.sessionConnKey) and
+        directSessionConnPathReady(liveDirectSessionConnPathKind(n, state.sessionConnKey)):
+      state.sessionConnKey
+    else:
+      0
+  let liveConnKey =
+    if taskConnKey > 0:
+      taskConnKey
+    else:
+      livePeerDirectSessionConnKey(n, safePeerId)
+  let livePathKind =
+    if liveConnKey > 0:
+      liveDirectSessionConnPathKind(n, liveConnKey)
+    else:
+      ""
+  let ready =
+    liveConnKey > 0 and
+    (state.sessionStage == "ready" or directSessionConnPathReady(livePathKind))
   let effectiveStatus =
     if ready:
       "ready"
-    elif running:
-      "running"
-    elif not task.isNil and task.state == bscsProbing:
-      "probing"
-    elif spec.taskKey.len == 0 and task.isNil:
+    elif running and state.sessionStage.len > 0:
+      state.sessionStage
+    elif state.sessionStage.len > 0:
+      state.sessionStage
+    elif spec.taskKey.len == 0:
       "missing"
-    elif not task.isNil and task.state == bscsFailed:
-      "failed"
-    elif not task.isNil and task.state == bscsCancelled:
-      "cleared"
     else:
       "pending"
   let effectiveError =
-    if not task.isNil and task.sessionWarmError.len > 0:
-      task.sessionWarmError
-    elif not task.isNil:
-      task.err
-    else:
+    if ready:
       ""
-  let attemptCount = spec.attemptCount
-  let successCount = spec.successCount
-  let failureCount = spec.failureCount
-  let lastAttemptAtMs = spec.lastAttemptAtMs
-  let lastReadyAtMs = spec.lastReadyAtMs
-  let lastFailureAtMs = spec.lastFailureAtMs
-  let lastFailureReason = spec.lastFailureReason
+    else:
+      state.lastError
   buildDirectSessionTargetSnapshot(
     safePeerId,
     taskKey,
     effectiveStatus,
     selectedAddrs = @selectedAddrs,
     source = spec.source,
+    desired = state.desired,
     error = effectiveError,
+    routeStage = state.routeStage,
+    sessionStage = effectiveStatus,
+    lastDialStage =
+      if ready:
+        "session_ready"
+      else:
+        state.lastDialStage,
+    lastError = state.lastError,
     ok = ready,
     taskRunning = running,
-    sessionWarmOk = ready or (not task.isNil and task.sessionWarmOk),
-    verifiedMuxer = not task.isNil and not task.verifiedMuxer.isNil,
-    sessionConnKey = if task.isNil: 0 else: task.sessionConnKey,
-    routeReady = routeStatus.ready,
-    routePathKind = routeStatus.pathKind,
-    updatedAtMs = spec.updatedAtMs,
-    attemptCount = attemptCount,
-    successCount = successCount,
-    failureCount = failureCount,
-    lastAttemptAtMs = lastAttemptAtMs,
-    lastReadyAtMs = lastReadyAtMs,
-    lastFailureAtMs = lastFailureAtMs,
-    lastFailureReason = lastFailureReason,
-    taskState = if task.isNil: "" else: bootstrapSeedConnectStateLabel(task.state),
-    verifiedMuxerWaitMs = if task.isNil: 0 else: task.verifiedMuxerWaitMs,
-    attemptedAddr = if task.isNil: "" else: task.attemptedAddr,
+    sessionWarmOk = ready,
+    verifiedMuxer = false,
+    sessionConnKey = liveConnKey,
+    routeReady = ready or state.routeStage in ["local_ready", "direct_route_ready"],
+    routePathKind =
+      if livePathKind.len > 0:
+        livePathKind
+      else:
+        state.routePathKind,
+    updatedAtMs = max(spec.updatedAtMs, state.updatedAtMs),
+    attemptCount = state.attemptCount,
+    successCount = state.successCount,
+    failureCount = state.failureCount,
+    lastAttemptAtMs = state.lastAttemptAtMs,
+    lastReadyAtMs = state.lastReadyAtMs,
+    lastFailureAtMs = state.lastFailureAtMs,
+    lastFailureReason =
+      if state.lastFailureAtMs > 0 and state.lastError.len > 0:
+        state.lastError
+      else:
+        "",
+    directDmLatencyMs = cachedDmPathLatencyMs(n, safePeerId, useRelay = false),
+    relayDmLatencyMs = cachedDmPathLatencyMs(n, safePeerId, useRelay = true),
+    taskState = effectiveStatus,
   )
 
 proc liveDirectSessionTargetStateJson(
@@ -6346,7 +8292,7 @@ proc getLiveReadyDirectSessionTargetConnKey(
     selectedAddrs: openArray[string]
 ): int {.gcsafe, raises: [].} =
   let snapshot = liveDirectSessionTargetSnapshot(n, peerId, selectedAddrs)
-  if snapshot.status.toLowerAscii() != "ready" or snapshot.sessionConnKey <= 0:
+  if snapshot.sessionStage.toLowerAscii() != "ready" or snapshot.sessionConnKey <= 0:
     return 0
   snapshot.sessionConnKey
 
@@ -6354,28 +8300,13 @@ proc liveDirectRouteStatusForAddr(
     n: NimNode,
     addrText: string
 ): tuple[ready: bool, pathKind: string] {.gcsafe, raises: [].} =
-  if n.isNil or n.switchInstance.isNil:
-    return (false, "")
-  let transport = n.switchInstance.tsnetTransport()
-  if transport.isNil:
-    return (false, "")
-  var normalizedAddr = canonicalizeMultiaddrText(addrText.strip())
-  for marker in ["/p2p/", "/ipfs/"]:
-    let idx = normalizedAddr.rfind(marker)
-    if idx >= 0:
-      normalizedAddr = normalizedAddr[0 ..< idx]
-      break
-  if normalizedAddr.len == 0:
-    return (false, "")
-  let maRes = parseDialableMultiaddr(normalizedAddr)
-  if maRes.isErr():
-    return (false, "")
-  let directRouteRes = transport.lookupUdpDirectRouteTarget(maRes.get())
-  if directRouteRes.isErr():
-    return (false, "")
+  let plan = directPeerPathPlanForAddr(n, addrText)
   (
-    true,
-    directRouteRes.get().pathKind.strip().toLowerAscii(),
+    plan.ready and plan.stage in [
+      TsnetUdpExactDialStage.LocalReady,
+      TsnetUdpExactDialStage.DirectRouteReady,
+    ],
+    plan.pathKind.strip().toLowerAscii(),
   )
 
 proc liveDirectRouteStatus(
@@ -6414,14 +8345,17 @@ proc latestOwnedDirectSessionTargetSnapshot(
 proc directTargetReady(
     snapshot: DirectSessionTargetSnapshot
 ): bool {.gcsafe, raises: [].} =
-  snapshot.status.toLowerAscii() == "ready" and
+  snapshot.sessionStage.toLowerAscii() == "ready" and
     snapshot.sessionWarmOk and
     snapshot.sessionConnKey > 0
 
 proc directTargetProbing(
     snapshot: DirectSessionTargetSnapshot
 ): bool {.gcsafe, raises: [].} =
-  snapshot.taskRunning or snapshot.status.toLowerAscii() in ["pending", "running", "probing"]
+  snapshot.taskRunning or (
+    snapshot.desired and
+      snapshot.sessionStage.toLowerAscii() in ["pending", "route_wait", "warming"]
+  )
 
 proc directTargetProjectedPathStatus(
     snapshot: DirectSessionTargetSnapshot
@@ -6479,6 +8413,9 @@ proc buildPeerPathProjection(
     "transport": transport,
     "pathStatus": pathStatus,
     "directTargetStatus": directSnapshot.status,
+    "directTargetRouteStage": directSnapshot.routeStage,
+    "directTargetSessionStage": directSnapshot.sessionStage,
+    "directTargetLastDialStage": directSnapshot.lastDialStage,
     "directTargetReady": directReady,
     "directTargetTaskRunning": directProbing,
     "directTargetSessionConnKey": directSnapshot.sessionConnKey,
@@ -6501,6 +8438,8 @@ proc buildPeerPathProjection(
   }
   if directSnapshot.error.len > 0:
     result["directTargetError"] = %directSnapshot.error
+  if directSnapshot.lastError.len > 0:
+    result["directTargetLastError"] = %directSnapshot.lastError
   if directSnapshot.lastFailureReason.len > 0:
     result["directTargetLastFailureReason"] = %directSnapshot.lastFailureReason
   if relaySnapshot.error.len > 0:
@@ -7068,6 +9007,7 @@ proc updateTailnetStartStatus(
       "attemptCount": (if n.isNil: 0 else: n.tailnetAttempts),
     }
     recordEvent(n, "system_status", $payload)
+    firePeerRouteSessionReconcileWake(n)
 
 proc buildTailnetStartStatusPayload(n: NimNode): JsonNode {.gcsafe, raises: [].} =
   result = %*{
@@ -7103,6 +9043,8 @@ type TailnetWarmWorkerArg = object
   handle: pointer
   providerConfigJson: cstring
 
+proc tailnetWarmWorker(arg: pointer) {.thread.}
+
 proc destroyTailnetWarmWorkerArg(arg: ptr TailnetWarmWorkerArg) {.gcsafe, raises: [].} =
   if arg.isNil:
     return
@@ -7130,6 +9072,65 @@ proc joinTailnetWarmThreadIfNeeded(n: NimNode) {.gcsafe, raises: [].} =
     return
   joinThread(n.tailnetWarmThread)
   n.tailnetWarmThreadJoined.store(true, moRelease)
+
+proc kickTailnetWarmOnOwnerThread(
+    n: NimNode
+): tuple[ok: bool, err: string] {.gcsafe, raises: [].} =
+  if n.isNil:
+    return (false, "node unavailable")
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    updateTailnetStartStatus(n, "failed", false, "tsnet transport unavailable")
+    return (false, "tsnet transport unavailable")
+  let providerReady = ffiTsnetSafe:
+    transport.providerReadySafe()
+  if providerReady:
+    ensureTailnetControlRefreshLoop(n)
+    updateTailnetStartStatus(n, "started", false)
+    return (true, "")
+  updateTailnetStartStatus(n, "starting", true)
+  if n.tailnetWarmThreadActive.load(moAcquire):
+    return (true, "")
+  joinTailnetWarmThreadIfNeeded(n)
+  clearTailnetWarmWorkerBuffers(n)
+  n.tailnetWarmFinalizePending.store(false, moRelease)
+  n.tailnetWarmSucceeded.store(false, moRelease)
+  debugLog("[nimlibp2p] tailnet warm worker: publish_local_peer_info_before_snapshot")
+  publishTsnetLocalPeerInfo(n, transport)
+  let cfgJson = ffiTsnetSafe:
+    transport.warmProviderConfigJsonSafe()
+  if cfgJson.isErr():
+    updateTailnetStartStatus(n, "failed", false, cfgJson.error)
+    return (false, cfgJson.error)
+  let workerArg = cast[ptr TailnetWarmWorkerArg](allocShared0(sizeof(TailnetWarmWorkerArg)))
+  if workerArg.isNil:
+    let err = "tailnet warm worker alloc failed"
+    updateTailnetStartStatus(n, "failed", false, err)
+    return (false, err)
+  workerArg.handle = n.selfHandle
+  workerArg.providerConfigJson = allocCString(cfgJson.get())
+  if workerArg.providerConfigJson.isNil:
+    destroyTailnetWarmWorkerArg(workerArg)
+    let err = "tailnet warm config alloc failed"
+    updateTailnetStartStatus(n, "failed", false, err)
+    return (false, err)
+  n.tailnetWarmThreadJoined.store(false, moRelease)
+  n.tailnetWarmThreadActive.store(true, moRelease)
+  try:
+    createThread(n.tailnetWarmThread, tailnetWarmWorker, cast[pointer](workerArg))
+    debugLog("[nimlibp2p] tailnet warm worker created")
+    (true, "")
+  except CatchableError as exc:
+    n.tailnetWarmThreadActive.store(false, moRelease)
+    n.tailnetWarmThreadJoined.store(true, moRelease)
+    destroyTailnetWarmWorkerArg(workerArg)
+    let err =
+      if exc.msg.len > 0:
+        exc.msg
+      else:
+        "tailnet warm worker createThread failed"
+    updateTailnetStartStatus(n, "failed", false, err)
+    (false, err)
 
 proc tailnetWarmWorker(arg: pointer) {.thread.} =
   setupForeignThreadGc()
@@ -7780,15 +9781,15 @@ proc handleContentFeedNode(n: NimNode, payload: string, originPeer: string) =
     let ts = jsonGetInt64(sanitized, "timestamp", nowMillis())
     let item = CachedFeedItem(id: itemId, author: author, payload: sanitized, timestamp: ts)
     addFeedItem(n, item)
-    socialStateMemLock.acquire()
-    try:
-      let state = loadSocialStateUnsafe(n)
-      let localPeer = localPeerId(n)
-      let publishState = jsonGetStr(sanitized, "publishState", "published").strip().toLowerAscii()
-      let visibility = jsonGetStr(sanitized, "visibility", "public").strip().toLowerAscii()
-      let homeEligible = jsonGetBool(sanitized, "homeEligible", true)
-      let tombstoned = jsonGetBool(sanitized, "tombstoned", false)
-      if author.len > 0 and author != localPeer and publishState == "published" and visibility == "public" and homeEligible and not tombstoned:
+    let localPeer = localPeerId(n)
+    let publishState = jsonGetStr(sanitized, "publishState", "published").strip().toLowerAscii()
+    let visibility = jsonGetStr(sanitized, "visibility", "public").strip().toLowerAscii()
+    let homeEligible = jsonGetBool(sanitized, "homeEligible", true)
+    let tombstoned = jsonGetBool(sanitized, "tombstoned", false)
+    if author.len > 0 and author != localPeer and publishState == "published" and visibility == "public" and homeEligible and not tombstoned:
+      socialStateMemLock.acquire()
+      try:
+        let state = loadSocialStateOnOwnerThread(n)
         var notificationPayload = sanitized
         notificationPayload["producer"] = %author
         notificationPayload["peerId"] = %author
@@ -7805,9 +9806,9 @@ proc handleContentFeedNode(n: NimNode, payload: string, originPeer: string) =
           notificationPayload,
           "inbox",
         )
-        persistSocialStateUnsafe(n, state)
-    finally:
-      socialStateMemLock.release()
+        persistSocialStateOnOwnerThread(n, state)
+      finally:
+        socialStateMemLock.release()
     var event = newJObject()
     event["type"] = %"ContentFeedItem"
     event["peer_id"] = %author
@@ -7860,11 +9861,11 @@ proc handleLanGroupMessage(n: NimNode, groupId: string, payload: seq[byte]) =
     event["payload"] = %raw
   recordEvent(n, "network_event", $event)
   if fromPeer.len > 0:
-    socialStateMemLock.acquire()
-    try:
-      let state = loadSocialStateUnsafe(n)
-      let localPeer = localPeerId(n)
-      if fromPeer != localPeer:
+    let localPeer = localPeerId(n)
+    if fromPeer != localPeer:
+      socialStateMemLock.acquire()
+      try:
+        let state = loadSocialStateOnOwnerThread(n)
         var message = newJObject()
         message["id"] = %(if mid.len > 0: mid else: ensureMessageId(""))
         message["sender"] = %fromPeer
@@ -7886,9 +9887,9 @@ proc handleLanGroupMessage(n: NimNode, groupId: string, payload: seq[byte]) =
         notificationPayload["topic"] = %("group/" & groupId)
         notificationPayload["timestampMs"] = %ts
         appendEarlyNotificationNoLock(state, "group_message_received", "群消息", body, notificationPayload, "inbox")
-        persistSocialStateUnsafe(n, state)
-    finally:
-      socialStateMemLock.release()
+        persistSocialStateOnOwnerThread(n, state)
+      finally:
+        socialStateMemLock.release()
   if n.lanGroups.hasKey(groupId):
     var state = n.lanGroups.getOrDefault(groupId)
     if ts > state.lastTimestamp:
@@ -8024,22 +10025,20 @@ proc finalizeReceivedDirectMessageAsync(
       convId = convId
     if fromPeer.len > 0 and convId.len > 0:
       {.cast(gcsafe).}:
-        warn "handleDirectMessageNode socialState lock wait", peer = fromPeer, mid = mid, convId = convId
-        socialStateMemLock.acquire()
-        try:
-          warn "handleDirectMessageNode socialState lock acquired", peer = fromPeer, mid = mid, convId = convId
-          warn "handleDirectMessageNode socialState load begin", peer = fromPeer, mid = mid, convId = convId
-          let state = loadSocialStateUnsafe(n)
-          warn "handleDirectMessageNode socialState load done", peer = fromPeer, mid = mid, convId = convId
-          let localPeer = localPeerId(n)
-          if fromPeer != localPeer:
-            let persistToSocial = shouldPersistDirectMessageToSocial(payloadNode)
-            warn "handleDirectMessageNode social persist decision",
-              peer = fromPeer,
-              mid = mid,
-              convId = convId,
-              persist = persistToSocial
-            if persistToSocial:
+        warn "handleDirectMessageNode socialState owner begin", peer = fromPeer, mid = mid, convId = convId
+        let localPeer = localPeerId(n)
+        if fromPeer != localPeer:
+          let persistToSocial = shouldPersistDirectMessageToSocial(payloadNode)
+          warn "handleDirectMessageNode social persist decision",
+            peer = fromPeer,
+            mid = mid,
+            convId = convId,
+            persist = persistToSocial
+          if persistToSocial:
+            socialStateMemLock.acquire()
+            try:
+              let state = loadSocialStateOnOwnerThread(n)
+              warn "handleDirectMessageNode socialState owner ready", peer = fromPeer, mid = mid, convId = convId
               let storedPayload = compactDirectPayloadForSocial(payloadNode)
               var message = newJObject()
               message["id"] = %mid
@@ -8064,15 +10063,14 @@ proc finalizeReceivedDirectMessageAsync(
               appendEarlyNotificationNoLock(state, "dm_received", "新消息", body, notificationPayload, "priority")
               warn "handleDirectMessageNode appendNotification done", peer = fromPeer, mid = mid, convId = convId
               warn "handleDirectMessageNode persistSocialState begin", peer = fromPeer, mid = mid, convId = convId
-              persistSocialStateUnsafe(n, state)
+              persistSocialStateOnOwnerThread(n, state)
               warn "handleDirectMessageNode persistSocialState done", peer = fromPeer, mid = mid, convId = convId
-            else:
-              warn "handleDirectMessageNode social persist skipped", peer = fromPeer, mid = mid, convId = convId
+            finally:
+              socialStateMemLock.release()
           else:
-            warn "handleDirectMessageNode social persist skipped self", peer = fromPeer, mid = mid, convId = convId
-        finally:
-          warn "handleDirectMessageNode socialState lock release", peer = fromPeer, mid = mid, convId = convId
-          socialStateMemLock.release()
+            warn "handleDirectMessageNode social persist skipped", peer = fromPeer, mid = mid, convId = convId
+        else:
+          warn "handleDirectMessageNode social persist skipped self", peer = fromPeer, mid = mid, convId = convId
     var event = newJObject()
     event["type"] = %"MessageReceived"
     event["peer_id"] = %((if fromPeer.len == 0: "unknown" else: fromPeer))
@@ -8847,26 +10845,13 @@ proc refreshLanAwareAddrs(n: NimNode): seq[MultiAddress] {.gcsafe.} =
   if wantsTsnetTransport(n.cfg):
     let publishedTexts = currentTsnetPublishedAddrTexts(n)
     if publishedTexts.len > 0:
-      let published = parseMultiaddrsFromTexts(publishedTexts)
-      debugLog(
-        "[nimlibp2p] refreshLanAwareAddrs tsnet_only published=" &
-        publishedTexts.join(",")
-      )
-      n.switchInstance.peerInfo.listenAddrs = published
-      n.switchInstance.peerInfo.addrs = published
       rememberPeerInfoAddrTexts(n, publishedTexts, publishedTexts)
-      return published
-    if n.peerInfoListenAddrTexts.len > 0:
-      let cached = parseMultiaddrsFromTexts(n.peerInfoListenAddrTexts)
-      if cached.len > 0:
-        debugLog(
-          "[nimlibp2p] refreshLanAwareAddrs tsnet_only cached=" &
-          n.peerInfoListenAddrTexts.join(",")
-        )
-        n.switchInstance.peerInfo.listenAddrs = cached
-        n.switchInstance.peerInfo.addrs = cached
-        rememberPeerInfoAddrTexts(n, n.peerInfoListenAddrTexts, n.peerInfoListenAddrTexts)
-        return cached
+    elif n.peerInfoListenAddrTexts.len > 0:
+      rememberPeerInfoAddrTexts(n, n.peerInfoListenAddrTexts, n.peerInfoListenAddrTexts)
+    if n.switchInstance.peerInfo.listenAddrs.len > 0:
+      return dedupeLocalMultiaddrs(n.switchInstance.peerInfo.listenAddrs)
+    if n.switchInstance.peerInfo.addrs.len > 0:
+      return dedupeLocalMultiaddrs(n.switchInstance.peerInfo.addrs)
     return @[]
   var base: seq[MultiAddress] = @[]
   let preferRuntimeBase = n.cfg.listenAddresses.anyIt(it.toLowerAscii().endsWith("/tsnet"))
@@ -9260,6 +11245,14 @@ proc configuredWanJournalPath(cfg: NodeConfig): string =
   else:
     ""
 
+proc configuredSocialStatePath(cfg: NodeConfig): string =
+  if cfg.dataDir.isNone:
+    return ""
+  let dataDir = cfg.dataDir.get().strip()
+  if dataDir.len == 0:
+    return ""
+  dataDir / "social_state.json"
+
 proc configuredWanBootstrapAuthoritative(cfg: NodeConfig): bool =
   if cfg.extra.kind == JObject:
     if jsonGetBool(cfg.extra, "bootstrapAuthoritative", false) or
@@ -9285,6 +11278,16 @@ proc configuredWanBootstrapAddrs(cfg: NodeConfig): seq[MultiAddress] =
         continue
       seen.incl(normalized)
       result.add(parsed.get())
+
+  for raw in configuredRelayBootstrapSeedAddrs(cfg):
+    let parsed = MultiAddress.init(raw)
+    if parsed.isErr():
+      continue
+    let normalized = $parsed.get()
+    if normalized in seen:
+      continue
+    seen.incl(normalized)
+    result.add(parsed.get())
 
   if result.len == 0 and publicBootstrapEnabled(cfg):
     for raw in LegacyPublicWanBootstrapFallbackAddrs:
@@ -9317,7 +11320,7 @@ proc configuredWanBootstrapAuthoritativePeerIds(cfg: NodeConfig): seq[string] =
 proc configuredRelayBootstrapGate(cfg: NodeConfig): bool =
   legacyCircuitRelayEnabled(cfg) and
     configuredWanBootstrapAuthoritativePeerIds(cfg).len > 0 and
-    extraMultiaddrTexts(cfg.extra, ["relayMultiaddrs"]).len > 0
+    configuredRelayBootstrapSeedAddrs(cfg).len > 0
 
 proc configuredWanBootstrapConfig(cfg: NodeConfig): WanBootstrapConfig =
   bootstrapRoleConfig(
@@ -9386,7 +11389,7 @@ proc parseLsmrPath(node: JsonNode): LsmrPath =
       return @[]
     result.add(uint8(digit))
 
-proc configuredLsmrPath(cfg: NodeConfig): LsmrPath =
+proc configuredExplicitLsmrPath(cfg: NodeConfig): LsmrPath =
   if cfg.extra.kind == JObject:
     let direct = cfg.extra.getOrDefault("lsmrPath")
     if not direct.isNil:
@@ -9395,6 +11398,24 @@ proc configuredLsmrPath(cfg: NodeConfig): LsmrPath =
     if not snake.isNil:
       return parseLsmrPath(snake)
   @[]
+
+proc configuredIdentityPeerId(cfg: NodeConfig): string =
+  if cfg.identity.isSome():
+    cfg.identity.get().peerId.strip()
+  else:
+    ""
+
+proc deterministicLsmrPath(peerId: string, serveDepth: int): LsmrPath =
+  let normalized = peerId.strip()
+  let suffixLen = max(0, min(8, max(1, serveDepth) - 1))
+  if normalized.len == 0 or suffixLen == 0:
+    return @[]
+  var hash = 0'i64
+  for ch in normalized:
+    hash = (hash * 131'i64 + ord(ch).int64) mod 2147483647'i64
+  for idx in 0 ..< suffixLen:
+    hash = (hash * 131'i64 + (idx + 1).int64) mod 2147483647'i64
+    result.add(uint8((hash mod 9'i64) + 1'i64))
 
 proc configuredLsmrServeDepth(cfg: NodeConfig): int =
   if cfg.extra.kind == JObject:
@@ -9430,6 +11451,54 @@ proc configuredNearFieldBootstrapEnabled(cfg: NodeConfig): bool =
     )
   else:
     false
+
+proc hasRequestedLsmrConfig(cfg: NodeConfig): bool =
+  if configuredRoutingPlaneMode(cfg) != RoutingPlaneMode.legacyOnly:
+    return true
+  if cfg.extra.kind != JObject:
+    return false
+  for key in [
+    "lsmrPath",
+    "lsmr_path",
+    "lsmrAnchors",
+    "lsmr_anchors",
+    "lsmrNetworkId",
+    "lsmr_network_id",
+    "lsmrServeDepth",
+    "lsmr_serve_depth",
+    "enableNearFieldBootstrap",
+    "enable_near_field_bootstrap",
+  ]:
+    let node = cfg.extra.getOrDefault(key)
+    if node.isNil:
+      continue
+    case node.kind
+    of JString:
+      if node.getStr().strip().len > 0:
+        return true
+    of JArray, JObject:
+      if node.len > 0:
+        return true
+    of JInt:
+      if node.getInt() != 0:
+        return true
+    of JBool:
+      if node.getBool():
+        return true
+    else:
+      discard
+  false
+
+proc configuredLsmrPath(cfg: NodeConfig): LsmrPath =
+  let explicit = configuredExplicitLsmrPath(cfg)
+  if explicit.len > 0:
+    return explicit
+  if not hasRequestedLsmrConfig(cfg):
+    return @[]
+  deterministicLsmrPath(
+    configuredIdentityPeerId(cfg),
+    configuredLsmrServeDepth(cfg),
+  )
 
 proc configuredNearFieldProviders(cfg: NodeConfig): seq[NearFieldBootstrapProvider] =
   if cfg.extra.kind != JObject:
@@ -9509,13 +11578,11 @@ proc configuredLsmrAnchors(cfg: NodeConfig): seq[LsmrAnchor] =
     )
 
 proc configuredLsmrConfig(cfg: NodeConfig): Option[LsmrConfig] =
-  let mode = configuredRoutingPlaneMode(cfg)
   let anchors = configuredLsmrAnchors(cfg)
   let hasExplicitLsmr =
-    mode != RoutingPlaneMode.legacyOnly or
+    hasRequestedLsmrConfig(cfg) or
     anchors.len > 0 or
-    configuredLsmrPath(cfg).len > 0 or
-    configuredNearFieldBootstrapEnabled(cfg)
+    configuredLsmrPath(cfg).len > 0
   if not hasExplicitLsmr:
     return none(LsmrConfig)
   some(
@@ -9541,12 +11608,28 @@ proc routingStatusToJson(status: RoutingPlaneStatus): JsonNode =
     "lsmrIsolations": status.lsmrIsolations,
   }
 
+proc lsmrPathToJson(path: LsmrPath): JsonNode =
+  result = newJArray()
+  for digit in path:
+    result.add(%int(digit))
+
 proc buildRoutingStatusPayload(node: NimNode): JsonNode {.gcsafe.} =
   if node.isNil:
-    return routingStatusToJson(RoutingPlaneStatus())
+    result = routingStatusToJson(RoutingPlaneStatus())
+    result["lsmrNetworkId"] = %""
+    result["lsmrPath"] = newJArray()
+    result["lsmrPathDerived"] = %false
+    result["lsmrServeDepth"] = %0
+    result["lsmrAnchorCount"] = %0
+    return
 
   let configuredMode = configuredRoutingPlaneMode(node.cfg)
   let configuredPrimary = configuredPrimaryRoutingPlane(node.cfg)
+  let configuredNetworkId = configuredLsmrNetworkId(node.cfg)
+  let configuredPath = configuredLsmrPath(node.cfg)
+  let explicitPath = configuredExplicitLsmrPath(node.cfg)
+  let configuredServeDepth = configuredLsmrServeDepth(node.cfg)
+  let configuredAnchors = configuredLsmrAnchors(node.cfg)
   var status = RoutingPlaneStatus(
     mode: configuredMode,
     primary: configuredPrimary,
@@ -9569,7 +11652,12 @@ proc buildRoutingStatusPayload(node: NimNode): JsonNode {.gcsafe.} =
     if observed.shadowMode:
       status.shadowMode = true
 
-  routingStatusToJson(status)
+  result = routingStatusToJson(status)
+  result["lsmrNetworkId"] = %configuredNetworkId
+  result["lsmrPath"] = lsmrPathToJson(configuredPath)
+  result["lsmrPathDerived"] = %(configuredPath.len > 0 and explicitPath.len == 0 and hasRequestedLsmrConfig(node.cfg))
+  result["lsmrServeDepth"] = %configuredServeDepth
+  result["lsmrAnchorCount"] = %configuredAnchors.len
 
 proc parseNearFieldObservation(payload: string): Result[NearFieldObservation, string] =
   let node =
@@ -9780,13 +11868,7 @@ proc reconnectAuthoritativeBootstrapExact(
     let peerRes = PeerId.init(peerId)
     if peerRes.isErr():
       continue
-    var parsed: seq[MultiAddress] = @[]
-    for addrStr in n.peerHints.getOrDefault(peerId):
-      let maRes = parseDialableMultiaddr(addrStr)
-      if maRes.isErr():
-        continue
-      parsed.add(maRes.get())
-    parsed = exactBootstrapReconnectAddrs(parsed)
+    let parsed = exactBootstrapReconnectAddrs(gatherKnownAddrs(n, peerRes.get()))
     if parsed.len == 0:
       continue
     try:
@@ -9795,7 +11877,7 @@ proc reconnectAuthoritativeBootstrapExact(
         peerRes.get(),
         parsed,
         source,
-        syncConnectedState = false,
+        syncConnectedState = true,
       )
       debugLog(
         "[nimlibp2p] reconnectAuthoritativeBootstrapExact peer=" & peerId &
@@ -10022,12 +12104,16 @@ proc updateMdnsAdvertisements(n: NimNode) {.gcsafe.} =
   if not n.mdnsInterface.advertisementUpdated.isNil:
     n.mdnsInterface.advertisementUpdated.fire()
 
-proc mdnsDialable(ma: MultiAddress, reason: var string): bool =
+proc transportDialable(
+    ma: MultiAddress,
+    reason: var string,
+    allowCircuit = false
+): bool {.gcsafe, raises: [].} =
   let text = $ma
   if text.len == 0:
     reason = "empty_multiaddr"
     return false
-  if "/p2p-circuit" in text:
+  if not allowCircuit and "/p2p-circuit" in text:
     reason = "p2p_circuit_address"
     return false
   if "/unix/" in text or "/memory/" in text:
@@ -10050,6 +12136,9 @@ proc mdnsDialable(ma: MultiAddress, reason: var string): bool =
     return false
   reason = ""
   true
+
+proc mdnsDialable(ma: MultiAddress, reason: var string): bool =
+  transportDialable(ma, reason, allowCircuit = false)
 
 proc mdnsPeerRetentionMs(n: NimNode): int64 =
   if n.isNil:
@@ -10428,6 +12517,7 @@ type WarmSeededDirectSessionResult = object
   sessionConnKey: int
   sessionWarmOk: bool
   sessionWarmError: string
+  lastDialStage: string
 
 proc muxerUsable(
     muxer: Muxer
@@ -10467,11 +12557,34 @@ proc waitForVerifiedMuxerWithinDeadline(
       return nil
     await sleepAsync(chronos.milliseconds(min(safePollMs, remainingMs)))
 
+proc dmWarmProgressDebugSuffix(detail: JsonNode): string {.gcsafe, raises: [].} =
+  if detail.kind != JObject:
+    return ""
+  let dmPhase = jsonGetStr(detail, "dmPhase").strip()
+  let failureStage = jsonGetStr(detail, "failureStage").strip()
+  let directionPreference = jsonGetStr(detail, "directionPreference").strip()
+  let errorText = jsonGetStr(detail, "error").strip()
+  let timeoutMs = jsonGetInt64(detail, "timeoutMs", -1)
+  let connKey = jsonGetInt64(detail, "connKey", 0)
+  if dmPhase.len > 0:
+    result.add(" phase=" & dmPhase)
+  if failureStage.len > 0:
+    result.add(" failureStage=" & failureStage)
+  if directionPreference.len > 0:
+    result.add(" direction=" & directionPreference)
+  if timeoutMs >= 0:
+    result.add(" timeoutMs=" & $timeoutMs)
+  if connKey > 0:
+    result.add(" connKey=" & $connKey)
+  if errorText.len > 0:
+    result.add(" err=" & errorText)
+
 proc warmSeededDirectSessionAsync(
     n: NimNode,
     peerId: PeerId,
     peerIdText: string,
     addrText: string,
+    directPlan: TsnetUdpExactDialPlan,
     timeoutMs: int
 ): Future[WarmSeededDirectSessionResult] {.async.} =
   var detail = WarmSeededDirectSessionResult(
@@ -10480,6 +12593,7 @@ proc warmSeededDirectSessionAsync(
     sessionConnKey: 0,
     sessionWarmOk: false,
     sessionWarmError: "",
+    lastDialStage: "",
   )
   if n.isNil or n.dmService.isNil or peerId.len == 0 or addrText.strip().len == 0:
     return detail
@@ -10487,22 +12601,68 @@ proc warmSeededDirectSessionAsync(
   let warmBudgetMs = min(max(safeTimeoutMs, 0), 10_000)
   if warmBudgetMs <= 0:
     detail.sessionWarmError = "warm_budget_exhausted"
+    detail.lastDialStage = "quic_dial_timeout"
     return detail
-  let warmRes = await n.dmService.warmSessionDetailed(
+  var lastWarmStage = ""
+  var lastWarmErr = ""
+  proc warmProgress(stage: string, detailNode: JsonNode) {.gcsafe, raises: [].} =
+    lastWarmStage = stage
+    let errText = jsonGetStr(detailNode, "error").strip()
+    if errText.len > 0:
+      lastWarmErr = errText
+    debugLog(
+      "[nimlibp2p] warmSeededDirectSessionAsync progress peer=" & peerIdText &
+      " addr=" & addrText &
+      " stage=" & stage &
+      dmWarmProgressDebugSuffix(detailNode)
+    )
+  let warmStartedAtMs = nowMillis()
+  let warmFuture = n.dmService.warmSessionDetailed(
     peerId,
     chronos.milliseconds(warmBudgetMs),
     preferredAddrs = parsePreferredDirectMultiaddrs(@[addrText]),
     verifiedMuxer = nil,
     preferredConnKey = 0,
     reuseVerifiedLiveConnection = false,
+    progress = warmProgress,
+    directOnly = true,
   )
+  while not warmFuture.finished():
+    let elapsedMs = nowMillis() - warmStartedAtMs
+    let remainingMs = warmBudgetMs - int(elapsedMs)
+    if remainingMs <= 0:
+      debugLog(
+        "[nimlibp2p] warmSeededDirectSessionAsync overdue peer=" & peerIdText &
+        " addr=" & addrText &
+        " elapsedMs=" & $elapsedMs &
+        (if lastWarmStage.len > 0: " lastStage=" & lastWarmStage else: "") &
+        (if lastWarmErr.len > 0: " lastErr=" & lastWarmErr else: "")
+      )
+      break
+    let waitMs = min(500, remainingMs)
+    let checkpoint = sleepAsync(chronos.milliseconds(waitMs))
+    let winner = await race(cast[FutureBase](warmFuture), cast[FutureBase](checkpoint))
+    if winner == cast[FutureBase](warmFuture):
+      checkpoint.cancelSoon()
+      break
+    debugLog(
+      "[nimlibp2p] warmSeededDirectSessionAsync waiting peer=" & peerIdText &
+      " addr=" & addrText &
+      " elapsedMs=" & $elapsedMs &
+      " remainingMs=" & $remainingMs &
+      (if lastWarmStage.len > 0: " lastStage=" & lastWarmStage else: "") &
+      (if lastWarmErr.len > 0: " lastErr=" & lastWarmErr else: "")
+    )
+  let warmRes = await warmFuture
   detail.sessionConnKey = warmRes.connKey
   detail.sessionWarmOk = warmRes.ok
+  detail.lastDialStage = warmRes.stage
   if warmRes.err.len > 0:
     detail.sessionWarmError = warmRes.err
   debugLog(
     "[nimlibp2p] warmSeededDirectSessionAsync peer=" & peerIdText &
     " addr=" & addrText &
+    " routeStage=" & exactDialStageLabel(directPlan.stage) &
     " connKey=" & $detail.sessionConnKey &
     " warmOk=" & $warmRes.ok &
     (if warmRes.err.len > 0: " err=" & warmRes.err else: "")
@@ -10893,8 +13053,6 @@ proc maybeKickAuthoritativeBootstrap(
     source = "auto_authoritative_seed_status",
     minIntervalMs = 5_000'i64,
 ) {.gcsafe.} =
-  when defined(ohos):
-    return
   if node.isNil or not node.started or node.switchInstance.isNil:
     return
   if node.authoritativeBootstrapPeerIds.len == 0:
@@ -10908,6 +13066,39 @@ proc maybeKickAuthoritativeBootstrap(
     return
   node.lastAuthoritativeBootstrapKickMs = nowMs
   asyncSpawn(reconnectAuthoritativeBootstrapExact(node, source))
+
+proc ensureBootstrapRefreshTask(
+    node: NimNode,
+    source = "bootstrap_tick",
+) : Future[void] {.gcsafe.} =
+  if node.isNil or node.switchInstance.isNil:
+    return nil
+  node.bootstrapRefreshPending.store(true, moRelease)
+  let current = node.bootstrapRefreshTask
+  if not current.isNil and not current.finished():
+    return current
+
+  proc refreshTask() {.async: (raises: [CancelledError]).} =
+    while true:
+      node.bootstrapRefreshPending.store(false, moRelease)
+      try:
+        discard await syncAdvertisedPeerInfo(
+          node,
+          reason = source & "_bootstrap_refresh",
+          reannounce = false,
+        )
+        discard await refreshBootstrapState(node.switchInstance)
+      except CancelledError as exc:
+        raise exc
+      except CatchableError as exc:
+        debug "bootstrap refresh task failed", source = source, err = exc.msg
+      if not node.bootstrapRefreshPending.load(moAcquire):
+        break
+
+  let task = refreshTask()
+  node.bootstrapRefreshTask = task
+  asyncSpawn(task)
+  task
 
 proc addBootstrapSource(target: var seq[string], source: string) =
   if source.len > 0 and source notin target:
@@ -10927,7 +13118,16 @@ proc addPeerHintSource(n: NimNode, peerId: string, source: string) {.gcsafe.} =
 
 proc isBootstrapInfraHint(source: string): bool =
   let normalized = source.strip().toLowerAscii()
-  normalized in ["bootstrap", "relay", "mdns", "dht"]
+  normalized in [
+    "bootstrap",
+    "relay",
+    "mdns",
+    "dht",
+    "peerstore",
+    "dnsaddr",
+    "rendezvous",
+    "journal",
+  ] or normalized.startsWith("auto_authoritative_seed")
 
 proc isDirectHintSource(source: string): bool =
   let normalized = source.strip()
@@ -10949,7 +13149,7 @@ proc normalizeBootstrapMultiaddr(peerId: string, rawAddr: string): string =
   if maRes.isErr():
     return ""
   var reason = ""
-  if not mdnsDialable(maRes.get(), reason):
+  if not transportDialable(maRes.get(), reason, allowCircuit = true):
     return ""
   $maRes.get()
 
@@ -11723,47 +13923,13 @@ proc ensureTailnetControlRefreshLoop(n: NimNode) {.gcsafe, raises: [].} =
       if n.started:
         let transport = activeTsnetTransport(n)
         if not transport.isNil:
-          debugLog(
-            "[nimlibp2p] tailnetControlRefresh step=ready_begin node=" &
-            $cast[int](n)
-          )
           let providerReady = ffiTsnetSafe:
             transport.providerReadySafe()
-          debugLog(
-            "[nimlibp2p] tailnetControlRefresh step=ready_done node=" &
-            $cast[int](n) &
-            " providerReady=" & $providerReady
-          )
           if providerReady:
-            debugLog(
-              "[nimlibp2p] tailnetControlRefresh step=merge_begin node=" &
-              $cast[int](n)
-            )
             let changed = mergeTsnetListenAddrsIntoPeerInfo(n, transport)
-            debugLog(
-              "[nimlibp2p] tailnetControlRefresh step=merge_done node=" &
-              $cast[int](n) &
-              " changed=" & $changed
-            )
-            debugLog(
-              "[nimlibp2p] tailnetControlRefresh step=publish_begin node=" &
-              $cast[int](n)
-            )
             publishTsnetLocalPeerInfo(n, transport)
-            debugLog(
-              "[nimlibp2p] tailnetControlRefresh step=publish_done node=" &
-              $cast[int](n)
-            )
             if changed:
-              debugLog(
-                "[nimlibp2p] tailnetControlRefresh step=warm_sync_begin node=" &
-                $cast[int](n)
-              )
               spawnTailnetWarmAdvertisedPeerInfo(n)
-              debugLog(
-                "[nimlibp2p] tailnetControlRefresh step=warm_sync_done node=" &
-                $cast[int](n)
-              )
       await sleepAsync(chronos.milliseconds(TailnetControlRefreshMs))
   let refreshFuture = loop()
   n.tailnetControlRefreshLoop = refreshFuture
@@ -11783,14 +13949,6 @@ proc boostConnectivity(n: NimNode): Future[void] {.async.} =
           bootstrapReconnectTriggered = true
           debugLog(
             "[nimlibp2p] boostConnectivity defer authoritative bootstrapReconnect until relay ready peer=" &
-            peerId
-          )
-        continue
-      when defined(ohos):
-        if not bootstrapReconnectTriggered:
-          bootstrapReconnectTriggered = true
-          debugLog(
-            "[nimlibp2p] boostConnectivity skip authoritative bootstrapReconnect on ohos peer=" &
             peerId
           )
         continue
@@ -12627,17 +14785,29 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
     )
 
   let wantsTcp =
-    if tsnetRequested:
-      false
-    elif listenAddressStrings.len == 0:
+    if listenAddressStrings.len == 0:
       true
     else:
-      listenAddressStrings.anyIt(it.contains("/tcp/"))
+      listenAddressStrings.anyIt(
+        block:
+          let lower = it.toLowerAscii()
+          lower.contains("/tcp/") and not lower.contains("/tsnet")
+      )
   let wantsQuic =
-    if tsnetRequested:
-      false
+    if listenAddressStrings.len == 0:
+      true
     else:
-      listenAddressStrings.anyIt(it.contains("/quic"))
+      listenAddressStrings.anyIt(
+        block:
+          let lower = it.toLowerAscii()
+          lower.contains("/quic") and not lower.contains("/tsnet")
+      )
+  debugLog(
+    "[nimlibp2p] buildSwitch transport selection tsnetRequested=" & $tsnetRequested &
+    " tcp=" & $wantsTcp &
+    " quic=" & $wantsQuic &
+    " listenCount=" & $listenAddressStrings.len
+  )
 
   if tsnetRequested:
     var tsnetBuilderCfg = configuredTsnetTransportBuilderConfig(cfg)
@@ -12664,6 +14834,11 @@ proc buildSwitch(cfg: NodeConfig): Result[Switch, string] =
           return err("MsQuic runtime unavailable for tsnet QUIC: " & errMsg)
     builder = builder.withTsnetTransport(tsnetBuilderCfg)
     debugLog("[nimlibp2p] buildSwitch applied tsnet transport")
+    if wantsTcp:
+      builder = builder.withTcpTransport({ServerFlags.TcpNoDelay})
+      debugLog("[nimlibp2p] buildSwitch applied TCP transport alongside tsnet")
+    else:
+      debugLog("[nimlibp2p] buildSwitch skipped TCP transport alongside tsnet")
   elif wantsTcp:
     builder = builder.withTcpTransport({ServerFlags.TcpNoDelay})
     debugLog("[nimlibp2p] buildSwitch applied TCP transport")
@@ -13233,6 +15408,7 @@ proc buildConnectedPeersArrayFromInfo(connectedInfo: JsonNode): JsonNode {.gcsaf
 proc buildConnectedPeersInfoSnapshotForNode(
     node: NimNode
 ): JsonNode {.gcsafe, raises: [].}
+proc flushSocialStateOnOwnerThread(node: NimNode) {.gcsafe, raises: [].}
 proc buildConnectedPeersInfoArrayForNode(
     node: NimNode,
     includeLatency = true
@@ -13249,7 +15425,15 @@ proc buildNetworkResourcesPayload(
     discoveredCount: int,
     connectedCount: int
 ): JsonNode {.gcsafe.}
+proc buildNetworkResourcesSnapshot(
+    node: NimNode,
+    source: string,
+    limit: int,
+    connectedInfo: JsonNode
+): JsonNode {.gcsafe.}
+proc connectedPeersArray(node: NimNode): JsonNode {.gcsafe, raises: [].}
 proc connectedPeersInfoArray(handle: pointer): JsonNode
+proc connectedPeersInfoArray(node: NimNode): JsonNode {.gcsafe, raises: [].}
 
 proc buildFeedSnapshotPayload(node: NimNode): JsonNode {.gcsafe.} =
   var arr = newJArray()
@@ -13434,6 +15618,26 @@ proc buildDiagnosticsSnapshotPayload(n: NimNode): JsonNode {.gcsafe, raises: [].
     if ident.keyPath.isSome:
       diagnostics["identityKeyPath"] = %ident.keyPath.get()
   diagnostics["routingStatus"] = buildRoutingStatusPayload(n)
+  var social = newJObject()
+  socialStateMemLock.acquire()
+  try:
+    let socialState = loadSocialStateOnOwnerThread(n)
+    try:
+      social = socialStatsNode(socialState)
+    except CatchableError:
+      social = newJObject()
+    except Defect:
+      social = newJObject()
+  finally:
+    socialStateMemLock.release()
+  if social.kind != JObject:
+    social = newJObject()
+  acquire(n.eventLogLock)
+  try:
+    social["eventQueueDepth"] = %n.eventLog.len
+  finally:
+    release(n.eventLogLock)
+  diagnostics["social"] = social
   diagnostics
 
 proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []), gcsafe.} =
@@ -13475,29 +15679,28 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           updateStartupStatus(n, "default_topics", true)
           await setupDefaultTopics(n)
           debugLog("[nimlibp2p] cmdStart: default topics configured")
+          debugLog("[nimlibp2p] cmdStart: social state preload begin")
+          discard loadSocialStateOnOwnerThread(n)
+          debugLog("[nimlibp2p] cmdStart: social state preload done")
           updateStartupStatus(n, "udp_echo", true)
           await startUdpEchoResponder(n)
           debugLog("[nimlibp2p] cmdStart: udp echo responder ready")
-          when not defined(ohos):
-            if n.authoritativeBootstrapPeerIds.len > 0 and not n.switchInstance.isNil:
-              if relayBootstrapGateReady(n):
-                proc delayedAuthoritativeBootstrapReconnect() {.async.} =
-                  await sleepAsync(chronos.seconds(1))
-                  try:
-                    await reconnectAuthoritativeBootstrapExact(n, "auto_authoritative_seed_startup")
-                  except CatchableError as exc:
-                    debugLog(
-                      "[nimlibp2p] delayed authoritative bootstrapReconnect failed err=" &
-                      exc.msg
-                    )
-                asyncSpawn(delayedAuthoritativeBootstrapReconnect())
-              else:
-                debugLog(
-                  "[nimlibp2p] cmdStart: defer authoritative bootstrap auto reconnect until relay ready"
-                )
-          when defined(ohos):
-            if n.authoritativeBootstrapPeerIds.len > 0:
-              debugLog("[nimlibp2p] cmdStart: skip authoritative bootstrap auto reconnect on ohos")
+          if n.authoritativeBootstrapPeerIds.len > 0 and not n.switchInstance.isNil:
+            if relayBootstrapGateReady(n):
+              proc delayedAuthoritativeBootstrapReconnect() {.async.} =
+                await sleepAsync(chronos.seconds(1))
+                try:
+                  await reconnectAuthoritativeBootstrapExact(n, "auto_authoritative_seed_startup")
+                except CatchableError as exc:
+                  debugLog(
+                    "[nimlibp2p] delayed authoritative bootstrapReconnect failed err=" &
+                    exc.msg
+                  )
+              asyncSpawn(delayedAuthoritativeBootstrapReconnect())
+            else:
+              debugLog(
+                "[nimlibp2p] cmdStart: defer authoritative bootstrap auto reconnect until relay ready"
+              )
           if n.peerHints.len > 0:
             proc delayedBoost() {.async.} =
               await sleepAsync(chronos.seconds(1))
@@ -13601,9 +15804,15 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         if not n.tailnetControlRefreshLoop.isNil:
           n.tailnetControlRefreshLoop.cancel()
           n.tailnetControlRefreshLoop = nil
+        if not n.tailnetListenerRepairTask.isNil:
+          n.tailnetListenerRepairTask.cancelSoon()
+          n.tailnetListenerRepairTask = nil
         if not n.directSessionTargetReconcileLoop.isNil:
           n.directSessionTargetReconcileLoop.cancel()
           n.directSessionTargetReconcileLoop = nil
+        if not n.peerRouteSessionReconcileLoop.isNil:
+          n.peerRouteSessionReconcileLoop.cancel()
+          n.peerRouteSessionReconcileLoop = nil
         for fut in n.bootstrapSeedConnectFutures.values:
           if not fut.isNil and not fut.finished():
             fut.cancelSoon()
@@ -13618,6 +15827,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         if not n.relayReservationCycle.isNil:
           n.relayReservationCycle.cancelSoon()
           n.relayReservationCycle = nil
+        flushSocialStateOnOwnerThread(n)
         n.started = false
         n.stopRequested.store(true, moRelease)
         if not n.signal.isNil:
@@ -14066,65 +16276,16 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
       command.stringResult = $diagnostics
       command.resultCode = NimResultOk
       debugLog("[nimlibp2p] cmdDiagnostics completed")
+    of cmdSocialStateFlush:
+      flushSocialStateOnOwnerThread(n)
+      command.resultCode = NimResultOk
     of cmdTailnetWarm:
-      let transport = activeTsnetTransport(n)
-      if transport.isNil:
-        command.resultCode = NimResultInvalidState
-        command.errorMsg = "tsnet transport unavailable"
-        updateTailnetStartStatus(n, "failed", false, command.errorMsg)
+      let warmKick = kickTailnetWarmOnOwnerThread(n)
+      if warmKick.ok:
+        command.resultCode = NimResultOk
       else:
-        let providerReady = ffiTsnetSafe:
-          transport.providerReadySafe()
-        if providerReady:
-          ensureTailnetControlRefreshLoop(n)
-          updateTailnetStartStatus(n, "started", false)
-          command.resultCode = NimResultOk
-        else:
-          updateTailnetStartStatus(n, "starting", true)
-          if n.tailnetWarmThreadActive.load(moAcquire):
-            command.resultCode = NimResultOk
-          else:
-            joinTailnetWarmThreadIfNeeded(n)
-            clearTailnetWarmWorkerBuffers(n)
-            n.tailnetWarmFinalizePending.store(false, moRelease)
-            n.tailnetWarmSucceeded.store(false, moRelease)
-            debugLog("[nimlibp2p] tailnet warm worker: publish_local_peer_info_before_snapshot")
-            publishTsnetLocalPeerInfo(n, transport)
-            let cfgJson = ffiTsnetSafe:
-              transport.warmProviderConfigJsonSafe()
-            if cfgJson.isErr():
-              command.resultCode = NimResultError
-              command.errorMsg = cfgJson.error
-              updateTailnetStartStatus(n, "failed", false, command.errorMsg)
-            else:
-              let workerArg = cast[ptr TailnetWarmWorkerArg](allocShared0(sizeof(TailnetWarmWorkerArg)))
-              if workerArg.isNil:
-                command.resultCode = NimResultError
-                command.errorMsg = "tailnet warm worker alloc failed"
-                updateTailnetStartStatus(n, "failed", false, command.errorMsg)
-              else:
-                workerArg.handle = n.selfHandle
-                workerArg.providerConfigJson = allocCString(cfgJson.get())
-                if workerArg.providerConfigJson.isNil:
-                  destroyTailnetWarmWorkerArg(workerArg)
-                  command.resultCode = NimResultError
-                  command.errorMsg = "tailnet warm config alloc failed"
-                  updateTailnetStartStatus(n, "failed", false, command.errorMsg)
-                else:
-                  n.tailnetWarmThreadJoined.store(false, moRelease)
-                  n.tailnetWarmThreadActive.store(true, moRelease)
-                  try:
-                    createThread(n.tailnetWarmThread, tailnetWarmWorker, cast[pointer](workerArg))
-                    debugLog("[nimlibp2p] tailnet warm worker created")
-                    command.resultCode = NimResultOk
-                  except CatchableError as exc:
-                    n.tailnetWarmThreadActive.store(false, moRelease)
-                    n.tailnetWarmThreadJoined.store(true, moRelease)
-                    destroyTailnetWarmWorkerArg(workerArg)
-                    command.resultCode = NimResultError
-                    command.errorMsg =
-                      if exc.msg.len > 0: exc.msg else: "tailnet warm worker createThread failed"
-                    updateTailnetStartStatus(n, "failed", false, command.errorMsg)
+        command.resultCode = NimResultError
+        command.errorMsg = warmKick.err
     of cmdTailnetWarmFinalize:
       ## 兼容旧路径；新的 tailnet warm 完成由事件循环线程读取原子状态后收尾。
       processTailnetWarmCompletion(n)
@@ -14200,12 +16361,96 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
     of cmdConnectedPeersInfo:
       command.stringResult = $buildConnectedPeersInfoSnapshotForNode(n)
       command.resultCode = NimResultOk
+    of cmdPathIntentUpsert:
+      let safePeerId = command.peerId.strip()
+      let selectedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(command.addresses))
+      if safePeerId.len == 0 or selectedAddrs.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peerId or addresses"
+      else:
+        let snapshot = upsertRouteTransportIntent(
+          n,
+          safePeerId,
+          selectedAddrs,
+          command.source,
+          parsePeerPathPolicy(command.policyText),
+        )
+        command.stringResult = conversationTransportSnapshotJson(snapshot)
+        command.resultCode = NimResultOk
+    of cmdPathIntentClear:
+      let safePeerId = command.peerId.strip()
+      let selectedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(command.addresses))
+      if safePeerId.len == 0 or selectedAddrs.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peerId or addresses"
+      else:
+        let snapshot = clearRouteTransportIntent(
+          n,
+          safePeerId,
+          selectedAddrs,
+          command.source,
+        )
+        command.stringResult = conversationTransportSnapshotJson(snapshot)
+        command.resultCode = NimResultOk
+    of cmdPathSnapshot:
+      let safePeerId = command.peerId.strip()
+      let selectedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(command.addresses))
+      if safePeerId.len == 0 or selectedAddrs.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peerId or addresses"
+      else:
+        let snapshot = latestConversationTransportSnapshot(n, safePeerId, selectedAddrs)
+        command.stringResult = conversationTransportSnapshotJson(snapshot)
+        command.resultCode = NimResultOk
     of cmdRegisterPeerHints:
       let registerRes = registerPeerHintsInternal(n, command.peerId, command.addresses, command.source)
       if registerRes.isErr():
         command.resultCode = NimResultInvalidArgument
         command.errorMsg = registerRes.error
       else:
+        command.resultCode = NimResultOk
+    of cmdPrepareRelaySession:
+      let safePeerId = command.peerId.strip()
+      if safePeerId.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peer id"
+      else:
+        let updatedAtMs = nowMillis()
+        n.relaySessionTargets[safePeerId] = RelaySessionTargetSpec(
+          peerId: safePeerId,
+          source:
+            if command.source.strip().len > 0:
+              command.source.strip()
+            else:
+              "relay_session_prepare",
+          selectedAddrs: prioritizeGameSeedAddrs(preferStableAddrStrings(command.addresses)),
+          updatedAtMs: updatedAtMs,
+          sticky: true,
+          retainedUntilAtMs: peerRouteSessionRetainDeadlineAtMs(true, updatedAtMs),
+        )
+        reconcilePeerRouteSession(
+          n,
+          safePeerId,
+          if command.source.strip().len > 0:
+            command.source.strip()
+          else:
+            "relay_session_prepare"
+        )
+        ensurePeerRouteSessionReconcileLoop(n)
+        firePeerRouteSessionReconcileWake(n)
+        command.stringResult = peerRouteSessionSnapshotJson(
+          latestPeerRouteSessionSnapshot(n, safePeerId)
+        )
+        command.resultCode = NimResultOk
+    of cmdRelaySessionStatus:
+      let safePeerId = command.peerId.strip()
+      if safePeerId.len == 0:
+        command.resultCode = NimResultInvalidArgument
+        command.errorMsg = "missing peer id"
+      else:
+        command.stringResult = peerRouteSessionSnapshotJson(
+          latestPeerRouteSessionSnapshot(n, safePeerId)
+        )
         command.resultCode = NimResultOk
     of cmdAddExternalAddress:
       if command.multiaddr.len == 0:
@@ -14302,7 +16547,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
         command.errorMsg = "switch not initialized"
       else:
         maybeKickAuthoritativeBootstrap(n, "auto_authoritative_seed_tick")
-        discard await refreshBootstrapState(n.switchInstance)
+        discard ensureBootstrapRefreshTask(n, "auto_authoritative_seed_tick")
         let providerNode = buildWanProviderPayload(n)
         var bootstrapNode = bootstrapStateJson(n.switchInstance, BootstrapCandidateCap)
         if n.authoritativeBootstrapPeerIds.len > 0:
@@ -14406,31 +16651,15 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.resultCode = NimResultInvalidArgument
           command.errorMsg = "no valid addresses"
           return
-        let hostNetwork = currentHostNetworkStatus(n)
+        let hostStatus = currentHostNetworkStatusSnapshot(n)
+        let hostNetwork = hostNetworkStatusToJson(hostStatus)
         let localSeedAddrs = collectLocalGameSeedAddrs(n)
-        let localHasIpv4 = block:
-          var found = false
-          for addrText in localSeedAddrs:
-            if "/ip4/" in addrText.toLowerAscii():
-              found = true
-              break
-          found
-        let localHasGlobalIpv6 = block:
-          var found = false
-          for addrText in localSeedAddrs:
-            let lower = addrText.toLowerAscii()
-            if "/ip6/" notin lower:
-              continue
-            let parts = lower.split("/ip6/")
-            if parts.len < 2:
-              continue
-            let ipPart = parts[^1]
-            let slashIdx = ipPart.find('/')
-            let ip = if slashIdx >= 0: ipPart[0 ..< slashIdx] else: ipPart
-            if isGlobalHostIpv6(ip):
-              found = true
-              break
-          found
+        let localHasIpv4 =
+          hostLocalIpv4Text(hostStatus).len > 0 or
+            localSeedAddrs.anyIt("/ip4/" in it.toLowerAscii())
+        let localHasGlobalIpv6 =
+          hostGlobalIpv6Text(hostStatus).len > 0 or
+            localSeedAddrs.anyIt(isWanProviderIpv6Addr(it))
         var filteredParsed: seq[MultiAddress] = @[]
         var filteredAddrs: seq[string] = @[]
         var sawIpv4 = false
@@ -14589,31 +16818,41 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             )
           command.resultCode = NimResultOk
     of cmdDirectSessionTargetSet:
-      if not n.started:
-        command.resultCode = NimResultInvalidState
-        command.errorMsg = "node not started"
-      elif command.peerId.len == 0 or command.addresses.len == 0:
+      if command.peerId.len == 0 or command.addresses.len == 0:
         command.resultCode = NimResultInvalidArgument
         command.errorMsg = "missing peerId or addresses"
       else:
         let safePeerId = command.peerId.strip()
         let selectedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(command.addresses))
-        let taskKey = bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs)
-        if taskKey.len == 0:
+        let routeKey = routeTransportTaskKey(safePeerId, selectedAddrs)
+        debugLog(
+          "[nimlibp2p] cmdDirectSessionTargetSet begin peer=" & safePeerId &
+          " source=" & command.source &
+          " addrCount=" & $selectedAddrs.len
+        )
+        if routeKey.len == 0:
           command.resultCode = NimResultInvalidArgument
           command.errorMsg = "no valid addresses"
         else:
-          let spec = upsertDirectSessionTarget(
+          let snapshot = upsertRouteTransportIntent(
             n,
             safePeerId,
             selectedAddrs,
             command.source,
+            ppDirectThenRelay,
           )
-          if spec.taskKey.len == 0:
+          if snapshot.routeKey.len == 0:
             command.resultCode = NimResultInvalidArgument
             command.errorMsg = "no valid addresses"
           else:
+            command.stringResult = conversationTransportSnapshotJson(snapshot)
             command.resultCode = NimResultOk
+            debugLog(
+              "[nimlibp2p] cmdDirectSessionTargetSet done peer=" & safePeerId &
+              " source=" & command.source &
+              " routeKey=" & snapshot.routeKey &
+              " addrCount=" & $selectedAddrs.len
+            )
     of cmdDirectSessionTargetClear:
       if command.peerId.len == 0 or command.addresses.len == 0:
         command.resultCode = NimResultInvalidArgument
@@ -14626,44 +16865,13 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           command.resultCode = NimResultInvalidArgument
           command.errorMsg = "no valid addresses"
         else:
-          let spec =
-            clearDirectSessionTargetDesiredState(
-              n,
-              safePeerId,
-              selectedAddrs,
-              command.source,
-            )
-          let existingTask = n.bootstrapSeedConnectTasks.getOrDefault(taskKey, nil)
-          let taskHasLiveSession =
-            not existingTask.isNil and
-              existingTask.sessionConnKey > 0 and
-              not n.dmService.isNil and
-              n.dmService.hasLiveSessionConnKey(existingTask.sessionConnKey)
-          let shouldCancelBackgroundWarm =
-            not existingTask.isNil and
-              existingTask.intent == bsciBackgroundWarm and
-              not taskHasLiveSession
-          if shouldCancelBackgroundWarm:
-            existingTask.state = bscsCancelled
-            existingTask.updatedAtMs = nowMillis()
-            existingTask.ok = false
-            existingTask.err = "direct_target_cleared"
-            existingTask.sessionWarmOk = false
-            existingTask.sessionWarmError = "direct_target_cleared"
-            existingTask.sessionConnKey = 0
-            existingTask.verifiedMuxer = nil
-            let existingFuture = n.bootstrapSeedConnectFutures.getOrDefault(taskKey, nil)
-            if not existingFuture.isNil and not existingFuture.finished():
-              existingFuture.cancelSoon()
-            if taskKey in n.bootstrapSeedConnectFutures:
-              n.bootstrapSeedConnectFutures.del(taskKey)
-            n.bootstrapSeedConnectTasks.del(taskKey)
-          publishDirectSessionTargetSnapshot(
+          let snapshot = clearRouteTransportIntent(
             n,
-            spec,
-            "cleared",
-            "direct_target_cleared"
+            safePeerId,
+            selectedAddrs,
+            command.source,
           )
+          command.stringResult = conversationTransportSnapshotJson(snapshot)
           command.resultCode = NimResultOk
     of cmdUdpEchoProbe:
       if not n.started:
@@ -14697,7 +16905,8 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
           "[nimlibp2p] cmdSendDirectKickoff dispatch request=" & requestKey &
           " peer=" & command.peerId &
           " addrCount=" & $command.addresses.len &
-          " relayOnly=" & $command.boolParam
+          " relayOnly=" & $command.boolParam &
+          " sessionConnKey=" & $command.sessionConnKey
         )
         ffiNodeSafe:
           setSendWithAckKickoffState(
@@ -14718,6 +16927,7 @@ proc runCommand(n: NimNode, command: Command): Future[void] {.async: (raises: []
             peerId: command.peerId.strip(),
             source: command.source.strip(),
             forceRelayConnectivity: command.boolParam,
+            preferredSessionConnKey: command.sessionConnKey,
             updatedAtMs: nowMillis(),
             completedAtMs: 0,
             running: true,
@@ -15704,10 +17914,6 @@ proc drainCommandQueue(n: NimNode) {.async: (raises: []), gcsafe.} =
           atomicDec(n.queuedCommands)
           if command.highPriority:
             atomicDec(n.queuedPriorityCommands)
-          debugLog(
-            "[nimlibp2p] processCommandQueue dispatch node=" & $cast[int](n) &
-            " kind=" & $command.kind
-          )
           atomicInc(n.pendingCommands)
           await runCommand(n, command)
           n.retiredCommandTails.add(command)
@@ -15727,87 +17933,33 @@ proc processCommandQueue(n: NimNode) {.raises: [], gcsafe.} =
   n.commandDrainWake.fire()
 
 proc signalLoop(n: NimNode) {.async.} =
-  debugLog("[nimlibp2p] signalLoop start node=" & $cast[int](n))
   while not n.stopRequested.load(moAcquire):
     try:
-      debugLog(
-        "[nimlibp2p] signalLoop wait node=" & $cast[int](n) &
-        " queued=" & $n.queuedCommands.load(moAcquire) &
-        " pending=" & $n.pendingCommands.load(moAcquire)
-      )
       await n.signal.wait()
-      let queued = n.queuedCommands.load(moAcquire)
-      debugLog(
-        "[nimlibp2p] signalLoop wake node=" & $cast[int](n) &
-        " stopRequested=" & $(n.stopRequested.load(moAcquire)) &
-        " queued=" & $queued &
-        " pending=" & $n.pendingCommands.load(moAcquire)
-      )
       processCommandQueue(n)
-      let afterLen = n.queuedCommands.load(moAcquire)
-      debugLog(
-        "[nimlibp2p] signalLoop after process node=" & $cast[int](n) &
-        " queued=" & $afterLen &
-        " pending=" & $n.pendingCommands.load(moAcquire)
-      )
     except CancelledError:
-      debugLog("[nimlibp2p] signalLoop cancelled node=" & $cast[int](n))
       break
     except CatchableError as exc:
       warn "signal loop error", err = exc.msg
-      debugLog("[nimlibp2p] signalLoop error node=" & $cast[int](n) & " err=" & exc.msg)
-    except Exception as exc:
-      debugLog("[nimlibp2p] signalLoop fatal node=" & $cast[int](n) & " err=" & exc.msg)
     processTailnetWarmCompletion(n)
-  debugLog("[nimlibp2p] signalLoop exit node=" & $cast[int](n))
 
 proc idleWakeLoop(n: NimNode) {.async.} =
   ## Keep the Chronos dispatcher from blocking indefinitely when idle.
   ## Commands are submitted from foreign threads via `submitCommand`, so we need
   ## the event loop to periodically wake and drain the command queue.
   var lastPublicIpProbeKickMs = 0'i64
-  var lastDrainLogMs = 0'i64
-  var lastPendingHeartbeatMs = 0'i64
   var lastTailnetListenerRepairMs = 0'i64
-  var tailnetListenerRepairTask: Future[void] = nil
   while not n.stopRequested.load(moAcquire):
     try:
       await sleepAsync(chronos.milliseconds(250))
       processCommandQueue(n)
       let nowMs = nowMillis()
-      let queued = n.queuedCommands.load(moAcquire)
-      let pending = n.pendingCommands.load(moAcquire)
-      if pending > 0 and (lastPendingHeartbeatMs == 0 or nowMs - lastPendingHeartbeatMs >= 1_000):
-        lastPendingHeartbeatMs = nowMs
-        let runningAgeMs =
-          if n.currentCommandStartedAtMs > 0:
-            max(0'i64, nowMs - n.currentCommandStartedAtMs)
-          else:
-            0'i64
-        debugLog(
-          "[nimlibp2p] idleWakeLoop heartbeat node=" & $cast[int](n) &
-          " queued=" & $queued &
-          " pending=" & $pending &
-          " drainActive=" & $n.commandDrainActive &
-          " runningKind=" & $n.currentCommandKind &
-          (if n.currentCommandPeerId.len > 0: " runningPeer=" & n.currentCommandPeerId else: "") &
-          (if n.currentCommandStreamKey.len > 0: " runningRequest=" & n.currentCommandStreamKey else: "") &
-          " runningAgeMs=" & $runningAgeMs
-        )
-      if queued > 0 and (lastDrainLogMs == 0 or nowMs - lastDrainLogMs >= 2_000):
-        lastDrainLogMs = nowMs
-        debugLog(
-          "[nimlibp2p] idleWakeLoop drain node=" & $cast[int](n) &
-          " queued=" & $queued &
-          " pending=" & $pending &
-          " drainActive=" & $n.commandDrainActive
-        )
       if nowMs - lastPublicIpProbeKickMs >= PublicIpProbeLoopKickMs:
         lastPublicIpProbeKickMs = nowMs
-        let hostStatus = n.hostNetworkStatus
+        let hostStatus = currentOwnedHostNetworkStatusSnapshot(n)
         if hostStatus.isConnected and shouldRefreshPublicIpProbe(n, hostStatus):
           asyncSpawn(refreshPublicIpProbeAsync(n, hostStatus))
-      if n.started and (tailnetListenerRepairTask.isNil or tailnetListenerRepairTask.finished()) and
+      if n.started and not tailnetListenerRepairTaskRunning(n) and
           (lastTailnetListenerRepairMs == 0 or nowMs - lastTailnetListenerRepairMs >= TailnetListenerRepairLoopMs):
         let transport = activeTsnetTransport(n)
         let needsRepair =
@@ -15817,8 +17969,7 @@ proc idleWakeLoop(n: NimNode) {.async.} =
             transport.listenerNeedsRepair()
         if needsRepair:
           lastTailnetListenerRepairMs = nowMs
-          tailnetListenerRepairTask = reconcileTailnetRelayListeners(n)
-          asyncSpawn(tailnetListenerRepairTask)
+          ensureTailnetListenerRepairTask(n, "idle_loop")
       processTailnetWarmCompletion(n)
     except CancelledError:
       debugLog("[nimlibp2p] idleWakeLoop cancelled node=" & $cast[int](n))
@@ -15966,7 +18117,6 @@ proc submitCommand(node: NimNode, cmd: Command): Command =
     recordRuntimeError(cmd.errorMsg)
     return cmd
   info "submitCommand", kind = $cmd.kind, pending = node.pendingCommands.load(moAcquire)
-  let enqueueStart = epochTime()
   if cmd.completion.isNil:
     let signalRes = ThreadSignalPtr.new()
     if signalRes.isErr():
@@ -15976,16 +18126,9 @@ proc submitCommand(node: NimNode, cmd: Command): Command =
       return cmd
     cmd.completion = signalRes.get()
   enqueueCommand(node, cmd)
-  let queueLen = node.queuedCommands.load(moAcquire)
   let fired = node.signal.fireSync()
   if fired.isErr():
     warn "failed to fire thread signal", err = fired.error
-  elif fired.get():
-    debugLog(
-      "[nimlibp2p] submitCommand fireSync ok node=" & $cast[int](node) &
-      " kind=" & $cmd.kind &
-      " queued=" & $queueLen
-    )
   let waitRes = cmd.completion.waitSync()
   if waitRes.isErr():
     cmd.resultCode = NimResultError
@@ -15995,13 +18138,6 @@ proc submitCommand(node: NimNode, cmd: Command): Command =
     cmd.resultCode = NimResultError
     if cmd.errorMsg.len == 0:
       cmd.errorMsg = "command wait timeout"
-  let elapsedMs = int((epochTime() - enqueueStart) * 1000)
-  debugLog(
-    "[nimlibp2p] submitCommand finished node=" & $cast[int](node) &
-    " kind=" & $cmd.kind &
-    " waitMs=" & $elapsedMs &
-    " rc=" & $int(cmd.resultCode)
-  )
   if cmd.resultCode == NimResultOk:
     clearRuntimeError()
   elif cmd.errorMsg.len > 0:
@@ -16029,22 +18165,9 @@ proc submitCommandNoWait(node: NimNode, cmd: Command): bool =
     cmd.completion = signalRes.get()
   info "submitCommandNoWait", kind = $cmd.kind, pending = node.pendingCommands.load(moAcquire)
   enqueueCommand(node, cmd)
-  let queueLen = node.queuedCommands.load(moAcquire)
   let fired = node.signal.fireSync(chronos.milliseconds(5))
   if fired.isErr():
     warn "failed to fire thread signal", err = fired.error
-  elif fired.get():
-    debugLog(
-      "[nimlibp2p] submitCommandNoWait fireSync ok node=" & $cast[int](node) &
-      " kind=" & $cmd.kind &
-      " queued=" & $queueLen
-    )
-  else:
-    debugLog(
-      "[nimlibp2p] submitCommandNoWait fireSync timeout node=" & $cast[int](node) &
-      " kind=" & $cmd.kind &
-      " queued=" & $queueLen
-    )
   true
 
 proc logMemoryLoop(n: NimNode) {.async.} =
@@ -16207,6 +18330,12 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       eventLogLimit: EventLogLimit,
       mediaFrameLogLimit: MediaFrameLogLimit,
       receivedDmLogLimit: ReceivedDmLogLimit,
+      socialStatePathText: configuredSocialStatePath(cfg),
+      socialStateSnapshot: "",
+      socialStateOwner: nil,
+      socialStateDirtyVersion: 0,
+      socialStatePersistedVersion: 0,
+      socialStateFlushEnqueued: false,
       localSystemProfile: newJObject(),
       localSystemProfileUpdatedAt: 0,
       hostNetworkStatus: defaultHostNetworkStatusSnapshot(),
@@ -16269,8 +18398,16 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
       bootstrapSeedConnectTasks: initTable[string, BootstrapSeedConnectTask](),
       bootstrapSeedConnectFutures: initTable[string, Future[void]](),
       directSessionTargets: initTable[string, DirectSessionTargetSpec](),
+      relaySessionTargets: initTable[string, RelaySessionTargetSpec](),
+      routeTransportIntents: initTable[string, RouteTransportIntent](),
+      routeTransportSnapshots: initTable[string, ConversationTransportSnapshot](),
+      routeTransportWakeups: initTable[string, AsyncEvent](),
+      peerTransportRoutes: initTable[string, seq[string]](),
+      directPeerPathStates: initTable[string, DirectPeerPathState](),
+      directPeerPathFutures: initTable[string, Future[void]](),
       peerRouteSessionTasks: initTable[string, PeerRouteSessionTask](),
       peerRouteSessionFutures: initTable[string, Future[void]](),
+      peerRouteSessionReconcileWake: newAsyncEvent(),
       sendDirectKickoffTasks: initTable[string, SendDirectKickoffTask](),
       sendDirectKickoffFutures: initTable[string, Future[void]](),
     )
@@ -16284,6 +18421,7 @@ proc libp2p_node_init*(configJson: cstring): pointer {.exportc, cdecl, dynlib.} 
     initLock(node.tailnetStatusLock)
     initLock(node.directSessionTargetLock)
     initLock(node.peerStateLock)
+    initLock(node.hostNetworkStatusLock)
     node.currentCommandKindCode.store(ord(cmdNone), moRelease)
     let disableMdns = (not cfg.extra.isNil and cfg.extra.kind == JObject) and
       (
@@ -17065,9 +19203,6 @@ proc libp2p_send_with_ack_seeded_kickoff*(
           "source": cmd.source,
           "ackRequested": cmd.ackRequested,
           "enqueueTrace": "seeded_submit_ok",
-          "queueQueued": node.queuedCommands.load(moAcquire),
-          "queuePending": node.pendingCommands.load(moAcquire),
-          "runningKind": currentCommandKindTextSnapshot(node),
         }
       )
   if not ok:
@@ -17185,6 +19320,27 @@ proc libp2p_update_host_network_status*(
     return false
   let statusSnapshot = parseHostNetworkStatusSnapshot($payloadJson).valueOr:
     return false
+  when defined(ohos):
+    let previousHost = currentHostNetworkStatusSnapshot(node)
+    let normalizedSnapshot = applyHostNetworkStatus(node, statusSnapshot)
+    let previousMdnsAllowed = mdnsAllowedForHostStatus(previousHost)
+    let currentMdnsAllowed = mdnsAllowedForHostStatus(normalizedSnapshot)
+    let mdnsTransportChanged =
+      previousMdnsAllowed != currentMdnsAllowed or
+      previousHost.networkType != normalizedSnapshot.networkType or
+      previousHost.transport != normalizedSnapshot.transport or
+      previousHost.preferredIpv4 != normalizedSnapshot.preferredIpv4 or
+      previousHost.localIpv4 != normalizedSnapshot.localIpv4
+    scheduleHostNetworkStatusSideEffects(
+      node,
+      normalizedSnapshot,
+      mdnsTransportChanged,
+      currentMdnsAllowed,
+      "libp2p_update_host_network_status_ohos",
+    )
+    recordEvent(node, "network_event", buildHostNetworkEventText(normalizedSnapshot))
+    clearRuntimeError()
+    return true
   let cmd = makeCommand(cmdUpdateHostNetworkStatus)
   cmd.hostNetworkStatusParam = statusSnapshot
   cmd.hostNetworkStatusParamSet = true
@@ -17211,22 +19367,26 @@ proc libp2p_submit_near_field_observation*(
 proc libp2p_get_host_network_status_json*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
-    return allocCString($defaultHostNetworkStatus())
-  let cmd = makeCommand(cmdGetHostNetworkStatus)
-  let result = submitCommand(node, cmd)
-  let text =
-    if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      cloneOwnedString(result.stringResult)
-    else:
-      $defaultHostNetworkStatus()
-  destroyCommand(cmd)
-  allocCString(text)
+    return allocCString(hostNetworkStatusToJsonText(defaultHostNetworkStatusSnapshot()))
+  allocCString(hostNetworkStatusToJsonText(currentHostNetworkStatusSnapshot(node)))
 
 proc libp2p_tailnet_status_json*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString($emptyTailnetStatusPayload(nil))
-  allocCString($buildTailnetStatusPayload(node))
+  let quick = buildTailnetStatusQuickPayload(node)
+  if not jsonGetBool(quick, "providerReady", false) or
+      not jsonGetBool(quick, "proxyListenersReady", false):
+    return allocCString($quick)
+  let cmd = makeCommand(cmdTailnetStatus)
+  let result = submitCommand(node, cmd)
+  let text =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      $emptyTailnetStatusPayload(node)
+  destroyCommand(cmd)
+  allocCString(text)
 
 proc libp2p_tailnet_ping*(
     handle: pointer,
@@ -17795,6 +19955,203 @@ proc libp2p_register_peer_hints*(
   destroyCommand(cmd)
   ok
 
+proc libp2p_prepare_relay_session*(
+    handle: pointer, peerId: cstring, source: cstring
+): bool {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return false
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return false
+  let cmd = makeCommand(cmdPrepareRelaySession)
+  cmd.peerId = $peerId
+  if source != nil:
+    cmd.source = $source
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk
+  destroyCommand(cmd)
+  ok
+
+proc libp2p_path_intent_upsert*(
+    handle: pointer,
+    peerId: cstring,
+    addressesJson: cstring,
+    source: cstring,
+    policy: cstring,
+    limit: cint
+): bool {.exportc, cdecl, dynlib.} =
+  clearRuntimeError()
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    recordRuntimeError("node_not_initialized")
+    return false
+  let safePeerId = (if peerId.isNil: "" else: $peerId).strip()
+  let safeAddressesJson = (if addressesJson.isNil: "" else: $addressesJson).strip()
+  if safePeerId.len == 0 or safeAddressesJson.len == 0:
+    recordRuntimeError("missing_peerId_or_addresses")
+    return false
+  let parsedAddresses = parseJsonStringSeq(safeAddressesJson)
+  let orderedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(parsedAddresses))
+  let safeLimit =
+    if limit > 0:
+      min(max(int(limit), 1), orderedAddrs.len)
+    else:
+      orderedAddrs.len
+  if safeLimit <= 0:
+    recordRuntimeError("no_valid_addresses")
+    return false
+  let cmd = makeCommand(cmdPathIntentUpsert)
+  cmd.peerId = safePeerId
+  cmd.addresses = orderedAddrs[0 ..< safeLimit]
+  cmd.source = (if source.isNil: "" else: $source).strip()
+  cmd.policyText = (if policy.isNil: "" else: $policy).strip()
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk
+  let err =
+    if ok:
+      ""
+    elif result.errorMsg.len > 0:
+      result.errorMsg
+    else:
+      "path_intent_upsert_failed"
+  destroyCommand(cmd)
+  if ok:
+    return true
+  recordRuntimeError(err)
+  false
+
+proc libp2p_path_intent_clear*(
+    handle: pointer,
+    peerId: cstring,
+    addressesJson: cstring,
+    limit: cint
+): bool {.exportc, cdecl, dynlib.} =
+  clearRuntimeError()
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    recordRuntimeError("node_not_initialized")
+    return false
+  let safePeerId = (if peerId.isNil: "" else: $peerId).strip()
+  let safeAddressesJson = (if addressesJson.isNil: "" else: $addressesJson).strip()
+  if safePeerId.len == 0 or safeAddressesJson.len == 0:
+    recordRuntimeError("missing_peerId_or_addresses")
+    return false
+  let parsedAddresses = parseJsonStringSeq(safeAddressesJson)
+  let orderedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(parsedAddresses))
+  let safeLimit =
+    if limit > 0:
+      min(max(int(limit), 1), orderedAddrs.len)
+    else:
+      orderedAddrs.len
+  if safeLimit <= 0:
+    recordRuntimeError("no_valid_addresses")
+    return false
+  let cmd = makeCommand(cmdPathIntentClear)
+  cmd.peerId = safePeerId
+  cmd.addresses = orderedAddrs[0 ..< safeLimit]
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk
+  let err =
+    if ok:
+      ""
+    elif result.errorMsg.len > 0:
+      result.errorMsg
+    else:
+      "path_intent_clear_failed"
+  destroyCommand(cmd)
+  if ok:
+    return true
+  recordRuntimeError(err)
+  false
+
+proc libp2p_path_snapshot_for_addresses*(
+    handle: pointer,
+    peerId: cstring,
+    addressesJson: cstring,
+    limit: cint
+): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  let safePeerId = (if peerId.isNil: "" else: $peerId).strip()
+  let safeAddressesJson = (if addressesJson.isNil: "" else: $addressesJson).strip()
+  if safePeerId.len == 0 or safeAddressesJson.len == 0:
+    return allocCString(
+      conversationTransportSnapshotJson(
+        missingConversationTransportSnapshot(
+          safePeerId,
+          err = "missing_peerId_or_addresses",
+        )
+      )
+    )
+  let parsedAddresses = parseJsonStringSeq(safeAddressesJson)
+  let orderedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(parsedAddresses))
+  let safeLimit =
+    if limit > 0:
+      min(max(int(limit), 1), orderedAddrs.len)
+    else:
+      orderedAddrs.len
+  if safeLimit <= 0:
+    return allocCString(
+      conversationTransportSnapshotJson(
+        missingConversationTransportSnapshot(
+          safePeerId,
+          err = "no_valid_addresses",
+        )
+      )
+    )
+  let cmd = makeCommand(cmdPathSnapshot)
+  cmd.peerId = safePeerId
+  cmd.addresses = orderedAddrs[0 ..< safeLimit]
+  let result = submitCommand(node, cmd)
+  let text =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      conversationTransportSnapshotJson(
+        missingConversationTransportSnapshot(
+          safePeerId,
+          selectedAddrs = orderedAddrs[0 ..< safeLimit],
+          status = "error",
+          err =
+            if result.errorMsg.len > 0:
+              result.errorMsg
+            else:
+              "path_snapshot_failed",
+        )
+      )
+  destroyCommand(cmd)
+  allocCString(text)
+
+proc libp2p_relay_session_status*(
+    handle: pointer, peerId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  if peerId.isNil:
+    return allocCString("""{"ok":false,"status":"missing","error":"missing_peer_id"}""")
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString("""{"ok":false,"status":"missing","error":"node_unavailable"}""")
+  let cmd = makeCommand(cmdRelaySessionStatus)
+  cmd.peerId = $peerId
+  let result = submitCommand(node, cmd)
+  let text =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      cloneOwnedString(result.stringResult)
+    else:
+      $(
+        %*{
+          "ok": false,
+          "peerId": cmd.peerId,
+          "status": "error",
+          "error": (
+            if result.errorMsg.len > 0:
+              result.errorMsg
+            else:
+              "relay_session_status_failed"
+          )
+        }
+      )
+  destroyCommand(cmd)
+  allocCString(text)
+
 proc libp2p_add_external_address*(
     handle: pointer, multiaddr: cstring
 ): bool {.exportc, cdecl, dynlib.} =
@@ -17859,41 +20216,20 @@ proc libp2p_get_diagnostics_json*(handle: pointer): cstring {.exportc, cdecl, dy
   if node.isNil:
     return nil
   info "libp2p_get_diagnostics_json called", nodeStarted = node.started
-  debugLog("[nimlibp2p] libp2p_get_diagnostics_json submit command")
   if not node.started:
     debugLog("[nimlibp2p] diagnostics requested while node not started")
     return allocCString("{}")
-  var payloadText =
-    block:
-      let payload = buildDiagnosticsSnapshotPayload(node)
-      if payload.kind == JObject and payload.len > 0:
-        $payload
-      else:
-        "{}"
+  debugLog("[nimlibp2p] libp2p_get_diagnostics_json submit command")
+  let cmd = makeCommand(cmdDiagnostics)
+  let result = submitCommand(node, cmd)
+  let payloadText =
+    if result.resultCode == NimResultOk and result.stringResult.len > 0:
+      result.stringResult
+    else:
+      "{}"
   debugLog("[nimlibp2p] libp2p_get_diagnostics_json snapshot ready len=" & $payloadText.len)
-  try:
-    var payload = parseJson(payloadText)
-    if payload.kind != JObject:
-      payload = newJObject()
-    var socialStats = newJObject()
-    socialStateMemLock.acquire()
-    try:
-      let socialState = loadSocialStateUnsafe(node)
-      socialStats = socialStatsNode(socialState)
-    finally:
-      socialStateMemLock.release()
-    if socialStats.kind != JObject:
-      socialStats = newJObject()
-    acquire(node.eventLogLock)
-    try:
-      socialStats["eventQueueDepth"] = %node.eventLog.len
-    finally:
-      release(node.eventLogLock)
-    payload["social"] = socialStats
-    payloadText = $payload
-  except CatchableError:
-    discard
-  let output = allocCString(payloadText)
+  let output = allocCString(cloneOwnedString(payloadText))
+  destroyCommand(cmd)
   output
 
 proc libp2p_string_free*(value: cstring) {.exportc, cdecl, dynlib.} =
@@ -17978,6 +20314,28 @@ proc ensureSocialSchema(state: JsonNode): JsonNode =
     result["tombstones"] = newJArray()
   if not result.hasKey("distributionLogs") or result["distributionLogs"].kind != JArray:
     result["distributionLogs"] = newJArray()
+
+proc safeDefaultSocialState(): JsonNode {.gcsafe, raises: [].} =
+  try:
+    return ensureSocialSchema(defaultSocialState())
+  except CatchableError:
+    discard
+  except Defect:
+    discard
+  result = newJObject()
+  result["version"] = %SocialStateVersion
+  result["conversations"] = newJObject()
+  result["contacts"] = newJObject()
+  result["groups"] = newJObject()
+  result["moments"] = newJArray()
+  result["notifications"] = newJArray()
+  result["subscriptions"] = newJObject()
+  result["synccastRooms"] = newJObject()
+  result["publishTasks"] = newJArray()
+  result["playbackSessions"] = newJArray()
+  result["reportTickets"] = newJArray()
+  result["tombstones"] = newJArray()
+  result["distributionLogs"] = newJArray()
 
 proc prependBoundedNode(arr: JsonNode, item: JsonNode, maxItems: int) =
   if arr.isNil or arr.kind != JArray:
@@ -18279,70 +20637,141 @@ proc containsAnyKeyword(text: string, keywords: openArray[string]): bool =
   false
 
 proc socialStatePath(node: NimNode): string =
-  if node.isNil or node.cfg.dataDir.isNone:
-    return ""
-  node.cfg.dataDir.get() / "social_state.json"
-
-proc loadSocialStateUnsafe(node: NimNode): JsonNode =
-  if not node.isNil and not node.socialStateParsedSnapshot.isNil and
-      node.socialStateParsedSnapshot.kind == JObject:
-    return node.socialStateParsedSnapshot
-  var snapshotText = ""
-  if not node.isNil and node.socialStateSnapshot.len > 0:
-    snapshotText = node.socialStateSnapshot
-  var state = defaultSocialState()
-  if snapshotText.len == 0:
-    let path = socialStatePath(node)
-    if path.len > 0:
-      try:
-        if fileExists(path):
-          snapshotText = readFile(path)
-      except CatchableError:
-        discard
-  if snapshotText.len > 0:
-    try:
-      let parsed = parseJson(snapshotText)
-      if parsed.kind == JObject:
-        state = parsed
-    except CatchableError:
-      discard
-  state = ensureSocialSchema(state)
-  if not node.isNil:
-    node.socialStateSnapshot = $state
-    node.socialStateParsedSnapshot = state
-  state
-
-proc persistSocialStateUnsafe(node: NimNode, state: JsonNode) =
   if node.isNil:
+    return ""
+  node.socialStatePathText
+
+proc ensureLiveSocialState(state: JsonNode): JsonNode {.gcsafe, raises: [].} =
+  try:
+    if state.isNil or state.kind != JObject:
+      return safeDefaultSocialState()
+    return ensureSocialSchema(state)
+  except CatchableError:
+    discard
+  except Defect:
+    discard
+  safeDefaultSocialState()
+
+proc loadSocialStateSnapshotText(node: NimNode): string {.gcsafe, raises: [].} =
+  if node.isNil:
+    return ""
+  result = node.socialStateSnapshot
+  if result.len > 0:
     return
-  var normalized = ensureSocialSchema(
-    if state.isNil or state.kind != JObject: defaultSocialState()
-    else: state
-  )
-  let snapshotText = $normalized
-  node.socialStateSnapshot = snapshotText
-  node.socialStateParsedSnapshot = normalized
   let path = socialStatePath(node)
   if path.len == 0:
     return
   try:
-    writeFile(path, snapshotText)
-  except CatchableError as exc:
-    warn "persist social state failed", err = exc.msg, path = path
+    if fileExists(path):
+      result = readFile(path)
+      if result.len > 0:
+        node.socialStateSnapshot = result
+  except CatchableError:
+    discard
+
+proc loadSocialStateUnsafe(node: NimNode): JsonNode {.gcsafe, raises: [].} =
+  if node.isNil:
+    return safeDefaultSocialState()
+  if not node.socialStateOwner.isNil and node.socialStateOwner.kind == JObject:
+    return node.socialStateOwner
+  let snapshotText = loadSocialStateSnapshotText(node)
+  if snapshotText.len > 0:
+    try:
+      let parsed = parseJson(snapshotText)
+      if parsed.kind == JObject:
+        node.socialStateOwner = ensureSocialSchema(parsed)
+        return node.socialStateOwner
+    except CatchableError:
+      discard
+  node.socialStateOwner = safeDefaultSocialState()
+  node.socialStateOwner
+
+proc loadSocialStateOnOwnerThread(node: NimNode): JsonNode {.gcsafe, raises: [].} =
+  loadSocialStateUnsafe(node)
+
+proc requestSocialStateFlush(node: NimNode) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  if node.running.load(moAcquire) and not node.signal.isNil:
+    let cmd = makeCommand(cmdSocialStateFlush)
+    if submitCommandNoWait(node, cmd):
+      return
+    destroyCommand(cmd)
+
+proc markSocialStateDirtyNoLock(node: NimNode, state: JsonNode): bool {.gcsafe, raises: [].} =
+  if node.isNil:
+    return false
+  node.socialStateOwner = ensureLiveSocialState(state)
+  inc node.socialStateDirtyVersion
+  if node.socialStateFlushEnqueued:
+    return false
+  node.socialStateFlushEnqueued = true
+  true
+
+proc flushSocialStateOnOwnerThread(node: NimNode) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  var snapshotText = ""
+  var path = ""
+  var targetVersion = 0'i64
+  socialStateMemLock.acquire()
+  try:
+    node.socialStateOwner = ensureLiveSocialState(node.socialStateOwner)
+    if node.socialStateDirtyVersion <= node.socialStatePersistedVersion:
+      node.socialStateFlushEnqueued = false
+      return
+    snapshotText = $node.socialStateOwner
+    path = socialStatePath(node)
+    targetVersion = node.socialStateDirtyVersion
+  finally:
+    socialStateMemLock.release()
+  if path.len > 0:
+    try:
+      writeFile(path, snapshotText)
+    except CatchableError as exc:
+      warn "persist social state failed", err = exc.msg, path = path
+  var needsReschedule = false
+  socialStateMemLock.acquire()
+  try:
+    node.socialStateSnapshot = snapshotText
+    if targetVersion > node.socialStatePersistedVersion:
+      node.socialStatePersistedVersion = targetVersion
+    needsReschedule = node.socialStateDirtyVersion > node.socialStatePersistedVersion
+    node.socialStateFlushEnqueued = needsReschedule
+  finally:
+    socialStateMemLock.release()
+  if needsReschedule:
+    requestSocialStateFlush(node)
+
+proc persistSocialStateOnOwnerThread(node: NimNode, state: JsonNode) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  if markSocialStateDirtyNoLock(node, state):
+    requestSocialStateFlush(node)
+
+proc persistSocialStateUnsafe(node: NimNode, state: JsonNode) {.gcsafe, raises: [].} =
+  if node.isNil:
+    return
+  if markSocialStateDirtyNoLock(node, state):
+    requestSocialStateFlush(node)
 
 proc makeTraceId(): string =
   "trace-" & $nowMillis() & "-" & $rand(1_000_000)
 
-proc socialStatsNode(state: JsonNode): JsonNode =
+proc socialStatsNode(state: JsonNode): JsonNode {.gcsafe, raises: [].} =
   result = newJObject()
-  let convCount = if state.hasKey("conversations"): state["conversations"].len else: 0
-  let contactCount = if state.hasKey("contacts"): state["contacts"].len else: 0
-  let groupCount = if state.hasKey("groups"): state["groups"].len else: 0
-  let momentCount = if state.hasKey("moments") and state["moments"].kind == JArray: state["moments"].len else: 0
-  let notificationCount =
-    if state.hasKey("notifications") and state["notifications"].kind == JArray: state["notifications"].len else: 0
-  let synccastRoomCount =
-    if state.hasKey("synccastRooms") and state["synccastRooms"].kind == JObject: state["synccastRooms"].len else: 0
+  let conversationsNode = if state.kind == JObject: state.getOrDefault("conversations") else: newJNull()
+  let contactsNode = if state.kind == JObject: state.getOrDefault("contacts") else: newJNull()
+  let groupsNode = if state.kind == JObject: state.getOrDefault("groups") else: newJNull()
+  let momentsNode = if state.kind == JObject: state.getOrDefault("moments") else: newJNull()
+  let notificationsNode = if state.kind == JObject: state.getOrDefault("notifications") else: newJNull()
+  let synccastRoomsNode = if state.kind == JObject: state.getOrDefault("synccastRooms") else: newJNull()
+  let convCount = if conversationsNode.kind == JObject: conversationsNode.len else: 0
+  let contactCount = if contactsNode.kind == JObject: contactsNode.len else: 0
+  let groupCount = if groupsNode.kind == JObject: groupsNode.len else: 0
+  let momentCount = if momentsNode.kind == JArray: momentsNode.len else: 0
+  let notificationCount = if notificationsNode.kind == JArray: notificationsNode.len else: 0
+  let synccastRoomCount = if synccastRoomsNode.kind == JObject: synccastRoomsNode.len else: 0
   result["conversations"] = %convCount
   result["contacts"] = %contactCount
   result["groups"] = %groupCount
@@ -19081,26 +21510,20 @@ proc buildMdnsDebugPayload(node: NimNode): JsonNode {.gcsafe.} =
   obj
 
 proc connectedPeersInfoArray(handle: pointer): JsonNode =
-  let raw = takeCStringAndFree(libp2p_connected_peers_info(handle))
-  if raw.len > 0:
-    try:
-      let parsed = parseJson(raw)
-      if parsed.kind == JArray:
-        return parsed
-    except CatchableError:
-      discard
-  newJArray()
+  connectedPeersInfoArray(nodeFromHandle(handle))
+
+proc connectedPeersInfoArray(node: NimNode): JsonNode {.gcsafe, raises: [].} =
+  if node.isNil:
+    return newJArray()
+  buildConnectedPeersInfoSnapshotForNode(node)
 
 proc connectedPeersArray(handle: pointer): JsonNode =
-  let raw = takeCStringAndFree(libp2p_get_connected_peers_json(handle))
-  if raw.len > 0:
-    try:
-      let parsed = parseJson(raw)
-      if parsed.kind == JArray:
-        return parsed
-    except CatchableError:
-      discard
-  newJArray()
+  connectedPeersArray(nodeFromHandle(handle))
+
+proc connectedPeersArray(node: NimNode): JsonNode {.gcsafe, raises: [].} =
+  if node.isNil:
+    return newJArray()
+  buildConnectedPeersArrayForNode(node)
 
 proc nodeResourceSnapshotToJson(snapshot: NodeResourceSnapshot): JsonNode {.gcsafe, raises: [].} =
   let resource = snapshot.resource
@@ -19219,12 +21642,75 @@ proc buildNetworkResourcesPayload(node: NimNode, discoveredCount: int, connected
     "snapshots": snapshots,
   }
 
+proc buildNetworkResourcesSnapshot(
+    node: NimNode,
+    source: string,
+    limit: int,
+    connectedInfo: JsonNode
+): JsonNode {.gcsafe.} =
+  if node.isNil:
+    return newJObject()
+  let connectedCount =
+    if connectedInfo.kind == JArray:
+      connectedInfo.len
+    else:
+      0
+  debugLog(
+    "[nimlibp2p] network resources snapshot begin source=" & source &
+    " limit=" & $limit &
+    " connectedCount=" & $connectedCount
+  )
+  info "network resources snapshot begin",
+    source = source,
+    limit = limit,
+    connectedCount = connectedCount
+  let discovered = filteredDiscoveredPeersForNode(node, "", limit, connectedInfo)
+  let discoveredCount =
+    if discovered.peers.kind == JArray:
+      discovered.peers.len
+    else:
+      0
+  debugLog(
+    "[nimlibp2p] network resources snapshot discovered source=" & source &
+    " limit=" & $limit &
+    " connectedCount=" & $connectedCount &
+    " discoveredCount=" & $discoveredCount &
+    " discoveredTotalCount=" & $discovered.totalCount
+  )
+  info "network resources snapshot discovered",
+    source = source,
+    limit = limit,
+    connectedCount = connectedCount,
+    discoveredCount = discoveredCount,
+    discoveredTotalCount = discovered.totalCount
+  result = buildNetworkResourcesPayload(node, discovered.totalCount, connectedCount)
+  let snapshotCount =
+    if result.kind == JObject and result.hasKey("snapshots") and
+        result["snapshots"].kind == JArray:
+      result["snapshots"].len
+    else:
+      0
+  debugLog(
+    "[nimlibp2p] network resources snapshot done source=" & source &
+    " limit=" & $limit &
+    " connectedCount=" & $connectedCount &
+    " discoveredTotalCount=" & $discovered.totalCount &
+    " snapshotCount=" & $snapshotCount
+  )
+  info "network resources snapshot done",
+    source = source,
+    limit = limit,
+    connectedCount = connectedCount,
+    discoveredTotalCount = discovered.totalCount,
+    snapshotCount = snapshotCount
+
 proc social_list_discovered_peers*(handle: pointer, sourceFilter: cstring, limit: cint): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{\"peers\":[],\"totalCount\":0}")
   let sourceFilterText = if sourceFilter != nil: $sourceFilter else: ""
-  let filtered = filteredDiscoveredPeers(handle, node, sourceFilterText, int(limit))
+  let connectedInfo = connectedPeersInfoArray(node)
+  let filtered = filteredDiscoveredPeersForNode(node, sourceFilterText, int(limit), connectedInfo)
   var response = newJObject()
   response["peers"] = filtered.peers
   response["totalCount"] = %filtered.totalCount
@@ -19240,21 +21726,22 @@ proc libp2p_get_network_resources_json*(handle: pointer): cstring {.exportc, cde
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{}")
-  prunePeerProfiles(node)
-  let discovered = filteredDiscoveredPeers(handle, node, "", 0)
-  let connected = connectedPeersInfoArray(handle)
-  let payload = buildNetworkResourcesPayload(node, discovered.totalCount, connected.len)
+  let connected = connectedPeersInfoArray(node)
+  let payload = buildNetworkResourcesSnapshot(node, "get_network_resources", 0, connected)
   allocCString($payload)
 
 proc libp2p_refresh_node_resources*(handle: pointer, limit: cint): cstring {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{}")
-  prunePeerProfiles(node)
   let effectiveLimit = if limit <= 0: 0 else: int(limit)
-  let discovered = filteredDiscoveredPeers(handle, node, "", effectiveLimit)
-  let connected = buildConnectedPeersInfoSnapshotForNode(node)
-  let payload = buildNetworkResourcesPayload(node, discovered.totalCount, connected.len)
+  let connected = connectedPeersInfoArray(node)
+  let payload = buildNetworkResourcesSnapshot(
+    node,
+    "refresh_node_resources",
+    effectiveLimit,
+    connected,
+  )
   allocCString($payload)
 
 proc libp2p_network_discovery_snapshot*(handle: pointer, sourceFilter: cstring, limit: cint, connectCap: cint): cstring {.exportc, cdecl, dynlib.} =
@@ -23795,6 +26282,8 @@ proc libp2p_get_last_node_peer_id*(): cstring {.exportc, cdecl, dynlib.} =
     return nil
   allocCString(peer)
 
+proc buildBootstrapStatusNode(node: NimNode): JsonNode {.gcsafe.}
+
 proc libp2p_node_is_started*(handle: pointer): bool {.exportc, cdecl, dynlib.} =
   let node = nodeFromHandle(handle)
   if node.isNil:
@@ -23862,19 +26351,9 @@ proc libp2p_bootstrap_tick*(handle: pointer): cstring {.exportc, cdecl, dynlib.}
   let node = nodeFromHandle(handle)
   if node.isNil:
     return allocCString("{\"ok\":false,\"error\":\"node_not_initialized\"}")
-  let cmd = makeCommand(cmdBootstrapTick)
-  let result = submitCommand(node, cmd)
-  let payload =
-    if result.resultCode == NimResultOk and result.stringResult.len > 0:
-      cloneOwnedString(result.stringResult)
-    else:
-      var response = newJObject()
-      response["ok"] = %false
-      response["error"] =
-        %(if result.errorMsg.len > 0: result.errorMsg else: "bootstrap_tick_failed")
-      $response
-  destroyCommand(cmd)
-  allocCString(payload)
+  maybeKickAuthoritativeBootstrap(node, "auto_authoritative_seed_tick")
+  discard ensureBootstrapRefreshTask(node, "auto_authoritative_seed_tick")
+  allocCString($buildBootstrapStatusNode(node))
 
 proc buildBootstrapStatusNode(node: NimNode): JsonNode {.gcsafe.} =
   if node.isNil:
@@ -24184,6 +26663,38 @@ proc bootstrapSeedConnectTaskRunning(
     not fut.isNil and
     not fut.finished()
 
+proc bootstrapSeedConnectTaskExpired(
+    task: BootstrapSeedConnectTask
+): bool {.gcsafe, raises: [].} =
+  not task.isNil and task.deadlineAtMs > 0 and nowMillis() >= task.deadlineAtMs
+
+proc expireBootstrapSeedConnectTask(
+    n: NimNode,
+    task: BootstrapSeedConnectTask,
+    reason: string
+) {.gcsafe, raises: [].} =
+  if n.isNil or task.isNil or task.taskKey.len == 0:
+    return
+  debugLog(
+    "[nimlibp2p] expireBootstrapSeedConnectTask peer=" & task.peerId &
+    " taskKey=" & task.taskKey &
+    " reason=" & reason
+  )
+  let fut = n.bootstrapSeedConnectFutures.getOrDefault(task.taskKey, nil)
+  if not fut.isNil and not fut.finished():
+    fut.cancelSoon()
+  if task.taskKey in n.bootstrapSeedConnectFutures:
+    n.bootstrapSeedConnectFutures.del(task.taskKey)
+  task.state = bscsFailed
+  task.updatedAtMs = nowMillis()
+  task.ok = false
+  task.err = reason
+  task.sessionWarmOk = false
+  task.sessionWarmError = reason
+  task.sessionConnKey = 0
+  task.verifiedMuxer = nil
+  task.verifiedMuxerWaitMs = 0
+
 proc liveSessionConnPathKind(
     n: NimNode,
     connKey: int
@@ -24192,11 +26703,49 @@ proc liveSessionConnPathKind(
     return ""
   n.dmService.liveSessionConnPathKind(connKey)
 
+proc directSessionConnPathReady(pathKind: string): bool {.gcsafe, raises: [].} =
+  pathKind.strip().toLowerAscii() in ["direct", "punched_direct", "local"]
+
 proc liveDirectSessionConnReady(
     n: NimNode,
     connKey: int
 ): bool {.gcsafe, raises: [].} =
-  liveSessionConnPathKind(n, connKey) == "direct"
+  directSessionConnPathReady(liveSessionConnPathKind(n, connKey))
+
+proc livePeerDirectSessionConnKey(
+    n: NimNode,
+    peerIdText: string
+): int {.gcsafe, raises: [].} =
+  if n.isNil or n.dmService.isNil:
+    return 0
+  let safePeerId = peerIdText.strip()
+  if safePeerId.len == 0:
+    return 0
+  let peerRes = PeerId.init(safePeerId)
+  if peerRes.isErr():
+    return 0
+  for snapshot in n.dmService.peerSessionControlSnapshots(peerRes.get()):
+    if snapshot.lifecycle != DmSessionLive:
+      continue
+    if snapshot.connKey <= 0:
+      continue
+    if directSessionConnPathReady(liveSessionConnPathKind(n, snapshot.connKey)):
+      return snapshot.connKey
+  0
+
+proc directSessionTargetDesired(
+    n: NimNode,
+    peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  if n.isNil:
+    return false
+  let safePeerId = peerIdText.strip()
+  if safePeerId.len == 0:
+    return false
+  for spec in copyDirectSessionTargetSpecs(n):
+    if spec.peerId.strip() == safePeerId:
+      return true
+  false
 
 proc sendDirectKickoffTaskRunning(
     n: NimNode,
@@ -24255,7 +26804,19 @@ proc peerRouteSessionTaskRunning(
     not fut.isNil and
     not fut.finished()
 
-proc livePeerRouteSessionConnKey(
+proc peerRouteSessionTaskRetryPending(
+    task: PeerRouteSessionTask
+): bool {.gcsafe, raises: [].} =
+  not task.isNil and
+    task.state in [prssFailed, prssCancelled] and
+    task.deadlineAtMs > nowMillis()
+
+proc peerRouteSessionTaskProviderPending(
+    task: PeerRouteSessionTask
+): bool {.gcsafe, raises: [].} =
+  not task.isNil and task.state == prssPending
+
+proc ownedPeerRouteSessionConnKey(
     n: NimNode,
     peerIdText: string
 ): int {.gcsafe, raises: [].} =
@@ -24264,28 +26825,29 @@ proc livePeerRouteSessionConnKey(
   let safePeerId = peerIdText.strip()
   if safePeerId.len == 0:
     return 0
-  let peerRes = PeerId.init(safePeerId)
-  if peerRes.isErr():
+  let task = n.peerRouteSessionTasks.getOrDefault(safePeerId, nil)
+  if task.isNil or task.state != prssReady or task.sessionConnKey <= 0:
     return 0
-  for snapshot in n.dmService.peerSessionControlSnapshots(peerRes.get()):
-    if snapshot.lifecycle != DmSessionLive:
-      continue
-    if snapshot.connKey <= 0:
-      continue
-    if n.dmService.hasLiveSessionConnKey(snapshot.connKey):
-      return snapshot.connKey
-  0
+  if not n.dmService.hasLiveSessionConnKey(task.sessionConnKey):
+    return 0
+  task.sessionConnKey
 
 proc latestPeerRouteSessionSnapshot(
     n: NimNode,
     peerIdText: string
 ): PeerRouteSessionSnapshot {.gcsafe, raises: [].} =
+  proc ownedSnapshotText(text: string): string {.gcsafe, raises: [].} =
+    if text.len == 0:
+      return ""
+    result = newStringOfCap(text.len)
+    result.add(text)
   let safePeerId = peerIdText.strip()
   if safePeerId.len == 0:
     return PeerRouteSessionSnapshot(
       peerId: "",
       status: "missing",
       error: "missing_peerId",
+      lastDialStage: "",
       ok: false,
       taskRunning: false,
       sessionWarmOk: false,
@@ -24296,7 +26858,7 @@ proc latestPeerRouteSessionSnapshot(
       nil
     else:
       n.peerRouteSessionTasks.getOrDefault(safePeerId, nil)
-  let liveConnKey = livePeerRouteSessionConnKey(n, safePeerId)
+  let liveConnKey = ownedPeerRouteSessionConnKey(n, safePeerId)
   let running = peerRouteSessionTaskRunning(n, task)
   let effectiveStatus =
     if liveConnKey > 0:
@@ -24309,6 +26871,8 @@ proc latestPeerRouteSessionSnapshot(
       "failed"
     elif task.state == prssCancelled:
       "cleared"
+    elif task.state == prssReady:
+      "pending"
     else:
       "pending"
   let effectiveError =
@@ -24316,10 +26880,16 @@ proc latestPeerRouteSessionSnapshot(
       ""
     else:
       task.err
+  let effectiveLastDialStage =
+    if task.isNil:
+      ""
+    else:
+      task.lastDialStage
   PeerRouteSessionSnapshot(
-    peerId: safePeerId,
-    status: effectiveStatus,
-    error: effectiveError,
+    peerId: ownedSnapshotText(safePeerId),
+    status: ownedSnapshotText(effectiveStatus),
+    error: ownedSnapshotText(effectiveError),
+    lastDialStage: ownedSnapshotText(effectiveLastDialStage),
     ok: liveConnKey > 0,
     taskRunning: running,
     sessionWarmOk: liveConnKey > 0,
@@ -24336,6 +26906,15 @@ proc peerRouteSessionProbing(
 ): bool {.gcsafe, raises: [].} =
   snapshot.taskRunning or snapshot.status.toLowerAscii() in ["pending", "running"]
 
+proc tailnetProviderWarmPending(detail: JsonNode): bool {.gcsafe, raises: [].}
+proc requestLocalTsnetProviderReady(
+    n: NimNode
+): tuple[ok: bool, err: string, detail: JsonNode] {.gcsafe, raises: [].}
+proc ensureLocalTsnetReady(
+    n: NimNode,
+    timeoutMs: int
+): Future[tuple[ok: bool, err: string, detail: JsonNode]] {.async.}
+
 proc runPeerRouteSessionWarmAsync(
     taskState: PeerRouteSessionTask,
     n: NimNode,
@@ -24350,6 +26929,11 @@ proc runPeerRouteSessionWarmAsync(
     else:
       "route_session_target"
   let safeTimeoutMs = max(timeoutMs, 250)
+  debugLog(
+    "[nimlibp2p] runPeerRouteSessionWarmAsync start peer=" & safePeerId &
+    " source=" & safeSource &
+    " timeoutMs=" & $safeTimeoutMs
+  )
   try:
     if n.isNil or n.dmService.isNil:
       raise (ref LPError)(msg: "direct message service unavailable")
@@ -24360,37 +26944,277 @@ proc runPeerRouteSessionWarmAsync(
     taskState.source = safeSource
     taskState.state = prssRunning
     taskState.updatedAtMs = nowMillis()
-    taskState.deadlineAtMs = taskState.updatedAtMs + int64(safeTimeoutMs)
+    if taskState.deadlineAtMs <= taskState.updatedAtMs:
+      taskState.deadlineAtMs = taskState.updatedAtMs + int64(safeTimeoutMs)
     taskState.err = ""
+    taskState.lastDialStage = ""
     taskState.sessionConnKey = 0
-    let warmRes = await n.dmService.warmSessionDetailed(
-      peerRes.get(),
-      chronos.milliseconds(safeTimeoutMs),
-      relayOnly = true,
+    publishPeerRouteTransportSnapshots(n, safePeerId)
+    proc remainingWarmBudgetMs(): int =
+      int(max(taskState.deadlineAtMs - nowMillis(), 0))
+    proc failRelayWarm(errMsg: string, stageText: string) {.gcsafe, raises: [].} =
+      taskState.updatedAtMs = nowMillis()
+      taskState.state = prssFailed
+      taskState.err = errMsg
+      taskState.lastDialStage = stageText
+      taskState.sessionConnKey = 0
+      taskState.deadlineAtMs = taskState.updatedAtMs + PeerRouteSessionRetryDelayMs
+      publishPeerRouteTransportSnapshots(n, safePeerId)
+    proc retryRelayWarm(errMsg: string, stageText: string) {.async: (raises: [CancelledError]).} =
+      taskState.updatedAtMs = nowMillis()
+      taskState.state = prssRunning
+      taskState.err = errMsg
+      taskState.lastDialStage = stageText
+      taskState.sessionConnKey = 0
+      publishPeerRouteTransportSnapshots(n, safePeerId)
+      let retryWaitMs = min(int(PeerRouteSessionRetryDelayMs), remainingWarmBudgetMs())
+      if retryWaitMs > 0:
+        await sleepAsync(chronos.milliseconds(retryWaitMs))
+    var lastWarmStage = ""
+    var lastWarmErr = ""
+    proc relayWarmProgress(stage: string, detailNode: JsonNode) {.gcsafe, raises: [].} =
+      lastWarmStage = stage
+      taskState.lastDialStage = stage
+      let errText = jsonGetStr(detailNode, "error").strip()
+      if errText.len > 0:
+        lastWarmErr = errText
+      publishPeerRouteTransportSnapshots(n, safePeerId)
+      debugLog(
+        "[nimlibp2p] runPeerRouteSessionWarmAsync progress peer=" & safePeerId &
+        " source=" & safeSource &
+        " stage=" & stage &
+        dmWarmProgressDebugSuffix(detailNode)
+      )
+    debugLog(
+      "[nimlibp2p] runPeerRouteSessionWarmAsync provider_wait_begin peer=" & safePeerId &
+      " source=" & safeSource &
+      " mode=nonblocking"
+    )
+    var localTailnetReady = requestLocalTsnetProviderReady(n)
+    if not localTailnetReady.ok:
+      if tailnetProviderWarmPending(localTailnetReady.detail):
+        debugLog(
+          "[nimlibp2p] runPeerRouteSessionWarmAsync provider_wait_pending peer=" & safePeerId &
+          " source=" & safeSource
+        )
+        taskState.updatedAtMs = nowMillis()
+        taskState.state = prssPending
+        taskState.err = localTailnetReady.err
+        taskState.lastDialStage = "provider_wait"
+        taskState.sessionConnKey = 0
+        taskState.deadlineAtMs = taskState.updatedAtMs
+        publishPeerRouteTransportSnapshots(n, safePeerId)
+        return
+      if not localTailnetReady.ok:
+        debugLog(
+          "[nimlibp2p] runPeerRouteSessionWarmAsync provider_wait_failed peer=" & safePeerId &
+          " source=" & safeSource &
+          " err=" & localTailnetReady.err
+        )
+        taskState.updatedAtMs = nowMillis()
+        taskState.state = prssFailed
+        taskState.err = localTailnetReady.err
+        taskState.lastDialStage = "udp_target_not_ready"
+        taskState.sessionConnKey = 0
+        taskState.deadlineAtMs = taskState.updatedAtMs + PeerRouteSessionRetryDelayMs
+        publishPeerRouteTransportSnapshots(n, safePeerId)
+        return
+    debugLog(
+      "[nimlibp2p] runPeerRouteSessionWarmAsync provider_wait_done peer=" & safePeerId &
+      " source=" & safeSource
     )
     taskState.updatedAtMs = nowMillis()
-    if warmRes.ok and warmRes.connKey > 0 and n.dmService.hasLiveSessionConnKey(warmRes.connKey):
-      taskState.state = prssReady
-      taskState.err = ""
-      taskState.sessionConnKey = warmRes.connKey
-    else:
-      taskState.state = prssFailed
-      taskState.err =
-        if warmRes.err.len > 0:
+    taskState.err = ""
+    taskState.lastDialStage = ""
+    taskState.sessionConnKey = 0
+    while true:
+      let totalRemainingMs = remainingWarmBudgetMs()
+      if totalRemainingMs <= 0:
+        failRelayWarm("relay route session budget exhausted before warm", "udp_target_not_ready")
+        return
+      lastWarmStage = ""
+      lastWarmErr = ""
+      let warmBudgetMs = min(totalRemainingMs, safeTimeoutMs)
+      let warmStartedAtMs = nowMillis()
+      let relayPreferredAddrs = parsePreferredDirectMultiaddrs(
+        relayWarmSelectedAddrs(n, safePeerId)
+      )
+      let warmFuture = n.dmService.warmSessionDetailed(
+        peerRes.get(),
+        chronos.milliseconds(warmBudgetMs),
+        preferredAddrs = relayPreferredAddrs,
+        progress = relayWarmProgress,
+        relayOnly = true,
+      )
+      while not warmFuture.finished():
+        let elapsedMs = nowMillis() - warmStartedAtMs
+        let remainingMs =
+          min(
+            int((warmStartedAtMs + int64(warmBudgetMs)) - nowMillis()),
+            remainingWarmBudgetMs()
+          )
+        if remainingMs <= 0:
+          debugLog(
+            "[nimlibp2p] runPeerRouteSessionWarmAsync overdue peer=" & safePeerId &
+            " source=" & safeSource &
+            " elapsedMs=" & $elapsedMs &
+            (if lastWarmStage.len > 0: " lastStage=" & lastWarmStage else: "") &
+            (if lastWarmErr.len > 0: " lastErr=" & lastWarmErr else: "")
+          )
+          break
+        let waitMs = min(500, remainingMs)
+        let checkpoint = sleepAsync(chronos.milliseconds(waitMs))
+        let winner = await race(cast[FutureBase](warmFuture), cast[FutureBase](checkpoint))
+        if winner == cast[FutureBase](warmFuture):
+          checkpoint.cancelSoon()
+          break
+        debugLog(
+          "[nimlibp2p] runPeerRouteSessionWarmAsync waiting peer=" & safePeerId &
+          " source=" & safeSource &
+          " elapsedMs=" & $elapsedMs &
+          " remainingMs=" & $remainingMs &
+          (if lastWarmStage.len > 0: " lastStage=" & lastWarmStage else: "") &
+          (if lastWarmErr.len > 0: " lastErr=" & lastWarmErr else: "")
+        )
+      if not warmFuture.finished():
+        try:
+          await noCancel warmFuture.cancelAndWait()
+        except CancelledError:
+          discard
+        except CatchableError as exc:
+          if lastWarmErr.len == 0 and exc.msg.len > 0:
+            lastWarmErr = exc.msg
+        let timeoutErr =
+          if lastWarmErr.len > 0:
+            lastWarmErr
+          else:
+            let normalizedStage = lastWarmStage.strip().toLowerAscii()
+            if "identify" in normalizedStage:
+              "identify_timeout"
+            elif "attach" in normalizedStage or "reader" in normalizedStage or "bind" in normalizedStage:
+              "session_attach_timeout"
+            else:
+              "direct message fresh dial timeout"
+        let timeoutStage =
+          if lastWarmStage.len > 0:
+            lastWarmStage
+          else:
+            timeoutErr
+        debugLog(
+          "[nimlibp2p] runPeerRouteSessionWarmAsync warm_timeout peer=" & safePeerId &
+          " source=" & safeSource &
+          " err=" & timeoutErr &
+          (if lastWarmStage.len > 0: " lastStage=" & lastWarmStage else: "")
+        )
+        if remainingWarmBudgetMs() > 0:
+          await retryRelayWarm(timeoutErr, timeoutStage)
+          continue
+        failRelayWarm(timeoutErr, timeoutStage)
+        return
+      let warmRes = await warmFuture
+      let warmConnPathKind =
+        if warmRes.connKey > 0 and
+            not n.isNil and
+            not n.dmService.isNil and
+            n.dmService.hasLiveSessionConnKey(warmRes.connKey):
+          liveSessionConnPathKind(n, warmRes.connKey)
+        else:
+          ""
+      debugLog(
+        "[nimlibp2p] runPeerRouteSessionWarmAsync warm_done peer=" & safePeerId &
+        " ok=" & $warmRes.ok &
+        " connKey=" & $warmRes.connKey &
+        (if warmConnPathKind.len > 0:
+          " pathKind=" & warmConnPathKind
+        else:
+          "") &
+        (if warmRes.stage.len > 0:
+          " stage=" & warmRes.stage
+        else:
+          "") &
+        (if warmRes.err.len > 0:
+          " err=" & warmRes.err
+        else:
+          "")
+      )
+      taskState.updatedAtMs = nowMillis()
+      if warmRes.ok and warmRes.connKey > 0 and
+          n.dmService.hasLiveSessionConnKey(warmRes.connKey) and
+          warmConnPathKind == "relay":
+        taskState.state = prssReady
+        taskState.err = ""
+        taskState.lastDialStage = "session_ready"
+        taskState.sessionConnKey = warmRes.connKey
+        taskState.deadlineAtMs = taskState.updatedAtMs
+        publishPeerRouteTransportSnapshots(n, safePeerId)
+        return
+      if warmRes.ok and warmRes.connKey > 0 and
+          warmConnPathKind.len > 0 and
+          warmConnPathKind != "relay" and
+          directSessionConnPathReady(warmConnPathKind) and
+          livePeerDirectSessionConnKey(n, safePeerId) > 0:
+        debugLog(
+          "[nimlibp2p] runPeerRouteSessionWarmAsync direct_ready peer=" & safePeerId &
+          " source=" & safeSource &
+          " connKey=" & $warmRes.connKey &
+          " pathKind=" & warmConnPathKind
+        )
+        taskState.state = prssCancelled
+        taskState.err = "direct_session_ready"
+        taskState.lastDialStage = "direct_session_ready"
+        taskState.sessionConnKey = 0
+        taskState.deadlineAtMs = taskState.updatedAtMs
+        publishPeerRouteTransportSnapshots(n, safePeerId)
+        return
+      let warmErr =
+        if warmRes.ok and warmRes.connKey > 0 and warmConnPathKind.len > 0 and
+            warmConnPathKind != "relay":
+          "relay_session_path_mismatch"
+        elif warmRes.err.len > 0:
           warmRes.err
+        elif warmRes.stage.len > 0:
+          warmRes.stage
         else:
           "relay route session unavailable"
-      taskState.sessionConnKey = 0
+      let warmStage =
+        if warmRes.stage.len > 0:
+          warmRes.stage
+        else:
+          warmErr
+      if remainingWarmBudgetMs() > 0:
+        await retryRelayWarm(warmErr, warmStage)
+        continue
+      failRelayWarm(warmErr, warmStage)
+      return
   except CancelledError:
+    debugLog(
+      "[nimlibp2p] runPeerRouteSessionWarmAsync cancelled peer=" & safePeerId
+    )
     taskState.updatedAtMs = nowMillis()
     taskState.state = prssCancelled
     taskState.err = "route_session_target_cancelled"
+    taskState.lastDialStage = "route_session_target_cancelled"
     taskState.sessionConnKey = 0
+    taskState.deadlineAtMs = taskState.updatedAtMs + PeerRouteSessionRetryDelayMs
+    publishPeerRouteTransportSnapshots(n, safePeerId)
   except CatchableError as exc:
+    debugLog(
+      "[nimlibp2p] runPeerRouteSessionWarmAsync failed peer=" & safePeerId &
+      " err=" & (if exc.msg.len > 0: exc.msg else: "route session warm failed")
+    )
     taskState.updatedAtMs = nowMillis()
     taskState.state = prssFailed
     taskState.err = if exc.msg.len > 0: exc.msg else: "route session warm failed"
+    taskState.lastDialStage =
+      if taskState.lastDialStage.len > 0:
+        taskState.lastDialStage
+      elif exc.msg.len > 0:
+        exc.msg
+      else:
+        "route_session_warm_failed"
     taskState.sessionConnKey = 0
+    taskState.deadlineAtMs = taskState.updatedAtMs + PeerRouteSessionRetryDelayMs
+    publishPeerRouteTransportSnapshots(n, safePeerId)
   finally:
     let currentTask =
       if n.isNil:
@@ -24399,6 +27223,8 @@ proc runPeerRouteSessionWarmAsync(
         n.peerRouteSessionTasks.getOrDefault(safePeerId, nil)
     if currentTask == taskState and safePeerId in n.peerRouteSessionFutures:
       n.peerRouteSessionFutures.del(safePeerId)
+    publishPeerRouteTransportSnapshots(n, safePeerId)
+    firePeerRouteSessionReconcileWake(n)
 
 proc reconcilePeerRouteSession(
     n: NimNode,
@@ -24415,9 +27241,71 @@ proc reconcilePeerRouteSession(
       source.strip()
     else:
       "route_session_target"
-  let liveConnKey = livePeerRouteSessionConnKey(n, safePeerId)
+  let hasRelayRouteIntent = peerHasRouteTransportIntentUsingRelay(n, safePeerId)
+  let hasDirectRouteIntent = directSessionTargetDesired(n, safePeerId)
+  let relaySpec = n.relaySessionTargets.getOrDefault(safePeerId, RelaySessionTargetSpec())
+  let liveDirectConnKey = livePeerDirectSessionConnKey(n, safePeerId)
+  let liveConnKey = ownedPeerRouteSessionConnKey(n, safePeerId)
   var task = n.peerRouteSessionTasks.getOrDefault(safePeerId, nil)
+  if liveDirectConnKey > 0 and directSessionTargetDesired(n, safePeerId):
+    let fut = n.peerRouteSessionFutures.getOrDefault(safePeerId, nil)
+    if not fut.isNil and not fut.finished():
+      fut.cancelSoon()
+    if safePeerId in n.peerRouteSessionFutures:
+      n.peerRouteSessionFutures.del(safePeerId)
+    if task.isNil:
+      task = PeerRouteSessionTask(
+        peerId: safePeerId,
+        source: safeSource,
+        state: prssCancelled,
+        updatedAtMs: nowMillis(),
+        deadlineAtMs: nowMillis(),
+        err: "direct_session_ready",
+        sessionConnKey: 0,
+      )
+    else:
+      task.peerId = safePeerId
+      task.source = safeSource
+      task.state = prssCancelled
+      task.updatedAtMs = nowMillis()
+      task.deadlineAtMs = task.updatedAtMs
+      task.err = "direct_session_ready"
+      task.sessionConnKey = 0
+    n.peerRouteSessionTasks[safePeerId] = task
+    publishPeerRouteTransportSnapshots(n, safePeerId)
+    debugLog(
+      "[nimlibp2p] reconcilePeerRouteSession direct_ready_skip peer=" & safePeerId &
+      " source=" & safeSource &
+      " connKey=" & $liveDirectConnKey
+    )
+    return
   if liveConnKey > 0:
+    if relaySpec.peerId.len > 0:
+      let updatedAtMs = nowMillis()
+      n.relaySessionTargets[safePeerId] = RelaySessionTargetSpec(
+        peerId: relaySpec.peerId,
+        source:
+          if relaySpec.source.len > 0:
+            relaySpec.source
+          else:
+            safeSource,
+        selectedAddrs:
+          if relaySpec.selectedAddrs.len > 0:
+            relaySpec.selectedAddrs
+          else:
+            relayWarmSelectedAddrs(n, safePeerId),
+        updatedAtMs: updatedAtMs,
+        sticky: relaySpec.sticky,
+        retainedUntilAtMs: peerRouteSessionRetainDeadlineAtMs(
+          relaySpec.sticky,
+          updatedAtMs,
+        ),
+      )
+    debugLog(
+      "[nimlibp2p] reconcilePeerRouteSession live_ready peer=" & safePeerId &
+      " source=" & safeSource &
+      " connKey=" & $liveConnKey
+    )
     if task.isNil:
       task = PeerRouteSessionTask(
         peerId: safePeerId,
@@ -24437,18 +27325,71 @@ proc reconcilePeerRouteSession(
       task.err = ""
       task.sessionConnKey = liveConnKey
     n.peerRouteSessionTasks[safePeerId] = task
+    publishPeerRouteTransportSnapshots(n, safePeerId)
     return
+  if relaySpec.peerId.len > 0 and
+      not hasRelayRouteIntent and
+      not hasDirectRouteIntent and
+      not relaySessionTargetRetained(relaySpec):
+    if peerRouteSessionTaskRunning(n, task):
+      if not task.isNil:
+        task.source = safeSource
+        task.updatedAtMs = nowMillis()
+        publishPeerRouteTransportSnapshots(n, safePeerId)
+      return
+    debugLog(
+      "[nimlibp2p] reconcilePeerRouteSession release_retained peer=" & safePeerId &
+      " source=" & safeSource
+    )
+    if safePeerId in n.relaySessionTargets:
+      n.relaySessionTargets.del(safePeerId)
+    cancelStalePeerRouteSessionTask(n, safePeerId)
+    return
+  if peerRouteSessionTaskRetryPending(task):
+    if not task.isNil:
+      task.source = safeSource
+      debugLog(
+        "[nimlibp2p] reconcilePeerRouteSession retry_pending peer=" & safePeerId &
+        " source=" & safeSource &
+        " state=" & $task.state &
+        (if task.err.len > 0: " err=" & task.err else: "")
+      )
+      publishPeerRouteTransportSnapshots(n, safePeerId)
+    return
+  if peerRouteSessionTaskProviderPending(task):
+    let localTailnetReady = requestLocalTsnetProviderReady(n)
+    if not localTailnetReady.ok and
+        localTailnetReady.err == TailnetProviderWarmPendingErr:
+      task.source = safeSource
+      task.updatedAtMs = nowMillis()
+      task.err = localTailnetReady.err
+      task.lastDialStage = "provider_wait"
+      task.sessionConnKey = 0
+      debugLog(
+        "[nimlibp2p] reconcilePeerRouteSession provider_pending peer=" & safePeerId &
+        " source=" & safeSource
+      )
+      publishPeerRouteTransportSnapshots(n, safePeerId)
+      return
   if peerRouteSessionTaskRunning(n, task):
     if not task.isNil:
       task.source = safeSource
       task.updatedAtMs = nowMillis()
+      task.deadlineAtMs = max(task.deadlineAtMs, task.updatedAtMs + PeerRouteSessionWarmWorkerMs)
+      debugLog(
+        "[nimlibp2p] reconcilePeerRouteSession already_running peer=" & safePeerId &
+        " source=" & safeSource &
+        " deadlineAtMs=" & $task.deadlineAtMs &
+        " updatedAtMs=" & $task.updatedAtMs
+      )
+      publishPeerRouteTransportSnapshots(n, safePeerId)
     return
   let taskState = PeerRouteSessionTask(
     peerId: safePeerId,
     source: safeSource,
     state: prssRunning,
     updatedAtMs: nowMillis(),
-    deadlineAtMs: nowMillis() + 4_500,
+    deadlineAtMs: nowMillis() + PeerRouteSessionWarmWorkerMs,
     err: "",
     sessionConnKey: 0,
   )
@@ -24457,10 +27398,16 @@ proc reconcilePeerRouteSession(
     n,
     safePeerId,
     safeSource,
-    4_500,
+    PeerRouteSessionWarmAttemptMs,
+  )
+  debugLog(
+    "[nimlibp2p] reconcilePeerRouteSession spawn peer=" & safePeerId &
+    " source=" & safeSource &
+    " deadlineAtMs=" & $taskState.deadlineAtMs
   )
   n.peerRouteSessionTasks[safePeerId] = taskState
   n.peerRouteSessionFutures[safePeerId] = fut
+  publishPeerRouteTransportSnapshots(n, safePeerId)
   asyncSpawn fut
 
 proc ensurePeerRouteSessionReconcileLoop(n: NimNode) {.gcsafe, raises: [].} =
@@ -24469,16 +27416,13 @@ proc ensurePeerRouteSessionReconcileLoop(n: NimNode) {.gcsafe, raises: [].} =
   if not n.peerRouteSessionReconcileLoop.isNil and not n.peerRouteSessionReconcileLoop.finished:
     return
   let loop = proc(): Future[void] {.closure, async: (raises: [CancelledError]).} =
+    let wakeup = n.peerRouteSessionReconcileWake
     while n.running.load(moAcquire):
+      if not wakeup.isNil:
+        wakeup.clear()
+      var waitDelayMs = -1
       if n.started:
-        var desired = initTable[string, DirectSessionTargetSpec]()
-        for spec in copyDirectSessionTargetSpecs(n):
-          let peerId = spec.peerId.strip()
-          if peerId.len == 0:
-            continue
-          let existing = desired.getOrDefault(peerId, DirectSessionTargetSpec())
-          if existing.taskKey.len == 0 or spec.updatedAtMs >= existing.updatedAtMs:
-            desired[peerId] = spec
+        let desired = copyDesiredPeerRouteSessionSpecs(n)
         for peerId, spec in desired.pairs:
           try:
             reconcilePeerRouteSession(n, peerId, spec.source)
@@ -24492,13 +27436,26 @@ proc ensurePeerRouteSessionReconcileLoop(n: NimNode) {.gcsafe, raises: [].} =
           if not desired.hasKey(peerId):
             stalePeers.add(peerId)
         for peerId in stalePeers:
-          let fut = n.peerRouteSessionFutures.getOrDefault(peerId, nil)
-          if not fut.isNil and not fut.finished():
-            fut.cancelSoon()
-          if peerId in n.peerRouteSessionFutures:
-            n.peerRouteSessionFutures.del(peerId)
-          n.peerRouteSessionTasks.del(peerId)
-      await sleepAsync(chronos.milliseconds(750))
+          cancelStalePeerRouteSessionTask(n, peerId)
+        waitDelayMs = nextPeerRouteSessionReconcileDelayMs(n, desired)
+      if wakeup.isNil:
+        let fallbackDelayMs =
+          if waitDelayMs >= 0:
+            waitDelayMs
+          else:
+            250
+        await sleepAsync(chronos.milliseconds(max(fallbackDelayMs, 1)))
+        continue
+      if waitDelayMs < 0:
+        await wakeup.wait()
+        continue
+      let timeoutFuture = sleepAsync(chronos.milliseconds(waitDelayMs))
+      let winner = await race(
+        cast[FutureBase](wakeup.wait()),
+        cast[FutureBase](timeoutFuture),
+      )
+      if winner != cast[FutureBase](timeoutFuture) and not timeoutFuture.finished():
+        timeoutFuture.cancelSoon()
   let reconcileFuture = loop()
   n.peerRouteSessionReconcileLoop = reconcileFuture
   asyncSpawn(reconcileFuture)
@@ -24516,13 +27473,37 @@ proc waitForPeerRouteSessionReady(
   reconcilePeerRouteSession(n, safePeerId, source)
   ensurePeerRouteSessionReconcileLoop(n)
   let deadlineAtMs = nowMillis() + int64(max(timeoutMs, 0))
+  var lastStatus = ""
+  var lastError = ""
+  var lastConnKey = -1
+  var lastLoggedAtMs = 0'i64
   while true:
     let snapshot = latestPeerRouteSessionSnapshot(n, safePeerId)
+    let loopNowMs = nowMillis()
+    if snapshot.status != lastStatus or
+        snapshot.error != lastError or
+        snapshot.sessionConnKey != lastConnKey or
+        loopNowMs - lastLoggedAtMs >= 500:
+      debugLog(
+        "[nimlibp2p] waitForPeerRouteSessionReady observe peer=" & safePeerId &
+        " source=" & source &
+        " status=" & snapshot.status &
+        " taskRunning=" & $snapshot.taskRunning &
+        " connKey=" & $snapshot.sessionConnKey &
+        (if snapshot.lastDialStage.len > 0: " lastStage=" & snapshot.lastDialStage else: "") &
+        (if snapshot.error.len > 0: " err=" & snapshot.error else: "")
+      )
+      lastStatus = snapshot.status
+      lastError = snapshot.error
+      lastConnKey = snapshot.sessionConnKey
+      lastLoggedAtMs = loopNowMs
     if peerRouteSessionReady(snapshot):
       return (true, snapshot.sessionConnKey, "", snapshot)
     if snapshot.status.toLowerAscii() in ["failed", "cleared"]:
       let errMsg =
-        if snapshot.error.len > 0:
+        if snapshot.lastDialStage.len > 0:
+          snapshot.lastDialStage
+        elif snapshot.error.len > 0:
           snapshot.error
         else:
           "relay route session unavailable"
@@ -24530,12 +27511,165 @@ proc waitForPeerRouteSessionReady(
     let remainingMs = int(deadlineAtMs - nowMillis())
     if remainingMs <= 0:
       let errMsg =
-        if snapshot.error.len > 0:
+        if snapshot.lastDialStage.len > 0:
+          snapshot.lastDialStage
+        elif snapshot.error.len > 0:
           snapshot.error
         else:
           "relay route session not ready"
       return (false, 0, errMsg, snapshot)
     await sleepAsync(chronos.milliseconds(min(100, remainingMs)))
+
+proc waitForRouteTransportReady(
+    n: NimNode,
+    peerIdText: string,
+    selectedAddrs: seq[string],
+    timeoutMs: int,
+    source: string
+): Future[tuple[
+    ok: bool,
+    useRelay: bool,
+    connKey: int,
+    err: string,
+    snapshot: ConversationTransportSnapshot
+]] {.async.} =
+  let safePeerId = peerIdText.strip()
+  let safeAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(selectedAddrs))
+  let routeKey = routeTransportTaskKey(safePeerId, safeAddrs)
+  let missingSnapshot = missingConversationTransportSnapshot(
+    safePeerId,
+    safeAddrs,
+    source = source,
+    err = "missing_peerId_or_addresses",
+  )
+  if n.isNil or safePeerId.len == 0 or routeKey.len == 0:
+    return (false, false, 0, "missing_peer_id_or_addresses", missingSnapshot)
+  let deadlineAtMs = nowMillis() + int64(max(timeoutMs, 0))
+  var lastStatus = ""
+  var lastSelectedPath = ""
+  var lastSelectedConnKey = -1
+  var lastLoggedAtMs = 0'i64
+  let wakeup = ensureRouteTransportWakeup(n, routeKey)
+  while true:
+    if not wakeup.isNil:
+      wakeup.clear()
+    let snapshot = latestConversationTransportSnapshot(n, safePeerId, safeAddrs)
+    let loopNowMs = nowMillis()
+    if snapshot.status != lastStatus or
+        snapshot.selectedPath != lastSelectedPath or
+        snapshot.selectedConnKey != lastSelectedConnKey or
+        loopNowMs - lastLoggedAtMs >= 500:
+      debugLog(
+        "[nimlibp2p] waitForRouteTransportReady observe peer=" & safePeerId &
+        " source=" & source &
+        " status=" & snapshot.status &
+        " policy=" & snapshot.policy &
+        " selectedPath=" & snapshot.selectedPath &
+        " selectedConnKey=" & $snapshot.selectedConnKey &
+        " directStage=" & snapshot.directStage &
+        " relayStage=" & snapshot.relayStage &
+        (if snapshot.lastError.len > 0: " err=" & snapshot.lastError else: "")
+      )
+      lastStatus = snapshot.status
+      lastSelectedPath = snapshot.selectedPath
+      lastSelectedConnKey = snapshot.selectedConnKey
+      lastLoggedAtMs = loopNowMs
+    if snapshot.ready and snapshot.selectedConnKey > 0 and
+        not n.dmService.isNil and
+        n.dmService.hasLiveSessionConnKey(snapshot.selectedConnKey):
+      return (
+        true,
+        snapshot.selectedPath == "relay",
+        snapshot.selectedConnKey,
+        "",
+        snapshot,
+      )
+    let policy = parsePeerPathPolicy(snapshot.policy)
+    let directTerminal = routeTransportDirectTerminalFailure(snapshot)
+    let relayTerminal = routeTransportRelayTerminalFailure(snapshot)
+    let terminalErr =
+      case policy
+      of ppDirectOnly:
+        directTerminal
+      of ppRelayOnly:
+        relayTerminal
+      of ppDirectThenRelay:
+        if directTerminal.len > 0 and relayTerminal.len > 0:
+          if relayTerminal.len > 0: relayTerminal else: directTerminal
+        else:
+          ""
+    if terminalErr.len > 0:
+      return (false, false, 0, terminalErr, snapshot)
+    let remainingMs = int(deadlineAtMs - nowMillis())
+    if remainingMs > 0 and
+        (
+          routeTransportDirectProviderPending(snapshot) or
+            routeTransportRelayProviderPending(snapshot)
+        ):
+      let localTailnetReady = await ensureLocalTsnetReady(n, remainingMs)
+      if localTailnetReady.ok:
+        reconcileDesiredRouteSessionsNow(
+          n,
+          if source.strip().len > 0: source else: "path_intent",
+        )
+        discard publishRouteTransportSnapshot(n, safePeerId, safeAddrs)
+        continue
+      if localTailnetReady.err.len > 0 and
+          localTailnetReady.err != TailnetProviderWarmPendingErr:
+        return (false, false, 0, localTailnetReady.err, snapshot)
+    if remainingMs <= 0:
+      let errMsg =
+        if snapshot.lastError.len > 0:
+          snapshot.lastError
+        elif relayTerminal.len > 0:
+          relayTerminal
+        elif directTerminal.len > 0:
+          directTerminal
+        else:
+          "route transport not ready"
+      return (false, false, 0, errMsg, snapshot)
+    if wakeup.isNil:
+      await sleepAsync(chronos.milliseconds(min(50, remainingMs)))
+      continue
+    let timeoutFuture = sleepAsync(chronos.milliseconds(remainingMs))
+    let winner = await race(cast[FutureBase](wakeup.wait()), cast[FutureBase](timeoutFuture))
+    if winner == cast[FutureBase](timeoutFuture):
+      let snapshot = latestConversationTransportSnapshot(n, safePeerId, safeAddrs)
+      let errMsg =
+        if snapshot.lastError.len > 0:
+          snapshot.lastError
+        else:
+          "route transport not ready"
+      return (false, false, 0, errMsg, snapshot)
+    if not timeoutFuture.finished():
+      timeoutFuture.cancelSoon()
+
+proc directTargetTerminalFailureStage(
+    snapshot: DirectSessionTargetSnapshot
+): string {.gcsafe, raises: [].}
+
+proc relayTargetTerminalFailureStage(
+    snapshot: PeerRouteSessionSnapshot
+): string {.gcsafe, raises: [].}
+
+proc directTargetProviderPending(
+    snapshot: DirectSessionTargetSnapshot
+): bool {.gcsafe, raises: [].} =
+  snapshot.desired and
+    snapshot.sessionStage.strip().toLowerAscii() in ["pending", "route_wait"] and
+    (
+      snapshot.lastDialStage.strip().toLowerAscii() == "provider_wait" or
+        snapshot.error.strip() == TailnetProviderWarmPendingErr
+    )
+
+proc relayTargetProviderPending(
+    snapshot: PeerRouteSessionSnapshot
+): bool {.gcsafe, raises: [].} =
+  snapshot.status.strip().toLowerAscii() in ["pending", "running"] and
+    (
+      snapshot.lastDialStage.strip().toLowerAscii() == "provider_wait" or
+        snapshot.error.strip() == TailnetProviderWarmPendingErr
+    )
 
 proc waitForDirectOrRelaySessionReady(
     n: NimNode,
@@ -24561,17 +27695,21 @@ proc waitForDirectOrRelaySessionReady(
   var relaySnapshot = latestPeerRouteSessionSnapshot(n, safePeerId)
   if n.isNil or safePeerId.len == 0:
     return (false, false, 0, "missing_peer_id", directSnapshot, relaySnapshot)
-  if selectedAddrs.len > 0:
-    discard upsertDirectSessionTarget(
-      n,
-      safePeerId,
-      selectedAddrs,
-      source,
-    )
-  reconcilePeerRouteSession(n, safePeerId, source)
-  ensureDirectSessionTargetReconcileLoop(n)
-  ensurePeerRouteSessionReconcileLoop(n)
+  debugLog(
+    "[nimlibp2p] waitForDirectOrRelaySessionReady start peer=" & safePeerId &
+    " selectedAddrCount=" & $selectedAddrs.len &
+    " timeoutMs=" & $max(timeoutMs, 0) &
+    " source=" & source
+  )
   let deadlineAtMs = nowMillis() + int64(max(timeoutMs, 0))
+  var lastDirectStatus = ""
+  var lastDirectError = ""
+  var lastDirectConnKey = -1
+  var lastRelayStatus = ""
+  var lastRelayStage = ""
+  var lastRelayError = ""
+  var lastRelayConnKey = -1
+  var lastLoggedAtMs = 0'i64
   while true:
     directSnapshot =
       if selectedAddrs.len > 0:
@@ -24599,121 +27737,267 @@ proc waitForDirectOrRelaySessionReady(
         directSnapshot,
         relaySnapshot,
       )
+    let directFailureStage = directTargetTerminalFailureStage(directSnapshot)
+    let relayFailureStage = relayTargetTerminalFailureStage(relaySnapshot)
+    if relayFailureStage.len > 0 and
+        not relaySnapshot.taskRunning and
+        not directTargetReady(directSnapshot):
+      debugLog(
+        "[nimlibp2p] waitForDirectOrRelaySessionReady relay_failed peer=" & safePeerId &
+        " err=" & relayFailureStage &
+        " directStatus=" & directSnapshot.status &
+        " relayStatus=" & relaySnapshot.status
+      )
+      return (false, false, 0, relayFailureStage, directSnapshot, relaySnapshot)
+    let loopNowMs = nowMillis()
+    if directSnapshot.status != lastDirectStatus or
+        directSnapshot.error != lastDirectError or
+        directSnapshot.sessionConnKey != lastDirectConnKey or
+        relaySnapshot.status != lastRelayStatus or
+        relaySnapshot.lastDialStage != lastRelayStage or
+        relaySnapshot.error != lastRelayError or
+        relaySnapshot.sessionConnKey != lastRelayConnKey or
+        loopNowMs - lastLoggedAtMs >= 500:
+      debugLog(
+        "[nimlibp2p] waitForDirectOrRelaySessionReady observe peer=" & safePeerId &
+        " source=" & source &
+        " directStatus=" & directSnapshot.status &
+        " directTaskRunning=" & $directSnapshot.taskRunning &
+        " directConnKey=" & $directSnapshot.sessionConnKey &
+        (if directFailureStage.len > 0: " directStage=" & directFailureStage else: "") &
+        (if directSnapshot.error.len > 0: " directErr=" & directSnapshot.error else: "") &
+        " relayStatus=" & relaySnapshot.status &
+        " relayTaskRunning=" & $relaySnapshot.taskRunning &
+        " relayConnKey=" & $relaySnapshot.sessionConnKey &
+        (if relaySnapshot.lastDialStage.len > 0:
+          " relayLastStage=" & relaySnapshot.lastDialStage
+        else:
+          "") &
+        (if relayFailureStage.len > 0: " relayStage=" & relayFailureStage else: "") &
+        (if relaySnapshot.error.len > 0: " relayErr=" & relaySnapshot.error else: "")
+      )
+      lastDirectStatus = directSnapshot.status
+      lastDirectError = directSnapshot.error
+      lastDirectConnKey = directSnapshot.sessionConnKey
+      lastRelayStatus = relaySnapshot.status
+      lastRelayStage = relaySnapshot.lastDialStage
+      lastRelayError = relaySnapshot.error
+      lastRelayConnKey = relaySnapshot.sessionConnKey
+      lastLoggedAtMs = loopNowMs
+    if directFailureStage.len > 0 and relayFailureStage.len > 0:
+      let errMsg =
+        if relayFailureStage.len > 0:
+          relayFailureStage
+        else:
+          directFailureStage
+      debugLog(
+        "[nimlibp2p] waitForDirectOrRelaySessionReady terminal_failure peer=" & safePeerId &
+        " err=" & errMsg &
+        " directStatus=" & directSnapshot.status &
+        " directStage=" & directFailureStage &
+        " relayStatus=" & relaySnapshot.status &
+        " relayStage=" & relayFailureStage
+      )
+      return (false, false, 0, errMsg, directSnapshot, relaySnapshot)
     let remainingMs = int(deadlineAtMs - nowMillis())
+    if remainingMs > 0 and
+        (
+          directTargetProviderPending(directSnapshot) or
+            relayTargetProviderPending(relaySnapshot)
+        ):
+      let localTailnetReady = await ensureLocalTsnetReady(n, remainingMs)
+      if localTailnetReady.ok:
+        if selectedAddrs.len > 0:
+          for spec in copyDirectSessionTargetSpecs(n):
+            if spec.peerId == safePeerId and spec.selectedAddrs == selectedAddrs:
+              reconcileDirectSessionTarget(n, spec)
+              break
+        reconcilePeerRouteSession(n, safePeerId, source)
+        continue
+      if localTailnetReady.err.len > 0 and
+          localTailnetReady.err != TailnetProviderWarmPendingErr:
+        debugLog(
+          "[nimlibp2p] waitForDirectOrRelaySessionReady provider_ready_failed peer=" & safePeerId &
+          " source=" & source &
+          " err=" & localTailnetReady.err
+        )
+        return (false, false, 0, localTailnetReady.err, directSnapshot, relaySnapshot)
     if remainingMs <= 0:
       let errMsg =
-        if relaySnapshot.error.len > 0:
+        if relayFailureStage.len > 0:
+          relayFailureStage
+        elif relaySnapshot.lastDialStage.len > 0 and relaySnapshot.taskRunning:
+          relaySnapshot.lastDialStage
+        elif directFailureStage.len > 0:
+          directFailureStage
+        elif relaySnapshot.lastDialStage.len > 0:
+          relaySnapshot.lastDialStage
+        elif relaySnapshot.error.len > 0:
           relaySnapshot.error
         elif directSnapshot.error.len > 0:
           directSnapshot.error
         else:
           "direct and relay sessions not ready"
+      debugLog(
+        "[nimlibp2p] waitForDirectOrRelaySessionReady timeout peer=" & safePeerId &
+        " err=" & errMsg &
+        " directStatus=" & directSnapshot.status &
+        " directRunning=" & $directSnapshot.taskRunning &
+        " directConnKey=" & $directSnapshot.sessionConnKey &
+        (if directFailureStage.len > 0:
+          " directStage=" & directFailureStage
+        else:
+          "") &
+        (if directSnapshot.error.len > 0:
+          " directErr=" & directSnapshot.error
+        else:
+          "") &
+        " relayStatus=" & relaySnapshot.status &
+        " relayRunning=" & $relaySnapshot.taskRunning &
+        " relayConnKey=" & $relaySnapshot.sessionConnKey &
+        (if relaySnapshot.lastDialStage.len > 0:
+          " relayLastStage=" & relaySnapshot.lastDialStage
+        else:
+          "") &
+        (if relayFailureStage.len > 0:
+          " relayStage=" & relayFailureStage
+        else:
+          "") &
+        (if relaySnapshot.error.len > 0:
+          " relayErr=" & relaySnapshot.error
+        else:
+          "")
+      )
       return (false, false, 0, errMsg, directSnapshot, relaySnapshot)
     await sleepAsync(chronos.milliseconds(min(100, remainingMs)))
 
-proc buildPublishedDirectSessionTargetSnapshot(
+proc selectedReadySendPath(
+    ok: bool,
+    useRelay: bool,
+    connKey: int
+): string {.gcsafe, raises: [].} =
+  if not ok or connKey <= 0:
+    return "not_ready"
+  if useRelay:
+    return "relay_ready_session"
+  "direct_ready_session"
+
+proc directSessionPathUsesDirect(pathKind: string): bool {.gcsafe, raises: [].} =
+  directSessionConnPathReady(pathKind)
+
+proc classifyDirectWarmFailureStage(err: string): string {.gcsafe, raises: [].} =
+  let normalized = err.strip().toLowerAscii()
+  if normalized.len == 0:
+    return ""
+  if "route_missing" in normalized or "no tsnet direct route is registered" in normalized:
+    return "route_missing"
+  if "udp target not ready" in normalized or "relay readiness" in normalized:
+    return "udp_target_not_ready"
+  if "fresh dial timeout" in normalized or "connect timeout" in normalized or "dial timeout" in normalized:
+    return "quic_dial_timeout"
+  if "identify" in normalized:
+    return "identify_timeout"
+  if "session attach" in normalized or "reader ready" in normalized:
+    return "session_attach_timeout"
+  ""
+
+proc directTargetTerminalFailureStage(
+    snapshot: DirectSessionTargetSnapshot
+): string {.gcsafe, raises: [].} =
+  if directTargetReady(snapshot) or directTargetProbing(snapshot):
+    return ""
+  let status = snapshot.sessionStage.strip().toLowerAscii()
+  if status.len == 0 or status in ["missing", "pending", "route_wait", "warming"]:
+    return ""
+  if snapshot.lastDialStage.len > 0:
+    return snapshot.lastDialStage
+  if snapshot.error.len > 0:
+    let classified = classifyDirectWarmFailureStage(snapshot.error)
+    if classified.len > 0:
+      return classified
+    return snapshot.error
+  if status.len > 0:
+    return status
+  "direct_session_unavailable"
+
+proc relayTargetTerminalFailureStage(
+    snapshot: PeerRouteSessionSnapshot
+): string {.gcsafe, raises: [].} =
+  if peerRouteSessionReady(snapshot) or peerRouteSessionProbing(snapshot):
+    return ""
+  let status = snapshot.status.strip().toLowerAscii()
+  if status.len == 0 or status in ["missing", "pending", "running"]:
+    return ""
+  if snapshot.lastDialStage.len > 0:
+    return snapshot.lastDialStage
+  if snapshot.error.len > 0:
+    let classified = classifyDirectWarmFailureStage(snapshot.error)
+    if classified.len > 0:
+      return classified
+    return snapshot.error
+  if status.len > 0:
+    return status
+  "relay_route_session_unavailable"
+
+proc directPlanPriority(plan: TsnetUdpExactDialPlan): int {.gcsafe, raises: [].} =
+  case plan.stage
+  of TsnetUdpExactDialStage.DirectRouteReady:
+    0
+  of TsnetUdpExactDialStage.LocalReady:
+    1
+  of TsnetUdpExactDialStage.DirectFailed:
+    2
+  of TsnetUdpExactDialStage.RouteMissing:
+    3
+  of TsnetUdpExactDialStage.Unavailable:
+    4
+  else:
+    5
+
+proc selectDirectPeerPathPlan(
+    n: NimNode,
+    spec: DirectSessionTargetSpec
+) : tuple[addrText: string, plan: TsnetUdpExactDialPlan] {.gcsafe, raises: [].} =
+  for addrText in spec.selectedAddrs:
+    let plan = directPeerPathPlanForAddr(n, addrText)
+    if result.addrText.len == 0 or directPlanPriority(plan) < directPlanPriority(result.plan):
+      result = (addrText, plan)
+    if plan.ready and plan.stage == TsnetUdpExactDialStage.DirectRouteReady:
+      return (addrText, plan)
+
+proc waitForDirectPeerPathPlanReady(
     n: NimNode,
     spec: DirectSessionTargetSpec,
-    task: BootstrapSeedConnectTask,
-    status: string,
-    error: string
-): DirectSessionTargetSnapshot {.gcsafe, raises: [].} =
-  let ready = bootstrapSeedConnectTaskSessionLive(n, task)
-  let running = bootstrapSeedConnectTaskRunning(n, task)
-  let routeStatus = liveDirectRouteStatus(n, spec.selectedAddrs)
-  let effectiveError =
-    if error.len > 0:
-      error
-    elif not task.isNil and task.sessionWarmError.len > 0:
-      task.sessionWarmError
-    elif not task.isNil:
-      task.err
-    else:
-      ""
-  buildDirectSessionTargetSnapshot(
-    spec.peerId,
-    spec.taskKey,
-    status,
-    selectedAddrs = spec.selectedAddrs,
-    source = spec.source,
-    error = effectiveError,
-    ok = ready,
-    taskRunning = running,
-    sessionWarmOk = ready or (not task.isNil and task.sessionWarmOk),
-    verifiedMuxer = (not task.isNil and not task.verifiedMuxer.isNil),
-    sessionConnKey = (if task.isNil: 0 else: task.sessionConnKey),
-    routeReady = routeStatus.ready,
-    routePathKind = routeStatus.pathKind,
-    updatedAtMs = spec.updatedAtMs,
-    attemptCount = spec.attemptCount,
-    successCount = spec.successCount,
-    failureCount = spec.failureCount,
-    lastAttemptAtMs = spec.lastAttemptAtMs,
-    lastReadyAtMs = spec.lastReadyAtMs,
-    lastFailureAtMs = spec.lastFailureAtMs,
-    lastFailureReason = spec.lastFailureReason,
-    taskState = if task.isNil: "" else: bootstrapSeedConnectStateLabel(task.state),
-    verifiedMuxerWaitMs = if task.isNil: 0 else: task.verifiedMuxerWaitMs,
-    attemptedAddr = if task.isNil: "" else: task.attemptedAddr,
-  )
+    timeoutMs: int
+): Future[tuple[addrText: string, plan: TsnetUdpExactDialPlan]] {.async.} =
+  result = selectDirectPeerPathPlan(n, spec)
+  if result.plan.ready:
+    return result
+  let deadlineAtMs = nowMillis() + int64(max(timeoutMs, 0))
+  while true:
+    let remainingMs = int(deadlineAtMs - nowMillis())
+    if remainingMs <= 0:
+      return result
+    await sleepAsync(chronos.milliseconds(min(100, remainingMs)))
+    result = selectDirectPeerPathPlan(n, spec)
+    if result.plan.ready:
+      return result
 
 proc publishDirectSessionTargetSnapshot(
     n: NimNode,
-    spec: DirectSessionTargetSpec,
-    forcedStatus = "",
-    forcedError = ""
+    spec: DirectSessionTargetSpec
 ) {.gcsafe, raises: [].} =
   if spec.peerId.len == 0 or spec.selectedAddrs.len == 0:
     return
-  let task =
-    if n.isNil:
-      nil
-    else:
-      n.bootstrapSeedConnectTasks.getOrDefault(spec.taskKey, nil)
-  let ready = bootstrapSeedConnectTaskSessionLive(n, task)
-  let running = bootstrapSeedConnectTaskRunning(n, task)
-  let effectiveStatus =
-    if forcedStatus.len > 0:
-      forcedStatus
-    elif ready:
-      "ready"
-    elif running:
-      "running"
-    elif not task.isNil and task.state == bscsProbing:
-      "probing"
-    elif not task.isNil and task.state == bscsFailed:
-      "failed"
-    else:
-      "pending"
-  let effectiveError =
-    if forcedError.len > 0:
-      forcedError
-    elif not task.isNil and task.sessionWarmError.len > 0:
-      task.sessionWarmError
-    elif not task.isNil:
-      task.err
-    else:
-      ""
-  let publishedSpec =
-    updatePublishedDirectSessionTargetSpec(
-      n,
-      spec,
-      effectiveStatus,
-      effectiveError,
-    )
-  let snapshot = buildPublishedDirectSessionTargetSnapshot(
-    n,
-    publishedSpec,
-    task,
-    effectiveStatus,
-    effectiveError,
-  )
+  let snapshot = liveDirectSessionTargetSnapshot(n, spec.peerId, spec.selectedAddrs)
   ffiNodeSafe:
     setDirectSessionTargetState(
-      publishedSpec.peerId,
-      publishedSpec.selectedAddrs,
+      spec.peerId,
+      spec.selectedAddrs,
       snapshot,
     )
+  firePeerRouteSessionReconcileWake(n)
+  discard publishRouteTransportSnapshot(n, spec.peerId, spec.selectedAddrs)
 
 proc reconcileDirectSessionTarget(
     n: NimNode,
@@ -24721,31 +28005,292 @@ proc reconcileDirectSessionTarget(
 ) {.gcsafe, raises: [].} =
   if n.isNil or spec.peerId.len == 0 or spec.selectedAddrs.len == 0:
     return
-  let hintRes = registerPeerHintsInternal(n, spec.peerId, spec.selectedAddrs, spec.source)
-  if hintRes.isErr():
-    publishDirectSessionTargetSnapshot(n, spec, "failed", hintRes.error)
+  if not n.started:
+    publishDirectSessionTargetSnapshot(n, spec)
     return
-  let existingTask = n.bootstrapSeedConnectTasks.getOrDefault(spec.taskKey, nil)
-  if bootstrapSeedConnectTaskSessionLive(n, existingTask):
-    publishDirectSessionTargetSnapshot(n, spec, "ready")
+  let liveDirectConnKey = livePeerDirectSessionConnKey(n, spec.peerId)
+  if liveDirectConnKey > 0:
+    var state = getOwnedDirectPeerPathState(n, spec.taskKey)
+    state.desired = true
+    markDirectPeerPathStateReady(
+      state,
+      liveDirectConnKey,
+      liveSessionConnPathKind(n, liveDirectConnKey),
+    )
+    setOwnedDirectPeerPathState(n, spec.taskKey, state)
+    publishDirectSessionTargetSnapshot(n, spec)
     return
-  if bootstrapSeedConnectTaskRunning(n, existingTask):
-    publishDirectSessionTargetSnapshot(n, spec, "running")
+  let currentState = getOwnedDirectPeerPathState(n, spec.taskKey)
+  if currentState.sessionConnKey > 0 and
+      not n.dmService.isNil and
+      n.dmService.hasLiveSessionConnKey(currentState.sessionConnKey) and
+      directSessionPathUsesDirect(liveSessionConnPathKind(n, currentState.sessionConnKey)):
+    var state = currentState
+    state.desired = true
+    markDirectPeerPathStateReady(
+      state,
+      currentState.sessionConnKey,
+      liveSessionConnPathKind(n, currentState.sessionConnKey),
+    )
+    setOwnedDirectPeerPathState(n, spec.taskKey, state)
+    publishDirectSessionTargetSnapshot(n, spec)
     return
-  publishDirectSessionTargetSnapshot(n, spec, "running")
-  try:
-    ffiNodeSafe:
-      discard getOrStartBootstrapSeedConnectTask(
-        n,
-        spec.peerId,
-        spec.selectedAddrs,
-        spec.source,
-        4_500,
-        bsciBackgroundWarm,
+  if directPeerPathTaskRunning(n, spec.taskKey):
+    publishDirectSessionTargetSnapshot(n, spec)
+    return
+  let taskKey = spec.taskKey
+  var reconcileFuture: Future[void] = nil
+  let task = proc() {.async: (raises: [Exception]).} =
+    try:
+      let hintRes = registerPeerHintsInternal(n, spec.peerId, spec.selectedAddrs, spec.source)
+      if hintRes.isErr():
+        var state = getOwnedDirectPeerPathState(n, taskKey)
+        state.desired = true
+        state.routeStage = "unavailable"
+        state.sessionStage = "failed"
+        state.sessionConnKey = 0
+        state.lastDialStage = "register_hints_failed"
+        state.lastError = hintRes.error
+        state.updatedAtMs = nowMillis()
+        inc state.failureCount
+        state.lastFailureAtMs = state.updatedAtMs
+        setOwnedDirectPeerPathState(n, taskKey, state)
+        publishDirectSessionTargetSnapshot(n, spec)
+        return
+
+      let reconcileDeadlineAtMs = nowMillis() + 4_500
+      proc remainingReconcileBudgetMs(): int =
+        int(max(reconcileDeadlineAtMs - nowMillis(), 0))
+      debugLog(
+        "[nimlibp2p] reconcileDirectSessionTarget provider_wait_begin peer=" & spec.peerId &
+        " taskKey=" & taskKey &
+        " mode=nonblocking"
       )
-  except Exception as exc:
-    publishDirectSessionTargetSnapshot(n, spec, "failed", exc.msg)
-    return
+      var localTailnetReady = requestLocalTsnetProviderReady(n)
+      if not localTailnetReady.ok:
+        if tailnetProviderWarmPending(localTailnetReady.detail):
+          debugLog(
+            "[nimlibp2p] reconcileDirectSessionTarget provider_wait_pending peer=" & spec.peerId &
+            " taskKey=" & taskKey
+          )
+          var state = getOwnedDirectPeerPathState(n, taskKey)
+          state.desired = true
+          state.routeStage = "provider_wait"
+          state.sessionStage = "pending"
+          state.sessionConnKey = 0
+          state.lastDialStage = "provider_wait"
+          state.lastError = localTailnetReady.err
+          state.updatedAtMs = nowMillis()
+          setOwnedDirectPeerPathState(n, taskKey, state)
+          publishDirectSessionTargetSnapshot(n, spec)
+          let providerWaitBudgetMs = remainingReconcileBudgetMs()
+          if providerWaitBudgetMs > 0:
+            localTailnetReady = await ensureLocalTsnetReady(n, providerWaitBudgetMs)
+          if not localTailnetReady.ok and
+              localTailnetReady.err == TailnetProviderWarmPendingErr:
+            return
+        if not localTailnetReady.ok:
+          debugLog(
+            "[nimlibp2p] reconcileDirectSessionTarget provider_wait_failed peer=" & spec.peerId &
+            " taskKey=" & taskKey &
+            " err=" & localTailnetReady.err
+          )
+          var state = getOwnedDirectPeerPathState(n, taskKey)
+          state.desired = true
+          state.routeStage = "unavailable"
+          state.sessionStage = "failed"
+          state.sessionConnKey = 0
+          state.lastDialStage = "udp_target_not_ready"
+          state.lastError = localTailnetReady.err
+          state.updatedAtMs = nowMillis()
+          inc state.failureCount
+          state.lastFailureAtMs = state.updatedAtMs
+          setOwnedDirectPeerPathState(n, taskKey, state)
+          publishDirectSessionTargetSnapshot(n, spec)
+          return
+      debugLog(
+        "[nimlibp2p] reconcileDirectSessionTarget provider_wait_done peer=" & spec.peerId &
+        " taskKey=" & taskKey
+      )
+      let liveDirectConnKeyAfterProvider = livePeerDirectSessionConnKey(n, spec.peerId)
+      if liveDirectConnKeyAfterProvider > 0:
+        var state = getOwnedDirectPeerPathState(n, taskKey)
+        state.desired = true
+        markDirectPeerPathStateReady(
+          state,
+          liveDirectConnKeyAfterProvider,
+          liveSessionConnPathKind(n, liveDirectConnKeyAfterProvider),
+        )
+        setOwnedDirectPeerPathState(n, taskKey, state)
+        publishDirectSessionTargetSnapshot(n, spec)
+        return
+      let directWarmBudgetMs = remainingReconcileBudgetMs()
+      if directWarmBudgetMs <= 0:
+        var state = getOwnedDirectPeerPathState(n, taskKey)
+        state.desired = true
+        state.routeStage = "unavailable"
+        state.sessionStage = "failed"
+        state.sessionConnKey = 0
+        state.lastDialStage = "udp_target_not_ready"
+        state.lastError = "direct session budget exhausted before warm"
+        state.updatedAtMs = nowMillis()
+        inc state.failureCount
+        state.lastFailureAtMs = state.updatedAtMs
+        setOwnedDirectPeerPathState(n, taskKey, state)
+        publishDirectSessionTargetSnapshot(n, spec)
+        return
+      var planned = selectDirectPeerPathPlan(n, spec)
+      var state = getOwnedDirectPeerPathState(n, taskKey)
+      state.desired = true
+      state.routeStage = exactDialStageLabel(planned.plan.stage)
+      state.routePathKind = planned.plan.pathKind.strip().toLowerAscii()
+      state.updatedAtMs = nowMillis()
+      if not planned.plan.ready:
+        state.sessionStage = "route_wait"
+        state.sessionConnKey = 0
+        state.lastDialStage = exactDialStageLabel(planned.plan.stage)
+        state.lastError =
+          if planned.plan.error.len > 0:
+            planned.plan.error
+          else:
+            exactDialStageLabel(planned.plan.stage)
+        setOwnedDirectPeerPathState(n, taskKey, state)
+        publishDirectSessionTargetSnapshot(n, spec)
+        let planWaitBudgetMs = remainingReconcileBudgetMs()
+        if planWaitBudgetMs > 0:
+          planned = await waitForDirectPeerPathPlanReady(n, spec, planWaitBudgetMs)
+        let liveDirectConnKeyAfterRouteWait = livePeerDirectSessionConnKey(n, spec.peerId)
+        if liveDirectConnKeyAfterRouteWait > 0:
+          state = getOwnedDirectPeerPathState(n, taskKey)
+          state.desired = true
+          markDirectPeerPathStateReady(
+            state,
+            liveDirectConnKeyAfterRouteWait,
+            liveSessionConnPathKind(n, liveDirectConnKeyAfterRouteWait),
+          )
+          setOwnedDirectPeerPathState(n, taskKey, state)
+          publishDirectSessionTargetSnapshot(n, spec)
+          return
+        state = getOwnedDirectPeerPathState(n, taskKey)
+        state.desired = true
+        state.routeStage = exactDialStageLabel(planned.plan.stage)
+        state.routePathKind = planned.plan.pathKind.strip().toLowerAscii()
+        state.updatedAtMs = nowMillis()
+        if not planned.plan.ready:
+          state.sessionStage = "route_wait"
+          state.sessionConnKey = 0
+          state.lastDialStage = exactDialStageLabel(planned.plan.stage)
+          state.lastError =
+            if planned.plan.error.len > 0:
+              planned.plan.error
+            else:
+              exactDialStageLabel(planned.plan.stage)
+          setOwnedDirectPeerPathState(n, taskKey, state)
+          publishDirectSessionTargetSnapshot(n, spec)
+          return
+
+      if state.sessionConnKey > 0 and
+          not n.dmService.isNil and
+          n.dmService.hasLiveSessionConnKey(state.sessionConnKey) and
+          directSessionPathUsesDirect(liveSessionConnPathKind(n, state.sessionConnKey)):
+        markDirectPeerPathStateReady(
+          state,
+          state.sessionConnKey,
+          liveSessionConnPathKind(n, state.sessionConnKey),
+        )
+        setOwnedDirectPeerPathState(n, taskKey, state)
+        publishDirectSessionTargetSnapshot(n, spec)
+        return
+
+      let peerRes = PeerId.init(spec.peerId)
+      if peerRes.isErr():
+        state.sessionStage = "failed"
+        state.sessionConnKey = 0
+        state.lastDialStage = "invalid_peer"
+        state.lastError = $peerRes.error
+        state.updatedAtMs = nowMillis()
+        inc state.failureCount
+        state.lastFailureAtMs = state.updatedAtMs
+        setOwnedDirectPeerPathState(n, taskKey, state)
+        publishDirectSessionTargetSnapshot(n, spec)
+        return
+
+      state.sessionStage = "warming"
+      state.sessionConnKey = 0
+      state.lastDialStage = "warming"
+      state.lastError = ""
+      state.updatedAtMs = nowMillis()
+      inc state.attemptCount
+      state.lastAttemptAtMs = state.updatedAtMs
+      setOwnedDirectPeerPathState(n, taskKey, state)
+      publishDirectSessionTargetSnapshot(n, spec)
+
+      let warmDetailBudgetMs = remainingReconcileBudgetMs()
+      let warmDetail = await warmSeededDirectSessionAsync(
+        n,
+        peerRes.get(),
+        spec.peerId,
+        planned.addrText,
+        planned.plan,
+        warmDetailBudgetMs,
+      )
+      let sessionPathKind = liveSessionConnPathKind(n, warmDetail.sessionConnKey)
+      state = getOwnedDirectPeerPathState(n, taskKey)
+      state.desired = true
+      state.routeStage = exactDialStageLabel(planned.plan.stage)
+      state.routePathKind =
+        if planned.plan.pathKind.len > 0:
+          planned.plan.pathKind.strip().toLowerAscii()
+        else:
+          sessionPathKind
+      state.updatedAtMs = nowMillis()
+      if warmDetail.sessionWarmOk and warmDetail.sessionConnKey > 0 and
+          directSessionPathUsesDirect(sessionPathKind):
+        markDirectPeerPathStateReady(
+          state,
+          warmDetail.sessionConnKey,
+          sessionPathKind,
+          exactDialStageLabel(planned.plan.stage),
+        )
+      else:
+        let errMsg =
+          if warmDetail.sessionWarmError.len > 0:
+            warmDetail.sessionWarmError
+          elif sessionPathKind.len > 0 and not directSessionPathUsesDirect(sessionPathKind):
+            "direct session resolved to " & sessionPathKind & " path"
+          else:
+            "direct session unavailable"
+        state.sessionStage = "failed"
+        state.sessionConnKey = 0
+        state.lastDialStage =
+          if warmDetail.lastDialStage.len > 0:
+            warmDetail.lastDialStage
+          else:
+            let classified = classifyDirectWarmFailureStage(errMsg)
+            if classified.len > 0:
+              classified
+            else:
+              "session_attach_timeout"
+        state.lastError = errMsg
+        inc state.failureCount
+        state.lastFailureAtMs = state.updatedAtMs
+      setOwnedDirectPeerPathState(n, taskKey, state)
+      publishDirectSessionTargetSnapshot(n, spec)
+    finally:
+      n.directSessionTargetLock.acquire()
+      try:
+        let current = n.directPeerPathFutures.getOrDefault(taskKey, nil)
+        if current == reconcileFuture:
+          n.directPeerPathFutures.del(taskKey)
+      finally:
+        n.directSessionTargetLock.release()
+  reconcileFuture = task()
+  n.directSessionTargetLock.acquire()
+  try:
+    n.directPeerPathFutures[taskKey] = reconcileFuture
+  finally:
+    n.directSessionTargetLock.release()
+  asyncSpawn(reconcileFuture)
   publishDirectSessionTargetSnapshot(n, spec)
 
 proc ensureDirectSessionTargetReconcileLoop(n: NimNode) {.gcsafe, raises: [].} =
@@ -24765,7 +28310,16 @@ proc ensureDirectSessionTargetReconcileLoop(n: NimNode) {.gcsafe, raises: [].} =
               "[nimlibp2p] directSessionTarget reconcile failed peer=" & spec.peerId &
               " err=" & exc.msg
             )
-            publishDirectSessionTargetSnapshot(n, spec, "failed", exc.msg)
+            var state = getOwnedDirectPeerPathState(n, spec.taskKey)
+            state.desired = true
+            state.sessionStage = "failed"
+            state.lastDialStage = classifyDirectWarmFailureStage(exc.msg)
+            state.lastError = exc.msg
+            state.updatedAtMs = nowMillis()
+            inc state.failureCount
+            state.lastFailureAtMs = state.updatedAtMs
+            setOwnedDirectPeerPathState(n, spec.taskKey, state)
+            publishDirectSessionTargetSnapshot(n, spec)
       await sleepAsync(chronos.milliseconds(750))
   let reconcileFuture = loop()
   n.directSessionTargetReconcileLoop = reconcileFuture
@@ -24775,17 +28329,49 @@ proc upsertDirectSessionTarget(
     n: NimNode,
     peerIdText: string,
     addresses: seq[string],
-    source: string
+    source: string,
+    reconcileRelay = true
 ): DirectSessionTargetSpec {.gcsafe, raises: [].} =
+  debugLog(
+    "[nimlibp2p] upsertDirectSessionTarget begin peer=" & peerIdText.strip() &
+    " source=" & source.strip() &
+    " addrCount=" & $addresses.len
+  )
   let spec = upsertDirectSessionTargetDesiredState(n, peerIdText, addresses, source)
   if spec.taskKey.len == 0:
     return DirectSessionTargetSpec()
-  publishDirectSessionTargetSnapshot(n, spec, "pending")
-  try:
-    reconcileDirectSessionTarget(n, spec)
-  except CatchableError as exc:
-    publishDirectSessionTargetSnapshot(n, spec, "failed", exc.msg)
+  publishDirectSessionTargetSnapshot(n, spec)
+  if n.started:
+    try:
+      reconcileDirectSessionTarget(n, spec)
+    except CatchableError as exc:
+      var state = getOwnedDirectPeerPathState(n, spec.taskKey)
+      state.desired = true
+      state.sessionStage = "failed"
+      state.lastDialStage = classifyDirectWarmFailureStage(exc.msg)
+      state.lastError = exc.msg
+      state.updatedAtMs = nowMillis()
+      inc state.failureCount
+      state.lastFailureAtMs = state.updatedAtMs
+      setOwnedDirectPeerPathState(n, spec.taskKey, state)
+      publishDirectSessionTargetSnapshot(n, spec)
+    if reconcileRelay:
+      try:
+        debugLog(
+          "[nimlibp2p] upsertDirectSessionTarget relay_reconcile_now peer=" & spec.peerId &
+          " source=" & spec.source &
+          " taskKey=" & spec.taskKey
+        )
+        reconcilePeerRouteSession(n, spec.peerId, spec.source)
+      except CatchableError as exc:
+        debugLog(
+          "[nimlibp2p] upsertDirectSessionTarget relay_reconcile_failed peer=" & spec.peerId &
+          " source=" & spec.source &
+          " err=" & exc.msg
+        )
   ensureDirectSessionTargetReconcileLoop(n)
+  if reconcileRelay:
+    ensurePeerRouteSessionReconcileLoop(n)
   spec
 
 proc exactSeedConnectTotalBudgetMs(addrs: openArray[string]): int {.gcsafe, raises: [].}
@@ -25345,17 +28931,91 @@ proc tailnetReadySnapshot(n: NimNode): JsonNode {.gcsafe, raises: [].} =
       "providerReady": false,
       "proxyListenersReady": false,
       "error": "node unavailable",
+      "tailnetStartStatus": {
+        "started": false,
+        "inFlight": false,
+        "stage": "invalid_node",
+        "error": "node unavailable",
+      },
     }
-  let payload = buildTailnetStatusPayload(n)
-  if payload.kind == JObject:
-    return cloneJson(payload)
-  %*{
-    "ok": false,
-    "phase": "invalid_tailnet_status",
-    "providerReady": false,
-    "proxyListenersReady": false,
-    "error": "tailnet status unavailable",
+  let tailnetStart = buildTailnetStartStatusPayload(n)
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    result = %*{
+      "ok": false,
+      "phase": "invalid_tailnet_status",
+      "enabled": false,
+      "running": not n.isNil and n.started,
+      "providerReady": false,
+      "proxyListenersReady": false,
+      "providerStage": "unavailable",
+      "tailnetIPs": newJArray(),
+      "error": "tailnet status unavailable",
+      "tailnetStartStatus": tailnetStart,
+    }
+    return
+  let providerReady = transport.providerReadySafe()
+  let proxyListenersReady = transport.proxyListenersReadySafe()
+  let providerStage =
+    if providerReady:
+      "ready"
+    else:
+      jsonGetStr(tailnetStart, "stage", "starting")
+  result = %*{
+    "ok": providerReady,
+    "enabled": true,
+    "running": not n.isNil and n.started,
+    "providerReady": providerReady,
+    "proxyListenersReady": proxyListenersReady,
+    "providerStage": providerStage,
+    "tailnetIPs": transport.providerTailnetIpTextsSafe(),
+    "tailnetStartStatus": tailnetStart,
   }
+  if jsonGetBool(tailnetStart, "inFlight", false):
+    result["deferred"] = %true
+
+proc tailnetProviderWarmPending(detail: JsonNode): bool {.gcsafe, raises: [].} =
+  if detail.kind != JObject or jsonGetBool(detail, "providerReady", false):
+    return false
+  var startStatus = newJObject()
+  let rawStartStatus = detail{"tailnetStartStatus"}
+  if not rawStartStatus.isNil and rawStartStatus.kind == JObject:
+    startStatus = rawStartStatus
+  let startStage =
+    jsonGetStr(
+      startStatus,
+      "stage",
+      jsonGetStr(detail, "providerStage", ""),
+    ).strip().toLowerAscii()
+  jsonGetBool(startStatus, "inFlight", false) or
+    jsonGetBool(detail, "deferred", false) or
+    startStage in ["queued", "starting", "started"]
+
+proc requestLocalTsnetProviderReady(
+    n: NimNode
+): tuple[ok: bool, err: string, detail: JsonNode] {.gcsafe, raises: [].} =
+  var snapshot = tailnetReadySnapshot(n)
+  if jsonGetBool(snapshot, "providerReady", false):
+    snapshot["phase"] = %"local_tailnet_provider_ready"
+    return (true, "", snapshot)
+  let transport = activeTsnetTransport(n)
+  if transport.isNil:
+    snapshot["phase"] = %"local_tailnet_unavailable"
+    snapshot["error"] = %"tsnet transport unavailable"
+    return (false, "tsnet transport unavailable", snapshot)
+  let warmKick = kickTailnetWarmOnOwnerThread(n)
+  snapshot = tailnetReadySnapshot(n)
+  if jsonGetBool(snapshot, "providerReady", false):
+    snapshot["phase"] = %"local_tailnet_provider_ready"
+    return (true, "", snapshot)
+  if not warmKick.ok:
+    snapshot["phase"] = %"local_tailnet_warm_failed"
+    snapshot["error"] = %warmKick.err
+    return (false, warmKick.err, snapshot)
+  ensureTailnetListenerRepairTask(n, "provider_wait")
+  snapshot["phase"] = %"local_tailnet_provider_pending"
+  snapshot["error"] = %TailnetProviderWarmPendingErr
+  (false, TailnetProviderWarmPendingErr, snapshot)
 
 proc tsnetLocalReady(n: NimNode): bool {.gcsafe, raises: [].} =
   let payload = tailnetReadySnapshot(n)
@@ -25377,15 +29037,14 @@ proc ensureLocalTsnetReady(
     return (false, "tsnet transport unavailable", snapshot)
   let deadlineMs = nowMillis() + int64(max(timeoutMs, 0))
   if not jsonGetBool(snapshot, "providerReady", false):
-    let warmRes = transport.warmProvider()
-    if warmRes.isErr():
-      snapshot = tailnetReadySnapshot(n)
+    let warmKick = kickTailnetWarmOnOwnerThread(n)
+    if not warmKick.ok:
       snapshot["phase"] = %"local_tailnet_warm_failed"
-      snapshot["error"] = %warmRes.error
-      return (false, warmRes.error, snapshot)
-    discard mergeTsnetListenAddrsIntoPeerInfo(n, transport)
-    publishTsnetLocalPeerInfo(n, transport)
+      snapshot["error"] = %warmKick.err
+      return (false, warmKick.err, snapshot)
+    ensureTailnetListenerRepairTask(n, "provider_wait")
     snapshot = tailnetReadySnapshot(n)
+    snapshot["phase"] = %"local_tailnet_warm_kicked"
   while true:
     if jsonGetBool(snapshot, "providerReady", false):
       snapshot["phase"] = %"local_tailnet_provider_ready"
@@ -25393,22 +29052,58 @@ proc ensureLocalTsnetReady(
     let remainingMs = int(deadlineMs - nowMillis())
     if remainingMs <= 0:
       break
+    ensureTailnetListenerRepairTask(n, "provider_wait")
     await sleepAsync(chronos.milliseconds(min(100, remainingMs)))
     snapshot = tailnetReadySnapshot(n)
   let errMsg =
-    if not jsonGetBool(snapshot, "providerReady", false):
+    if tailnetProviderWarmPending(snapshot):
+      TailnetProviderWarmPendingErr
+    elif not jsonGetBool(snapshot, "providerReady", false):
       "local tailnet provider not ready"
     else:
       "local tailnet not ready"
-  snapshot["phase"] = %"local_tailnet_provider_not_ready"
+  snapshot["phase"] = %(
+    if errMsg == TailnetProviderWarmPendingErr:
+      "local_tailnet_provider_pending"
+    else:
+      "local_tailnet_provider_not_ready"
+  )
   snapshot["error"] = %errMsg
   (false, errMsg, snapshot)
+
+proc reconcileDesiredRouteSessionsNow(n: NimNode, source: string) {.gcsafe, raises: [].} =
+  if n.isNil or not n.started:
+    return
+  let desiredTargets = copyDirectSessionTargetSpecs(n)
+  if desiredTargets.len == 0:
+    return
+  for spec in desiredTargets:
+    try:
+      reconcileDirectSessionTarget(n, spec)
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] reconcileDesiredRouteSessionsNow direct failed peer=" & spec.peerId &
+        " source=" & source &
+        " err=" & exc.msg
+      )
+  for spec in latestDesiredRelayRouteTargets(n):
+    try:
+      reconcilePeerRouteSession(n, spec.peerId, spec.source)
+    except CatchableError as exc:
+      debugLog(
+        "[nimlibp2p] reconcileDesiredRouteSessionsNow relay failed peer=" & spec.peerId &
+        " source=" & source &
+        " err=" & exc.msg
+      )
 
 proc executeSendDirectCommand(
     n: NimNode,
     command: Command
 ): Future[void] {.async.} =
   template updateKickoffStage(stageText: string, errText = "", detailNode: JsonNode = newJNull()) =
+    var mergedDetail = detailNode
+    if mergedDetail.kind != JObject:
+      mergedDetail = newJObject()
     ffiNodeSafe:
       updateSendWithAckKickoffProgress(
         command.streamKey,
@@ -25419,7 +29114,7 @@ proc executeSendDirectCommand(
         command.ackRequested,
         command.messageId,
         errText,
-        detailNode,
+        mergedDetail,
       )
 
   template finalizeKickoffFailure(defaultStage: string, errText: string, detailNode: JsonNode = newJNull()) =
@@ -25595,61 +29290,93 @@ proc executeSendDirectCommand(
   var reuseVerifiedLiveConnection = false
   var verifiedMuxer: Muxer = nil
   var usedRelayRouteSession = false
-  var preferredSessionConnKey =
-    if command.sessionConnKey > 0 and n.dmService.hasLiveSessionConnKey(command.sessionConnKey):
-      command.sessionConnKey
-    elif selectedTargetAddrs.len > 0:
-      let snapshotConnKey = ffiNodeSafe:
-        getLiveReadyDirectSessionTargetConnKey(n, normalizedPeerId, selectedTargetAddrs)
-      if snapshotConnKey > 0 and n.dmService.hasLiveSessionConnKey(snapshotConnKey):
-        snapshotConnKey
-      else:
-        0
-    else:
-      0
+  var preferredSessionConnIsRelay = false
+  var preferredSessionConnKey = 0
+  let explicitTsnetSeedRoute =
+    command.addresses.len > 0 and hasTsnetTargetAddress(command.addresses)
+  if command.sessionConnKey > 0 and n.dmService.hasLiveSessionConnKey(command.sessionConnKey):
+    preferredSessionConnKey = command.sessionConnKey
+    preferredSessionConnIsRelay = command.boolParam
+  elif selectedTargetAddrs.len > 0:
+    let snapshotConnKey = ffiNodeSafe:
+      getLiveReadyDirectSessionTargetConnKey(n, normalizedPeerId, selectedTargetAddrs)
+    if snapshotConnKey > 0 and n.dmService.hasLiveSessionConnKey(snapshotConnKey):
+      preferredSessionConnKey = snapshotConnKey
+      preferredSessionConnIsRelay = false
   if command.addresses.len > 0:
-    if hasTsnetTargetAddress(command.addresses):
-      let remainingMs = remainingBudgetMs()
-      if remainingMs <= 0:
-        peerReadyOk = false
-        peerReadyErr = "send timeout budget exhausted before local tailnet ready"
-        updateKickoffStage("local_tailnet_budget_exhausted", peerReadyErr)
-      else:
-        updateKickoffStage("local_tailnet_ready_wait")
-        let tailnetReady = await ensureLocalTsnetReady(n, remainingMs)
-        if not tailnetReady.ok:
-          peerReadyOk = false
-          peerReadyErr = tailnetReady.err
-          updateKickoffStage("local_tailnet_not_ready", peerReadyErr, tailnetReady.detail)
+    if explicitTsnetSeedRoute:
+      let effectiveSource =
+        if command.source.len > 0:
+          command.source
         else:
-          updateKickoffStage("local_tailnet_ready", "", tailnetReady.detail)
-    if not peerReadyErr.isEmptyOrWhitespace():
-      discard
-    elif command.boolParam:
-      if selectedTargetAddrs.len == 0:
+          "cmd_send_direct"
+      let pathPolicy =
+        if command.boolParam:
+          ppRelayOnly
+        else:
+          ppDirectThenRelay
+      if preferredSessionConnKey > 0:
+        peerReadyOk = true
+        peerReadyErr = ""
+        updateKickoffStage(
+          "peer_ready",
+          "",
+          %*{
+            "pathSelection": peerPathPolicyText(pathPolicy),
+            "sendPath":
+              if preferredSessionConnIsRelay:
+                "relay_ready_session"
+              else:
+                "direct_ready_session",
+            "sessionReuse": "command_session_conn",
+            "addressCount": command.addresses.len,
+            "selectedAddrCount": selectedTargetAddrs.len,
+            "hintAddressCount": selectedTargetAddrs.len,
+            "reservedAckBudgetMs": 0,
+            "sessionConnKey": preferredSessionConnKey,
+          }
+        )
+      elif selectedTargetAddrs.len == 0:
         peerReadyOk = false
         peerReadyErr = "no dialable seed address"
         updateKickoffStage(
           "connect_exact_failed",
           peerReadyErr,
           %*{
-            "pathSelection": "relay_only",
+            "pathSelection": peerPathPolicyText(pathPolicy),
             "addressCount": command.addresses.len,
             "selectedAddrCount": selectedTargetAddrs.len,
           }
         )
       else:
-        let routeWaitBudgetMs = remainingBudgetMs()
-        let sessionReady = await waitForDirectOrRelaySessionReady(
+        updateKickoffStage(
+          "path_intent_upsert",
+          "",
+          %*{
+            "pathSelection": peerPathPolicyText(pathPolicy),
+            "addressCount": command.addresses.len,
+            "selectedAddrCount": selectedTargetAddrs.len,
+          }
+        )
+        let routeSnapshot = upsertRouteTransportIntent(
+          n,
+          normalizedPeerId,
+          selectedTargetAddrs,
+          effectiveSource,
+          pathPolicy,
+        )
+        let routeWaitBudgetMs = max(remainingBudgetMs(), 0)
+        let sessionReady = await waitForRouteTransportReady(
           n,
           normalizedPeerId,
           selectedTargetAddrs,
           routeWaitBudgetMs,
-          if command.source.len > 0: command.source else: "cmd_send_direct",
+          effectiveSource,
         )
         if sessionReady.ok and sessionReady.connKey > 0:
           preferredDmAddrs = @[]
           preferredSessionConnKey = sessionReady.connKey
+          preferredSessionConnIsRelay = sessionReady.useRelay
           reuseVerifiedLiveConnection = false
           verifiedMuxer = nil
           usedRelayRouteSession = sessionReady.useRelay
@@ -25659,7 +29386,7 @@ proc executeSendDirectCommand(
             "peer_ready",
             "",
             %*{
-              "pathSelection": "direct_ready_or_relay",
+              "pathSelection": peerPathPolicyText(pathPolicy),
               "sendPath":
                 if sessionReady.useRelay:
                   "relay_ready_session"
@@ -25668,12 +29395,12 @@ proc executeSendDirectCommand(
               "addressCount": command.addresses.len,
               "selectedAddrCount": selectedTargetAddrs.len,
               "hintAddressCount": selectedTargetAddrs.len,
-              "directTargetStatus": sessionReady.directSnapshot.status,
-              "directTargetTaskRunning": sessionReady.directSnapshot.taskRunning,
-              "directTargetSessionConnKey": sessionReady.directSnapshot.sessionConnKey,
-              "relayTargetStatus": sessionReady.relaySnapshot.status,
-              "relayTargetTaskRunning": sessionReady.relaySnapshot.taskRunning,
-              "relayTargetSessionConnKey": sessionReady.relaySnapshot.sessionConnKey,
+              "directStage": sessionReady.snapshot.directStage,
+              "directConnKey": sessionReady.snapshot.directConnKey,
+              "relayStage": sessionReady.snapshot.relayStage,
+              "relayConnKey": sessionReady.snapshot.relayConnKey,
+              "selectedPath": sessionReady.snapshot.selectedPath,
+              "reservedAckBudgetMs": 0,
               "sessionConnKey": sessionReady.connKey,
             }
           )
@@ -25684,21 +29411,16 @@ proc executeSendDirectCommand(
             "connect_exact_failed",
             peerReadyErr,
             %*{
-              "pathSelection": "direct_ready_or_relay",
-              "sendPath":
-                if sessionReady.useRelay:
-                  "relay_ready_session"
-                else:
-                  "direct_ready_session",
+              "pathSelection": peerPathPolicyText(pathPolicy),
               "addressCount": command.addresses.len,
               "selectedAddrCount": selectedTargetAddrs.len,
-              "hintAddressCount": selectedTargetAddrs.len,
-              "directTargetStatus": sessionReady.directSnapshot.status,
-              "directTargetTaskRunning": sessionReady.directSnapshot.taskRunning,
-              "directTargetError": sessionReady.directSnapshot.error,
-              "relayTargetStatus": sessionReady.relaySnapshot.status,
-              "relayTargetTaskRunning": sessionReady.relaySnapshot.taskRunning,
-              "relayTargetError": sessionReady.relaySnapshot.error,
+              "directStage": sessionReady.snapshot.directStage,
+              "directError": sessionReady.snapshot.directError,
+              "relayStage": sessionReady.snapshot.relayStage,
+              "relayError": sessionReady.snapshot.relayError,
+              "selectedPath": sessionReady.snapshot.selectedPath,
+              "routeStatus": routeSnapshot.status,
+              "reservedAckBudgetMs": 0,
             }
           )
     elif preferredSessionConnKey > 0:
@@ -25715,100 +29437,23 @@ proc executeSendDirectCommand(
         }
       )
     else:
-      let remainingMs = remainingBudgetMs()
-      if remainingMs <= 0:
-        peerReadyOk = false
-        peerReadyErr = "send timeout budget exhausted before connect"
-        updateKickoffStage("connect_exact_budget_exhausted", peerReadyErr)
-        debugLog(
-          "[nimlibp2p] cmdSendDirect connect budget exhausted peer=" & command.peerId &
-          " addrCount=" & $command.addresses.len
-        )
+      updateKickoffStage("connect_exact")
+      let connectBudgetMs = max(remainingBudgetMs(), 0)
+      let connectReady = await ensurePeerReadyViaExplicitAddresses(
+        n,
+        normalizedPeerId,
+        selectedTargetAddrs,
+        if command.source.len > 0: command.source else: "cmd_send_direct",
+        connectBudgetMs,
+      )
+      peerReadyOk = connectReady.ok
+      peerReadyErr = connectReady.err
+      verifiedMuxer = connectReady.verifiedMuxer
+      reuseVerifiedLiveConnection = connectReady.ok and not connectReady.verifiedMuxer.isNil
+      if peerReadyOk:
+        updateKickoffStage("peer_ready", "", connectReady.detail)
       else:
-        updateKickoffStage("connect_exact")
-        let directTargetSpec = upsertDirectSessionTarget(
-          n,
-          normalizedPeerId,
-          selectedTargetAddrs,
-          if command.source.len > 0: command.source else: "cmd_send_direct",
-        )
-        var directTargetSnapshot = ffiNodeSafe:
-          liveDirectSessionTargetSnapshot(n, normalizedPeerId, selectedTargetAddrs)
-        var directTargetConnKey = ffiNodeSafe:
-          getLiveReadyDirectSessionTargetConnKey(n, normalizedPeerId, selectedTargetAddrs)
-        if directTargetConnKey > 0 and
-            not n.dmService.hasLiveSessionConnKey(directTargetConnKey):
-          directTargetConnKey = 0
-        var directTargetDetail = %*{
-          "joinedDirectTarget": directTargetSpec.taskKey.len > 0,
-          "taskKey": directTargetSpec.taskKey,
-          "status": directTargetSnapshot.status,
-          "taskRunning": directTargetSnapshot.taskRunning,
-          "sessionWarmOk": directTargetSnapshot.sessionWarmOk,
-          "verifiedMuxer": directTargetSnapshot.verifiedMuxer,
-          "sessionConnKey": directTargetSnapshot.sessionConnKey,
-          "addressCount": selectedTargetAddrs.len,
-        }
-        if directTargetSnapshot.error.len > 0:
-          directTargetDetail["error"] = %directTargetSnapshot.error
-        if directTargetConnKey > 0:
-          peerReadyOk = true
-          peerReadyErr = ""
-          reuseVerifiedLiveConnection = false
-          verifiedMuxer = nil
-          preferredSessionConnKey = directTargetConnKey
-          directTargetDetail["sessionReuse"] = %"direct_target_ready"
-          directTargetDetail["sessionConnKey"] = %directTargetConnKey
-          updateKickoffStage("peer_ready", "", directTargetDetail)
-          debugLog(
-            "[nimlibp2p] cmdSendDirect direct target ready peer=" & command.peerId &
-            " sessionConnKey=" & $directTargetConnKey &
-            " status=" & directTargetSnapshot.status
-          )
-        else:
-          let directTargetErr =
-            if directTargetSnapshot.error.len > 0:
-              directTargetSnapshot.error
-            elif directTargetSpec.taskKey.len == 0:
-              "direct session target unavailable"
-            elif directTargetSnapshot.status.toLowerAscii() == "failed":
-              "bootstrap direct session failed"
-            else:
-              "bootstrap direct session probing"
-          directTargetDetail["fallbackPath"] = %"relay_route_session"
-          updateKickoffStage("connect_relay_fallback", directTargetErr, directTargetDetail)
-          let fallbackBudgetMs = remainingBudgetMs()
-          if fallbackBudgetMs <= 0:
-            peerReadyOk = false
-            peerReadyErr = "send timeout budget exhausted before relay fallback"
-            updateKickoffStage("connect_exact_failed", peerReadyErr, directTargetDetail)
-          else:
-            let routeReady = await waitForPeerRouteSessionReady(
-              n,
-              normalizedPeerId,
-              fallbackBudgetMs,
-              if command.source.len > 0: command.source else: "cmd_send_direct",
-            )
-            if routeReady.ok and routeReady.connKey > 0:
-              preferredDmAddrs = @[]
-              preferredSessionConnKey = routeReady.connKey
-              reuseVerifiedLiveConnection = false
-              verifiedMuxer = nil
-              usedRelayRouteSession = true
-              peerReadyOk = true
-              peerReadyErr = ""
-              directTargetDetail["sendPath"] = %"relay_ready_session"
-              directTargetDetail["relayTargetStatus"] = %routeReady.snapshot.status
-              directTargetDetail["relayTargetTaskRunning"] = %routeReady.snapshot.taskRunning
-              directTargetDetail["sessionConnKey"] = %routeReady.connKey
-              updateKickoffStage("peer_ready", "", directTargetDetail)
-            else:
-              peerReadyOk = false
-              peerReadyErr = routeReady.err
-              directTargetDetail["relayTargetStatus"] = %routeReady.snapshot.status
-              directTargetDetail["relayTargetTaskRunning"] = %routeReady.snapshot.taskRunning
-              directTargetDetail["relayTargetError"] = %routeReady.snapshot.error
-              updateKickoffStage("connect_exact_failed", peerReadyErr, directTargetDetail)
+        updateKickoffStage("connect_exact_failed", peerReadyErr, connectReady.detail)
   else:
     updateKickoffStage("ensure_connectivity")
     let connectivityOk = await ensurePeerConnectivity(
@@ -25818,15 +29463,23 @@ proc executeSendDirectCommand(
     )
     if connectivityOk:
       let remainingMs = remainingBudgetMs()
-      if remainingMs <= 0:
+      let connectRemainingMs = remainingBudgetMs()
+      if connectRemainingMs <= 0:
         peerReadyOk = false
         peerReadyErr = "send timeout budget exhausted before identify"
-        updateKickoffStage("identify_wait_budget_exhausted", peerReadyErr)
+        updateKickoffStage(
+          "identify_wait_budget_exhausted",
+          peerReadyErr,
+          %*{
+            "reservedAckBudgetMs": 0,
+            "remainingBudgetMs": remainingMs,
+          }
+        )
       else:
         updateKickoffStage("identify_wait")
         let identifyWaitMs =
           if overallTimeoutMs > 0:
-            max(min(remainingMs div 2, 8_000), 1_000)
+            max(min(connectRemainingMs div 2, 8_000), 1_000)
           else:
             8_000
         peerReadyOk = await ensurePeerIdentified(
@@ -25869,10 +29522,11 @@ proc executeSendDirectCommand(
       recordDirectAckLatencyFailure(n, command.peerId, errMsg)
     info "cmdSendDirect failed", peer = command.peerId, mid = mid, err = errMsg
     return
+  let usedRelaySession = usedRelayRouteSession or preferredSessionConnIsRelay
   let sendPath =
-    if usedRelayRouteSession:
+    if usedRelaySession:
       "relay_ready_session"
-    elif preferredSessionConnKey > 0 and command.boolParam:
+    elif preferredSessionConnKey > 0 and explicitTsnetSeedRoute:
       "direct_ready_session"
     elif preferredSessionConnKey > 0:
       "warmed_session_conn"
@@ -25882,7 +29536,7 @@ proc executeSendDirectCommand(
       "verified_live_connection"
     else:
       "generic_connectivity"
-  let sendRelayOnly = command.boolParam and usedRelayRouteSession
+  let sendRelayOnly = explicitTsnetSeedRoute and command.boolParam and usedRelaySession
   debugLog("[nimlibp2p] cmdSendDirect connectivity peer=" & command.peerId &
     " ok=true ackRequested=" & $command.ackRequested &
     " path=" & sendPath &
@@ -25894,7 +29548,14 @@ proc executeSendDirectCommand(
     command.errorMsg = errMsg
     n.lastDirectError = errMsg
     command.resultCode = NimResultError
-    updateKickoffStage("send_budget_exhausted", errMsg)
+    updateKickoffStage(
+      "send_budget_exhausted",
+      errMsg,
+      %*{
+        "reservedAckBudgetMs": 0,
+        "remainingBudgetMs": sendBudgetMs,
+      }
+    )
     finalizeKickoffFailure("send_budget_exhausted", errMsg)
     debugLog(
       "[nimlibp2p] cmdSendDirect send budget exhausted peer=" & command.peerId &
@@ -26057,6 +29718,12 @@ proc runSendDirectKickoffAsync(
     " peer=" & safePeerId &
     " addrCount=" & $safeAddresses.len &
     " relayOnly=" & $(not taskState.isNil and taskState.forceRelayConnectivity) &
+    " sessionConnKey=" & $(
+      if not taskState.isNil:
+        taskState.preferredSessionConnKey
+      else:
+        0
+    ) &
     " timeoutMs=" & $timeoutMs &
     " remainingBudgetMs=" & $remainingBudgetMs &
     " source=" & safeSource
@@ -26100,6 +29767,8 @@ proc runSendDirectKickoffAsync(
     else:
       ""
   cmd.boolParam = not taskState.isNil and taskState.forceRelayConnectivity
+  if not taskState.isNil and taskState.preferredSessionConnKey > 0:
+    cmd.sessionConnKey = taskState.preferredSessionConnKey
   if payloadMid.len > 0:
     cmd.messageId = payloadMid
   let derivedOp = parseDirectEnvelopeOp(safePayload)
@@ -26117,22 +29786,20 @@ proc runSendDirectKickoffAsync(
       " err=" & cmd.errorMsg &
       " durationMs=" & $durationMs
     )
-    var progressStage = ""
-    if not ok:
-      ffiNodeSafe:
-        if sendWithAckKickoffProgressStage.hasKey(safeRequestKey):
-          progressStage =
-            sendWithAckKickoffProgressStage.getOrDefault(safeRequestKey, "").strip()
+    let progressPayload = ffiNodeSafe:
+      getSendWithAckKickoffPayloadSnapshot(safeRequestKey)
+    let progressStage =
+      if progressPayload.kind == JObject:
+        jsonGetStr(progressPayload, "stage").strip()
+      else:
+        ""
     let finalStage =
       if ok:
         "sent"
+      elif progressStage.len > 0 and progressStage != "send_done":
+        progressStage
       else:
-        if progressStage.len > 0 and progressStage != "send_done":
-          progressStage
-        else:
-          "send_with_ack"
-    let progressPayload = ffiNodeSafe:
-      getSendWithAckKickoffPayloadSnapshot(safeRequestKey)
+        "send_with_ack"
     var payload = progressPayload
     if payload.kind != JObject:
       payload = newJObject()
@@ -26159,15 +29826,17 @@ proc runSendDirectKickoffAsync(
       " peer=" & safePeerId &
       " err=" & exc.msg
     )
-    var failureStage = "send_exception"
-    ffiNodeSafe:
-      if sendWithAckKickoffProgressStage.hasKey(safeRequestKey):
-        let progressStage =
-          sendWithAckKickoffProgressStage.getOrDefault(safeRequestKey, "").strip()
-        if progressStage.len > 0:
-          failureStage = progressStage
     let progressPayload = ffiNodeSafe:
       getSendWithAckKickoffPayloadSnapshot(safeRequestKey)
+    let failureStage =
+      if progressPayload.kind == JObject:
+        let progressStage = jsonGetStr(progressPayload, "stage").strip()
+        if progressStage.len > 0:
+          progressStage
+        else:
+          "send_exception"
+      else:
+        "send_exception"
     var payload = progressPayload
     if payload.kind != JObject:
       payload = newJObject()
@@ -26722,7 +30391,7 @@ proc runBootstrapSeedConnectExactAsync(
       var peerConnected = false
       if peerRes.isOk():
         peerConnected = peerCurrentlyConnected(node, peerRes.get())
-      let warmWaitMs =
+      let connectWaitMs =
         exactSeedAllocatedBudgetMs(
           timeoutMs,
           remainingBudgetMs,
@@ -26730,118 +30399,92 @@ proc runBootstrapSeedConnectExactAsync(
           250
         )
       debugLog(
-        "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:session_warm_start peer=" & safePeerId &
+        "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:peer_ready_start peer=" & safePeerId &
         " addr=" & addr &
-        " waitMs=" & $warmWaitMs
+        " waitMs=" & $connectWaitMs
       )
-      var sessionReadyOk = false
-      var warmDetail = WarmSeededDirectSessionResult(
-        verifiedMuxer: nil,
-        verifiedMuxerWaitMs: 0,
-        sessionConnKey: 0,
-        sessionWarmOk: false,
-        sessionWarmError: "",
-      )
+      var connectReadyOk = false
+      var connectReadyErr = ""
+      var connectReadyPhase = ""
+      var connectReadyDetail = newJObject()
+      var verifiedMuxer: Muxer = nil
       try:
-        if peerRes.isOk():
-          warmDetail = await warmSeededDirectSessionAsync(
-            node,
-            peerRes.get(),
-            safePeerId,
-            addr,
-            warmWaitMs,
-          )
+        let readyRes = await ensurePeerReadyViaExplicitAddresses(
+          node,
+          safePeerId,
+          @[addr],
+          effectiveSource,
+          connectWaitMs,
+        )
+        connectReadyOk = readyRes.ok
+        connectReadyErr = readyRes.err
+        connectReadyPhase = readyRes.phase
+        if readyRes.detail.kind == JObject:
+          connectReadyDetail = cloneJson(readyRes.detail)
+        verifiedMuxer = readyRes.verifiedMuxer
       except CatchableError as exc:
-        warmDetail.sessionWarmError =
+        connectReadyErr =
           if exc.msg.len > 0: exc.msg else: $exc.name
-      let sessionPathKind = liveSessionConnPathKind(node, warmDetail.sessionConnKey)
-      let directRouteStatus = liveDirectRouteStatusForAddr(node, addr)
-      sessionReadyOk = warmDetail.sessionWarmOk and warmDetail.sessionConnKey > 0
-      let directSessionReadyOk = sessionReadyOk and sessionPathKind == "direct"
+        connectReadyPhase = "connect_failed"
       if peerRes.isOk():
         peerConnected = peerCurrentlyConnected(node, peerRes.get())
-      attemptNode["ok"] = %directSessionReadyOk
+      if connectReadyDetail.kind == JObject:
+        attemptNode = connectReadyDetail
+      attemptNode["addr"] = %addr
+      attemptNode["path"] = %addrPathKind
+      attemptNode["timeoutMs"] = %timeoutMs
+      attemptNode["ok"] = %connectReadyOk
       attemptNode["peerConnected"] = %peerConnected
-      attemptNode["connectOk"] = %sessionReadyOk
-      attemptNode["secureOk"] = %sessionReadyOk
-      attemptNode["verifiedMuxer"] = %(not warmDetail.verifiedMuxer.isNil)
-      attemptNode["verifiedMuxerWaitMs"] = %warmDetail.verifiedMuxerWaitMs
-      attemptNode["sessionConnKey"] = %warmDetail.sessionConnKey
-      attemptNode["sessionWarmOk"] = %warmDetail.sessionWarmOk
-      attemptNode["sessionReadyOk"] = %sessionReadyOk
-      attemptNode["sessionPathKind"] = %sessionPathKind
-      attemptNode["directRouteReady"] = %directRouteStatus.ready
-      attemptNode["directRoutePathKind"] = %directRouteStatus.pathKind
-      attemptNode["identifiedOk"] = %sessionReadyOk
-      if warmDetail.sessionWarmError.len > 0:
-        attemptNode["error"] = %warmDetail.sessionWarmError
-        attemptNode["sessionWarmError"] = %warmDetail.sessionWarmError
+      if connectReadyPhase.len > 0:
+        attemptNode["phase"] = %connectReadyPhase
+      if attemptNode{"connectOk"}.isNil:
+        attemptNode["connectOk"] = %connectReadyOk
+      attemptNode["verifiedMuxer"] = %(not verifiedMuxer.isNil)
+      if connectReadyErr.len > 0:
+        attemptNode["error"] = %connectReadyErr
+      let verifiedMuxerWaitMs = int(jsonGetInt64(attemptNode, "verifiedMuxerWaitMs", 0))
+      var bootstrapConnected = false
+      try:
+        let bootstrapNode = buildBootstrapStatusNode(node)
+        bootstrapConnected = bootstrapStatusShowsConnectedPeer(bootstrapNode, safePeerId)
+      except Exception:
+        bootstrapConnected = false
+      attemptNode["bootstrapConnected"] = %bootstrapConnected
       if not taskState.isNil:
-        taskState.verifiedMuxer = warmDetail.verifiedMuxer
-        taskState.verifiedMuxerWaitMs = warmDetail.verifiedMuxerWaitMs
-        taskState.sessionConnKey = warmDetail.sessionConnKey
-        taskState.sessionWarmOk = warmDetail.sessionWarmOk
-        taskState.sessionWarmError = warmDetail.sessionWarmError
+        taskState.verifiedMuxer = verifiedMuxer
+        taskState.verifiedMuxerWaitMs = verifiedMuxerWaitMs
+        taskState.sessionConnKey = 0
+        taskState.sessionWarmOk = false
+        taskState.sessionWarmError = connectReadyErr
       debugLog(
-        "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:session_warm_done peer=" & safePeerId &
+        "[nimlibp2p] bootstrapSeedConnectExactAsync attempt:peer_ready_done peer=" & safePeerId &
         " addr=" & addr &
-        " sessionWarmOk=" & $warmDetail.sessionWarmOk &
-        " sessionConnKey=" & $warmDetail.sessionConnKey &
-        (if sessionPathKind.len > 0:
-          " sessionPath=" & sessionPathKind
-        else:
-          "") &
-        " directRouteReady=" & $directRouteStatus.ready &
-        (if directRouteStatus.pathKind.len > 0:
-          " directRoutePath=" & directRouteStatus.pathKind
-        else:
-          "") &
-        (if warmDetail.sessionWarmError.len > 0:
-          " err=" & warmDetail.sessionWarmError
+        " ok=" & $connectReadyOk &
+        " phase=" & connectReadyPhase &
+        " peerConnected=" & $peerConnected &
+        " bootstrapConnected=" & $bootstrapConnected &
+        " verifiedMuxer=" & $(not verifiedMuxer.isNil) &
+        (if connectReadyErr.len > 0:
+          " err=" & connectReadyErr
         else:
           "")
       )
 
-      attemptNode["bootstrapConnected"] = %false
       attempts.add(attemptNode)
 
-      if directSessionReadyOk:
+      if connectReadyOk:
         if not taskState.isNil:
           taskState.ok = true
           taskState.state = bscsReady
           taskState.updatedAtMs = nowMillis()
           taskState.err = ""
-        ffiNodeSafe:
-          setDirectSessionTargetState(
-            safePeerId,
-            selectedAddrs,
-            buildDirectSessionTargetSnapshot(
-              safePeerId,
-              bootstrapSeedConnectTaskKey(safePeerId, selectedAddrs),
-              "ready",
-              selectedAddrs = selectedAddrs,
-              ok = true,
-              taskRunning = false,
-              sessionWarmOk = true,
-              verifiedMuxer = (not warmDetail.verifiedMuxer.isNil),
-              sessionConnKey = warmDetail.sessionConnKey,
-              routeReady = directRouteStatus.ready,
-              routePathKind =
-                if directRouteStatus.pathKind.len > 0:
-                  directRouteStatus.pathKind
-                else:
-                  sessionPathKind,
-              taskState = "ready",
-              verifiedMuxerWaitMs = warmDetail.verifiedMuxerWaitMs,
-              attemptedAddr = addr,
-            ),
-          )
+          taskState.sessionWarmError = ""
         debugLog(
           "[nimlibp2p] bootstrapSeedConnectExactAsync success peer=" & safePeerId &
           " addr=" & addr &
-          " connectOk=" & $sessionReadyOk &
-          " secureOk=" & $sessionReadyOk &
-          " peerConnected=" & $peerConnected
+          " phase=" & connectReadyPhase &
+          " peerConnected=" & $peerConnected &
+          " bootstrapConnected=" & $bootstrapConnected
         )
         asyncSpawn(promoteConnectedBootstrapPeerDetached(
           node,
@@ -26856,27 +30499,21 @@ proc runBootstrapSeedConnectExactAsync(
           attempts,
           true,
           "",
+          bootstrapConnected,
         )
-        payload["connectOk"] = %sessionReadyOk
-        payload["secureOk"] = %sessionReadyOk
-        payload["identifiedOk"] = %sessionReadyOk
-        payload["sessionReadyOk"] = %sessionReadyOk
+        payload["connectOk"] = %jsonGetBool(attemptNode, "connectOk", connectReadyOk)
+        payload["secureOk"] = %jsonGetBool(attemptNode, "secureOk", connectReadyOk)
+        payload["identifiedOk"] = %jsonGetBool(attemptNode, "identifiedOk", connectReadyPhase == "ready")
         if attemptNode.kind == JObject:
+          let phaseNode = attemptNode{"phase"}
+          if not phaseNode.isNil:
+            payload["phase"] = cloneJson(phaseNode)
           let verifiedMuxerNode = attemptNode{"verifiedMuxer"}
           if not verifiedMuxerNode.isNil:
             payload["verifiedMuxer"] = cloneJson(verifiedMuxerNode)
           let verifiedMuxerWaitMsNode = attemptNode{"verifiedMuxerWaitMs"}
           if not verifiedMuxerWaitMsNode.isNil:
             payload["verifiedMuxerWaitMs"] = cloneJson(verifiedMuxerWaitMsNode)
-          let sessionConnKeyNode = attemptNode{"sessionConnKey"}
-          if not sessionConnKeyNode.isNil:
-            payload["sessionConnKey"] = cloneJson(sessionConnKeyNode)
-          let sessionWarmOkNode = attemptNode{"sessionWarmOk"}
-          if not sessionWarmOkNode.isNil:
-            payload["sessionWarmOk"] = cloneJson(sessionWarmOkNode)
-          let sessionWarmErrorNode = attemptNode{"sessionWarmError"}
-          if not sessionWarmErrorNode.isNil:
-            payload["sessionWarmError"] = cloneJson(sessionWarmErrorNode)
         if publishKickoffState:
           ffiNodeSafe:
             setBootstrapSeedConnectKickoffState(
@@ -26887,25 +30524,24 @@ proc runBootstrapSeedConnectExactAsync(
             )
         return
 
-      if sessionReadyOk and not directSessionReadyOk:
-        let directSessionErr =
-          if sessionPathKind.len > 0 and sessionPathKind != "direct":
-            "direct session resolved to " & sessionPathKind & " path"
+      if not taskState.isNil:
+        taskState.state = bscsProbing
+        taskState.updatedAtMs = nowMillis()
+        taskState.ok = false
+        taskState.err =
+          if connectReadyErr.len > 0:
+            connectReadyErr
+          elif connectReadyPhase.len > 0:
+            connectReadyPhase
           else:
-            "direct session path not ready"
-        if not taskState.isNil:
-          taskState.state = bscsProbing
-          taskState.updatedAtMs = nowMillis()
-          taskState.ok = false
-          taskState.err = directSessionErr
-        lastError = directSessionErr
-        continue
+            "peer not ready"
 
-      let sessionWarmError = jsonGetStr(attemptNode, "sessionWarmError")
-      if sessionWarmError.len > 0:
-        lastError = sessionWarmError
-      elif jsonGetBool(attemptNode, "sessionWarmOk", false):
-        lastError = "bootstrap direct session unavailable"
+      if connectReadyErr.len > 0:
+        lastError = connectReadyErr
+      elif connectReadyPhase.len > 0:
+        lastError = connectReadyPhase
+      else:
+        lastError = "peer not ready"
 
     if lastError.len == 0:
       lastError = "bootstrap_seed_connect_timeout"
@@ -26916,8 +30552,7 @@ proc runBootstrapSeedConnectExactAsync(
     )
     if not taskState.isNil:
       taskState.state =
-        if lastError == "direct session path not ready" or
-            lastError == "direct session resolved to relay path":
+        if lastError in ["connect_timeout", "muxer_timeout", "identify_timeout", "secure_timeout", "connected"]:
           bscsProbing
         else:
           bscsFailed
@@ -27538,6 +31173,7 @@ proc libp2p_direct_session_target_set*(
     return false
   let parsedAddresses = parseJsonStringSeq(safeAddressesJson)
   let orderedAddrs = prioritizeGameSeedAddrs(preferStableAddrStrings(parsedAddresses))
+  let safeSource = (if source.isNil: "" else: $source).strip()
   let safeLimit =
     if limit > 0:
       min(max(int(limit), 1), orderedAddrs.len)
@@ -27547,6 +31183,11 @@ proc libp2p_direct_session_target_set*(
     recordRuntimeError("no_valid_addresses")
     return false
   let selectedAddrs = orderedAddrs[0 ..< safeLimit]
+  debugLog(
+    "[nimlibp2p] libp2p_direct_session_target_set begin peer=" & safePeerId &
+    " source=" & safeSource &
+    " addrCount=" & $selectedAddrs.len
+  )
   setDirectSessionTargetState(
     safePeerId,
     selectedAddrs,
@@ -27557,16 +31198,28 @@ proc libp2p_direct_session_target_set*(
       selectedAddrs = selectedAddrs,
     ),
   )
-  let spec =
-    upsertDirectSessionTarget(
-      node,
-      safePeerId,
-      selectedAddrs,
-      (if source.isNil: "" else: $source).strip(),
+  let cmd = makeCommand(cmdDirectSessionTargetSet)
+  cmd.peerId = safePeerId
+  cmd.addresses = selectedAddrs
+  cmd.source = safeSource
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk
+  let err =
+    if ok:
+      ""
+    elif result.errorMsg.len > 0:
+      result.errorMsg
+    else:
+      "direct_session_target_set_failed"
+  destroyCommand(cmd)
+  if ok:
+    debugLog(
+      "[nimlibp2p] libp2p_direct_session_target_set done peer=" & safePeerId &
+      " source=" & safeSource &
+      " addrCount=" & $selectedAddrs.len &
+      " ok=true"
     )
-  if spec.taskKey.len > 0:
     return true
-  let err = "direct_session_target_set_failed"
   setDirectSessionTargetState(
     safePeerId,
     selectedAddrs,
@@ -27579,6 +31232,12 @@ proc libp2p_direct_session_target_set*(
     ),
   )
   recordRuntimeError(err)
+  debugLog(
+    "[nimlibp2p] libp2p_direct_session_target_set done peer=" & safePeerId &
+    " source=" & safeSource &
+    " addrCount=" & $selectedAddrs.len &
+    " ok=false err=" & err
+  )
   false
 
 proc libp2p_direct_session_target_clear*(
@@ -27608,36 +31267,21 @@ proc libp2p_direct_session_target_clear*(
     recordRuntimeError("no_valid_addresses")
     return false
   let selectedAddrs = orderedAddrs[0 ..< safeLimit]
-  let spec =
-    clearDirectSessionTargetDesiredState(
-      node,
-      safePeerId,
-      selectedAddrs,
-      "",
-    )
-  if spec.taskKey.len > 0:
-    setDirectSessionTargetState(
-      safePeerId,
-      selectedAddrs,
-      buildDirectSessionTargetSnapshot(
-        safePeerId,
-        spec.taskKey,
-        "cleared",
-        selectedAddrs = selectedAddrs,
-        source = spec.source,
-        error = "direct_target_cleared",
-        updatedAtMs = spec.updatedAtMs,
-        attemptCount = spec.attemptCount,
-        successCount = spec.successCount,
-        failureCount = spec.failureCount,
-        lastAttemptAtMs = spec.lastAttemptAtMs,
-        lastReadyAtMs = spec.lastReadyAtMs,
-        lastFailureAtMs = spec.lastFailureAtMs,
-        lastFailureReason = spec.lastFailureReason,
-      ),
-    )
+  let cmd = makeCommand(cmdDirectSessionTargetClear)
+  cmd.peerId = safePeerId
+  cmd.addresses = selectedAddrs
+  let result = submitCommand(node, cmd)
+  let ok = result.resultCode == NimResultOk
+  let err =
+    if ok:
+      ""
+    elif result.errorMsg.len > 0:
+      result.errorMsg
+    else:
+      "direct_session_target_clear_failed"
+  destroyCommand(cmd)
+  if ok:
     return true
-  let err = "direct_session_target_clear_failed"
   recordRuntimeError(err)
   false
 
@@ -28157,3 +31801,122 @@ proc libp2p_mpc_sign_combine*(s1Hex: cstring, s2Hex: cstring, jointNoncePubHex: 
   let v_byte = if R_bytes[0] == 0x02: "0" else: "1"
   
   result = allocCString(r_hex & "|" & s_hex & "|" & $v_byte)
+
+proc libp2p_fabric_cluster_config*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  let node = nodeFromHandle(handle)
+  if node.isNil:
+    return allocCString(buildFabricBridgeError("fabric.cluster_config", "node_nil"))
+  allocCString($buildFabricClusterSnapshot(node.cfg))
+
+proc libp2p_fabric_status*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  invokeFabricClusterRpcSync(handle, "fabric.status")
+
+proc libp2p_fabric_quiesce*(handle: pointer): cstring {.exportc, cdecl, dynlib.} =
+  invokeFabricClusterRpcSync(handle, "fabric.quiesce")
+
+proc libp2p_fabric_submit_event*(handle: pointer, txJson: cstring): cstring {.exportc, cdecl, dynlib.} =
+  if txJson.isNil:
+    return allocCString(buildFabricBridgeError("fabric.submit_event", "missing_required_field:txJson"))
+  let txText = ($txJson).strip()
+  if txText.len == 0:
+    return allocCString(buildFabricBridgeError("fabric.submit_event", "missing_required_field:txJson"))
+  try:
+    let tx = parseJson(txText)
+    var params = newJObject()
+    params["tx"] = tx
+    invokeFabricClusterRpcSync(handle, "fabric.submit_event", params)
+  except CatchableError as exc:
+    allocCString(buildFabricBridgeError("fabric.submit_event", "invalid_tx_json", exc.msg))
+
+proc libp2p_fabric_get_event*(handle: pointer, eventId: cstring): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "eventId", if eventId.isNil: "" else: $eventId)
+  invokeFabricClusterRpcSync(handle, "fabric.get_event", params)
+
+proc libp2p_fabric_get_event_certificate*(handle: pointer, eventId: cstring): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "eventId", if eventId.isNil: "" else: $eventId)
+  invokeFabricClusterRpcSync(handle, "fabric.get_event_certificate", params)
+
+proc libp2p_fabric_get_checkpoint*(handle: pointer, checkpointId: cstring): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "fabric.get_checkpoint", params)
+
+proc libp2p_fabric_query_projection*(
+    handle: pointer,
+    projection: cstring,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "projection", if projection.isNil: "" else: $projection)
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "fabric.query_projection", params)
+
+proc libp2p_social_publish_tasks*(handle: pointer, checkpointId: cstring): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "social.publish_tasks", params)
+
+proc libp2p_social_feed_snapshot*(
+    handle: pointer,
+    limit: cint,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  if limit > 0:
+    params["limit"] = %(int(limit))
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "social.feed_snapshot", params)
+
+proc libp2p_social_content_detail*(
+    handle: pointer,
+    contentId: cstring,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "contentId", if contentId.isNil: "" else: $contentId)
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "social.content_detail", params)
+
+proc libp2p_governance_report_list*(
+    handle: pointer,
+    contentId: cstring,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "contentId", if contentId.isNil: "" else: $contentId)
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "governance.report_list", params)
+
+proc libp2p_credit_balance*(
+    handle: pointer,
+    owner: cstring,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "owner", if owner.isNil: "" else: $owner)
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "credit.balance", params)
+
+proc libp2p_treasury_intent_status*(
+    handle: pointer,
+    mintIntentId: cstring,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "mintIntentId", if mintIntentId.isNil: "" else: $mintIntentId)
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "treasury.intent_status", params)
+
+proc libp2p_name_resolve*(
+    handle: pointer,
+    name: cstring,
+    nowTs: int64,
+    checkpointId: cstring
+): cstring {.exportc, cdecl, dynlib.} =
+  var params = newJObject()
+  jsonPutIfNotEmpty(params, "name", if name.isNil: "" else: $name)
+  jsonPutIfPositive(params, "nowTs", nowTs)
+  jsonPutIfNotEmpty(params, "checkpointId", if checkpointId.isNil: "" else: $checkpointId)
+  invokeFabricClusterRpcSync(handle, "name.resolve", params)

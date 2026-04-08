@@ -608,7 +608,7 @@ proc adoptMsQuicStream*(
   )
   stream
 
-method getWrapped*(conn: MsQuicConnection): Connection =
+method getWrapped*(conn: MsQuicConnection): Connection {.gcsafe.} =
   conn
 
 method beginProtocolNegotiation*(

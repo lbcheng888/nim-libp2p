@@ -287,7 +287,7 @@ method write*(
 
   s.completeWrite(fut, msg.len)
 
-method getWrapped*(s: LPChannel): Connection =
+method getWrapped*(s: LPChannel): Connection {.gcsafe.} =
   s.conn
 
 proc init*(

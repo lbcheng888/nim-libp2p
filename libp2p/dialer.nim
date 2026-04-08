@@ -62,6 +62,8 @@ proc dialLockDomain(addrs: openArray[MultiAddress], options: DialOptions): strin
   if hasTsnetAddr(addrs):
     if options.routing == dppRelayOnly:
       return "tsnet_relay"
+    if options.routing == dppDirectOnly:
+      return "tsnet_direct"
     return "tsnet_exact"
   "default"
 
@@ -201,15 +203,30 @@ method dialAndUpgrade*(
       let dialed =
         try:
           libp2p_total_dial_attempts.inc()
-          if options.routing == dppRelayOnly and transport of TsnetTransport:
-            await TsnetTransport(transport).dialWithPreference(
-              hostname,
-              addrs,
-              peerId,
-              relayOnly = true,
-            )
-          else:
-            await transport.dial(hostname, addrs, peerId)
+          if transport of TsnetTransport:
+            warn "dialer transport dial begin",
+              peerId = peerId.get(default(PeerId)),
+              address = addrs,
+              routing = $options.routing,
+              relayOnly = options.routing == dppRelayOnly,
+              directOnly = options.routing == dppDirectOnly
+          let conn =
+            if transport of TsnetTransport and options.routing in [dppRelayOnly, dppDirectOnly]:
+              await TsnetTransport(transport).dialWithPreference(
+                hostname,
+                addrs,
+                peerId,
+                relayOnly = options.routing == dppRelayOnly,
+                directOnly = options.routing == dppDirectOnly,
+              )
+            else:
+              await transport.dial(hostname, addrs, peerId)
+          if transport of TsnetTransport:
+            warn "dialer transport dial done",
+              peerId = peerId.get(default(PeerId)),
+              address = addrs,
+              routing = $options.routing
+          conn
         except CancelledError as exc:
           when defined(lsmr_diag):
             echo "dialer dial-cancel peer=", $peerId.get(default(PeerId)),
@@ -238,46 +255,77 @@ method dialAndUpgrade*(
           " addr=", $addrs,
           " ts=", dialDiagNowMs()
 
-      let mux =
-        try:
-          # This is for the very specific case of a simultaneous dial during DCUtR. In this case, both sides will have
-          # an Outbound direction at the transport level. Therefore we update the DCUtR initiator transport direction to Inbound.
-          # The if below is more general and might handle other use cases in the future.
-          if dialed.dir != dir:
-            dialed.dir = dir
-          when defined(lsmr_diag):
-            echo "dialer upgrade-begin peer=", $peerId.get(default(PeerId)),
-              " addr=", $addrs,
-              " dir=", $dialed.dir,
-              " ts=", dialDiagNowMs()
-          await transport.upgrade(dialed, peerId)
-        except CancelledError as exc:
-          when defined(lsmr_diag):
-            echo "dialer upgrade-cancel peer=", $peerId.get(default(PeerId)),
-              " addr=", $addrs,
-              " err=", exc.msg,
-              " ts=", dialDiagNowMs()
-          await dialed.close()
-          raise exc
-        except CatchableError as exc:
-          # If we failed to establish the connection through one transport,
-          # we won't succeeded through another - no use in trying again
-          when defined(lsmr_diag):
-            echo "dialer upgrade-fail peer=", $peerId.get(default(PeerId)),
-              " addr=", $addrs,
-              " err=", exc.msg,
-              " ts=", dialDiagNowMs()
-          await dialed.close()
-          debug "Connection upgrade failed",
-            description = exc.msg, peerId = peerId.get(default(PeerId))
-          if dialed.dir == Direction.Out:
-            libp2p_failed_upgrades_outgoing.inc()
-          else:
-            libp2p_failed_upgrades_incoming.inc()
+      var mux: Muxer = nil
+      try:
+        # This is for the very specific case of a simultaneous dial during DCUtR. In this case, both sides will have
+        # an Outbound direction at the transport level. Therefore we update the DCUtR initiator transport direction to Inbound.
+        # The if below is more general and might handle other use cases in the future.
+        if dialed.dir != dir:
+          dialed.dir = dir
+        if transport of TsnetTransport:
+          warn "dialer transport upgrade begin",
+            peerId = peerId.get(default(PeerId)),
+            address = addrs,
+            routing = $options.routing,
+            relayOnly = options.routing == dppRelayOnly,
+            directOnly = options.routing == dppDirectOnly,
+            protocol = dialed.protocol,
+            negotiated = dialed.negotiatedMuxer
+        when defined(lsmr_diag):
+          echo "dialer upgrade-begin peer=", $peerId.get(default(PeerId)),
+            " addr=", $addrs,
+            " dir=", $dialed.dir,
+            " ts=", dialDiagNowMs()
+        let upgraded = await transport.upgrade(dialed, peerId)
+        if transport of TsnetTransport:
+          warn "dialer transport upgrade done",
+            peerId = peerId.get(default(PeerId)),
+            address = addrs,
+            routing = $options.routing,
+            relayOnly = options.routing == dppRelayOnly,
+            directOnly = options.routing == dppDirectOnly,
+            protocol = (if upgraded.isNil or upgraded.connection.isNil: dialed.protocol else: upgraded.connection.protocol),
+            negotiated = (if upgraded.isNil or upgraded.connection.isNil: dialed.negotiatedMuxer else: upgraded.connection.negotiatedMuxer)
+        mux = upgraded
+      except CancelledError as exc:
+        if transport of TsnetTransport:
+          warn "dialer transport upgrade cancelled",
+            peerId = peerId.get(default(PeerId)),
+            address = addrs,
+            routing = $options.routing,
+            err = exc.msg
+        when defined(lsmr_diag):
+          echo "dialer upgrade-cancel peer=", $peerId.get(default(PeerId)),
+            " addr=", $addrs,
+            " err=", exc.msg,
+            " ts=", dialDiagNowMs()
+        await dialed.close()
+        raise exc
+      except CatchableError as exc:
+        # If we failed to establish the connection through one transport,
+        # we won't succeeded through another - no use in trying again
+        if transport of TsnetTransport:
+          warn "dialer transport upgrade failed",
+            peerId = peerId.get(default(PeerId)),
+            address = addrs,
+            routing = $options.routing,
+            err = exc.msg
+        when defined(lsmr_diag):
+          echo "dialer upgrade-fail peer=", $peerId.get(default(PeerId)),
+            " addr=", $addrs,
+            " err=", exc.msg,
+            " ts=", dialDiagNowMs()
+        await dialed.close()
+        debug "Connection upgrade failed",
+          description = exc.msg, peerId = peerId.get(default(PeerId))
+        if dialed.dir == Direction.Out:
+          libp2p_failed_upgrades_outgoing.inc()
+        else:
+          libp2p_failed_upgrades_incoming.inc()
 
-          lastErr = exc
-          lastMsg = "upgrade failed: " & exc.msg
-          continue
+        lastErr = exc
+        lastMsg = "upgrade failed: " & exc.msg
+        continue
 
       if mux.isNil:
         when defined(lsmr_diag):
@@ -453,6 +501,14 @@ proc internalConnect(
 ): Future[Muxer] {.async: (raises: [DialFailedError, CancelledError]).} =
   if Opt.some(self.localPeerId) == peerId:
     raise newException(DialFailedError, "internalConnect can't dial self!")
+  let tsnetDial = hasTsnetAddr(addrs)
+  if tsnetDial:
+    warn "dialer internalConnect begin",
+      peerId = peerId.get(default(PeerId)),
+      addrs = addrs.len,
+      routing = $options.routing,
+      reuseConnection = reuseConnection,
+      forceDial = forceDial
 
   # Ensure there's only one in-flight attempt per peer
   let lockKey = buildDialLockKey(peerId, addrs, options)
@@ -460,12 +516,20 @@ proc internalConnect(
   if lock.isNil:
     lock = newAsyncLock()
   self.dialLock[lockKey] = lock
+  if tsnetDial:
+    warn "dialer internalConnect lock wait",
+      peerId = peerId.get(default(PeerId)),
+      lockKey = lockKey
   await lock.acquire()
   defer:
     try:
       lock.release()
     except AsyncLockError as e:
       raiseAssert "lock must have been acquired in line above: " & e.msg
+  if tsnetDial:
+    warn "dialer internalConnect lock acquired",
+      peerId = peerId.get(default(PeerId)),
+      lockKey = lockKey
 
   if reuseConnection:
     peerId.withValue(pid):
@@ -483,20 +547,30 @@ proc internalConnect(
         DialFailedError, "failed getOutgoingSlot in internalConnect: " & exc.msg, exc
       )
 
-  let muxed =
-    try:
-      ## direct exact path and relay path are independent state machines.
-      ## Keep their dial serialization separate so background direct warm
-      ## cannot block a foreground relay send for the same peer.
-      await self.dialAndUpgrade(peerId, addrs, dir, options)
-    except CancelledError as exc:
-      slot.release()
-      raise exc
-    except CatchableError as exc:
-      slot.release()
-      raise newException(
-        DialFailedError, "failed dialAndUpgrade in internalConnect: " & exc.msg, exc
-      )
+  var muxed: Muxer = nil
+  try:
+    ## direct exact path and relay path are independent state machines.
+    ## Keep their dial serialization separate so background direct warm
+    ## cannot block a foreground relay send for the same peer.
+    if tsnetDial:
+      warn "dialer internalConnect dialAndUpgrade begin",
+        peerId = peerId.get(default(PeerId)),
+        addrs = addrs.len,
+        routing = $options.routing
+    muxed = await self.dialAndUpgrade(peerId, addrs, dir, options)
+  except CancelledError as exc:
+    slot.release()
+    raise exc
+  except CatchableError as exc:
+    slot.release()
+    raise newException(
+      DialFailedError, "failed dialAndUpgrade in internalConnect: " & exc.msg, exc
+    )
+  if tsnetDial:
+    warn "dialer internalConnect dialAndUpgrade done",
+      peerId = peerId.get(default(PeerId)),
+      addrs = addrs.len,
+      routing = $options.routing
 
   slot.trackMuxer(muxed)
   if isNil(muxed): # None of the addresses connected
@@ -712,12 +786,52 @@ method connectMuxer*(
   )
 
 method negotiateStream*(
-    self: Dialer, conn: Connection, protos: seq[string]
+    self: Dialer,
+    conn: Connection,
+    protos: seq[string],
+    firstProtoTrailingBytes: seq[byte] = @[],
+    totalTimeout: Duration = ZeroDuration,
 ): Future[Connection] {.async: (raises: [CatchableError]).} =
   trace "Negotiating stream", conn, protos
-  await conn.beginProtocolNegotiation()
+  let negotiationDeadline =
+    if totalTimeout > ZeroDuration:
+      Moment.now() + totalTimeout
+    else:
+      Moment.now()
+  let budgeted = totalTimeout > ZeroDuration
+  proc remainingNegotiationBudget(): Duration =
+    if not budgeted:
+      return ZeroDuration
+    let remaining = negotiationDeadline - Moment.now()
+    if remaining > ZeroDuration:
+      remaining
+    else:
+      ZeroDuration
+  if budgeted:
+    let beginBudget = remainingNegotiationBudget()
+    if beginBudget <= ZeroDuration:
+      raise newException(DialFailedError, "protocol negotiation begin timeout")
+    let timeoutFut = sleepAsync(beginBudget)
+    let beginFuture = conn.beginProtocolNegotiation()
+    let winner = await race(cast[FutureBase](beginFuture), cast[FutureBase](timeoutFut))
+    if winner == cast[FutureBase](timeoutFut):
+      beginFuture.cancelSoon()
+      raise newException(DialFailedError, "protocol negotiation begin timeout")
+    timeoutFut.cancelSoon()
+    await beginFuture
+  else:
+    await conn.beginProtocolNegotiation()
   try:
-    let selected = await MultistreamSelect.select(conn, protos)
+    let selected = await MultistreamSelect.select(
+      conn,
+      protos,
+      firstProtoTrailingBytes = firstProtoTrailingBytes,
+      totalTimeout =
+        if budgeted:
+          remainingNegotiationBudget()
+        else:
+          ZeroDuration,
+    )
     if not protos.contains(selected):
       await conn.closeWithEOF()
       raise newException(DialFailedError, "Unable to select sub-protocol: " & $protos)
@@ -814,6 +928,7 @@ method dial*(
   var
     conn: Muxer
     stream: Connection
+  let tsnetDial = hasTsnetAddr(addrs)
 
   proc cleanup() {.async: (raises: []).} =
     if not (isNil(stream)):
@@ -834,8 +949,28 @@ method dial*(
       reuseConnection,
       options = options,
     )
+    if tsnetDial:
+      warn "dialer stream dial muxer ready",
+        peerId = peerId,
+        addrs = addrs.len,
+        routing = $options.routing,
+        protocol = (if conn.isNil or conn.connection.isNil: "" else: conn.connection.protocol),
+        negotiated = (if conn.isNil or conn.connection.isNil: "" else: conn.connection.negotiatedMuxer)
     trace "Opening stream", conn
+    if tsnetDial:
+      warn "dialer stream open begin",
+        peerId = peerId,
+        addrs = addrs.len,
+        routing = $options.routing,
+        protocolCount = protos.len
     stream = await self.connManager.getStream(conn)
+    if tsnetDial:
+      warn "dialer stream open done",
+        peerId = peerId,
+        addrs = addrs.len,
+        routing = $options.routing,
+        protocol = (if stream.isNil: "" else: stream.protocol),
+        negotiated = (if stream.isNil: "" else: stream.negotiatedMuxer)
 
     if isNil(stream):
       raise newException(
@@ -843,7 +978,21 @@ method dial*(
         "Couldn't get muxed stream in new dial for remote_peer_id: " & shortLog(peerId),
       )
 
-    return await self.negotiateStream(stream, protos)
+    if tsnetDial:
+      warn "dialer protocol select begin",
+        peerId = peerId,
+        addrs = addrs.len,
+        routing = $options.routing,
+        protocolCount = protos.len
+    let negotiated = await self.negotiateStream(stream, protos)
+    if tsnetDial:
+      warn "dialer protocol select done",
+        peerId = peerId,
+        addrs = addrs.len,
+        routing = $options.routing,
+        protocol = (if negotiated.isNil: "" else: negotiated.protocol),
+        negotiatedMuxer = (if negotiated.isNil: "" else: negotiated.negotiatedMuxer)
+    return negotiated
   except CancelledError as exc:
     trace "Dial canceled", conn, description = exc.msg
     await cleanup()
@@ -853,7 +1002,7 @@ method dial*(
     await cleanup()
     raise newException(DialFailedError, "failed new dial: " & exc.msg, exc)
 
-method addTransport*(self: Dialer, t: Transport) =
+method addTransport*(self: Dialer, t: Transport) {.raises: [].} =
   self.transports &= t
 
 proc new*(

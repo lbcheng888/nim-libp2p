@@ -27,7 +27,20 @@ type
 
   LsmrControlApplyItem = object
     kind: LsmrControlApplyKind
+    sourcePeerId: PeerId
     node: JsonNode
+
+  LsmrDaYanLocalSubscription = object
+    subscription: LsmrDaYanSubscription
+    handler: LsmrDaYanHandler
+
+  LsmrDaYanRemoteSnapshot = object
+    version: uint64
+    subscriptions: seq[LsmrDaYanSubscription]
+
+  LsmrDaYanDispatchItem = object
+    peerId: PeerId
+    envelope: LsmrDaYanEnvelope
 
   LsmrValidationTrust* {.pure.} = enum
     rejected
@@ -49,11 +62,14 @@ type
     publishedCoordinatePayloads: HashSet[string]
     publishedMigrationPayloads: HashSet[string]
     publishedIsolationPayloads: HashSet[string]
+    publishedDaYanSubscriptionVersion: uint64
 
   LsmrPublishBatch = object
     request: JsonNode
     publishAllKnown: bool
     publishPeers: seq[PeerId]
+    dayanSubscriptionVersion: uint64
+    includesDaYanSubscriptions: bool
     coordinateDigests: seq[string]
     migrationDigests: seq[string]
     isolationDigests: seq[string]
@@ -99,6 +115,7 @@ type
     forgedRecords*: int64
     biasReorders*: int64
     controlSessions: Table[string, LsmrControlSession]
+    dayanSessions: Table[string, LsmrControlSession]
     connectFlights: Table[string, Future[bool]]
     dialLocks: Table[string, AsyncLock]
     topologyChangeSeq: uint64
@@ -115,6 +132,14 @@ type
     applyRunner: Future[void]
     revalidatePending: bool
     revalidateRunner: Future[void]
+    dayanSubscriptions: Table[string, LsmrDaYanLocalSubscription]
+    remoteDaYanSubscriptions: Table[PeerId, LsmrDaYanRemoteSnapshot]
+    dayanSubscriptionVersion: uint64
+    dayanSeenMessages: Table[string, int64]
+    dayanMessageSeq: uint64
+    dayanBackgroundQueue: Deque[LsmrDaYanDispatchItem]
+    dayanBackgroundRunner: Future[void]
+    dayanFlowConfig: LsmrDaYanFlowConfig
 
 proc nowMillis(): int64 =
   int64(epochTime() * 1000)
@@ -163,6 +188,7 @@ proc buildPeerAddressEntry(peerId: PeerId, addrs: seq[MultiAddress]): JsonNode =
 proc localCoordinateRecord*(
     switch: Switch
 ): Option[SignedLsmrCoordinateRecord] {.gcsafe.}
+proc shouldAutoConnectPeer(svc: LsmrService, peerId: PeerId): bool {.gcsafe.}
 proc schedulePeerConnect(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].}
 
 proc applyPeerAddressEntries(svc: LsmrService, node: JsonNode) =
@@ -173,7 +199,6 @@ proc applyPeerAddressEntries(svc: LsmrService, node: JsonNode) =
       PeerId()
     else:
       svc.switch.peerInfo.peerId
-  let canConnect = localCoordinateRecord(svc.switch).isSome()
   for item in node.items():
     if item.kind != JObject or not item.hasKey("peerId") or not item.hasKey("addrs"):
       continue
@@ -204,7 +229,8 @@ proc applyPeerAddressEntries(svc: LsmrService, node: JsonNode) =
         merged.add(addr)
         changed = true
     svc.switch.peerStore.setAddresses(peerId, merged)
-    if changed and canConnect and peerId != selfPeerId:
+    if changed and localCoordinateRecord(svc.switch).isSome() and peerId != selfPeerId and
+        svc.shouldAutoConnectPeer(peerId):
       svc.schedulePeerConnect(peerId)
 
 const
@@ -253,7 +279,7 @@ proc storeCoordinateRecord(
     promoteNow = true,
 ) {.gcsafe.}
 proc scheduleControlApply(
-    svc: LsmrService, kind: LsmrControlApplyKind, node: JsonNode
+    svc: LsmrService, kind: LsmrControlApplyKind, sourcePeerId: PeerId, node: JsonNode
 ) {.gcsafe, raises: [].}
 proc promoteValidatedCoordinateRecord*(
     switch: Switch, config: LsmrConfig, peerId: PeerId
@@ -469,18 +495,361 @@ proc scheduleImmediateRefresh(
 proc refreshCoordinateRecord*(
     svc: LsmrService
 ): Future[bool] {.async: (raises: [CancelledError]).}
+proc subscribeDaYan*(
+    svc: LsmrService, subscription: LsmrDaYanSubscription, handler: LsmrDaYanHandler
+): string {.gcsafe, raises: [].}
+proc unsubscribeDaYan*(svc: LsmrService, subscriptionId: string): bool {.gcsafe, raises: [].}
+proc publishDaYan*(
+    svc: LsmrService, topic: LsmrDaYanTopic, payload: seq[byte]
+): Future[int] {.async: (raises: [CancelledError]).}
+proc acceptDaYanEnvelope*(
+    svc: LsmrService, sourcePeerId: PeerId, envelope: LsmrDaYanEnvelope
+): Future[bool] {.async: (raises: [CancelledError]).}
+
+proc dayanModeName(mode: LsmrDaYanMode): string {.gcsafe, raises: [].} =
+  case mode
+  of LsmrDaYanMode.ldymZhen:
+    "zhen"
+  of LsmrDaYanMode.ldymXun:
+    "xun"
+
+proc parseDaYanMode(value: string): Option[LsmrDaYanMode] {.gcsafe, raises: [].} =
+  case value.toLowerAscii().strip()
+  of "zhen":
+    some(LsmrDaYanMode.ldymZhen)
+  of "xun":
+    some(LsmrDaYanMode.ldymXun)
+  else:
+    none(LsmrDaYanMode)
+
+proc dayanStageName(stage: LsmrDaYanStage): string {.gcsafe, raises: [].} =
+  case stage
+  of LsmrDaYanStage.ldysKunLocal:
+    "kun"
+  of LsmrDaYanStage.ldysDuiRegional:
+    "dui"
+  of LsmrDaYanStage.ldysLiGlobal:
+    "li"
+
+proc parseDaYanStage(value: string): Option[LsmrDaYanStage] {.gcsafe, raises: [].} =
+  case value.toLowerAscii().strip()
+  of "kun":
+    some(LsmrDaYanStage.ldysKunLocal)
+  of "dui":
+    some(LsmrDaYanStage.ldysDuiRegional)
+  of "li":
+    some(LsmrDaYanStage.ldysLiGlobal)
+  else:
+    none(LsmrDaYanStage)
+
+proc dayanPayloadKindName(kind: LsmrDaYanPayloadKind): string {.gcsafe, raises: [].} =
+  case kind
+  of LsmrDaYanPayloadKind.ldypkCsgDelta:
+    "csg_delta"
+  of LsmrDaYanPayloadKind.ldypkSemanticFingerprint:
+    "semantic_fingerprint"
+
+proc parseDaYanPayloadKind(
+    value: string
+): Option[LsmrDaYanPayloadKind] {.gcsafe, raises: [].} =
+  case value.toLowerAscii().strip()
+  of "csg_delta":
+    some(LsmrDaYanPayloadKind.ldypkCsgDelta)
+  of "semantic_fingerprint":
+    some(LsmrDaYanPayloadKind.ldypkSemanticFingerprint)
+  else:
+    none(LsmrDaYanPayloadKind)
+
+proc dayanDigestMix(seed: uint64, value: string): uint64 {.gcsafe, raises: [].} =
+  result = seed xor 0x9E37_79B1_85EB_CA87'u64
+  for idx, ch in value:
+    result = (result shl 7) xor (result shr 3) xor uint64((idx + 1) * ch.ord)
+
+proc dayanDigestMix(seed: uint64, path: LsmrPath): uint64 {.gcsafe, raises: [].} =
+  result = seed xor uint64(path.len)
+  for idx, digit in path:
+    result = (result shl 5) xor (result shr 2) xor uint64((idx + 11) * int(digit))
+
+proc dayanSubscriptionId(
+    subscription: LsmrDaYanSubscription
+): string {.gcsafe, raises: [].} =
+  var digest = 0xD41A_1F73_C9E2_44B1'u64
+  digest = dayanDigestMix(digest, subscription.topologyPrefix)
+  digest = dayanDigestMix(digest, $subscription.minResolution)
+  digest = dayanDigestMix(digest, $subscription.maxResolution)
+  digest = dayanDigestMix(digest, subscription.semanticPrefix)
+  digest = dayanDigestMix(digest, subscription.guardPrefix)
+  digest = dayanDigestMix(digest, if subscription.acceptUrgent: "1" else: "0")
+  digest = dayanDigestMix(digest, if subscription.acceptBackground: "1" else: "0")
+  digest.toHex(16)
+
+proc buildDaYanMessageId(svc: LsmrService, topic: LsmrDaYanTopic): string {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerInfo.isNil:
+    return ""
+  inc svc.dayanMessageSeq
+  var digest = 0x51C8_DA7A_F10B_3419'u64 xor svc.dayanMessageSeq
+  digest = dayanDigestMix(digest, $svc.switch.peerInfo.peerId)
+  digest = dayanDigestMix(digest, $nowMillis())
+  digest = dayanDigestMix(digest, topic.center)
+  digest = dayanDigestMix(digest, $topic.resolution)
+  digest = dayanDigestMix(digest, topic.semanticFingerprint)
+  digest = dayanDigestMix(digest, topic.guardDigest)
+  digest = dayanDigestMix(digest, dayanModeName(topic.mode))
+  digest.toHex(16)
+
+proc dayanField(node: JsonNode, key: string): JsonNode {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject:
+    return newJNull()
+  let value = node.getOrDefault(key)
+  if value.isNil:
+    return newJNull()
+  value
+
+proc dayanTopicToJson(topic: LsmrDaYanTopic): JsonNode {.gcsafe, raises: [].} =
+  %*{
+    "center": pathToJson(topic.center),
+    "resolution": int(topic.resolution),
+    "semanticFingerprint": topic.semanticFingerprint,
+    "guardDigest": topic.guardDigest,
+    "mode": dayanModeName(topic.mode),
+  }
+
+proc jsonToDaYanTopic(node: JsonNode): Option[LsmrDaYanTopic] {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject:
+    return none(LsmrDaYanTopic)
+  let modeNode = dayanField(node, "mode")
+  let resolutionNode = dayanField(node, "resolution")
+  let centerNode = dayanField(node, "center")
+  let semanticNode = dayanField(node, "semanticFingerprint")
+  let guardNode = dayanField(node, "guardDigest")
+  if modeNode.kind != JString or resolutionNode.kind != JInt or centerNode.kind != JArray or
+      semanticNode.kind != JString or guardNode.kind != JString:
+    return none(LsmrDaYanTopic)
+  let modeOpt = parseDaYanMode(modeNode.getStr())
+  if modeOpt.isNone():
+    return none(LsmrDaYanTopic)
+  let resolutionValue = resolutionNode.getInt()
+  if resolutionValue <= 0 or resolutionValue > high(uint8).int:
+    return none(LsmrDaYanTopic)
+  let topic =
+    LsmrDaYanTopic.init(
+      center = jsonToPath(centerNode),
+      resolution = uint8(resolutionValue),
+      semanticFingerprint = semanticNode.getStr(),
+      guardDigest = guardNode.getStr(),
+      mode = modeOpt.get(),
+    )
+  if not topic.isValid():
+    return none(LsmrDaYanTopic)
+  some(topic)
+
+proc dayanSubscriptionToJson(
+    subscription: LsmrDaYanSubscription
+): JsonNode {.gcsafe, raises: [].} =
+  %*{
+    "topologyPrefix": pathToJson(subscription.topologyPrefix),
+    "minResolution": int(subscription.minResolution),
+    "maxResolution": int(subscription.maxResolution),
+    "semanticPrefix": subscription.semanticPrefix,
+    "guardPrefix": subscription.guardPrefix,
+    "acceptUrgent": subscription.acceptUrgent,
+    "acceptBackground": subscription.acceptBackground,
+  }
+
+proc jsonToDaYanSubscription(
+    node: JsonNode
+): Option[LsmrDaYanSubscription] {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject:
+    return none(LsmrDaYanSubscription)
+  let minNode = dayanField(node, "minResolution")
+  let maxNode = dayanField(node, "maxResolution")
+  let topologyNode = dayanField(node, "topologyPrefix")
+  let semanticNode = dayanField(node, "semanticPrefix")
+  let guardNode = dayanField(node, "guardPrefix")
+  let urgentNode = dayanField(node, "acceptUrgent")
+  let backgroundNode = dayanField(node, "acceptBackground")
+  if minNode.kind != JInt or maxNode.kind != JInt or topologyNode.kind != JArray or
+      semanticNode.kind != JString or guardNode.kind != JString or urgentNode.kind != JBool or
+      backgroundNode.kind != JBool:
+    return none(LsmrDaYanSubscription)
+  let minValue = minNode.getInt()
+  let maxValue = maxNode.getInt()
+  if minValue <= 0 or minValue > high(uint8).int or maxValue <= 0 or
+      maxValue > high(uint8).int:
+    return none(LsmrDaYanSubscription)
+  let subscription =
+    LsmrDaYanSubscription.init(
+      topologyPrefix = jsonToPath(topologyNode),
+      minResolution = uint8(minValue),
+      maxResolution = uint8(maxValue),
+      semanticPrefix = semanticNode.getStr(),
+      guardPrefix = guardNode.getStr(),
+      acceptUrgent = urgentNode.getBool(),
+      acceptBackground = backgroundNode.getBool(),
+    )
+  if not subscription.isValid():
+    return none(LsmrDaYanSubscription)
+  some(subscription)
+
+proc dayanEnvelopeToJson(
+    envelope: LsmrDaYanEnvelope
+): JsonNode {.gcsafe, raises: [].} =
+  var payloadText = ""
+  if envelope.payload.len > 0:
+    payloadText = base64.encode(bytesToString(envelope.payload))
+  %*{
+    "messageId": envelope.messageId,
+    "originPeerId": $envelope.originPeerId,
+    "topic": dayanTopicToJson(envelope.topic),
+    "stage": dayanStageName(envelope.stage),
+    "mode": dayanModeName(envelope.mode),
+    "payloadKind": dayanPayloadKindName(envelope.payloadKind),
+    "resolution": int(envelope.resolution),
+    "semanticFingerprint": envelope.semanticFingerprint,
+    "payload": payloadText,
+  }
+
+proc jsonToDaYanEnvelope(
+    node: JsonNode
+): Option[LsmrDaYanEnvelope] {.gcsafe, raises: [].} =
+  if node.isNil or node.kind != JObject:
+    return none(LsmrDaYanEnvelope)
+  let messageIdNode = dayanField(node, "messageId")
+  let originPeerNode = dayanField(node, "originPeerId")
+  let topicNode = dayanField(node, "topic")
+  let stageNode = dayanField(node, "stage")
+  let modeNode = dayanField(node, "mode")
+  let payloadKindNode = dayanField(node, "payloadKind")
+  let resolutionNode = dayanField(node, "resolution")
+  let payloadNode = dayanField(node, "payload")
+  let semanticNode = dayanField(node, "semanticFingerprint")
+  if messageIdNode.kind != JString or originPeerNode.kind != JString or
+      topicNode.kind != JObject or stageNode.kind != JString or modeNode.kind != JString or
+      payloadKindNode.kind != JString or resolutionNode.kind != JInt or
+      (payloadNode.kind != JNull and payloadNode.kind != JString) or semanticNode.kind != JString:
+    return none(LsmrDaYanEnvelope)
+  let messageId = messageIdNode.getStr()
+  if messageId.len == 0:
+    return none(LsmrDaYanEnvelope)
+  let originPeerId = PeerId.init(originPeerNode.getStr()).valueOr:
+    return none(LsmrDaYanEnvelope)
+  let topicOpt = jsonToDaYanTopic(topicNode)
+  if topicOpt.isNone():
+    return none(LsmrDaYanEnvelope)
+  let stageOpt = parseDaYanStage(stageNode.getStr())
+  let modeOpt = parseDaYanMode(modeNode.getStr())
+  let payloadKindOpt = parseDaYanPayloadKind(payloadKindNode.getStr())
+  if stageOpt.isNone() or modeOpt.isNone() or payloadKindOpt.isNone():
+    return none(LsmrDaYanEnvelope)
+  let resolutionValue = resolutionNode.getInt()
+  if resolutionValue <= 0 or resolutionValue > high(uint8).int:
+    return none(LsmrDaYanEnvelope)
+  var payload: seq[byte] = @[]
+  if payloadNode.kind == JString and payloadNode.getStr().len > 0:
+    try:
+      payload = stringToBytes(base64.decode(payloadNode.getStr()))
+    except CatchableError:
+      return none(LsmrDaYanEnvelope)
+  let topic = topicOpt.get()
+  if topic.mode != modeOpt.get():
+    return none(LsmrDaYanEnvelope)
+  let semanticFingerprint = semanticNode.getStr()
+  let envelope =
+    LsmrDaYanEnvelope.init(
+      messageId = messageId,
+      originPeerId = originPeerId,
+      topic = topic,
+      stage = stageOpt.get(),
+      payloadKind = payloadKindOpt.get(),
+      resolution = uint8(resolutionValue),
+      payload = payload,
+      semanticFingerprint =
+        if semanticFingerprint.len > 0: semanticFingerprint else: topic.semanticFingerprint,
+    )
+  if envelope.semanticFingerprint != topic.semanticFingerprint:
+    return none(LsmrDaYanEnvelope)
+  some(envelope)
+
+proc buildDaYanSubscriptionSnapshotNode(
+    svc: LsmrService
+): tuple[version: uint64, subscriptions: JsonNode] {.gcsafe, raises: [].} =
+  result.version = if svc.isNil: 0'u64 else: svc.dayanSubscriptionVersion
+  result.subscriptions = newJArray()
+  if svc.isNil:
+    return
+  var ids = svc.dayanSubscriptions.keys.toSeq()
+  ids.sort()
+  for id in ids:
+    let state = svc.dayanSubscriptions.getOrDefault(id)
+    result.subscriptions.add(state.subscription.dayanSubscriptionToJson())
+
+proc applyDaYanSubscriptionSnapshot(
+    svc: LsmrService, sourcePeerId: PeerId, node: JsonNode
+) {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or sourcePeerId.data.len == 0 or
+      sourcePeerId == svc.switch.peerInfo.peerId or node.isNil or node.kind != JObject:
+    return
+  let versionNode = dayanField(node, "dayanSubscriptionVersion")
+  let subscriptionsNode = dayanField(node, "dayanSubscriptions")
+  if versionNode.kind != JInt or subscriptionsNode.kind != JArray:
+    return
+  let versionValue = versionNode.getBiggestInt()
+  if versionValue < 0:
+    return
+  let version = uint64(versionValue)
+  let current = svc.remoteDaYanSubscriptions.getOrDefault(sourcePeerId)
+  if current.version > version:
+    return
+  var subscriptions: seq[LsmrDaYanSubscription] = @[]
+  for item in subscriptionsNode.items():
+    let subOpt = jsonToDaYanSubscription(item)
+    if subOpt.isSome():
+      subscriptions.add(subOpt.get())
+  subscriptions.sort(proc(a, b: LsmrDaYanSubscription): int =
+    cmp(dayanSubscriptionId(a), dayanSubscriptionId(b))
+  )
+  svc.remoteDaYanSubscriptions[sourcePeerId] = LsmrDaYanRemoteSnapshot(
+    version: version,
+    subscriptions: subscriptions,
+  )
+
+proc pruneSeenDaYanMessages(svc: LsmrService) {.gcsafe, raises: [].} =
+  if svc.isNil:
+    return
+  let currentMs = nowMillis()
+  var expired: seq[string] = @[]
+  for messageId, expiresAtMs in svc.dayanSeenMessages.pairs:
+    if expiresAtMs <= currentMs:
+      expired.add(messageId)
+  for messageId in expired:
+    svc.dayanSeenMessages.del(messageId)
+
+proc markDaYanMessageSeen(
+    svc: LsmrService, messageId: string
+): bool {.gcsafe, raises: [].} =
+  if svc.isNil or messageId.len == 0:
+    return false
+  svc.pruneSeenDaYanMessages()
+  if svc.dayanSeenMessages.hasKey(messageId):
+    return false
+  let ttlMs = max(1'i64, durationToMillis(svc.config.recordTtl))
+  svc.dayanSeenMessages[messageId] = nowMillis() + ttlMs
+  true
 
 proc buildCoordinateSyncResponse(svc: LsmrService): JsonNode {.gcsafe.} =
   let coordinateRecords = newJArray()
   let migrationRecords = newJArray()
   let isolationEvidence = newJArray()
   let peerAddresses = newJArray()
+  let dayanSnapshot = svc.buildDaYanSubscriptionSnapshotNode()
   result = %*{
     "ok": true,
     "coordinateRecords": coordinateRecords,
     "migrationRecords": migrationRecords,
     "isolationEvidence": isolationEvidence,
     "peerAddresses": peerAddresses,
+    "dayanSubscriptionVersion": int(dayanSnapshot.version),
+    "dayanSubscriptions": dayanSnapshot.subscriptions,
   }
   if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil:
     return
@@ -622,10 +991,11 @@ proc fillCoordinatePublishState(
       peerAddresses.add(item)
 
 proc applyCoordinateRecords(
-    svc: LsmrService, node: JsonNode
+    svc: LsmrService, sourcePeerId: PeerId, node: JsonNode
 ): Future[void] {.async: (raises: [CancelledError]).} =
   if svc.isNil or svc.switch.isNil:
     return
+  let sourcePeerKey = $sourcePeerId
   let startedAt = nowMillis()
   var appliedCoords = 0
   var appliedMigrations = 0
@@ -646,6 +1016,7 @@ proc applyCoordinateRecords(
     else:
       newJNull()
   svc.applyPeerAddressEntries(peerAddressesNode)
+  svc.applyDaYanSubscriptionSnapshot(sourcePeerId, node)
   let coordinateRecordsNode =
     if node.kind == JObject:
       node.getOrDefault("coordinateRecords")
@@ -705,7 +1076,8 @@ proc applyCoordinateRecords(
       var recoverySeen = initHashSet[string]()
       proc addRecoveryPeer(peerId: PeerId) =
         let key = $peerId
-        if peerId.data.len == 0 or key in recoverySeen:
+        if peerId.data.len == 0 or (sourcePeerKey.len > 0 and key == sourcePeerKey) or
+            key in recoverySeen:
           return
         recoverySeen.incl(key)
         recoveryPeers.add(peerId)
@@ -776,6 +1148,10 @@ proc buildCoordinatePublishBatch(
   var coordinatePayloads: seq[string] = @[]
   var migrationPayloads: seq[string] = @[]
   var isolationPayloads: seq[string] = @[]
+  let dayanSnapshot = svc.buildDaYanSubscriptionSnapshotNode()
+  let includeDaYanSubscriptions =
+    session.isNil or
+    session.publishedDaYanSubscriptionVersion != dayanSnapshot.version
   var request = %*{
     "op": "coordinate_publish",
     "coordinateRecords": coordinateRecords,
@@ -783,6 +1159,9 @@ proc buildCoordinatePublishBatch(
     "isolationEvidence": isolationEvidence,
     "peerAddresses": peerAddresses,
   }
+  if includeDaYanSubscriptions:
+    request["dayanSubscriptionVersion"] = %int(dayanSnapshot.version)
+    request["dayanSubscriptions"] = dayanSnapshot.subscriptions
 
   proc addCoordinateRecord(record: SignedLsmrCoordinateRecord) =
     let encoded = encodeSignedRecord(record)
@@ -865,7 +1244,8 @@ proc buildCoordinatePublishBatch(
   else:
     for peerId in publishPeers:
       addSubjectPeerState(peerId)
-  if coordinateRecords.len == 0 and migrationRecords.len == 0 and isolationEvidence.len == 0:
+  if coordinateRecords.len == 0 and migrationRecords.len == 0 and isolationEvidence.len == 0 and
+      not includeDaYanSubscriptions:
     request = newJNull()
   when defined(lsmr_diag):
     let selfPeerId =
@@ -887,6 +1267,8 @@ proc buildCoordinatePublishBatch(
     request: request,
     publishAllKnown: publishAllKnown,
     publishPeers: publishPeers,
+    dayanSubscriptionVersion: dayanSnapshot.version,
+    includesDaYanSubscriptions: includeDaYanSubscriptions,
     coordinateDigests: coordinateDigests,
     migrationDigests: migrationDigests,
     isolationDigests: isolationDigests,
@@ -898,6 +1280,8 @@ proc buildCoordinatePublishBatch(
 proc notePublishedBatch(session: LsmrControlSession, batch: LsmrPublishBatch) {.gcsafe.} =
   if session.isNil:
     return
+  if batch.includesDaYanSubscriptions:
+    session.publishedDaYanSubscriptionVersion = batch.dayanSubscriptionVersion
   for digest in batch.coordinateDigests:
     session.publishedCoordinateDigests.incl(digest)
   for digest in batch.migrationDigests:
@@ -922,10 +1306,11 @@ proc restoreQueuedPublishState(session: LsmrControlSession, batch: LsmrPublishBa
     session.publishPeers[$peerId] = peerId
 
 proc applyCoordinatePublishRequest(
-    svc: LsmrService, request: JsonNode
+    svc: LsmrService, sourcePeerId: PeerId, request: JsonNode
 ): Future[void] {.async: (raises: [CancelledError]).} =
   if svc.isNil or svc.switch.isNil:
     return
+  let sourcePeerKey = $sourcePeerId
   let startedAt = nowMillis()
   var yieldPoints = 0
   var maxSliceMs = 0'i64
@@ -943,6 +1328,7 @@ proc applyCoordinatePublishRequest(
     else:
       newJNull()
   svc.applyPeerAddressEntries(peerAddressesNode)
+  svc.applyDaYanSubscriptionSnapshot(sourcePeerId, request)
   let decoded = await collectCoordinateRecordsAsync(svc, decodeCoordinatePublishRecordNodes(request))
   yieldPoints += decoded.yields
   if decoded.maxSliceMs > maxSliceMs:
@@ -993,7 +1379,8 @@ proc applyCoordinatePublishRequest(
       var recoverySeen = initHashSet[string]()
       proc addRecoveryPeer(peerId: PeerId) =
         let key = $peerId
-        if peerId.data.len == 0 or key in recoverySeen:
+        if peerId.data.len == 0 or (sourcePeerKey.len > 0 and key == sourcePeerKey) or
+            key in recoverySeen:
           return
         recoverySeen.incl(key)
         recoveryPeers.add(peerId)
@@ -1065,8 +1452,33 @@ proc getOrCreateControlSession(
       publishedCoordinatePayloads: initHashSet[string](),
       publishedMigrationPayloads: initHashSet[string](),
       publishedIsolationPayloads: initHashSet[string](),
+      publishedDaYanSubscriptionVersion: 0'u64,
     )
   svc.controlSessions.getOrDefault(key)
+
+proc getOrCreateDaYanSession(
+    svc: LsmrService, peerId: PeerId
+): LsmrControlSession =
+  let key = controlSessionKey(peerId)
+  if not svc.dayanSessions.hasKey(key):
+    svc.dayanSessions[key] = LsmrControlSession(
+      peerId: peerId,
+      conn: nil,
+      syncPending: false,
+      publishPending: false,
+      publishAllKnown: false,
+      publishPeers: initTable[string, PeerId](),
+      runner: nil,
+      lock: newAsyncLock(),
+      publishedCoordinateDigests: initHashSet[string](),
+      publishedMigrationDigests: initHashSet[string](),
+      publishedIsolationDigests: initHashSet[string](),
+      publishedCoordinatePayloads: initHashSet[string](),
+      publishedMigrationPayloads: initHashSet[string](),
+      publishedIsolationPayloads: initHashSet[string](),
+      publishedDaYanSubscriptionVersion: 0'u64,
+    )
+  svc.dayanSessions.getOrDefault(key)
 
 proc releaseSessionLock(session: LsmrControlSession) =
   if session.isNil or session.lock.isNil:
@@ -2121,6 +2533,7 @@ proc new*(
     refreshRunner: nil,
     nearFieldRecords: initTable[PeerId, NearFieldHandshakeRecord](),
     controlSessions: initTable[string, LsmrControlSession](),
+    dayanSessions: initTable[string, LsmrControlSession](),
     connectFlights: initTable[string, Future[bool]](),
     dialLocks: initTable[string, AsyncLock](),
     topologyChangeSeq: 0'u64,
@@ -2128,6 +2541,13 @@ proc new*(
     appliedMigrationPayloads: initHashSet[string](),
     appliedIsolationPayloads: initHashSet[string](),
     applyQueue: initDeque[LsmrControlApplyItem](),
+    dayanSubscriptions: initTable[string, LsmrDaYanLocalSubscription](),
+    remoteDaYanSubscriptions: initTable[PeerId, LsmrDaYanRemoteSnapshot](),
+    dayanSubscriptionVersion: 0'u64,
+    dayanSeenMessages: initTable[string, int64](),
+    dayanMessageSeq: 0'u64,
+    dayanBackgroundQueue: initDeque[LsmrDaYanDispatchItem](),
+    dayanFlowConfig: LsmrDaYanFlowConfig.init(),
   )
 
 proc buildWitnessProtocol(svc: LsmrService): LPProtocol =
@@ -2271,8 +2691,15 @@ proc buildControlProtocol(svc: LsmrService): LPProtocol =
             " coords=", (if coordsNode.kind == JArray: coordsNode.len else: 0),
             " migrations=", (if migrationsNode.kind == JArray: migrationsNode.len else: 0),
             " isolations=", (if isolationsNode.kind == JArray: isolationsNode.len else: 0)
-        svc.scheduleControlApply(lcakPublish, request)
+        svc.scheduleControlApply(lcakPublish, conn.peerId, request)
         await conn.writeLp(stringToBytes($(%*{"ok": true})))
+      of "dayan_publish":
+        let envelopeOpt = jsonToDaYanEnvelope(request)
+        if envelopeOpt.isNone():
+          await conn.writeLp(stringToBytes($(%*{"ok": false})))
+        else:
+          let accepted = await svc.acceptDaYanEnvelope(conn.peerId, envelopeOpt.get())
+          await conn.writeLp(stringToBytes($(%*{"ok": accepted})))
       of "migration_request":
         let targetPrefix =
           if request.hasKey("targetPrefix"):
@@ -2451,30 +2878,6 @@ proc knownSyncPeers(svc: LsmrService): seq[PeerId] {.gcsafe.} =
       continue
     seen.incl(key)
     result.add(peerId)
-  for peerId, _ in svc.switch.peerStore[AddressBook].book.pairs:
-    if peerId.data.len == 0 or peerId == selfPeerId:
-      continue
-    let key = $peerId
-    if key in seen:
-      continue
-    seen.incl(key)
-    result.add(peerId)
-  for peerId, _ in svc.switch.peerStore[LsmrBook].book.pairs:
-    if peerId.data.len == 0 or peerId == selfPeerId:
-      continue
-    let key = $peerId
-    if key in seen:
-      continue
-    seen.incl(key)
-    result.add(peerId)
-  for peerId, _ in svc.switch.peerStore[ActiveLsmrBook].book.pairs:
-    if peerId.data.len == 0 or peerId == selfPeerId:
-      continue
-    let key = $peerId
-    if key in seen:
-      continue
-    seen.incl(key)
-    result.add(peerId)
 
 proc knowsCoordinatePeer(svc: LsmrService, peerId: PeerId): bool {.gcsafe.} =
   if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or
@@ -2521,6 +2924,19 @@ proc desiredOverlayPeers(svc: LsmrService): seq[PeerId] {.gcsafe.} =
     echo "lsmr overlay-plan self=", $selfPeerId,
       " peers=", result.mapIt($it).join(","),
       " active=", svc.switch.peerStore[ActiveLsmrBook].book.len
+
+proc shouldAutoConnectPeer(svc: LsmrService, peerId: PeerId): bool {.gcsafe.} =
+  if svc.isNil or svc.switch.isNil or peerId.data.len == 0 or
+      peerId == svc.switch.peerInfo.peerId:
+    return false
+  let peerKey = $peerId
+  for desiredPeerId in svc.desiredOverlayPeers():
+    if $desiredPeerId == peerKey:
+      return true
+  for anchor in svc.effectiveAnchors():
+    if $anchor.peerId == peerKey:
+      return true
+  false
 
 proc performOverlayConnect(
     svc: LsmrService, peerId: PeerId
@@ -2772,9 +3188,9 @@ proc runControlApplyQueue(svc: LsmrService): Future[void] {.async: (raises: []).
     try:
       case item.kind
       of lcakSync:
-        await svc.applyCoordinateRecords(item.node)
+        await svc.applyCoordinateRecords(item.sourcePeerId, item.node)
       of lcakPublish:
-        await svc.applyCoordinatePublishRequest(item.node)
+        await svc.applyCoordinatePublishRequest(item.sourcePeerId, item.node)
     except CancelledError:
       return
     except CatchableError as exc:
@@ -2788,11 +3204,13 @@ proc runControlApplyQueue(svc: LsmrService): Future[void] {.async: (raises: []).
   svc.applyRunner = nil
 
 proc scheduleControlApply(
-    svc: LsmrService, kind: LsmrControlApplyKind, node: JsonNode
+    svc: LsmrService, kind: LsmrControlApplyKind, sourcePeerId: PeerId, node: JsonNode
 ) {.gcsafe, raises: [].} =
   if svc.isNil or not svc.running or node.isNil or node.kind != JObject:
     return
-  svc.applyQueue.addLast(LsmrControlApplyItem(kind: kind, node: node))
+  svc.applyQueue.addLast(
+    LsmrControlApplyItem(kind: kind, sourcePeerId: sourcePeerId, node: node)
+  )
   when defined(lsmr_diag):
     echo "lsmr apply-queue self=", $svc.switch.peerInfo.peerId,
       " kind=", controlApplyKindName(kind),
@@ -2865,6 +3283,310 @@ proc sendControlRequest(
         " op=", op,
         " err=", getCurrentExceptionMsg()
     none(JsonNode)
+
+proc dayanPeerPrefix(svc: LsmrService, peerId: PeerId): LsmrPath {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or peerId.data.len == 0:
+    return @[]
+  if svc.switch.peerStore[ActiveLsmrBook].contains(peerId):
+    return svc.switch.peerStore[ActiveLsmrBook][peerId].data.certifiedPrefix()
+  if svc.switch.peerStore[LsmrBook].contains(peerId):
+    return svc.switch.peerStore[LsmrBook][peerId].data.certifiedPrefix()
+  @[]
+
+proc currentDaYanRelayPeers(svc: LsmrService): seq[LsmrDaYanPeer] {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil:
+    return @[]
+  let selfPeerId =
+    if svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  for peerId, snapshot in svc.remoteDaYanSubscriptions.pairs:
+    if peerId.data.len == 0 or peerId == selfPeerId or snapshot.subscriptions.len == 0 or
+        not svc.hasDialableRoute(peerId):
+      continue
+    let prefix = svc.dayanPeerPrefix(peerId)
+    if prefix.len == 0:
+      continue
+    result.add(LsmrDaYanPeer.init(peerId, prefix, snapshot.subscriptions))
+
+proc localDaYanHandlers(
+    svc: LsmrService, topic: LsmrDaYanTopic, resolution: uint8
+): seq[LsmrDaYanHandler] {.gcsafe, raises: [].} =
+  if svc.isNil:
+    return @[]
+  var ids = svc.dayanSubscriptions.keys.toSeq()
+  ids.sort()
+  for id in ids:
+    let state = svc.dayanSubscriptions.getOrDefault(id)
+    if state.handler.isNil:
+      continue
+    if state.subscription.matches(topic, resolution):
+      result.add(state.handler)
+
+proc deliverDaYanLocally(
+    svc: LsmrService, envelope: LsmrDaYanEnvelope
+): Future[void] {.async: (raises: [CancelledError]).} =
+  let handlers = svc.localDaYanHandlers(envelope.topic, envelope.resolution)
+  when defined(lsmr_diag):
+    echo "lsmr dayan-local self=", $svc.switch.peerInfo.peerId,
+      " message=", envelope.messageId,
+      " stage=", $envelope.stage,
+      " resolution=", envelope.resolution,
+      " handlers=", handlers.len
+  if handlers.len == 0:
+    return
+  let message =
+    LsmrDaYanMessage.init(
+      messageId = envelope.messageId,
+      originPeerId = envelope.originPeerId,
+      topic = envelope.topic,
+      stage = envelope.stage,
+      payloadKind = envelope.payloadKind,
+      resolution = envelope.resolution,
+      payload = envelope.payload,
+      semanticFingerprint = envelope.semanticFingerprint,
+    )
+  for handler in handlers:
+    try:
+      await handler(message)
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      debug "lsmr dayan handler failed", err = exc.msg, messageId = message.messageId
+
+proc buildRelayEnvelope(
+    route: LsmrDaYanRoute, envelope: LsmrDaYanEnvelope
+): LsmrDaYanEnvelope {.gcsafe, raises: [].} =
+  let payload =
+    if route.payloadKind == LsmrDaYanPayloadKind.ldypkCsgDelta:
+      envelope.payload
+    else:
+      @[]
+  LsmrDaYanEnvelope.init(
+    messageId = envelope.messageId,
+    originPeerId = envelope.originPeerId,
+    topic = envelope.topic,
+    stage = route.stage,
+    payloadKind = route.payloadKind,
+    resolution = route.resolution,
+    payload = payload,
+    semanticFingerprint = envelope.semanticFingerprint,
+  )
+
+proc plannedDaYanRelayRoutes(
+    svc: LsmrService, sourcePeerId: PeerId, envelope: LsmrDaYanEnvelope
+): seq[LsmrDaYanRoute] {.gcsafe, raises: [].} =
+  let peers = svc.currentDaYanRelayPeers()
+  let excluded =
+    if sourcePeerId.data.len == 0:
+      none(PeerId)
+    else:
+      some(sourcePeerId)
+  planDaYanRelay(
+    peers,
+    envelope.topic,
+    envelope.stage,
+    envelope.resolution,
+    svc.dayanFlowConfig,
+    excluded,
+  )
+
+proc sendDaYanEnvelopeToPeer(
+    svc: LsmrService, peerId: PeerId, envelope: LsmrDaYanEnvelope
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or peerId.data.len == 0 or not svc.hasDialableRoute(peerId):
+    return false
+  when defined(lsmr_diag):
+    echo "lsmr dayan-send-begin self=", $svc.switch.peerInfo.peerId,
+      " peer=", $peerId,
+      " message=", envelope.messageId,
+      " stage=", $envelope.stage,
+      " resolution=", envelope.resolution
+  let session = svc.getOrCreateDaYanSession(peerId)
+  try:
+    await session.lock.acquire()
+    try:
+      let conn = await svc.ensureControlConnection(session)
+      if conn.isNil:
+        if not svc.switch.isConnected(peerId):
+          svc.schedulePeerConnect(peerId)
+        return false
+      defer:
+        await svc.closeControlSession(session)
+      var request = envelope.dayanEnvelopeToJson()
+      request["op"] = %"dayan_publish"
+      let response = await sendControlRequest(svc, conn, request, 8 * 1024)
+      if response.isNone():
+        when defined(lsmr_diag):
+          echo "lsmr dayan-send-miss self=", $svc.switch.peerInfo.peerId,
+            " peer=", $peerId,
+            " message=", envelope.messageId
+        return false
+      let node = response.get()
+      let okNode =
+        if node.kind == JObject:
+          node.getOrDefault("ok")
+        else:
+          newJNull()
+      let ok = okNode.kind == JBool and okNode.getBool()
+      when defined(lsmr_diag):
+        echo "lsmr dayan-send-", (if ok: "ok" else: "reject"),
+          " self=", $svc.switch.peerInfo.peerId,
+          " peer=", $peerId,
+          " message=", envelope.messageId,
+          " stage=", $envelope.stage
+      ok
+    finally:
+      releaseSessionLock(session)
+  except CancelledError as exc:
+    raise exc
+  except CatchableError as exc:
+    debug "lsmr dayan send failed", peerId = peerId, err = exc.msg
+    false
+
+proc dispatchDaYanRoutesNow(
+    svc: LsmrService, routes: seq[LsmrDaYanRoute], envelope: LsmrDaYanEnvelope
+): Future[int] {.async: (raises: [CancelledError]).} =
+  for route in routes:
+    if await svc.sendDaYanEnvelopeToPeer(route.peerId, route.buildRelayEnvelope(envelope)):
+      inc result
+
+proc runDaYanBackgroundQueue(svc: LsmrService): Future[void] {.async: (raises: []).} =
+  while svc.running and svc.dayanBackgroundQueue.len > 0:
+    let item = svc.dayanBackgroundQueue.popFirst()
+    try:
+      discard await svc.sendDaYanEnvelopeToPeer(item.peerId, item.envelope)
+    except CancelledError:
+      return
+    except CatchableError as exc:
+      debug "lsmr dayan background dispatch failed", peerId = item.peerId, err = exc.msg
+  svc.dayanBackgroundRunner = nil
+
+proc queueDaYanBackgroundDispatch(
+    svc: LsmrService,
+    peerId: PeerId,
+    envelope: LsmrDaYanEnvelope,
+    prepend = false,
+) {.gcsafe, raises: [].} =
+  if svc.isNil or not svc.running or peerId.data.len == 0:
+    return
+  let item = LsmrDaYanDispatchItem(peerId: peerId, envelope: envelope)
+  if prepend:
+    svc.dayanBackgroundQueue.addFirst(item)
+  else:
+    svc.dayanBackgroundQueue.addLast(item)
+  if svc.dayanBackgroundRunner.isNil or svc.dayanBackgroundRunner.finished():
+    svc.dayanBackgroundRunner = svc.runDaYanBackgroundQueue()
+    asyncSpawn svc.dayanBackgroundRunner
+
+proc relayDaYanEnvelope(
+    svc: LsmrService,
+    sourcePeerId: PeerId,
+    envelope: LsmrDaYanEnvelope,
+    waitForWrites: bool,
+): Future[int] {.async: (raises: [CancelledError]).} =
+  let routes = svc.plannedDaYanRelayRoutes(sourcePeerId, envelope)
+  when defined(lsmr_diag):
+    echo "lsmr dayan-relay-plan self=", $svc.switch.peerInfo.peerId,
+      " source=", $sourcePeerId,
+      " message=", envelope.messageId,
+      " stage=", $envelope.stage,
+      " resolution=", envelope.resolution,
+      " routes=", routes.len,
+      " wait=", waitForWrites
+  if routes.len == 0:
+    return 0
+  if envelope.mode == LsmrDaYanMode.ldymXun:
+    for route in routes:
+      svc.queueDaYanBackgroundDispatch(route.peerId, route.buildRelayEnvelope(envelope))
+    return 0
+  if waitForWrites:
+    return await svc.dispatchDaYanRoutesNow(routes, envelope)
+  for idx in countdown(routes.high, 0):
+    let route = routes[idx]
+    svc.queueDaYanBackgroundDispatch(
+      route.peerId, route.buildRelayEnvelope(envelope), prepend = true
+    )
+  0
+
+proc subscribeDaYan*(
+    svc: LsmrService, subscription: LsmrDaYanSubscription, handler: LsmrDaYanHandler
+): string {.gcsafe, raises: [].} =
+  if svc.isNil or not subscription.isValid():
+    return ""
+  let subscriptionId = dayanSubscriptionId(subscription)
+  let existed = svc.dayanSubscriptions.hasKey(subscriptionId)
+  svc.dayanSubscriptions[subscriptionId] = LsmrDaYanLocalSubscription(
+    subscription: subscription,
+    handler: handler,
+  )
+  if not existed:
+    inc svc.dayanSubscriptionVersion
+    if svc.running:
+      for peerId in svc.knownSyncPeers():
+        svc.queueControlPublish(peerId)
+  subscriptionId
+
+proc unsubscribeDaYan*(svc: LsmrService, subscriptionId: string): bool {.gcsafe, raises: [].} =
+  if svc.isNil or subscriptionId.len == 0 or not svc.dayanSubscriptions.hasKey(subscriptionId):
+    return false
+  svc.dayanSubscriptions.del(subscriptionId)
+  inc svc.dayanSubscriptionVersion
+  if svc.running:
+    for peerId in svc.knownSyncPeers():
+      svc.queueControlPublish(peerId)
+  true
+
+proc acceptDaYanEnvelope*(
+    svc: LsmrService, sourcePeerId: PeerId, envelope: LsmrDaYanEnvelope
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or not svc.running or envelope.messageId.len == 0 or
+      not envelope.topic.isValid() or envelope.resolution == 0'u8:
+    return false
+  if not svc.markDaYanMessageSeen(envelope.messageId):
+    when defined(lsmr_diag):
+      echo "lsmr dayan-drop-dup self=", $svc.switch.peerInfo.peerId,
+        " source=", $sourcePeerId,
+        " message=", envelope.messageId
+    return false
+  when defined(lsmr_diag):
+    echo "lsmr dayan-accept self=", $svc.switch.peerInfo.peerId,
+      " source=", $sourcePeerId,
+      " message=", envelope.messageId,
+      " stage=", $envelope.stage,
+      " resolution=", envelope.resolution
+  await svc.deliverDaYanLocally(envelope)
+  discard await svc.relayDaYanEnvelope(sourcePeerId, envelope, waitForWrites = false)
+  true
+
+proc publishDaYan*(
+    svc: LsmrService, topic: LsmrDaYanTopic, payload: seq[byte]
+): Future[int] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerInfo.isNil or not topic.isValid():
+    return 0
+  let messageId = svc.buildDaYanMessageId(topic)
+  if messageId.len == 0 or not svc.markDaYanMessageSeen(messageId):
+    return 0
+  when defined(lsmr_diag):
+    echo "lsmr dayan-publish self=", $svc.switch.peerInfo.peerId,
+      " message=", messageId,
+      " mode=", $topic.mode,
+      " resolution=", topic.resolution,
+      " payload=", payload.len
+  let envelope =
+    LsmrDaYanEnvelope.init(
+      messageId = messageId,
+      originPeerId = svc.switch.peerInfo.peerId,
+      topic = topic,
+      stage = LsmrDaYanStage.ldysKunLocal,
+      payloadKind = LsmrDaYanPayloadKind.ldypkCsgDelta,
+      resolution = topic.resolution,
+      payload = payload,
+      semanticFingerprint = topic.semanticFingerprint,
+    )
+  await svc.deliverDaYanLocally(envelope)
+  await svc.relayDaYanEnvelope(svc.switch.peerInfo.peerId, envelope, waitForWrites = true)
 
 proc requestWitnessFromPeer*(
     svc: LsmrService, peerId: PeerId, targetPrefix: LsmrPath
@@ -3009,7 +3731,7 @@ proc syncCoordinatesOnConn(
   when defined(lsmr_diag):
     echo "lsmr sync-apply-begin self=", $svc.switch.peerInfo.peerId,
       " peer=", $peerId
-  await svc.applyCoordinateRecords(node)
+  await svc.applyCoordinateRecords(peerId, node)
   when defined(lsmr_diag):
     let coordsNode = node.getOrDefault("coordinateRecords")
     let migrationsNode = node.getOrDefault("migrationRecords")
@@ -3735,6 +4457,10 @@ method stop*(
       await svc.applyRunner.cancelAndWait()
     svc.applyRunner = nil
     svc.applyQueue.clear()
+    if not svc.dayanBackgroundRunner.isNil and not svc.dayanBackgroundRunner.finished():
+      await svc.dayanBackgroundRunner.cancelAndWait()
+    svc.dayanBackgroundRunner = nil
+    svc.dayanBackgroundQueue.clear()
     var connectFlights: seq[Future[bool]] = @[]
     for _, future in svc.connectFlights.pairs:
       if not future.isNil:
@@ -3751,6 +4477,12 @@ method stop*(
         await session.runner.cancelAndWait()
       await svc.closeControlSession(session)
     svc.controlSessions.clear()
+    var dayanSessions: seq[LsmrControlSession] = @[]
+    for _, session in svc.dayanSessions.pairs:
+      dayanSessions.add(session)
+    for session in dayanSessions:
+      await svc.closeControlSession(session)
+    svc.dayanSessions.clear()
     if not svc.connectedHandler.isNil and not switch.isNil:
       switch.removeConnEventHandler(svc.connectedHandler, ConnEventKind.Connected)
       svc.connectedHandler = nil

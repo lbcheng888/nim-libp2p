@@ -197,7 +197,7 @@ proc verifyPeerCertificate(
   var pid: PeerId
   try:
     pid = parsed.peerId()
-  except LPError as exc:
+  except CatchableError as exc:
     raise (ref TLSHandshakeError)(
       msg: "Failed to extract peer id from certificate: " & exc.msg, parent: exc
     )

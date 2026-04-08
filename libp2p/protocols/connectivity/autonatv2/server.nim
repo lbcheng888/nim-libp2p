@@ -178,18 +178,17 @@ proc forceNewConnection(
   ## Force a new protocol stream to ``pid`` instead of reusing a preexisting
   ## connection.
   let dialer = self.switch.dialer
-  if dialer.isNil or not (dialer of Dialer):
+  if dialer.isNil:
     error "AutoNAT v2 server requires a concrete Dialer", peer = pid
     return Opt.none((Muxer, Connection))
   try:
-    let concreteDialer = Dialer(dialer)
-    let mux = await concreteDialer.dialAndUpgrade(Opt.some(pid), addrs)
+    let mux = await dialer.dialAndUpgrade(Opt.some(pid), addrs)
     if mux.isNil():
       return Opt.none((Muxer, Connection))
     return Opt.some(
       (
         mux,
-        await concreteDialer.negotiateStream(
+        await dialer.negotiateStream(
           await mux.newStream(), @[$AutonatV2Codec.DialBack]
         ),
       )

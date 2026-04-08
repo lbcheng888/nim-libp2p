@@ -77,7 +77,7 @@ COMMON_FLAGS=(
   "--app:console"
   "--os:linux"
   "--cpu:arm64"
-  "--mm:arc"
+  "--mm:orc"
   "--deepCopy:on"
   "--threads:on"
   "--cc:clang"

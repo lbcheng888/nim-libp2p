@@ -83,6 +83,18 @@ proc sendError(conn: Connection, status: FetchStatus) {.async.} =
   var resp = FetchResponse(status: status, data: @[])
   await conn.writeLp(resp.encode())
 
+proc sendFetchInvalidError(conn: Connection) {.async.} =
+  try:
+    await conn.sendError(FetchStatus.fsError)
+  except CatchableError as sendErr:
+    trace "failed sending fetch error", conn, err = sendErr.msg
+
+proc sendFetchTooLargeError(conn: Connection) {.async.} =
+  try:
+    await conn.sendError(FetchStatus.fsTooLarge)
+  except CatchableError as sendErr:
+    trace "failed sending fetch too-large error", conn, err = sendErr.msg
+
 proc diagKey(key: string): string =
   let idx = key.find(':')
   if idx >= 0:
@@ -100,80 +112,77 @@ method init*(svc: FetchService) =
         " fetch-server enter peer=", $conn.peerId,
         " proto=", proto
     try:
-      when defined(fetch_diag) or defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fetch-server read-begin peer=", $conn.peerId
-      let payload = await conn.readLp(svc.config.maxRequestBytes)
-      when defined(fetch_diag) or defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fetch-server read-ok peer=", $conn.peerId,
-          " bytes=", payload.len
-      let reqOpt = decodeFetchRequest(payload)
-      if reqOpt.isNone():
         when defined(fetch_diag) or defined(fabric_lsmr_diag):
           echo "t=", diagNowMs(),
-            " fetch-server decode-invalid peer=", $conn.peerId
-        debug "failed decoding fetch request", conn
-        try:
-          await conn.sendError(FetchStatus.fsError)
-        except CatchableError as sendErr:
-          trace "failed sending fetch error", conn, err = sendErr.msg
-        return
-      let request = reqOpt.get()
-      when defined(fetch_diag) or defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fetch-server decode-ok peer=", $conn.peerId,
-          " key=", diagKey(request.identifier)
-      var response: FetchResponse
-      if svc.fetchHandler.isNil:
-        response = FetchResponse(status: FetchStatus.fsNotFound, data: @[])
-      else:
+            " fetch-server read-begin peer=", $conn.peerId
+        let payload = await conn.readLp(svc.config.maxRequestBytes)
         when defined(fetch_diag) or defined(fabric_lsmr_diag):
           echo "t=", diagNowMs(),
-            " fetch-server handler-begin peer=", $conn.peerId,
+            " fetch-server read-ok peer=", $conn.peerId,
+            " bytes=", payload.len
+        let reqOpt = decodeFetchRequest(payload)
+        if reqOpt.isNone():
+          when defined(fetch_diag) or defined(fabric_lsmr_diag):
+            echo "t=", diagNowMs(),
+              " fetch-server decode-invalid peer=", $conn.peerId
+          debug "failed decoding fetch request", conn
+          await sendFetchInvalidError(conn)
+          return
+        let request = reqOpt.get()
+        when defined(fetch_diag) or defined(fabric_lsmr_diag):
+          echo "t=", diagNowMs(),
+            " fetch-server decode-ok peer=", $conn.peerId,
             " key=", diagKey(request.identifier)
-        if svc.config.handlerTimeout > 0.seconds:
-          let handlerFuture = svc.fetchHandler(request.identifier)
-          let completed = await withTimeout(handlerFuture, svc.config.handlerTimeout)
-          if not completed:
-            trace "fetch handler timeout", conn, key = request.identifier
-            when defined(fetch_diag) or defined(fabric_lsmr_diag):
-              echo "t=", diagNowMs(),
-                " fetch-server handler-timeout peer=", $conn.peerId,
-                " key=", diagKey(request.identifier)
-            response = FetchResponse(status: FetchStatus.fsError, data: @[])
-          else:
-            response = await handlerFuture
+        var response: FetchResponse
+        if svc.fetchHandler.isNil:
+          response = FetchResponse(status: FetchStatus.fsNotFound, data: @[])
         else:
-          response = await svc.fetchHandler(request.identifier)
+          when defined(fetch_diag) or defined(fabric_lsmr_diag):
+            echo "t=", diagNowMs(),
+              " fetch-server handler-begin peer=", $conn.peerId,
+              " key=", diagKey(request.identifier)
+          if svc.config.handlerTimeout > 0.seconds:
+            let handlerFuture = svc.fetchHandler(request.identifier)
+            let completed = await withTimeout(handlerFuture, svc.config.handlerTimeout)
+            if not completed:
+              trace "fetch handler timeout", conn, key = request.identifier
+              when defined(fetch_diag) or defined(fabric_lsmr_diag):
+                echo "t=", diagNowMs(),
+                  " fetch-server handler-timeout peer=", $conn.peerId,
+                  " key=", diagKey(request.identifier)
+              response = FetchResponse(status: FetchStatus.fsError, data: @[])
+            else:
+              response = await handlerFuture
+          else:
+            response = await svc.fetchHandler(request.identifier)
         when defined(fetch_diag) or defined(fabric_lsmr_diag):
           echo "t=", diagNowMs(),
             " fetch-server handler-done peer=", $conn.peerId,
             " key=", diagKey(request.identifier),
             " status=", ord(response.status)
-      if response.data.len > svc.config.maxResponseBytes:
-        trace "fetch response exceeded maxResponseBytes",
-          size = response.data.len, limit = svc.config.maxResponseBytes
-        try:
-          await conn.sendError(FetchStatus.fsTooLarge)
-        except CatchableError as sendErr:
-          trace "failed sending fetch too-large error", conn, err = sendErr.msg
-        return
-      when defined(fetch_diag) or defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fetch-server write-begin peer=", $conn.peerId,
-          " key=", diagKey(request.identifier)
-      await conn.writeLp(response.encode())
-      when defined(fetch_diag) or defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fetch-server write-done peer=", $conn.peerId,
-          " key=", diagKey(request.identifier)
+        if response.data.len > svc.config.maxResponseBytes:
+          trace "fetch response exceeded maxResponseBytes",
+            size = response.data.len, limit = svc.config.maxResponseBytes
+          await sendFetchTooLargeError(conn)
+        else:
+          when defined(fetch_diag) or defined(fabric_lsmr_diag):
+            echo "t=", diagNowMs(),
+              " fetch-server write-begin peer=", $conn.peerId,
+              " key=", diagKey(request.identifier),
+              " bytes=", response.data.len
+          await conn.writeLp(response.encode())
+          when defined(fetch_diag) or defined(fabric_lsmr_diag):
+            echo "t=", diagNowMs(),
+              " fetch-server write-done peer=", $conn.peerId,
+              " key=", diagKey(request.identifier)
     except CancelledError as exc:
       trace "fetch handler cancelled", conn
       when defined(fetch_diag) or defined(fabric_lsmr_diag):
         echo "t=", diagNowMs(),
           " fetch-server cancelled peer=", $conn.peerId
       raise exc
+    except LPStreamEOFError:
+      discard
     except LPStreamError as exc:
       trace "stream error during fetch", conn, err = exc.msg
       when defined(fetch_diag) or defined(fabric_lsmr_diag):
@@ -193,6 +202,98 @@ method init*(svc: FetchService) =
 
   svc.handler = handle
   svc.codec = FetchCodec
+
+proc fetchOnConn*(
+    conn: Connection,
+    key: string,
+    timeout: Duration,
+    maxResponseBytes: int,
+): Future[FetchResponse] {.async: (raises: [CancelledError, FetchError]).} =
+  if conn.isNil:
+    raise (ref FetchError)(
+      msg: "fetch connection is nil", kind: FetchErrorKind.feConfig
+    )
+
+  if maxResponseBytes <= 0:
+    raise (ref FetchError)(
+      msg: "maxResponseBytes must be positive", kind: FetchErrorKind.feConfig
+    )
+
+  let req = FetchRequest(identifier: key)
+  try:
+    when defined(fetch_diag) or defined(fabric_lsmr_diag):
+      echo "t=", diagNowMs(),
+        " fetch-stage write-begin peer=", $conn.peerId,
+        " key=", diagKey(key)
+    await conn.writeLp(req.encode())
+    when defined(fetch_diag) or defined(fabric_lsmr_diag):
+      echo "t=", diagNowMs(),
+        " fetch-stage write-ok peer=", $conn.peerId,
+        " key=", diagKey(key)
+  except LPStreamError as exc:
+    when defined(fetch_diag) or defined(fabric_lsmr_diag):
+      echo "t=", diagNowMs(),
+        " fetch-stage write-exc peer=", $conn.peerId,
+        " key=", diagKey(key),
+        " err=", exc.msg
+    raise (ref FetchError)(
+      msg: "fetch write failed: " & exc.msg,
+      parent: exc,
+      kind: FetchErrorKind.feWriteFailure,
+    )
+
+  let readFuture = conn.readLp(maxResponseBytes)
+  when defined(fetch_diag) or defined(fabric_lsmr_diag):
+    echo "t=", diagNowMs(),
+      " fetch-stage read-begin peer=", $conn.peerId,
+      " key=", diagKey(key),
+      " timeoutMs=", timeout.milliseconds
+  let completed =
+    try:
+      await withTimeout(readFuture, timeout)
+    except CancelledError as exc:
+      raise exc
+  if not completed:
+    when defined(fetch_diag) or defined(fabric_lsmr_diag):
+      echo "t=", diagNowMs(),
+        " fetch-stage read-timeout peer=", $conn.peerId,
+        " key=", diagKey(key)
+    raise (ref FetchError)(
+      msg: "fetch response timeout", kind: FetchErrorKind.feTimeout
+    )
+
+  let payload =
+    try:
+      await readFuture
+    except CancelledError as exc:
+      raise exc
+    except LPStreamError as exc:
+      when defined(fetch_diag) or defined(fabric_lsmr_diag):
+        echo "t=", diagNowMs(),
+          " fetch-stage read-exc peer=", $conn.peerId,
+          " key=", diagKey(key),
+          " err=", exc.msg
+      raise (ref FetchError)(
+        msg: "fetch read failed: " & exc.msg,
+        parent: exc,
+        kind: FetchErrorKind.feReadFailure,
+      )
+  when defined(fetch_diag) or defined(fabric_lsmr_diag):
+    echo "t=", diagNowMs(),
+      " fetch-stage read-ok peer=", $conn.peerId,
+      " key=", diagKey(key),
+      " bytes=", payload.len
+
+  let respOpt = decodeFetchResponse(payload)
+  if respOpt.isNone():
+    when defined(fetch_diag) or defined(fabric_lsmr_diag):
+      echo "t=", diagNowMs(),
+        " fetch-stage decode-invalid peer=", $conn.peerId,
+        " key=", diagKey(key)
+    raise (ref FetchError)(
+      msg: "invalid fetch response payload", kind: FetchErrorKind.feInvalidResponse
+    )
+  respOpt.get()
 
 proc fetchOnce(
     sw: Switch,
@@ -235,86 +336,7 @@ proc fetchOnce(
   defer:
     await conn.close()
 
-  if maxResponseBytes <= 0:
-    raise (ref FetchError)(
-      msg: "maxResponseBytes must be positive", kind: FetchErrorKind.feConfig
-    )
-
-  let req = FetchRequest(identifier: key)
-  try:
-    when defined(fetch_diag) or defined(fabric_lsmr_diag):
-      echo "t=", diagNowMs(),
-        " fetch-stage write-begin peer=", $peerId,
-        " key=", diagKey(key)
-    await conn.writeLp(req.encode())
-    when defined(fetch_diag) or defined(fabric_lsmr_diag):
-      echo "t=", diagNowMs(),
-        " fetch-stage write-ok peer=", $peerId,
-        " key=", diagKey(key)
-  except LPStreamError as exc:
-    when defined(fetch_diag) or defined(fabric_lsmr_diag):
-      echo "t=", diagNowMs(),
-        " fetch-stage write-exc peer=", $peerId,
-        " key=", diagKey(key),
-        " err=", exc.msg
-    raise (ref FetchError)(
-      msg: "fetch write failed: " & exc.msg,
-      parent: exc,
-      kind: FetchErrorKind.feWriteFailure,
-    )
-
-  let readFuture = conn.readLp(maxResponseBytes)
-  when defined(fetch_diag) or defined(fabric_lsmr_diag):
-    echo "t=", diagNowMs(),
-      " fetch-stage read-begin peer=", $peerId,
-      " key=", diagKey(key),
-      " timeoutMs=", timeout.milliseconds
-  let completed =
-    try:
-      await withTimeout(readFuture, timeout)
-    except CancelledError as exc:
-      raise exc
-  if not completed:
-    when defined(fetch_diag) or defined(fabric_lsmr_diag):
-      echo "t=", diagNowMs(),
-        " fetch-stage read-timeout peer=", $peerId,
-        " key=", diagKey(key)
-    raise (ref FetchError)(
-      msg: "fetch response timeout", kind: FetchErrorKind.feTimeout
-    )
-
-  let payload =
-    try:
-      await readFuture
-    except CancelledError as exc:
-      raise exc
-    except LPStreamError as exc:
-      when defined(fetch_diag) or defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fetch-stage read-exc peer=", $peerId,
-          " key=", diagKey(key),
-          " err=", exc.msg
-      raise (ref FetchError)(
-        msg: "fetch read failed: " & exc.msg,
-        parent: exc,
-        kind: FetchErrorKind.feReadFailure,
-      )
-  when defined(fetch_diag) or defined(fabric_lsmr_diag):
-    echo "t=", diagNowMs(),
-      " fetch-stage read-ok peer=", $peerId,
-      " key=", diagKey(key),
-      " bytes=", payload.len
-
-  let respOpt = decodeFetchResponse(payload)
-  if respOpt.isNone():
-    when defined(fetch_diag) or defined(fabric_lsmr_diag):
-      echo "t=", diagNowMs(),
-        " fetch-stage decode-invalid peer=", $peerId,
-        " key=", diagKey(key)
-    raise (ref FetchError)(
-      msg: "invalid fetch response payload", kind: FetchErrorKind.feInvalidResponse
-    )
-  respOpt.get()
+  return await fetchOnConn(conn, key, timeout, maxResponseBytes)
 
 proc fetch*(
     sw: Switch,

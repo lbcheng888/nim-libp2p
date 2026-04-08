@@ -179,7 +179,7 @@ proc encodeMsg(
   ## Optionally populate signedPeerRecord field.
   ## See https://github.com/libp2p/go-libp2p/blob/ddf96ce1cfa9e19564feb9bd3e8269958bbc0aba/p2p/protocol/identify/pb/identify.proto for reference.
   if sendSpr:
-    peerInfo.signedPeerRecord.envelope.encode().toOpt().withValue(sprBuff):
+    peerInfo.currentSignedPeerRecordBytes().toOpt().withValue(sprBuff):
       result.write(8, sprBuff)
 
   for (key, value) in metadata:

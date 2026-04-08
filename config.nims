@@ -51,10 +51,11 @@ switch("warning", "LockLevel:off")
 --styleCheck:
   error
 --mm:
-  refc
+  orc
+--deepcopy:on
 --warnings:off
 --hints:off
-  # reconsider when there's a version-2-2 branch worth testing with as we might switch to orc
+  # repository default memory manager
 
 # Avoid some rare stack corruption while using exceptions with a SEH-enabled
 # toolchain: https://github.com/status-im/nimbus-eth2/issues/3121

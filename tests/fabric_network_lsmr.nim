@@ -46,32 +46,21 @@ proc makeGenesis(validators: seq[NodeIdentity], observer: NodeIdentity): Genesis
     result.balances.add(KeyValueU64(key: identity.account, value: 1_000_000))
   result.balances.add(KeyValueU64(key: observer.account, value: 1_000_000))
 
-proc signedTx(identity: NodeIdentity, nonce: uint64, suffix: string): Tx =
-  result = Tx(
-    txId: "",
-    kind: txContentPublishIntent,
-    sender: "",
-    senderPublicKey: "",
-    nonce: nonce,
-    epoch: 0,
-    timestamp: int64(nonce),
-    payload: %*{
-      "intent": {
-        "contentId": "net-post-" & suffix,
-        "author": identity.account,
-        "title": "net-post-" & suffix,
-        "body": "network body " & suffix,
-        "kind": "text",
-        "manifestCid": "net-manifest-" & suffix,
-        "createdAt": int(nonce),
-        "accessPolicy": "public",
-        "previewCid": "net-preview-" & suffix,
-        "seqNo": int(nonce)
-      }
-    },
-    signature: "",
-  )
-  signTx(identity, result)
+proc publishPayload(identity: NodeIdentity, nonce: uint64, suffix: string): JsonNode =
+  %*{
+    "intent": {
+      "contentId": "net-post-" & suffix,
+      "author": identity.account,
+      "title": "net-post-" & suffix,
+      "body": "network body " & suffix,
+      "kind": "text",
+      "manifestCid": "net-manifest-" & suffix,
+      "createdAt": int(nonce),
+      "accessPolicy": "public",
+      "previewCid": "net-preview-" & suffix,
+      "seqNo": int(nonce)
+    }
+  }
 
 proc waitUntil(
     predicate: proc(): bool {.closure, gcsafe.}, timeoutMs = 30_000, intervalMs = 100
@@ -389,7 +378,27 @@ proc awaitCheckpointConvergence(
       raise newException(ValueError, "checkpoint stalled fingerprint=" & fingerprint)
     await sleepAsync(intervalMs)
 
+proc assertQuiesced(node: FabricNode, expectedCommittedNonce: uint64) =
+  let snapshot = node.submitFence()
+  check snapshot.pendingInbound == 0
+  check snapshot.localOfferedNonce == expectedCommittedNonce
+  check snapshot.localCommittedNonce == expectedCommittedNonce
+  check snapshot.pendingEvents == 0
+  check snapshot.pendingAttestations == 0
+  check snapshot.pendingEventCertificates == 0
+  check snapshot.pendingCertificationEvents == 0
+  check snapshot.pendingWitnessPulls == 0
+  check snapshot.pendingIndexFlushes == 0
+  check snapshot.eventOutstanding == 0
+  check snapshot.attOutstanding == 0
+  check snapshot.certOutstanding == 0
+
 proc stopAll(nodes: seq[FabricNode]) {.async.} =
+  for node in nodes:
+    try:
+      await node.prepareStop()
+    except CatchableError:
+      discard
   for idx in countdown(nodes.len - 1, 0):
     try:
       await nodes[idx].stop()
@@ -614,7 +623,6 @@ suite "Fabric lsmr only network":
             " account=", status.localAccount,
             " activeCerts=", status.routingStatus.lsmrActiveCertificates
 
-      var nonce0 = 0'u64
       let targetTxCount =
         when defined(fabric_diag):
           4
@@ -625,8 +633,12 @@ suite "Fabric lsmr only network":
       for idx in 0 ..< targetTxCount:
         let submitStartedAtMs = int64(epochTime() * 1000)
         echo "SUBMIT-START idx=", idx
-        inc nonce0
-        let submit = n0.submitTx(signedTx(v0, nonce0, "lsmr-v0-" & $idx))
+        let nextNonce = n0.nextLocalNonce()
+        let submit = n0.submitLocalTx(
+          txContentPublishIntent,
+          publishPayload(v0, nextNonce, "lsmr-v0-" & $idx),
+          timestamp = int64(nextNonce),
+        )
         let submitElapsedMs = int64(epochTime() * 1000) - submitStartedAtMs
         echo "SUBMIT-DONE idx=", idx,
           " elapsedMs=", submitElapsedMs,
@@ -670,6 +682,12 @@ suite "Fabric lsmr only network":
         check checkpoint0.get().checkpointId == checkpoint1.get().checkpointId
         check checkpoint0.get().checkpointId == checkpoint2.get().checkpointId
         check checkpoint0.get().checkpointId == checkpoint3.get().checkpointId
+
+        for idx, node in nodes:
+          let expectedNonce =
+            if idx == 0: uint64(targetTxCount)
+            else: 0'u64
+          node.assertQuiesced(expectedNonce)
 
         let observerProjection = nodes[^1].queryProjection("content")
         check observerProjection["contents"].len == targetTxCount

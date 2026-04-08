@@ -32,7 +32,7 @@ COMMON_FLAGS=(
   "--noMain"
   "--forceBuild:on"
   "--os:ios"
-  "--mm:arc"
+  "--mm:orc"
   "--deepCopy:on"
   "--threads:on"
   "--cc:clang"

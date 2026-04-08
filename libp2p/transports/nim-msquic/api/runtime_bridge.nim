@@ -159,12 +159,15 @@ type
     ownsRuntime: bool
     lock: Lock
     lockInit: bool
-    connectionContexts: Table[HQUIC, ConnectionCallbackContext]
-    streamContexts: Table[HQUIC, StreamCallbackContext]
-    listenerContexts: Table[HQUIC, ListenerCallbackContext]
-    retiredConnectionContexts: seq[ConnectionCallbackContext]
-    retiredStreamContexts: seq[StreamCallbackContext]
-    retiredListenerContexts: seq[ListenerCallbackContext]
+    connectionContexts: Table[HQUIC, pointer]
+    streamContexts: Table[HQUIC, pointer]
+    listenerContexts: Table[HQUIC, pointer]
+    activeConnectionRoots: Table[pointer, bool]
+    activeStreamRoots: Table[pointer, bool]
+    activeListenerRoots: Table[pointer, bool]
+    retiredConnectionRoots: Table[pointer, bool]
+    retiredStreamRoots: Table[pointer, bool]
+    retiredListenerRoots: Table[pointer, bool]
 
 template withBridgeLock(bridge: RuntimeBridge; body: untyped) =
   if bridge.isNil or not bridge.lockInit:
@@ -190,6 +193,14 @@ proc copyAlpn(payload: ptr QuicConnectionEventConnectedPayload): string =
 proc isBuiltinRuntime(bridge: RuntimeBridge): bool {.inline.} =
   not bridge.isNil and bridge.runtime.path == BuiltinRuntimeName
 
+template rootRawContext(rawCtx: pointer; T: typedesc) =
+  if not rawCtx.isNil:
+    GC_ref(cast[T](rawCtx))
+
+template unrootRawContext(rawCtx: pointer; T: typedesc) =
+  if not rawCtx.isNil:
+    GC_unref(cast[T](rawCtx))
+
 proc connectionExtensionEventForwarder(event: ConnectionEvent) {.gcsafe.} =
   if event.kind notin {
       ceDatagramStateChanged, ceDatagramReceived, ceSettingsApplied, ceParameterUpdated
@@ -197,15 +208,21 @@ proc connectionExtensionEventForwarder(event: ConnectionEvent) {.gcsafe.} =
     return
   if event.userContext.isNil:
     return
-  let ctx = cast[ConnectionCallbackContext](event.userContext)
-  if ctx.isNil or ctx.handler.isNil:
+  var ctx = cast[ConnectionCallbackContext](event.userContext)
+  if ctx.isNil:
     return
-  var forwarded = event
-  forwarded.userContext = ctx.userContext
+  GC_ref(ctx)
   try:
-    ctx.handler(forwarded)
-  except Exception:
-    discard
+    if ctx.handler.isNil:
+      return
+    var forwarded = event
+    forwarded.userContext = ctx.userContext
+    try:
+      ctx.handler(forwarded)
+    except Exception:
+      discard
+  finally:
+    GC_unref(ctx)
 
 proc convertConnectionEvent(connection: HQUIC;
     eventPtr: ptr QuicConnectionEvent; userContext: pointer): ConnectionEvent =
@@ -428,12 +445,15 @@ proc initRuntimeBridge*(runtime: MsQuicRuntime;
     api: apiTable,
     ownsRuntime: ownsRuntime,
     lockInit: false,
-    connectionContexts: initTable[HQUIC, ConnectionCallbackContext](),
-    streamContexts: initTable[HQUIC, StreamCallbackContext](),
-    listenerContexts: initTable[HQUIC, ListenerCallbackContext](),
-    retiredConnectionContexts: @[],
-    retiredStreamContexts: @[],
-    retiredListenerContexts: @[])
+    connectionContexts: initTable[HQUIC, pointer](),
+    streamContexts: initTable[HQUIC, pointer](),
+    listenerContexts: initTable[HQUIC, pointer](),
+    activeConnectionRoots: initTable[pointer, bool](),
+    activeStreamRoots: initTable[pointer, bool](),
+    activeListenerRoots: initTable[pointer, bool](),
+    retiredConnectionRoots: initTable[pointer, bool](),
+    retiredStreamRoots: initTable[pointer, bool](),
+    retiredListenerRoots: initTable[pointer, bool]())
   initLock(result.lock)
   result.lockInit = true
 
@@ -453,56 +473,161 @@ proc getRuntime*(bridge: RuntimeBridge): MsQuicRuntime {.inline.} =
     return nil
   bridge.runtime
 
+proc activateConnectionContext(bridge: RuntimeBridge; rawCtx: pointer) =
+  if bridge.isNil or rawCtx.isNil:
+    return
+  if bridge.activeConnectionRoots.contains(rawCtx):
+    return
+  if bridge.retiredConnectionRoots.contains(rawCtx):
+    bridge.retiredConnectionRoots.del(rawCtx)
+    bridge.activeConnectionRoots[rawCtx] = true
+    return
+  rootRawContext(rawCtx, ConnectionCallbackContext)
+  bridge.activeConnectionRoots[rawCtx] = true
+
+proc activateStreamContext(bridge: RuntimeBridge; rawCtx: pointer) =
+  if bridge.isNil or rawCtx.isNil:
+    return
+  if bridge.activeStreamRoots.contains(rawCtx):
+    return
+  if bridge.retiredStreamRoots.contains(rawCtx):
+    bridge.retiredStreamRoots.del(rawCtx)
+    bridge.activeStreamRoots[rawCtx] = true
+    return
+  rootRawContext(rawCtx, StreamCallbackContext)
+  bridge.activeStreamRoots[rawCtx] = true
+
+proc activateListenerContext(bridge: RuntimeBridge; rawCtx: pointer) =
+  if bridge.isNil or rawCtx.isNil:
+    return
+  if bridge.activeListenerRoots.contains(rawCtx):
+    return
+  if bridge.retiredListenerRoots.contains(rawCtx):
+    bridge.retiredListenerRoots.del(rawCtx)
+    bridge.activeListenerRoots[rawCtx] = true
+    return
+  rootRawContext(rawCtx, ListenerCallbackContext)
+  bridge.activeListenerRoots[rawCtx] = true
+
+proc retireConnectionContext(bridge: RuntimeBridge; rawCtx: pointer) =
+  if bridge.isNil or rawCtx.isNil:
+    return
+  if bridge.activeConnectionRoots.contains(rawCtx):
+    bridge.activeConnectionRoots.del(rawCtx)
+  if not bridge.retiredConnectionRoots.contains(rawCtx):
+    bridge.retiredConnectionRoots[rawCtx] = true
+
+proc retireStreamContext(bridge: RuntimeBridge; rawCtx: pointer) =
+  if bridge.isNil or rawCtx.isNil:
+    return
+  if bridge.activeStreamRoots.contains(rawCtx):
+    bridge.activeStreamRoots.del(rawCtx)
+  if not bridge.retiredStreamRoots.contains(rawCtx):
+    bridge.retiredStreamRoots[rawCtx] = true
+
+proc retireListenerContext(bridge: RuntimeBridge; rawCtx: pointer) =
+  if bridge.isNil or rawCtx.isNil:
+    return
+  if bridge.activeListenerRoots.contains(rawCtx):
+    bridge.activeListenerRoots.del(rawCtx)
+  if not bridge.retiredListenerRoots.contains(rawCtx):
+    bridge.retiredListenerRoots[rawCtx] = true
+
+proc releaseRootedConnectionContexts(bridge: RuntimeBridge) =
+  if bridge.isNil:
+    return
+  for rawCtx in bridge.activeConnectionRoots.keys:
+    unrootRawContext(rawCtx, ConnectionCallbackContext)
+  for rawCtx in bridge.retiredConnectionRoots.keys:
+    unrootRawContext(rawCtx, ConnectionCallbackContext)
+  bridge.activeConnectionRoots.clear()
+  bridge.retiredConnectionRoots.clear()
+
+proc releaseRootedStreamContexts(bridge: RuntimeBridge) =
+  if bridge.isNil:
+    return
+  for rawCtx in bridge.activeStreamRoots.keys:
+    unrootRawContext(rawCtx, StreamCallbackContext)
+  for rawCtx in bridge.retiredStreamRoots.keys:
+    unrootRawContext(rawCtx, StreamCallbackContext)
+  bridge.activeStreamRoots.clear()
+  bridge.retiredStreamRoots.clear()
+
+proc releaseRootedListenerContexts(bridge: RuntimeBridge) =
+  if bridge.isNil:
+    return
+  for rawCtx in bridge.activeListenerRoots.keys:
+    unrootRawContext(rawCtx, ListenerCallbackContext)
+  for rawCtx in bridge.retiredListenerRoots.keys:
+    unrootRawContext(rawCtx, ListenerCallbackContext)
+  bridge.activeListenerRoots.clear()
+  bridge.retiredListenerRoots.clear()
+
 proc storeConnectionContext(bridge: RuntimeBridge; connection: HQUIC;
     ctx: ConnectionCallbackContext) =
   if bridge.isNil or connection.isNil:
     return
+  let rawCtx = cast[pointer](ctx)
   bridge.withBridgeLock:
-    bridge.connectionContexts[connection] = ctx
+    if bridge.connectionContexts.contains(connection):
+      let prevRawCtx = bridge.connectionContexts[connection]
+      if prevRawCtx != rawCtx:
+        bridge.retireConnectionContext(prevRawCtx)
+    bridge.connectionContexts[connection] = rawCtx
+    bridge.activateConnectionContext(rawCtx)
 
 proc dropConnectionContext(bridge: RuntimeBridge; connection: HQUIC) =
   if bridge.isNil or connection.isNil:
     return
   bridge.withBridgeLock:
     if bridge.connectionContexts.contains(connection):
-      let ctx = bridge.connectionContexts[connection]
+      let rawCtx = bridge.connectionContexts[connection]
+      bridge.retireConnectionContext(rawCtx)
       bridge.connectionContexts.del(connection)
-      if not ctx.isNil:
-        bridge.retiredConnectionContexts.add(ctx)
 
 proc storeStreamContext(bridge: RuntimeBridge; stream: HQUIC;
     ctx: StreamCallbackContext) =
   if bridge.isNil or stream.isNil:
     return
+  let rawCtx = cast[pointer](ctx)
   bridge.withBridgeLock:
-    bridge.streamContexts[stream] = ctx
+    if bridge.streamContexts.contains(stream):
+      let prevRawCtx = bridge.streamContexts[stream]
+      if prevRawCtx != rawCtx:
+        bridge.retireStreamContext(prevRawCtx)
+    bridge.streamContexts[stream] = rawCtx
+    bridge.activateStreamContext(rawCtx)
 
 proc dropStreamContext(bridge: RuntimeBridge; stream: HQUIC) =
   if bridge.isNil or stream.isNil:
     return
   bridge.withBridgeLock:
     if bridge.streamContexts.contains(stream):
-      let ctx = bridge.streamContexts[stream]
+      let rawCtx = bridge.streamContexts[stream]
+      bridge.retireStreamContext(rawCtx)
       bridge.streamContexts.del(stream)
-      if not ctx.isNil:
-        bridge.retiredStreamContexts.add(ctx)
 
 proc storeListenerContext(bridge: RuntimeBridge; listener: HQUIC;
     ctx: ListenerCallbackContext) =
   if bridge.isNil or listener.isNil:
     return
+  let rawCtx = cast[pointer](ctx)
   bridge.withBridgeLock:
-    bridge.listenerContexts[listener] = ctx
+    if bridge.listenerContexts.contains(listener):
+      let prevRawCtx = bridge.listenerContexts[listener]
+      if prevRawCtx != rawCtx:
+        bridge.retireListenerContext(prevRawCtx)
+    bridge.listenerContexts[listener] = rawCtx
+    bridge.activateListenerContext(rawCtx)
 
 proc dropListenerContext(bridge: RuntimeBridge; listener: HQUIC) =
   if bridge.isNil or listener.isNil:
     return
   bridge.withBridgeLock:
     if bridge.listenerContexts.contains(listener):
-      let ctx = bridge.listenerContexts[listener]
+      let rawCtx = bridge.listenerContexts[listener]
+      bridge.retireListenerContext(rawCtx)
       bridge.listenerContexts.del(listener)
-      if not ctx.isNil:
-        bridge.retiredListenerContexts.add(ctx)
 
 proc connectionCallbackShim(connection: HQUIC; context: pointer;
     event: pointer): QUIC_STATUS {.cdecl.} =
@@ -510,16 +635,22 @@ proc connectionCallbackShim(connection: HQUIC; context: pointer;
   var ctx: ConnectionCallbackContext = nil
   if not context.isNil:
     ctx = cast[ConnectionCallbackContext](context)
-  if ctx.isNil or ctx.bridge.isNil:
+  if ctx.isNil:
     return QUIC_STATUS_SUCCESS
-  let bridge = ctx.bridge
-  let eventPtr = cast[ptr QuicConnectionEvent](event)
-  let nimEvent = convertConnectionEvent(connection, eventPtr, ctx.userContext)
-  if not ctx.handler.isNil:
-    ctx.handler(nimEvent)
-  if nimEvent.kind == ceShutdownComplete:
-    bridge.dropConnectionContext(connection)
-  QUIC_STATUS_SUCCESS
+  GC_ref(ctx)
+  try:
+    if ctx.bridge.isNil:
+      return QUIC_STATUS_SUCCESS
+    let bridge = ctx.bridge
+    let eventPtr = cast[ptr QuicConnectionEvent](event)
+    let nimEvent = convertConnectionEvent(connection, eventPtr, ctx.userContext)
+    if not ctx.handler.isNil:
+      ctx.handler(nimEvent)
+    if nimEvent.kind == ceShutdownComplete:
+      bridge.dropConnectionContext(connection)
+    QUIC_STATUS_SUCCESS
+  finally:
+    GC_unref(ctx)
 
 proc streamCallbackShim(stream: HQUIC; context: pointer;
     event: pointer): QUIC_STATUS {.cdecl.} =
@@ -527,19 +658,25 @@ proc streamCallbackShim(stream: HQUIC; context: pointer;
   var ctx: StreamCallbackContext = nil
   if not context.isNil:
     ctx = cast[StreamCallbackContext](context)
-  if ctx.isNil or ctx.bridge.isNil:
+  if ctx.isNil:
     return QUIC_STATUS_SUCCESS
-  let bridge = ctx.bridge
-  let eventPtr = cast[ptr QuicStreamEvent](event)
-  let nimEvent = convertStreamEvent(stream, eventPtr, ctx.userContext)
-  if not ctx.handler.isNil:
-    ctx.handler(nimEvent)
-  case nimEvent.kind
-  of seShutdownComplete:
-    bridge.dropStreamContext(stream)
-  else:
-    discard
-  QUIC_STATUS_SUCCESS
+  GC_ref(ctx)
+  try:
+    if ctx.bridge.isNil:
+      return QUIC_STATUS_SUCCESS
+    let bridge = ctx.bridge
+    let eventPtr = cast[ptr QuicStreamEvent](event)
+    let nimEvent = convertStreamEvent(stream, eventPtr, ctx.userContext)
+    if not ctx.handler.isNil:
+      ctx.handler(nimEvent)
+    case nimEvent.kind
+    of seShutdownComplete:
+      bridge.dropStreamContext(stream)
+    else:
+      discard
+    QUIC_STATUS_SUCCESS
+  finally:
+    GC_unref(ctx)
 
 proc listenerCallbackShim(listener: HQUIC; context: pointer;
     event: pointer): QUIC_STATUS {.cdecl.} =
@@ -547,16 +684,22 @@ proc listenerCallbackShim(listener: HQUIC; context: pointer;
   var ctx: ListenerCallbackContext = nil
   if not context.isNil:
     ctx = cast[ListenerCallbackContext](context)
-  if ctx.isNil or ctx.bridge.isNil:
+  if ctx.isNil:
     return QUIC_STATUS_SUCCESS
-  let bridge = ctx.bridge
-  let eventPtr = cast[ptr QuicListenerEvent](event)
-  let nimEvent = convertListenerEvent(listener, eventPtr, ctx.userContext)
-  if not ctx.handler.isNil:
-    ctx.handler(nimEvent)
-  if nimEvent.kind == leStopComplete:
-    bridge.dropListenerContext(listener)
-  QUIC_STATUS_SUCCESS
+  GC_ref(ctx)
+  try:
+    if ctx.bridge.isNil:
+      return QUIC_STATUS_SUCCESS
+    let bridge = ctx.bridge
+    let eventPtr = cast[ptr QuicListenerEvent](event)
+    let nimEvent = convertListenerEvent(listener, eventPtr, ctx.userContext)
+    if not ctx.handler.isNil:
+      ctx.handler(nimEvent)
+    if nimEvent.kind == leStopComplete:
+      bridge.dropListenerContext(listener)
+    QUIC_STATUS_SUCCESS
+  finally:
+    GC_unref(ctx)
 
 proc openRegistration*(bridge: RuntimeBridge; config: ptr QuicRegistrationConfigC;
     registration: var HQUIC): QUIC_STATUS =
@@ -866,9 +1009,9 @@ proc close*(bridge: var RuntimeBridge) =
     bridge.connectionContexts.clear()
     bridge.streamContexts.clear()
     bridge.listenerContexts.clear()
-    bridge.retiredConnectionContexts.setLen(0)
-    bridge.retiredStreamContexts.setLen(0)
-    bridge.retiredListenerContexts.setLen(0)
+    bridge.releaseRootedConnectionContexts()
+    bridge.releaseRootedStreamContexts()
+    bridge.releaseRootedListenerContexts()
   if bridge.ownsRuntime:
     var runtime = bridge.runtime
     unloadMsQuic(runtime)

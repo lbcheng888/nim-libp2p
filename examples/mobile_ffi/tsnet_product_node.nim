@@ -7,14 +7,25 @@ void nim_bridge_emit_event(const char *topic, const char *payload) {
 }
 """.}
 
-import std/[base64, json, net, options, os, sets, strutils, syncio]
+import std/[base64, json, net, options, os, posix, sets, strutils, syncio]
 from std/nativesockets import selectRead
 from std/times import epochTime
+import chronos
 import ../../libp2p/crypto/crypto
 import ../../libp2p/peerid
+import ../../libp2p/transports/tsnet/quicrelay
 import ./libnimlibp2p
 
 type
+  Ifaddrs {.importc: "struct ifaddrs", header: "<ifaddrs.h>", bycopy.} = object
+    ifa_next: ptr Ifaddrs
+    ifa_name: cstring
+    ifa_flags: cuint
+    ifa_addr: ptr SockAddr
+    ifa_netmask: ptr SockAddr
+    ifa_dstaddr: ptr SockAddr
+    ifa_data: pointer
+
   NodeOptions = object
     label: string
     rpcHost: string
@@ -68,8 +79,89 @@ const
 
 var productRpcNonce: uint64 = 0
 
+when not declared(getifaddrs):
+  proc getifaddrs(ifap: ptr ptr Ifaddrs): cint {.importc, header: "<ifaddrs.h>".}
+when not declared(freeifaddrs):
+  proc freeifaddrs(ifa: ptr Ifaddrs) {.importc, header: "<ifaddrs.h>".}
+
 proc nowMillis(): int64 {.gcsafe.} =
   int64(epochTime() * 1000)
+
+proc normalizeIpv6Text(ip: string): string =
+  let trimmed = ip.strip()
+  if trimmed.len == 0:
+    return ""
+  let zoneIdx = trimmed.find('%')
+  if zoneIdx >= 0:
+    return trimmed[0 ..< zoneIdx].strip()
+  trimmed
+
+proc isGlobalIpv6Text(ip: string): bool =
+  let normalized = normalizeIpv6Text(ip)
+  if normalized.len == 0:
+    return false
+  let lower = normalized.toLowerAscii()
+  if lower == "::" or lower == "::1":
+    return false
+  if lower.startsWith("fe80:") or lower.startsWith("fc") or lower.startsWith("fd"):
+    return false
+  if lower.startsWith("ff"):
+    return false
+  true
+
+proc isVpnInterfaceName(ifName: string): bool =
+  let lower = ifName.strip().toLowerAscii()
+  lower.startsWith("utun") or
+    lower.startsWith("tun") or
+    lower.startsWith("tap") or
+    lower.startsWith("tailscale")
+
+proc interfacePriority(ifName: string): int =
+  let lower = ifName.strip().toLowerAscii()
+  if lower.startsWith("en") or lower.startsWith("eth") or lower.startsWith("wlan") or lower.startsWith("wl"):
+    return 0
+  if lower.startsWith("rmnet") or lower.startsWith("wwan") or lower.startsWith("pdp_ip"):
+    return 1
+  2
+
+proc detectBestGlobalIpv6(): string =
+  var bestScore = high(int)
+  var bestIp = ""
+  when declared(getifaddrs):
+    var ifap: ptr Ifaddrs = nil
+    if getifaddrs(addr ifap) == 0:
+      defer:
+        freeifaddrs(ifap)
+      var cursor = ifap
+      while cursor != nil:
+        let ifName =
+          if cursor.ifa_name.isNil:
+            ""
+          else:
+            $cursor.ifa_name
+        when declared(cursor.ifa_flags):
+          when declared(IFF_LOOPBACK):
+            if (cursor.ifa_flags and IFF_LOOPBACK) != 0:
+              cursor = cursor.ifa_next
+              continue
+        if ifName.len == 0 or isVpnInterfaceName(ifName):
+          cursor = cursor.ifa_next
+          continue
+        let addrPtr = cursor.ifa_addr
+        when declared(posix.AF_INET6):
+          if addrPtr != nil and cint(addrPtr.sa_family) == posix.AF_INET6:
+            let sin6 = cast[ptr Sockaddr_in6](addrPtr)
+            var buffer: array[64, char]
+            when declared(inet_ntop):
+              if inet_ntop(posix.AF_INET6, addr sin6.sin6_addr, cast[ptr char](addr buffer[0]), buffer.len.cint) != nil:
+                let ip = normalizeIpv6Text($cast[cstring](addr buffer[0]))
+                if isGlobalIpv6Text(ip):
+                  let score = interfacePriority(ifName)
+                  if score < bestScore:
+                    bestScore = score
+                    bestIp = ip
+        cursor = cursor.ifa_next
+  bestIp
 
 proc nextProductRpcNonce(): uint64 =
   inc productRpcNonce
@@ -515,8 +607,156 @@ proc tailnetStartStatus(node: ProductNode): JsonNode {.raises: [].} =
 proc tailnetStatus(node: ProductNode): JsonNode {.raises: [].} =
   safeJson(libp2p_tailnet_status_json(node.handle), """{"ok":false}""")
 
+proc tailnetStatusText(node: ProductNode): string {.raises: [].} =
+  let text = safeCString(libp2p_tailnet_status_json(node.handle))
+  if text.len > 0:
+    text
+  else:
+    """{"ok":false}"""
+
 proc tailnetDerpMap(node: ProductNode): JsonNode {.raises: [].} =
   safeJson(libp2p_tailnet_derp_map(node.handle), "null")
+
+proc connectedPeersInfo(node: ProductNode): JsonNode {.raises: [].} =
+  try:
+    safeJson(libp2p_connected_peers_info(node.handle), "[]")
+  except Exception:
+    newJArray()
+
+proc discoverySnapshot(node: ProductNode): JsonNode {.raises: [].} =
+  try:
+    safeJson(libp2p_network_discovery_snapshot(node.handle, nil, 0.cint, 0.cint), "{}")
+  except Exception:
+    newJObject()
+
+proc relayProbeUrl(node: ProductNode; request: JsonNode): string {.raises: [].} =
+  let explicitRelayUrl = strField(request, "relayUrl").strip()
+  if explicitRelayUrl.len > 0:
+    return explicitRelayUrl
+  let tailnetPayload = node.tailnetStatus()
+  for candidate in [
+    strField(tailnetPayload, "controlEndpoint").strip(),
+    strField(tailnetPayload, "controlUrl").strip(),
+    node.opts.relayEndpoint.strip(),
+    node.opts.controlEndpoint.strip(),
+    node.opts.controlUrl.strip(),
+  ]:
+    if candidate.len == 0:
+      continue
+    let lowered = candidate.toLowerAscii()
+    if lowered.startsWith("quic://"):
+      return candidate
+  ""
+
+proc relayPingPayload(node: ProductNode; request: JsonNode): JsonNode {.raises: [].} =
+  let relayUrl = relayProbeUrl(node, request)
+  if relayUrl.len == 0:
+    return %*{
+      "ok": false,
+      "target": "relay",
+      "error": "relay_url_unavailable"
+    }
+  let sampleCount = max(1, intField(request, "sampleCount", max(1, intField(request, "samples", 5))))
+  let timeoutMs = max(250, intField(request, "timeoutMs", 3_000))
+  let startedAtMs = nowMillis()
+  var successCount = 0
+  var minLatencyMs = high(int64)
+  var maxLatencyMs = 0'i64
+  var latencyTotalMs = 0'i64
+  var firstError = ""
+  var runtimePreference = ""
+  var runtimeImplementation = ""
+  var runtimeKind = ""
+  var runtimePath = ""
+  var samples = newJArray()
+  for sequence in 1 .. sampleCount:
+    let sampleStartedAtMs = nowMillis()
+    var probe = TsnetQuicRelayProbeResult(
+      ok: false,
+      relayUrl: relayUrl,
+      route: "",
+      runtimePreference: "",
+      runtimeImplementation: "",
+      runtimePath: "",
+      runtimeKind: "",
+      connected: false,
+      acknowledged: false,
+      error: ""
+    )
+    try:
+      probe = waitFor probeRelayPing(
+        relayUrl,
+        timeout = chronos.milliseconds(timeoutMs)
+      )
+    except CatchableError as exc:
+      probe.error = exc.msg
+    let latencyMs = max(nowMillis() - sampleStartedAtMs, 0)
+    if runtimePreference.len == 0:
+      runtimePreference = probe.runtimePreference
+    if runtimeImplementation.len == 0:
+      runtimeImplementation = probe.runtimeImplementation
+    if runtimeKind.len == 0:
+      runtimeKind = probe.runtimeKind
+    if runtimePath.len == 0:
+      runtimePath = probe.runtimePath
+    if probe.ok:
+      inc successCount
+      minLatencyMs = min(minLatencyMs, latencyMs)
+      maxLatencyMs = max(maxLatencyMs, latencyMs)
+      latencyTotalMs += latencyMs
+    elif firstError.len == 0:
+      firstError =
+        if probe.error.len > 0:
+          probe.error
+        else:
+          "relay_ping_failed"
+    var sample = %*{
+      "sequence": sequence,
+      "latencyMs": latencyMs,
+      "ok": probe.ok,
+      "connected": probe.connected,
+      "acknowledged": probe.acknowledged,
+    }
+    if probe.runtimePreference.len > 0:
+      sample["runtimePreference"] = %probe.runtimePreference
+    if probe.runtimeImplementation.len > 0:
+      sample["runtimeImplementation"] = %probe.runtimeImplementation
+    if probe.runtimeKind.len > 0:
+      sample["runtimeKind"] = %probe.runtimeKind
+    if probe.runtimePath.len > 0:
+      sample["runtimePath"] = %probe.runtimePath
+    if probe.error.len > 0:
+      sample["error"] = %probe.error
+    samples.add(sample)
+  let ok = successCount > 0
+  %*{
+    "ok": ok,
+    "target": "relay",
+    "relayUrl": relayUrl,
+    "tailnetRelay": strField(node.tailnetStatus(), "tailnetRelay"),
+    "sampleCount": sampleCount,
+    "successCount": successCount,
+    "minLatencyMs": (if ok: minLatencyMs else: 0),
+    "maxLatencyMs": (if ok: maxLatencyMs else: 0),
+    "avgLatencyMs": (if ok: latencyTotalMs div int64(successCount) else: 0),
+    "elapsedMs": max(nowMillis() - startedAtMs, 0),
+    "timeoutMs": timeoutMs,
+    "runtimePreference": runtimePreference,
+    "runtimeImplementation": runtimeImplementation,
+    "runtimeKind": runtimeKind,
+    "runtimePath": runtimePath,
+    "samples": samples,
+    "error": (if ok: "" else: firstError),
+  }
+
+proc tailnetPing(node: ProductNode; request: JsonNode): JsonNode {.raises: [].} =
+  let target =
+    strField(request, "target", strField(request, "mode", strField(request, "pingTarget"))).
+      strip().
+      toLowerAscii()
+  if target == "relay":
+    return relayPingPayload(node, request)
+  safeJson(libp2p_tailnet_ping(node.handle, ($request).cstring), """{"ok":false}""")
 
 proc pollEvents(node: ProductNode; maxEvents: int): JsonNode {.raises: [].} =
   try:
@@ -534,6 +774,21 @@ proc initNode(opts: NodeOptions): ProductNode =
   if not libp2p_node_start_kickoff(handle):
     libp2p_node_free(handle)
     fail("libp2p_node_start_kickoff failed")
+  let globalIpv6 = detectBestGlobalIpv6()
+  var initialHostNetworkStatus = %*{
+    "networkType": "other",
+    "transport": "other",
+    "listenPort": opts.listenPort,
+    "isConnected": true,
+    "isMetered": false,
+    "timestampMs": nowMillis(),
+    "reason": "start"
+  }
+  if globalIpv6.len > 0:
+    initialHostNetworkStatus["localIpv6"] = %globalIpv6
+    initialHostNetworkStatus["preferredIpv6"] = %globalIpv6
+    initialHostNetworkStatus["publicIpv6"] = %globalIpv6
+  discard libp2p_update_host_network_status(handle, ($initialHostNetworkStatus).cstring)
   stderr.writeLine("[tsnet-product-node] node start queued")
   ProductNode(handle: handle, opts: opts, stopRequested: false)
 
@@ -733,11 +988,98 @@ proc connectExactStatus(peerId: string): JsonNode {.raises: [].} =
   except CatchableError as exc:
     %*{"ok": false, "peerId": peerId, "status": "error", "error": exc.msg}
 
+proc relaySessionStatus(node: ProductNode; peerId: string): JsonNode {.raises: [].} =
+  let safePeerId = peerId.strip()
+  if safePeerId.len == 0:
+    return %*{"ok": false, "status": "missing", "error": "peer_id_missing"}
+  try:
+    safeJson(
+      libp2p_relay_session_status(node.handle, safePeerId.cstring),
+      """{"ok":false,"status":"missing","error":"relay_session_status_failed"}"""
+    )
+  except CatchableError as exc:
+    %*{"ok": false, "peerId": safePeerId, "status": "error", "error": exc.msg}
+
+proc relaySessionPrepare(
+    node: ProductNode;
+    peerId: string;
+    listenAddrs: JsonNode;
+    timeoutMs: int
+): JsonNode {.raises: [].} =
+  let safePeerId = peerId.strip()
+  if safePeerId.len == 0:
+    return %*{"ok": false, "error": "peer_id_missing"}
+  let normalizedAddrs = normalizeExactDialAddrs(safePeerId, listenAddrs)
+  if listenAddrs.kind == JArray and listenAddrs.len > 0 and normalizedAddrs.len == 0:
+    return %*{
+      "ok": false,
+      "peerId": safePeerId,
+      "error": "no_supported_exact_addrs"
+    }
+  if normalizedAddrs.len > 0:
+    let hintsOk =
+      try:
+        libp2p_register_peer_hints(
+          node.handle,
+          safePeerId.cstring,
+          ($(%normalizedAddrs)).cstring,
+          "product_relay_session_prepare".cstring
+        )
+      except Exception:
+        false
+    if not hintsOk:
+      return %*{
+        "ok": false,
+        "peerId": safePeerId,
+        "error": "register_peer_hints_failed",
+        "listenAddrs": normalizedAddrs,
+      }
+  let prepareOk =
+    try:
+      libp2p_prepare_relay_session(
+        node.handle,
+        safePeerId.cstring,
+        "product_relay_session_prepare".cstring
+      )
+    except Exception:
+      false
+  if not prepareOk:
+    return %*{
+      "ok": false,
+      "peerId": safePeerId,
+      "error": safeCString(libp2p_get_last_direct_error(node.handle)),
+      "listenAddrs": normalizedAddrs,
+    }
+  let startedAtMs = nowMillis()
+  let deadlineAtMs = startedAtMs + int64(max(1_000, timeoutMs))
+  var lastSnapshot = relaySessionStatus(node, safePeerId)
+  while true:
+    let status = strField(lastSnapshot, "status").toLowerAscii()
+    let sessionConnKey = intField(lastSnapshot, "sessionConnKey", 0)
+    if status == "ready" and sessionConnKey > 0:
+      lastSnapshot["prepareLatencyMs"] = %(nowMillis() - startedAtMs)
+      lastSnapshot["listenAddrs"] = %normalizedAddrs
+      return lastSnapshot
+    if status in ["failed", "cleared"] or (status == "missing" and nowMillis() >= deadlineAtMs):
+      lastSnapshot["prepareLatencyMs"] = %(nowMillis() - startedAtMs)
+      lastSnapshot["listenAddrs"] = %normalizedAddrs
+      return lastSnapshot
+    if nowMillis() >= deadlineAtMs:
+      lastSnapshot["ok"] = %false
+      lastSnapshot["error"] = %"relay_session_prepare_timeout"
+      lastSnapshot["prepareLatencyMs"] = %(nowMillis() - startedAtMs)
+      lastSnapshot["listenAddrs"] = %normalizedAddrs
+      return lastSnapshot
+    sleep(50)
+    lastSnapshot = relaySessionStatus(node, safePeerId)
+
 proc sendDmKickoff(
     node: ProductNode;
     peerId, listenAddrsJson, messageId, text, replyTo: string;
     requestAck: bool;
-    timeoutMs: int
+    timeoutMs: int;
+    relayOnly: bool;
+    preferredSessionConnKey: int
 ): JsonNode {.raises: [].} =
   let safePeerId = peerId.strip()
   let safeText = text
@@ -775,8 +1117,8 @@ proc sendDmKickoff(
         (if listenAddrsJson.len > 0: listenAddrsJson.cstring else: "[]".cstring),
         "product_send_dm_async".cstring,
         cint(timeoutMs),
-        clonglong(0),
-        false
+        clonglong(preferredSessionConnKey),
+        relayOnly
       )
     except CatchableError:
       false
@@ -795,6 +1137,8 @@ proc sendDmKickoff(
     "messageId": mid,
     "requestKey": requestKey,
     "requestAck": requestAck,
+    "relayOnly": relayOnly,
+    "sessionConnKey": preferredSessionConnKey,
     "addressCount": addressCount,
     "timeoutMs": timeoutMs
   }
@@ -882,6 +1226,17 @@ proc rpcResponse(ok: bool; payload: JsonNode): JsonNode =
     "ok": ok,
     "payload": payload
   }
+
+proc rpcResponseText(ok: bool; payloadText: string): string =
+  let trimmedPayload = payloadText.strip()
+  let safePayload =
+    if trimmedPayload.len > 0:
+      trimmedPayload
+    else:
+      "{}"
+  "{\"version\":" & $ProductProtocolVersion &
+    ",\"ok\":" & (if ok: "true" else: "false") &
+    ",\"payload\":" & safePayload & "}"
 
 proc rpcEvent(kind: string; payload: JsonNode): JsonNode =
   %*{
@@ -1022,7 +1377,9 @@ proc registerPendingRequest(
       strField(request, "text"),
       strField(request, "replyTo"),
       boolField(request, "requestAck", true),
-      timeoutMs
+      timeoutMs,
+      boolField(request, "relayOnly", false),
+      max(0, intField(request, "sessionConnKey", 0))
     )
     if not boolField(kickoffPayload, "ok"):
       sendFrame(client, $rpcResponse(true, kickoffPayload))
@@ -1128,7 +1485,9 @@ proc handleRequest(
         strField(request, "text"),
         strField(request, "replyTo"),
         boolField(request, "requestAck", true),
-        max(1_000, intField(request, "timeoutMs", 30_000))
+        max(1_000, intField(request, "timeoutMs", 30_000)),
+        boolField(request, "relayOnly", false),
+        max(0, intField(request, "sessionConnKey", 0))
       )
     )
   if op == "send_dm_status":
@@ -1150,8 +1509,26 @@ proc handleRequest(
     return rpcResponse(true, %*{
       "events": node.pollEvents(max(1, intField(request, "maxEvents", 64)))
     })
+  if op == "tailnet_ping":
+    return rpcResponse(true, node.tailnetPing(request))
   if op == "tailnet_status":
     return rpcResponse(true, node.tailnetStatus())
+  if op == "relay_session_prepare":
+    return rpcResponse(
+      true,
+      relaySessionPrepare(
+        node,
+        strField(request, "peerId"),
+        requestListenAddrs,
+        max(1_000, intField(request, "timeoutMs", 30_000))
+      )
+    )
+  if op == "relay_session_status":
+    return rpcResponse(true, relaySessionStatus(node, strField(request, "peerId")))
+  if op == "connected_peers_info":
+    return rpcResponse(true, node.connectedPeersInfo())
+  if op == "discovery_snapshot":
+    return rpcResponse(true, node.discoverySnapshot())
   if op == "stop":
     node.stopRequested = true
     return rpcResponse(true, %*{"stopping": true})
@@ -1300,6 +1677,10 @@ proc serve(node: ProductNode) =
               sendFrame(client, $(rpcResponse(false, %*{"error": "invalid_json", "detail": exc.msg})))
               closeSocketQuiet(client)
               continue
+        if strField(request, "op").toLowerAscii() == "tailnet_status":
+          sendFrame(client, rpcResponseText(true, tailnetStatusText(node)))
+          closeSocketQuiet(client)
+          continue
         if registerPendingRequest(node, client, request, pendingRequests):
           client = nil
           continue

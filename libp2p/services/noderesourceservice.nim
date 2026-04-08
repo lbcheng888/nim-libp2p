@@ -993,6 +993,24 @@ proc collectNodeResourceInfo*(
   result.updatedAtMs = src.nowMs()
   clampLocalInfo(result)
 
+proc refreshMacResourceInfo(
+    current: NodeResourceInfo,
+    dataDir: string,
+    source: NodeResourceCollectorSource
+): NodeResourceInfo =
+  let src = effectiveSource(source)
+  let resolvedDir = src.resolvePath(dataDir)
+  result = current
+  if result.os.name.len == 0:
+    result = collectMacResourceInfo(resolvedDir, src)
+  let stat = src.statVolume(resolvedDir)
+  if result.disk.mountPath.len == 0:
+    result.disk.mountPath = resolvedDir
+  result.disk.totalBytes = stat.totalBytes
+  result.disk.availableBytes = stat.availableBytes
+  result.updatedAtMs = src.nowMs()
+  clampLocalInfo(result)
+
 proc collectNodeResourceInfo*(dataDir: string): NodeResourceInfo =
   collectNodeResourceInfo(dataDir, defaultCollectorSource())
 
@@ -1318,7 +1336,10 @@ proc refreshLocalSnapshot(
   if not force and svc.localInfo.updatedAtMs > 0 and refreshEvery > 0 and
       nowMs - svc.lastLocalRefreshMs < refreshEvery:
     return
-  svc.localInfo = collectNodeResourceInfo(svc.dataDir, svc.source)
+  if normalizePlatform(svc.source.platform) == "macos" and svc.localInfo.updatedAtMs > 0:
+    svc.localInfo = refreshMacResourceInfo(svc.localInfo, svc.dataDir, svc.source)
+  else:
+    svc.localInfo = collectNodeResourceInfo(svc.dataDir, svc.source)
   svc.lastLocalRefreshMs = nowMs
 
 proc openNodeResourceConn(

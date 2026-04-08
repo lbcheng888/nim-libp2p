@@ -138,7 +138,7 @@ NIM_FLAGS=(
   "--noMain"
   "--os:linux"
   "--cpu:${CPU_FLAG}"
-  "--mm:arc"
+  "--mm:orc"
   "--deepCopy:on"
   "--threads:on"
   "--cc:clang"

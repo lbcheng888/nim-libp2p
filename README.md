@@ -85,6 +85,18 @@ Run unit tests:
 nimble test
 ```
 
+Run the stable LSMR regression sets:
+```sh
+# pure LSMR model and data-structure tests
+nimble testlsmr
+
+# stable LSMR service integration tests
+nimble testlsmrservice
+```
+
+For the full LSMR grouping and explicit single-file entrypoints, see
+[tests/README_LSMR.md](tests/README_LSMR.md).
+
 For a list of all available test suites, use:
 ```
 nimble tasks

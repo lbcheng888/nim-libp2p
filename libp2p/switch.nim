@@ -92,7 +92,7 @@ type
     transports*: seq[Transport]
     ms*: MultistreamSelect
     acceptFuts: seq[Future[void]]
-    dialer*: Dial
+    dialer*: Dialer
     peerStore*: PeerStore
     nameResolver*: NameResolver
     started: bool
@@ -903,7 +903,7 @@ proc resourceSnapshot*(s: Switch): ResourceMetrics {.public.} =
     return ResourceMetrics()
   s.resourceManager.snapshot()
 
-method addTransport*(s: Switch, t: Transport) =
+method addTransport*(s: Switch, t: Transport) {.raises: [].} =
   s.transports &= t
   s.dialer.addTransport(t)
 

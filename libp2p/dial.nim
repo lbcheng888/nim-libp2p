@@ -20,7 +20,8 @@ type
   DialFailedError* = object of LPError
   DialPathPreference* {.pure.} = enum
     dppDefault,
-    dppRelayOnly
+    dppRelayOnly,
+    dppDirectOnly
   DialOptions* = object
     routing*: DialPathPreference
 
@@ -102,11 +103,14 @@ method dial*(
 
   doAssert(false, "[Dial.dial] abstract method not implemented!")
 
-method addTransport*(self: Dial, transport: Transport) {.base.} =
+method addTransport*(self: Dial, transport: Transport) {.base, raises: [].} =
   doAssert(false, "[Dial.addTransport] abstract method not implemented!")
 
 method negotiateStream*(
-    self: Dial, conn: Connection, protos: seq[string]
+    self: Dial,
+    conn: Connection,
+    protos: seq[string],
+    firstProtoTrailingBytes: seq[byte] = @[],
 ): Future[Connection] {.base, async: (raises: [CatchableError]).} =
   doAssert(false, "[Dial.negotiateStream] abstract method not implemented!")
 

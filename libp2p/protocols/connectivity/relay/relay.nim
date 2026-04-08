@@ -107,6 +107,8 @@ proc createReserveResponse(
 proc isRelayed*(conn: Connection): bool =
   var wrappedConn = conn
   while not isNil(wrappedConn):
+    if wrappedConn.relayPath:
+      return true
     if wrappedConn of RelayConnection:
       return true
     wrappedConn = wrappedConn.getWrapped()

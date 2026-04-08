@@ -423,7 +423,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
     let maxPolls = max(1, timeoutMs div 100)
     var lastError = "udp relay dial not ready"
     for _ in 0..<maxPolls:
-      let state = runtime.udpDialState(raw)
+      let state = runtime.udpDialState($raw)
       if state.known:
         if state.ready:
           return ok()
@@ -697,7 +697,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check duplicate.isOk()
       check relayOwnerTaskCountForTests(9101) == 1
 
-    test "openDialUdpProxy replaces older dial task for the same route":
+    test "openDialUdpProxy reuses active dial task for the same route":
       let (gateway, relayUrl) = startRelayGateway()
       defer:
         gateway.stop()
@@ -711,7 +711,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
 
       let second = openDialUdpProxy(9102, relayUrl, "ip4", "100.64.0.11", remoteAdvertised)
       check second.isOk()
-      check $second.get() != $first.get()
+      check $second.get() == $first.get()
       check relayOwnerTaskCountForTests(9102) == 1
 
     test "relayOwnerHasRunningRouteTask stays readable after listener stage rewrites":
@@ -878,8 +878,11 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
 
       clearRelayReadyRouteIfTaskCurrent(ownerId, route, 11, 1)
       markRelayListenerStageIfTaskCurrent(ownerId, route, 11, 1, "udp", "stopped", "stale_route")
+      relayFinishRouteTaskForTests(ownerId, 11, route, 1)
 
       check relayRouteReady(ownerId, route)
+      check relayOwnerHasActiveRouteTask(ownerId, route)
+      check relayOwnerHasRunningRouteTask(ownerId, route)
       let states = relayListenerStatesPayload(ownerId)
       check states.len == 1
       check states[0].getOrDefault("stage").getStr("").toLowerAscii() == "bridge_attached"
@@ -1069,12 +1072,13 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       stopRelayListeners(runtime.runtimeId)
       runtime.status = TsnetInAppRuntimeStatus.Running
       runtime.udpListenerRoutes = @[route]
-      runtime.udpListenerRouteTargets = initOrderedTable[string, string]()
-      runtime.udpListenerRouteTargets[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
+      runtime.udpListenerRawByRoute = initOrderedTable[string, string]()
+      runtime.udpListenerRawByRoute[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
       markRelayListenerStageIfCurrent(runtime.runtimeId, route, 1, "udp", "bridge_attached", "")
 
       check relayRouteLocallyReady(runtime.runtimeId, route)
       check not runtime.listenerNeedsRepair()
+      check runtime.publishedListenerRoutes() == @[route]
 
     test "runtime reconcile skips locally usable udp route even without task registry":
       let (gateway, relayUrl) = startRelayGateway()
@@ -1095,8 +1099,8 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       runtime.session.status.started = true
       runtime.session.status.tailnetIPs = @["100.64.0.42"]
       runtime.udpListenerRoutes = @[route]
-      runtime.udpListenerRouteTargets = initOrderedTable[string, string]()
-      runtime.udpListenerRouteTargets[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
+      runtime.udpListenerRawByRoute = initOrderedTable[string, string]()
+      runtime.udpListenerRawByRoute[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
       markRelayListenerStage(runtime.runtimeId, route, "udp", "incoming", "")
 
       check relayRouteLocallyReady(runtime.runtimeId, route)
@@ -1105,7 +1109,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check repaired.isOk()
       check relayOwnerTaskCountForTests(runtime.runtimeId) == 0
 
-    test "runtime listenerNeedsRepair skips serving incoming udp route without ready registry":
+    test "runtime listenerNeedsRepair repairs stale incoming udp route after route task exit":
       let (gateway, relayUrl) = startRelayGateway()
       defer:
         gateway.stop()
@@ -1124,18 +1128,52 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       runtime.session.status.started = true
       runtime.session.status.tailnetIPs = @["100.64.0.43"]
       runtime.udpListenerRoutes = @[route]
-      runtime.udpListenerRouteTargets = initOrderedTable[string, string]()
-      runtime.udpListenerRouteTargets[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
-      markRelayListenerStage(runtime.runtimeId, route, "udp", "incoming", "")
+      runtime.udpListenerRawByRoute = initOrderedTable[string, string]()
+      runtime.udpListenerRawByRoute[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
+      relayRememberRouteTaskForTests(runtime.runtimeId, route, 11, 1)
+      markRelayListenerStageIfTaskCurrent(runtime.runtimeId, route, 11, 1, "udp", "incoming", "")
       requestRelayRouteRepair(runtime.runtimeId, route)
+      relayFinishRouteTaskForTests(runtime.runtimeId, 11, route, 1)
 
       check not relayRouteLocallyReady(runtime.runtimeId, route)
-      check relayRouteServingStage(runtime.runtimeId, route)
-      check not runtime.listenerNeedsRepair()
-      check not relayRouteRepairRequested(runtime.runtimeId, route)
+      check not relayRouteServingStage(runtime.runtimeId, route)
+      check runtime.listenerNeedsRepair()
+      check relayRouteRepairRequested(runtime.runtimeId, route)
       let repaired = waitFor runtime.reconcileProxyListeners()
       check repaired.isOk()
-      check relayOwnerTaskCountForTests(runtime.runtimeId) == 0
+      check relayOwnerTaskCountForTests(runtime.runtimeId) == 1
+
+    test "runtime listenerNeedsRepair requests repair for known udp route without explicit flag":
+      let (gateway, relayUrl) = startRelayGateway()
+      defer:
+        gateway.stop()
+
+      let runtime = buildRuntime(
+        "quic://127.0.0.1:9444/nim-tsnet-control-quic/v1",
+        relayUrl,
+        "relay-stage-known-runtime",
+        tempRuntimeDir("listener-stage-known")
+      )
+      let route = "/ip4/100.64.0.44/udp/4001/quic-v1/tsnet"
+      defer:
+        stopRelayListeners(runtime.runtimeId)
+
+      runtime.status = TsnetInAppRuntimeStatus.Running
+      runtime.session.status.started = true
+      runtime.session.status.tailnetIPs = @["100.64.0.44"]
+      runtime.udpListenerRoutes = @[route]
+      runtime.udpListenerRawByRoute = initOrderedTable[string, string]()
+      runtime.udpListenerRawByRoute[route] = "/ip4/127.0.0.1/udp/4001/quic-v1"
+      markRelayListenerStage(runtime.runtimeId, route, "udp", "known", "")
+
+      check not relayRouteRepairRequested(runtime.runtimeId, route)
+      check not relayRouteLocallyReady(runtime.runtimeId, route)
+      check not relayOwnerHasRunningRouteTask(runtime.runtimeId, route)
+      check runtime.listenerNeedsRepair()
+      check relayRouteRepairRequested(runtime.runtimeId, route)
+      let repaired = waitFor runtime.reconcileProxyListeners()
+      check repaired.isOk()
+      check relayOwnerTaskCountForTests(runtime.runtimeId) == 1
 
     test "runtime reconcile repairs only explicitly requested route and keeps active listener":
       let (gateway, relayUrl) = startRelayGateway()
@@ -1162,9 +1200,9 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       runtime.session.status.started = true
       runtime.session.status.tailnetIPs = @["100.64.0.61", "fd7a:115c:a1e0::61"]
       runtime.udpListenerRoutes = @[route4, route6]
-      runtime.udpListenerRouteTargets = initOrderedTable[string, string]()
-      runtime.udpListenerRouteTargets[route4] = $raw4
-      runtime.udpListenerRouteTargets[route6] = $raw6
+      runtime.udpListenerRawByRoute = initOrderedTable[string, string]()
+      runtime.udpListenerRawByRoute[route4] = $raw4
+      runtime.udpListenerRawByRoute[route6] = $raw6
 
       let started = startUdpRelayListener(runtime.runtimeId, relayUrl, advertised4, raw4)
       check started.isOk()
@@ -1224,11 +1262,10 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
       check not wrongDialDecision.accept
       check not wrongDialDecision.learnClient
 
-    test "relay candidates include public and lan hints from bridgeExtraJson":
+    test "relay candidates include public IPv6 and explicit hints from bridgeExtraJson":
       let candidates = relayCandidatesForRaw(
         "/ip4/127.0.0.1/udp/4001/quic-v1",
         $ %*{
-          "publicIpv4": "198.51.100.50",
           "publicIpv6": "2001:db8::50",
           "directCandidates": [
             "/ip4/203.0.113.77/udp/4100/quic-v1",
@@ -1247,7 +1284,6 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         }
       )
       check candidates == @[
-        "/ip4/198.51.100.50/udp/4001/quic-v1",
         "/ip6/2001:db8::50/udp/4001/quic-v1",
         "/ip4/203.0.113.77/udp/4100/quic-v1",
         "/ip4/192.168.1.10/udp/4001/quic-v1"
@@ -1357,7 +1393,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         let firstDial = client.dialUdpProxy("ip4", "100.64.0.10", 4001)
         check firstDial.isOk()
         check $firstDial.get() != $rawServer
-        let firstDialState = client.udpDialState(firstDial.get())
+        let firstDialState = client.udpDialState($firstDial.get())
         check firstDialState.known
         check not firstDialState.ready
         check firstDialState.error.len == 0
@@ -1382,7 +1418,7 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         relayGateway.stop()
         controlGateway.stop()
 
-    test "live runtimes exchange public candidates and listener learns punched_direct backup":
+    test "live runtimes exchange explicit candidates and listener learns punched_direct backup":
       let (controlGateway, controlUrl) = startControlGateway()
       let (relayGateway, relayUrl) = startRelayGateway()
       let server = buildRuntime(
@@ -1390,14 +1426,22 @@ BXA0gnTq7oJ+vdw30hkU17SZ957/C7KtPFZ1AoGATM42Hj6UCOwN28kI8H97g3hB
         relayUrl,
         "relay-server",
         tempRuntimeDir("udp-public-server"),
-        $ %*{"publicIpv4": "198.51.100.10"}
+        $ %*{
+          "directCandidates": [
+            "/ip4/198.51.100.10/udp/41012/quic-v1"
+          ]
+        }
       )
       let client = buildRuntime(
         controlUrl,
         relayUrl,
         "relay-client",
         tempRuntimeDir("udp-public-client"),
-        $ %*{"publicIpv4": "203.0.113.20"}
+        $ %*{
+          "directCandidates": [
+            "/ip4/203.0.113.20/udp/4555/quic-v1"
+          ]
+        }
       )
 
       proc waitForDirectRouteCount(runtime: TsnetInAppRuntime, expected: int, timeoutMs = 5000): bool =

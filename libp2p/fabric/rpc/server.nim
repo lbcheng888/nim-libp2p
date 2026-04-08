@@ -76,27 +76,57 @@ proc jTxKind(payload: JsonNode, key: string): TxKind =
   else:
     raise newException(ValueError, "invalid tx kind")
 
-proc txFromJson(payload: JsonNode): Tx =
-  result = Tx(
-    txId: jStr(payload, "txId"),
-    kind: jTxKind(payload, "kind"),
-    sender: jStr(payload, "sender"),
-    senderPublicKey: jStr(payload, "senderPublicKey"),
-    nonce: uint64(jInt(payload, "nonce")),
-    epoch: uint64(jInt(payload, "epoch")),
-    timestamp: jI64(payload, "timestamp"),
-    payload: if payload.kind == JObject and payload.hasKey("payload"): payload["payload"] else: newJObject(),
-    signature: jStr(payload, "signature"),
+proc txPayloadNode(payload: JsonNode): JsonNode =
+  if payload.kind == JObject and payload.hasKey("payload"):
+    payload["payload"]
+  else:
+    newJObject()
+
+proc rpcSubmitResult(
+    server: FabricRpcServer, payload: JsonNode
+): JsonNode =
+  if server.isNil or server.node.isNil:
+    raise newException(ValueError, "fabric node missing")
+  let localTx = server.node.prepareLocalTx(
+    kind = jTxKind(payload, "kind"),
+    payload = txPayloadNode(payload),
+    epoch = uint64(jInt(payload, "epoch")),
+    timestamp = jI64(payload, "timestamp"),
   )
-  if result.txId.len == 0:
-    result.txId = computeTxId(result)
+  let offeredNonce = jInt(payload, "nonce", -1)
+  if offeredNonce >= 0 and uint64(offeredNonce) != localTx.nonce:
+    raise newException(
+      ValueError,
+      "submit nonce mismatch: expected " & $localTx.nonce & " got " & $offeredNonce,
+    )
+  let offeredSender = jStr(payload, "sender")
+  if offeredSender.len > 0 and offeredSender != localTx.sender:
+    raise newException(
+      ValueError,
+      "submit sender mismatch: expected " & localTx.sender & " got " & offeredSender,
+    )
+  let offeredPub = jStr(payload, "senderPublicKey")
+  if offeredPub.len > 0 and offeredPub != localTx.senderPublicKey:
+    raise newException(ValueError, "submit senderPublicKey mismatch")
+  let offeredSig = jStr(payload, "signature")
+  if offeredSig.len > 0 and offeredSig != localTx.signature:
+    raise newException(ValueError, "submit signature mismatch")
+  let offeredTxId = jStr(payload, "txId")
+  if offeredTxId.len > 0 and offeredTxId != localTx.txId:
+    raise newException(
+      ValueError,
+      "submit txId mismatch: expected " & localTx.txId & " got " & offeredTxId,
+    )
+  toJson(server.node.submitTx(localTx))
 
 proc dispatch(server: FabricRpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   of "fabric.status":
     toJson(server.node.fabricStatus())
+  of "fabric.quiesce":
+    toJson(server.node.submitFence())
   of "fabric.submit_event":
-    toJson(server.node.submitTx(txFromJson(params["tx"])))
+    server.rpcSubmitResult(params["tx"])
   of "fabric.get_event":
     let eventOpt = server.node.getEvent(jStr(params, "eventId"))
     if eventOpt.isSome(): toJson(eventOpt.get()) else: newJNull()

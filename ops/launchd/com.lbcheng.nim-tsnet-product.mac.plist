@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lbcheng.nim-tsnet-product.mac</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/lbcheng/nim-libp2p</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/lbcheng/nim-libp2p/build/tsnet_product_node</string>
+    <string>--label=prod-mac</string>
+    <string>--rpc-host=127.0.0.1</string>
+    <string>--rpc-port=19113</string>
+    <string>--control-protocol=nim_quic</string>
+    <string>--control-endpoint=quic://64.176.84.12:9444/nim-tsnet-control-quic/v1</string>
+    <string>--relay-endpoint=quic://64.176.84.12:9446/nim-tsnet-relay-quic/v1</string>
+    <string>--hostname=prod-mac</string>
+    <string>--state-dir=/Users/lbcheng/nim-libp2p/build/prod-mac/node/state</string>
+    <string>--data-dir=/Users/lbcheng/nim-libp2p/build/prod-mac/node/data</string>
+    <string>--identity-path=/Users/lbcheng/nim-libp2p/build/prod-mac/node/identity.json</string>
+    <string>--listen-port=40113</string>
+    <string>--wait-timeout-sec=120</string>
+    <string>--quic-only=true</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/lbcheng/nim-libp2p/build/prod-mac/node/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lbcheng/nim-libp2p/build/prod-mac/node/stderr.log</string>
+</dict>
+</plist>

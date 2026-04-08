@@ -321,6 +321,7 @@ proc newMsQuicChannel(
       dir: stream.dir,
       observedAddr: session.observedAddr,
       localAddr: session.localAddr,
+      relayPath: session.relayPath,
       protocol: session.protocol,
       negotiatedMuxer: "msquic",
       multistreamVersion: version,
@@ -374,7 +375,7 @@ method endProtocolNegotiation*(s: MsQuicChannel) {.gcsafe.} =
   except CatchableError:
     discard
 
-method getWrapped*(s: MsQuicChannel): Connection =
+method getWrapped*(s: MsQuicChannel): Connection {.gcsafe.} =
   nil
 
 proc closePendingMsQuicState(
@@ -463,27 +464,24 @@ method newStream*(
     m: MsQuicMuxer, name: string = "", lazy: bool = false
 ): Future[Connection] {.async: (raises: [CancelledError, LPStreamError, MuxerError]).} =
   try:
-    when defined(ohos):
-      warn "MsQuic muxer newStream begin",
-        peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
-        protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
-        name = name,
-        lazy = lazy
+    warn "MsQuic muxer newStream begin",
+      peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
+      protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
+      name = name,
+      lazy = lazy
     if not m.bootstrapOutbound.isNil:
       let channel = m.bootstrapOutbound
       m.bootstrapOutbound = nil
-      when defined(ohos):
-        warn "MsQuic muxer reused bootstrap outbound stream",
-          peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
-          protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
-          name = name
-      return channel
-    let stream = m.session.openMsQuicStream(false, Direction.Out)
-    when defined(ohos):
-      warn "MsQuic muxer newStream opened",
+      warn "MsQuic muxer reused bootstrap outbound stream",
         peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
         protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
         name = name
+      return channel
+    let stream = m.session.openMsQuicStream(false, Direction.Out)
+    warn "MsQuic muxer newStream opened",
+      peerId = (if m.isNil or m.session.isNil: default(PeerId) else: m.session.peerId),
+      protocol = (if m.isNil or m.session.isNil: "" else: m.session.protocol),
+      name = name
     return newMsQuicChannel(m.session, stream)
   except LPStreamError as exc:
     raise exc
@@ -2647,7 +2645,6 @@ proc awaitMsQuicDial(
         return (true, "handshake_complete_poll")
       trace "MsQuic dial event timeout", attempt = attempt, timeoutCount = timeoutCount
       continue
-    timeoutFut.cancel()
     let event =
       try:
         await fut
@@ -2715,6 +2712,8 @@ method start*(
 ) {.async: (raises: [LPError, basetransport.TransportError, CancelledError]).} =
   if self.running:
     return
+  let clientOnly = addrs.len == 0
+  warn "MsQuicTransport start begin", addrs = addrs.len, clientOnly = clientOnly
   let needsWebtransportCerthash =
     addrs.anyIt(addressRequestsWebtransport(it)) or self.webtransportCerthashHistory.len > 0
   var initHandle: msquicdrv.MsQuicTransportHandle = nil
@@ -2780,9 +2779,7 @@ method start*(
 
   let effectiveAddrs = filterRedundantWildcardListeners(addrs, quicRuntimeInfo(initHandle))
   var listenerPlans: seq[(Option[MultiAddress], bool)] = @[]
-  if effectiveAddrs.len == 0:
-    listenerPlans.add((none(MultiAddress), false))
-  else:
+  if effectiveAddrs.len > 0:
     for ma in effectiveAddrs:
       if not self.handles(ma):
         trace "MsQuic skip non-quic listen address", address = $ma
@@ -2933,6 +2930,10 @@ method start*(
   resetListenerFutures(self)
   when defined(libp2p_msquic_debug):
     warn "MsQuic advertised addresses", addrs = advertisedAddrs.mapIt($it)
+  warn "MsQuicTransport start done",
+    addrs = addrs.len,
+    clientOnly = clientOnly,
+    listeners = self.listeners.len
   await procCall basetransport.Transport(self).start(advertisedAddrs)
 
 # Only claim QUIC/WebTransport multiaddrs; let TCP transports handle /tcp.
@@ -3177,6 +3178,7 @@ method dial*(
   var connStateOpt: Option[msquicdrv.MsQuicConnectionState]
   var dialErr = ""
   try:
+    warn "MsQuic dial create begin", address = $address, hostname = hostname, host = host, port = port
     let res = block:
       var tmp: tuple[
         connection: pointer,
@@ -3197,6 +3199,14 @@ method dial*(
     connPtr = res.connection
     connStateOpt = res.state
     dialErr = res.error
+    warn "MsQuic dial create done",
+      address = $address,
+      hostname = hostname,
+      host = host,
+      port = port,
+      connNil = connPtr.isNil,
+      hasState = connStateOpt.isSome,
+      err = dialErr
   except Exception as exc:
     dialErr = "MsQuic dial raised: " & exc.msg
   if dialErr.len > 0 or connPtr.isNil or connStateOpt.isNone:
@@ -3209,9 +3219,23 @@ method dial*(
   var connected = false
   var reason = ""
   try:
+    warn "MsQuic dial await begin",
+      address = $address,
+      hostname = hostname,
+      host = host,
+      port = port,
+      conn = cast[uint64](connPtr)
     let res = await awaitMsQuicDial(connState)
     connected = res[0]
     reason = res[1]
+    warn "MsQuic dial await done",
+      address = $address,
+      hostname = hostname,
+      host = host,
+      port = port,
+      conn = cast[uint64](connPtr),
+      connected = connected,
+      reason = reason
   except Exception as exc:
     connected = false
     reason = "MsQuic dial wait raised: " & exc.msg

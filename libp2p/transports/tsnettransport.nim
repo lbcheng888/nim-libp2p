@@ -41,10 +41,29 @@ proc ownedText(text: string): string {.gcsafe, raises: [].} =
   result = newStringOfCap(text.len)
   result.add(text)
 
+proc ownedTextSeq(items: openArray[string]): seq[string] {.gcsafe, raises: [].} =
+  result = newSeqOfCap[string](items.len)
+  for item in items:
+    result.add(ownedText(item))
+
 proc currentUnixMilli(): int64 =
   int64(epochTime() * 1000.0)
 
+const
+  TsnetSessionHandshakeIdleTimeoutMs = 30_000'u64
+  TsnetSessionIdleTimeoutMs = 120_000'u64
+  TsnetSessionKeepAliveIntervalMs = 5_000'u32
+
 type
+  TsnetBridgeExtraPayload* = object
+    updatedAtMs*: int64
+    publicIpv6*: string
+    directCandidates*: seq[string]
+
+  TsnetBridgeExtraField = object
+    key: string
+    valueJson: string
+
   TsnetPathKind* {.pure.} = enum
     Tcp
     Quic
@@ -94,6 +113,7 @@ type
 
   TsnetTransport* = ref object of Transport
     cfg*: TsnetTransportBuilderConfig
+    bridgeExtraBaseFields: seq[TsnetBridgeExtraField]
     tcpTransport: TcpTransport
     when defined(libp2p_msquic_experimental):
       quicTransport: MsQuicTransport
@@ -140,7 +160,11 @@ proc init*(_: type[TsnetTransportBuilderConfig]): TsnetTransportBuilderConfig =
     bridgeExtraJson: ""
   )
   when defined(libp2p_msquic_experimental):
-    result.quicConfig = MsQuicTransportConfig()
+    result.quicConfig = MsQuicTransportConfig(
+      handshakeIdleTimeoutMs: TsnetSessionHandshakeIdleTimeoutMs,
+      idleTimeoutMs: TsnetSessionIdleTimeoutMs,
+      keepAliveIntervalMs: TsnetSessionKeepAliveIntervalMs,
+    )
     result.quicTlsTempDir = ""
 
 proc providerConfig(cfg: TsnetTransportBuilderConfig): TsnetProviderConfig =
@@ -159,37 +183,124 @@ proc providerConfig(cfg: TsnetTransportBuilderConfig): TsnetProviderConfig =
     bridgeExtraJson: ownedText(cfg.bridgeExtraJson)
   )
 
+proc bridgeExtraFieldReserved(key: string): bool =
+  key == "libp2pPeerId" or
+    key == "localPeerId" or
+    key == "libp2pListenAddrs" or
+    key == "listenAddresses" or
+    key == "bridgeExtraUpdatedAtMs" or
+    key == "publicIpv6" or
+    key == "directCandidates"
+
+proc parseBridgeExtraBaseFields(raw: string): seq[TsnetBridgeExtraField] =
+  let payload = raw.strip()
+  if payload.len == 0:
+    return @[]
+  let parsed =
+    try:
+      parseJson(payload)
+    except CatchableError:
+      return @[]
+  if parsed.kind != JObject:
+    return @[]
+  result = @[]
+  for key, value in parsed.pairs():
+    if bridgeExtraFieldReserved(key):
+      continue
+    result.add(TsnetBridgeExtraField(
+      key: ownedText(key),
+      valueJson: ownedText($value)
+    ))
+
+proc appendJsonFieldSep(result: var string) {.inline.} =
+  if result.len > 1:
+    result.add(',')
+
+proc appendSerializedJsonField(
+    result: var string,
+    key: string,
+    valueJson: string
+) =
+  appendJsonFieldSep(result)
+  result.add('"')
+  result.add(key)
+  result.add("\":")
+  result.add(valueJson)
+
+proc appendJsonStringField(
+    result: var string,
+    key: string,
+    value: string
+) =
+  appendSerializedJsonField(result, key, escapeJson(value))
+
+proc appendJsonStringArrayField(
+    result: var string,
+    key: string,
+    values: openArray[string]
+) =
+  appendJsonFieldSep(result)
+  result.add('"')
+  result.add(key)
+  result.add("\":[")
+  for idx, value in values:
+    if idx > 0:
+      result.add(',')
+    result.add(escapeJson(value))
+  result.add(']')
+
+proc appendJsonIntField(
+    result: var string,
+    key: string,
+    value: int64
+) =
+  appendJsonFieldSep(result)
+  result.add('"')
+  result.add(key)
+  result.add("\":")
+  result.add($value)
+
 proc mergeBridgeExtraJson(
-    current: string,
+    baseFields: openArray[TsnetBridgeExtraField],
     peerId: string,
-    listenAddrs: openArray[string]
+    listenAddrs: openArray[string],
+    bridgeMetadata: TsnetBridgeExtraPayload = TsnetBridgeExtraPayload()
 ): string =
-  var payload =
-    if current.strip().len > 0:
-      try:
-        parseJson(current)
-      except CatchableError:
-        newJObject()
-    else:
-      newJObject()
-  if payload.kind != JObject:
-    payload = newJObject()
+  result = newStringOfCap(512)
+  result.add('{')
+  for field in baseFields:
+    appendSerializedJsonField(result, field.key, field.valueJson)
+  appendJsonIntField(result, "bridgeExtraUpdatedAtMs", bridgeMetadata.updatedAtMs)
+  if bridgeMetadata.publicIpv6.len > 0:
+    appendJsonStringField(result, "publicIpv6", bridgeMetadata.publicIpv6)
+  if bridgeMetadata.directCandidates.len > 0:
+    appendJsonStringArrayField(
+      result,
+      "directCandidates",
+      bridgeMetadata.directCandidates
+    )
   let normalizedPeerId = peerId.strip()
   if normalizedPeerId.len > 0:
-    payload["libp2pPeerId"] = %normalizedPeerId
-    payload["localPeerId"] = %normalizedPeerId
+    appendJsonStringField(result, "libp2pPeerId", normalizedPeerId)
+    appendJsonStringField(result, "localPeerId", normalizedPeerId)
   var normalizedListenAddrs: seq[string] = @[]
   for addr in listenAddrs:
     let text = addr.strip()
     if text.len > 0 and text notin normalizedListenAddrs:
       normalizedListenAddrs.add(text)
   if normalizedListenAddrs.len > 0:
-    payload["libp2pListenAddrs"] = %normalizedListenAddrs
-    payload["listenAddresses"] = %normalizedListenAddrs
-  $payload
+    appendJsonStringArrayField(result, "libp2pListenAddrs", normalizedListenAddrs)
+    appendJsonStringArrayField(result, "listenAddresses", normalizedListenAddrs)
+  result.add('}')
 
 proc parseKnownAddress(text: string): MultiAddress {.gcsafe.} =
   MultiAddress.init(text).expect("tsnet transport constructed a valid multiaddr")
+
+proc boolText(value: bool): string {.inline, gcsafe, raises: [].} =
+  if value:
+    "true"
+  else:
+    "false"
 
 proc jsonField(node: JsonNode, key: string): JsonNode =
   if node.isNil or node.kind != JObject or not node.hasKey(key):
@@ -242,6 +353,10 @@ proc providerUsesProxyRouting(self: TsnetTransport): bool {.gcsafe.} =
   tsnetSafe:
     result = not self.provider.isNil and self.provider.isProxyBacked()
 
+proc providerUsesExactRouting(self: TsnetTransport): bool {.gcsafe.} =
+  tsnetSafe:
+    result = not self.provider.isNil and self.provider.supportsExactRouting()
+
 proc providerCapabilitiesSafe(self: TsnetTransport): TsnetProviderCapabilities {.gcsafe.} =
   tsnetSafe:
     result =
@@ -268,7 +383,7 @@ proc providerPublishedAddrTextsSafe(self: TsnetTransport): seq[string] {.gcsafe.
       if self.provider.isNil:
         @[]
       else:
-        self.provider.publishedAddrTexts()
+        ownedTextSeq(self.provider.publishedAddrTexts())
 
 proc parseTsnetAddress(
     address: MultiAddress, listen: bool
@@ -400,11 +515,17 @@ proc applyWarmProviderSnapshotSafe*(
 proc publishLocalPeerInfo*(
     self: TsnetTransport,
     peerId: string,
-    listenAddrs: openArray[string]
+    listenAddrs: openArray[string],
+    bridgeMetadata: TsnetBridgeExtraPayload = TsnetBridgeExtraPayload()
 ) {.gcsafe.} =
   if self.isNil:
     return
-  let nextJson = mergeBridgeExtraJson(self.cfg.bridgeExtraJson, peerId, listenAddrs)
+  let nextJson = mergeBridgeExtraJson(
+    self.bridgeExtraBaseFields,
+    peerId,
+    listenAddrs,
+    bridgeMetadata
+  )
   let ownedJson = ownedText(nextJson)
   self.cfg.bridgeExtraJson = ownedJson
   self.provider.updateBridgeExtraJson(ownedJson)
@@ -442,7 +563,7 @@ proc reconcileProviderListeners*(
 proc publishedAddrs*(self: TsnetTransport): seq[MultiAddress] {.gcsafe.} =
   if self.isNil:
     return @[]
-  if self.providerUsesProxyRouting():
+  if self.providerUsesExactRouting():
     let providerPublished = self.providerPublishedAddrTextsSafe()
     if providerPublished.len > 0:
       result = newSeqOfCap[MultiAddress](providerPublished.len)
@@ -461,10 +582,10 @@ proc publishedAddrs*(self: TsnetTransport): seq[MultiAddress] {.gcsafe.} =
 proc publishedAddrTexts*(self: TsnetTransport): seq[string] {.gcsafe.} =
   if self.isNil:
     return @[]
-  if self.providerUsesProxyRouting():
+  if self.providerUsesExactRouting():
     let providerPublished = self.providerPublishedAddrTextsSafe()
     if providerPublished.len > 0:
-      return providerPublished
+      return ownedTextSeq(providerPublished)
   let mappings = listenerMappingSnapshot(self.listenerMappings)
   for mapping in mappings:
     if mapping.published and mapping.advertisedText.len > 0:
@@ -553,6 +674,15 @@ proc providerDialUdpExactTargetSafe(
   tsnetSafe:
     result = self.provider.dialUdpProxyExactTarget(family, ip, port)
 
+proc providerPlanUdpExactTargetSafe(
+    self: TsnetTransport,
+    family, ip: string,
+    port: int,
+    relayAllowed: bool
+): TsnetUdpExactDialPlan {.gcsafe.} =
+  tsnetSafe:
+    result = self.provider.planUdpExactDialTarget(family, ip, port, relayAllowed)
+
 proc providerLookupUdpDirectTargetSafe(
     self: TsnetTransport,
     family, ip: string,
@@ -587,7 +717,8 @@ proc providerMarkFailedDirectUdpSafe(
 
 proc providerUdpDialStateSafe(
     self: TsnetTransport,
-    rawAddress: MultiAddress
+    rawKey: string,
+    routeKey = ""
 ): tuple[
     known, ready: bool,
     error, phase, detail: string,
@@ -595,7 +726,7 @@ proc providerUdpDialStateSafe(
     updatedUnixMilli: int64
   ] {.gcsafe.} =
   tsnetSafe:
-    result = self.provider.udpDialState(rawAddress)
+    result = self.provider.udpDialState(rawKey, routeKey)
 
 proc providerResolveRemoteSafe(
     self: TsnetTransport,
@@ -607,6 +738,14 @@ proc providerResolveRemoteSafe(
 proc providerStatusPayloadSafe(self: TsnetTransport): Result[JsonNode, string] {.gcsafe.} =
   tsnetSafe:
     result = self.provider.statusPayload()
+
+proc providerTailnetIpTextsSafe*(self: TsnetTransport): seq[string] {.gcsafe.} =
+  tsnetSafe:
+    result =
+      if self.isNil or self.provider.isNil:
+        @[]
+      else:
+        self.provider.tailnetIpTexts()
 
 proc familyFromAddress(address: MultiAddress): string {.gcsafe.}
 
@@ -636,84 +775,50 @@ proc waitForProviderUdpDialReady(
     self: TsnetTransport,
     dialTarget: TsnetProxyDialTarget
 ) {.async: (raises: [CancelledError, transport.TransportError]).} =
-  const
-    pollStep = 25.milliseconds
-    dialReadyTimeout = 30.seconds
-    dialProgressStallNoticeMs = 3_000'i64
-
   if dialTarget.mode != TsnetProxyDialMode.RelayBridge:
     return
 
   let rawAddress = dialTarget.rawAddress
-  let deadline = Moment.now() + dialReadyTimeout
+  let rawText = $rawAddress
+  var lastKnown = false
   var lastPhase = ""
   var lastDetail = ""
+  var lastError = ""
   var lastAttempts = -1
-  var lastUpdate = int64(0)
-  var lastStallNoticeUpdate = int64(-1)
+  var lastLoggedAtMs = 0'i64
   while true:
-    let state = self.providerUdpDialStateSafe(rawAddress)
-    if not state.known:
-      if Moment.now() >= deadline:
-        raise newException(
-          TsnetTransportDialError,
-          "timeout waiting for tsnet udp relay dial state for " & $rawAddress &
-            " mode=relay_bridge"
-        )
-      await sleepAsync(pollStep)
-      continue
+    let state = self.providerUdpDialStateSafe(rawText, dialTarget.routeKey)
     if state.ready:
       return
-    if state.phase.len > 0 and (
-        state.phase != lastPhase or
-        state.detail != lastDetail or
-        state.attempts != lastAttempts or
-        state.updatedUnixMilli != lastUpdate
-      ):
-      trace "tsnet udp dial progress",
-        rawAddress = $rawAddress,
-        phase = state.phase,
-        detail = state.detail,
-        attempts = state.attempts
-      lastPhase = state.phase
-      lastDetail = state.detail
-      lastAttempts = state.attempts
-      lastUpdate = state.updatedUnixMilli
-      lastStallNoticeUpdate = int64(-1)
     if state.error.len > 0:
       raise newException(
         TsnetTransportDialError,
-        "tsnet udp relay dial failed for " & $rawAddress & ": " & state.error &
+        "tsnet udp relay dial failed for " & rawText & ": " & state.error &
           (if state.phase.len > 0: " (phase=" & state.phase & ")" else: "") &
           (if state.attempts > 0: " attempts=" & $state.attempts else: "")
       )
-    if state.updatedUnixMilli > 0 and state.phase.len > 0:
-      let ageMs = currentUnixMilli() - state.updatedUnixMilli
-      if ageMs >= dialProgressStallNoticeMs and
-          state.updatedUnixMilli != lastStallNoticeUpdate:
-        trace "tsnet udp dial stalled",
-          rawAddress = $rawAddress,
-          phase = state.phase,
-          detail = state.detail,
-          attempts = state.attempts,
-          stallMs = ageMs
-        lastStallNoticeUpdate = state.updatedUnixMilli
-    if Moment.now() >= deadline:
-      let extra =
-        if state.phase.len == 0:
-          ""
-        else:
-          " lastPhase=" & state.phase &
-            (if state.detail.len > 0: " detail=" & state.detail else: "") &
-            (if state.attempts > 0: " attempts=" & $state.attempts else: "") &
-            (if state.updatedUnixMilli > 0:
-              " ageMs=" & $(max(int64(0), currentUnixMilli() - state.updatedUnixMilli))
-             else: "")
-      raise newException(
-        TsnetTransportDialError,
-        "timeout waiting for tsnet udp relay readiness for " & $rawAddress & extra
+    let nowMs = currentUnixMilli()
+    if state.known != lastKnown or
+        state.phase != lastPhase or
+        state.detail != lastDetail or
+        state.error != lastError or
+        state.attempts != lastAttempts or
+        nowMs - lastLoggedAtMs >= 500:
+      debugEcho(
+        "[tsnettransport] udp dial waiting" &
+        " rawAddress=" & rawText &
+        " known=" & boolText(state.known) &
+        " phase=" & state.phase &
+        " detail=" & state.detail &
+        " attempts=" & $state.attempts
       )
-    await sleepAsync(pollStep)
+      lastKnown = state.known
+      lastPhase = state.phase
+      lastDetail = state.detail
+      lastError = state.error
+      lastAttempts = state.attempts
+      lastLoggedAtMs = nowMs
+    await sleepAsync(chronos.milliseconds(50))
 
 proc hasTsnetSuffix(address: MultiAddress): bool {.gcsafe.} =
   let text = $address
@@ -793,12 +898,50 @@ proc lookupUdpDirectRouteTarget*(
     return err("invalid tsnet quic target")
   self.providerLookupUdpDirectTargetSafe(family, host, port)
 
+proc planUdpExactDialTarget*(
+    self: TsnetTransport,
+    address: MultiAddress,
+    relayAllowed: bool
+): TsnetUdpExactDialPlan {.gcsafe.} =
+  if self.isNil:
+    return TsnetUdpExactDialPlan(
+      mode:
+        if relayAllowed:
+          TsnetProxyDialMode.RelayBridge
+        else:
+          TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: "tsnet transport is nil",
+      updatedUnixMilli: 0,
+    )
+  let family = familyFromAddress(address)
+  let host = hostFromAddress(address)
+  let port = portFromAddress(address)
+  if family.len == 0 or host.len == 0 or port <= 0:
+    return TsnetUdpExactDialPlan(
+      mode:
+        if relayAllowed:
+          TsnetProxyDialMode.RelayBridge
+        else:
+          TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: "invalid tsnet quic target",
+      updatedUnixMilli: 0,
+    )
+  self.providerPlanUdpExactTargetSafe(family, host, port, relayAllowed)
+
 proc quicDialHostname*(
     self: TsnetTransport,
     requestedHostname: string,
     rawTarget: MultiAddress
 ): string =
-  if self.providerUsesProxyRouting():
+  if self.providerUsesExactRouting():
     let rawHost = hostFromAddress(rawTarget)
     if rawHost.len > 0:
       return rawHost
@@ -898,9 +1041,7 @@ proc advertisedAddress(
   buildTsnetAddress(parsed.family, ip, port, parsed.kind)
 
 proc providerTailnetIp(self: TsnetTransport, family: string): string =
-  let payload = self.providerStatusPayloadSafe().valueOr:
-    return if family == "ip6": self.syntheticIPv6 else: self.syntheticIPv4
-  for candidate in jsonFieldStrings(payload, "tailnetIPs"):
+  for candidate in self.providerTailnetIpTextsSafe():
     let lowered = candidate.toLowerAscii()
     if family == "ip6":
       if lowered.contains(":"):
@@ -943,7 +1084,7 @@ proc fallbackDialEndpoint(
     kind: TsnetPathKind
 ): MultiAddress =
   let ip =
-    if transport.providerUsesProxyRouting():
+    if transport.providerUsesExactRouting():
       transport.providerTailnetIp(family)
     elif family == "ip6":
       transport.syntheticIPv6
@@ -1045,7 +1186,7 @@ proc rewriteAcceptedConnection(
     let observedOpt = transport.lookupAdvertisedListenerForRaw(conn.observedAddr.get())
     if observedOpt.isSome:
       conn.observedAddr = Opt.some(observedOpt.get())
-    elif transport.providerUsesProxyRouting():
+    elif transport.providerUsesExactRouting():
       let remoteRes = transport.providerResolveRemoteSafe(conn.observedAddr.get())
       if remoteRes.isOk:
         conn.observedAddr = Opt.some(remoteRes.get())
@@ -1064,8 +1205,10 @@ proc new*(
     cfg: TsnetTransportBuilderConfig = TsnetTransportBuilderConfig.init(),
 ): TsnetTransport =
   let syntheticId = nextSyntheticNodeId()
+  let bridgeExtraBaseFields = parseBridgeExtraBaseFields(cfg.bridgeExtraJson)
   result = TsnetTransport(
     cfg: cfg,
+    bridgeExtraBaseFields: bridgeExtraBaseFields,
     upgrader: upgrader,
     networkReachability: NetworkReachability.Unknown,
     providerListenersActivated: false,
@@ -1286,18 +1429,42 @@ proc dialWithPreference*(
     address: MultiAddress,
     peerId: Opt[PeerId] = Opt.none(PeerId),
     relayOnly = false,
+    directOnly = false,
 ): Future[Connection] {.async: (raises: [transport.TransportError, CancelledError]).} =
+  if relayOnly and directOnly:
+    raise newException(
+      TsnetTransportDialError,
+      "tsnet dial cannot be relay-only and direct-only at the same time"
+    )
   let parsed = parseTsnetAddress(address, listen = false).valueOr:
     raise newException(TsnetTransportDialError, error)
-  if not self.providerUsesProxyRouting() and not self.provider.isNil and self.provider.runtimeRequested():
-    discard self.providerStartSafe().valueOr:
-      raise newException(TsnetTransportDialError, error)
+  let exactRouting = self.providerUsesExactRouting()
+  let runtimeRequested = not self.provider.isNil and self.provider.runtimeRequested()
+  debugEcho(
+    "[tsnettransport] dial begin" &
+    " address=" & $address &
+    " relayOnly=" & boolText(relayOnly) &
+    " directOnly=" & boolText(directOnly) &
+    " exactRouting=" & boolText(exactRouting)
+  )
+  if not exactRouting and runtimeRequested:
+    debugEcho(
+      "[tsnettransport] dial provider not ready" &
+      " address=" & $address &
+      " relayOnly=" & boolText(relayOnly) &
+      " directOnly=" & boolText(directOnly)
+    )
+    raise newException(
+      TsnetTransportDialError,
+      "udp target not ready: tsnet provider not ready"
+    )
   var udpDialTarget = TsnetProxyDialTarget(
     rawAddress: buildRawLoopbackAddress(parsed),
     mode: TsnetProxyDialMode.Local,
+    routeKey: "",
   )
   let rawTarget =
-    if self.providerUsesProxyRouting():
+    if exactRouting:
       case parsed.kind
       of TsnetPathKind.Tcp:
         if relayOnly:
@@ -1309,13 +1476,29 @@ proc dialWithPreference*(
           raise newException(TsnetTransportDialError, error)
       of TsnetPathKind.Quic:
         when defined(libp2p_msquic_experimental):
-          udpDialTarget =
-            if relayOnly:
-              self.providerDialUdpFallbackTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
-                raise newException(TsnetTransportDialError, error)
-            else:
-              self.providerDialUdpExactTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
-                raise newException(TsnetTransportDialError, error)
+          if directOnly:
+            let plan = self.planUdpExactDialTarget(address, relayAllowed = false)
+            if not plan.ready:
+              raise newException(
+                TsnetTransportDialError,
+                if plan.error.len > 0:
+                  plan.error
+                else:
+                  exactDialStageLabel(plan.stage)
+              )
+            udpDialTarget = TsnetProxyDialTarget(
+              rawAddress: plan.rawAddress,
+              mode: plan.mode,
+              routeKey: "",
+            )
+          else:
+            udpDialTarget =
+              if relayOnly:
+                self.providerDialUdpFallbackTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+                  raise newException(TsnetTransportDialError, error)
+              else:
+                self.providerDialUdpExactTargetSafe(parsed.family, parsed.ip, parsed.port).valueOr:
+                  raise newException(TsnetTransportDialError, error)
           if relayOnly and udpDialTarget.mode != TsnetProxyDialMode.RelayBridge:
             raise newException(
               TsnetTransportDialError,
@@ -1335,6 +1518,14 @@ proc dialWithPreference*(
           "no local /tsnet route is registered for " & $address
         )
       rawTargetOpt.get()
+  debugEcho(
+    "[tsnettransport] dial target ready" &
+    " address=" & $address &
+    " rawTarget=" & $rawTarget &
+    " relayOnly=" & boolText(relayOnly) &
+    " directOnly=" & boolText(directOnly) &
+    " udpMode=" & $udpDialTarget.mode
+  )
   let conn =
     case parsed.kind
     of TsnetPathKind.Tcp:
@@ -1344,7 +1535,22 @@ proc dialWithPreference*(
         if not self.quicTransport.running:
           try:
             # QUIC clients may dial without registering a local /tsnet listener first.
+            debugEcho(
+              "[tsnettransport] quic client transport start begin" &
+              " address=" & $address &
+              " rawTarget=" & $rawTarget &
+              " relayOnly=" & boolText(relayOnly) &
+              " directOnly=" & boolText(directOnly)
+            )
             await self.quicTransport.start(@[])
+            debugEcho(
+              "[tsnettransport] quic client transport start done" &
+              " address=" & $address &
+              " rawTarget=" & $rawTarget &
+              " relayOnly=" & boolText(relayOnly) &
+              " directOnly=" & boolText(directOnly) &
+              " running=" & boolText(self.quicTransport.running)
+            )
           except CancelledError as exc:
             raise exc
           except transport.TransportError as exc:
@@ -1353,15 +1559,60 @@ proc dialWithPreference*(
             raise newException(TsnetTransportDialError, exc.msg, exc)
           except CatchableError as exc:
             raise newException(TsnetTransportDialError, exc.msg, exc)
-        if self.providerUsesProxyRouting():
+        if exactRouting:
+          debugEcho(
+            "[tsnettransport] dial udp wait begin" &
+            " address=" & $address &
+            " rawTarget=" & $udpDialTarget.rawAddress &
+            " relayOnly=" & boolText(relayOnly) &
+            " directOnly=" & boolText(directOnly) &
+            " udpMode=" & $udpDialTarget.mode
+          )
           await self.waitForProviderUdpDialReady(udpDialTarget)
+          debugEcho(
+            "[tsnettransport] dial udp wait done" &
+            " address=" & $address &
+            " rawTarget=" & $udpDialTarget.rawAddress &
+            " relayOnly=" & boolText(relayOnly) &
+            " directOnly=" & boolText(directOnly) &
+            " udpMode=" & $udpDialTarget.mode
+          )
         let dialHostname = self.quicDialHostname(hostname, rawTarget)
+        debugEcho(
+          "[tsnettransport] quic dial begin" &
+          " address=" & $address &
+          " rawTarget=" & $rawTarget &
+          " hostname=" & dialHostname &
+          " relayOnly=" & boolText(relayOnly) &
+          " directOnly=" & boolText(directOnly) &
+          " udpMode=" & $udpDialTarget.mode
+        )
         try:
-          await self.quicTransport.dial(dialHostname, rawTarget, peerId)
+          let dialedConn = await self.quicTransport.dial(dialHostname, rawTarget, peerId)
+          debugEcho(
+            "[tsnettransport] quic dial done" &
+            " address=" & $address &
+            " rawTarget=" & $rawTarget &
+            " hostname=" & dialHostname &
+            " relayOnly=" & boolText(relayOnly) &
+            " directOnly=" & boolText(directOnly) &
+            " udpMode=" & $udpDialTarget.mode
+          )
+          dialedConn
         except CancelledError as exc:
           raise exc
         except CatchableError as exc:
-          if self.providerUsesProxyRouting() and not relayOnly:
+          debugEcho(
+            "[tsnettransport] quic dial failed" &
+            " address=" & $address &
+            " rawTarget=" & $rawTarget &
+            " hostname=" & dialHostname &
+            " relayOnly=" & boolText(relayOnly) &
+            " directOnly=" & boolText(directOnly) &
+            " udpMode=" & $udpDialTarget.mode &
+            " err=" & exc.msg
+          )
+          if exactRouting and not relayOnly and not directOnly:
             let status = self.providerStatusPayloadSafe()
             let path =
               if status.isOk():
@@ -1391,13 +1642,14 @@ proc dialWithPreference*(
   if conn.localAddr.isSome:
     let rawLocal = conn.localAddr.get()
     let advertisedLocal =
-      if self.providerUsesProxyRouting():
+      if exactRouting:
         self.providerSynthesizedEndpointSafe(rawLocal, parsed.kind)
       else:
         self.synthesizedEndpoint(rawLocal, parsed.kind)
     conn.localAddr = Opt.some(advertisedLocal)
   else:
     conn.localAddr = Opt.some(self.fallbackDialEndpoint(parsed.family, parsed.kind))
+  conn.relayPath = udpDialTarget.mode == TsnetProxyDialMode.RelayBridge
   conn.observedAddr = Opt.some(address)
   conn
 
@@ -1469,6 +1721,23 @@ proc tailnetStatusPayload*(self: TsnetTransport): Result[JsonNode, string] {.gcs
     "tailnetDerpMapSummary": "",
     "tailnetPeers": newJArray(),
   }))
+
+proc tailnetStatusQuickPayload*(self: TsnetTransport): JsonNode {.gcsafe.} =
+  if self.isNil:
+    return newJObject()
+  var payload = %*{
+    "ok": self.providerReadySafe(),
+    "started": self.running,
+    "tailnetIPs": self.providerTailnetIpTextsSafe(),
+    "tailnetPath": "",
+    "tailnetRelay": "",
+    "tailnetDerpMapSummary": "",
+    "tailnetPeers": newJArray(),
+    "proxyListenersReady": self.proxyListenersReadySafe(),
+  }
+  if not self.provider.isNil:
+    payload = self.provider.annotatePayload(payload)
+  payload
 
 proc listenerNeedsRepair*(self: TsnetTransport): bool {.gcsafe.} =
   if self.isNil:

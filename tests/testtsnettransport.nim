@@ -43,6 +43,43 @@ suite "Tsnet transport":
     builder = builder.withTsnetTransport(cfg)
     check builder != nil
 
+  test "tsnet quic transport defaults keep resident session alive":
+    var cfg = TsnetTransportBuilderConfig.init()
+    when defined(libp2p_msquic_experimental):
+      check cfg.quicConfig.handshakeIdleTimeoutMs == 30_000'u64
+      check cfg.quicConfig.idleTimeoutMs == 120_000'u64
+      check cfg.quicConfig.keepAliveIntervalMs == 5_000'u32
+
+  test "publishLocalPeerInfo keeps static tsnet config and merges bridge direct candidates":
+    let privKey = PrivateKey.random(rng[]).expect("private key")
+    var cfg = TsnetTransportBuilderConfig.init()
+    cfg.bridgeExtraJson = $(%*{
+      "hostname": "android-node",
+      "androidInterfaces": [
+        {"name": "wlan0"}
+      ]
+    })
+    let transport = TsnetTransport.new(Upgrade(), privKey, cfg)
+    transport.publishLocalPeerInfo(
+      "12D3KooWTestBridgeMeta",
+      ["/ip4/100.64.0.10/udp/52488/quic-v1/tsnet/p2p/12D3KooWTestBridgeMeta"],
+      TsnetBridgeExtraPayload(
+        updatedAtMs: 123456789,
+        publicIpv6: "2001:db8::52",
+        directCandidates: @[
+          "/ip6/2001:db8::52/udp/52488/quic-v1/p2p/12D3KooWTestBridgeMeta"
+        ]
+      )
+    )
+    let payload = parseJson(transport.cfg.bridgeExtraJson)
+    check payload["hostname"].getStr() == "android-node"
+    check payload["androidInterfaces"][0]["name"].getStr() == "wlan0"
+    check payload["libp2pPeerId"].getStr() == "12D3KooWTestBridgeMeta"
+    check not payload.hasKey("publicIpv4")
+    check payload["publicIpv6"].getStr() == "2001:db8::52"
+    check payload["directCandidates"][0].getStr() ==
+      "/ip6/2001:db8::52/udp/52488/quic-v1/p2p/12D3KooWTestBridgeMeta"
+
   asyncTest "listener advertises /tsnet addresses":
     let transport = TsnetTransport(makeTransport())
     await transport.start(@[MultiAddress.init("/ip4/0.0.0.0/tcp/0/tsnet").tryGet()])

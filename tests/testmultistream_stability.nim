@@ -16,6 +16,14 @@ type DuplicateHandshakeStream = ref object of Connection
 type CoalescedListenerStream = ref object of Connection
   payload*: seq[byte]
   offset*: int
+  writes*: seq[seq[byte]]
+
+type PipelinedDialerStream = ref object of Connection
+  payload*: seq[byte]
+  offset*: int
+  writes*: seq[seq[byte]]
+  readStarted*: bool
+  firstProtoWrittenBeforeRead*: bool
 
 method readOnce*(
     s: DuplicateHandshakeStream, pbytes: pointer, nbytes: int
@@ -106,6 +114,7 @@ method write*(
     s: CoalescedListenerStream, msg: seq[byte]
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError], raw: true).} =
   let fut = newFuture[void]()
+  s.writes.add(msg)
   fut.complete()
   fut
 
@@ -123,6 +132,54 @@ proc newCoalescedListenerStream(): CoalescedListenerStream =
     lpFrame("/test/proto/1.0.0\n") &
     lpFrame("hello")
   result.offset = 0
+  result.writes = @[]
+
+method readOnce*(
+    s: PipelinedDialerStream, pbytes: pointer, nbytes: int
+): Future[int] {.async: (raises: [CancelledError, LPStreamError], raw: true).} =
+  let fut = newFuture[int]()
+  s.readStarted = true
+  if s.offset >= s.payload.len:
+    s.isEof = true
+    fut.complete(0)
+    return fut
+  let remaining = s.payload.len - s.offset
+  let toRead = min(remaining, nbytes)
+  copyMem(pbytes, unsafeAddr s.payload[s.offset], toRead)
+  s.offset += toRead
+  if s.offset >= s.payload.len:
+    s.isEof = true
+  fut.complete(toRead)
+  fut
+
+method write*(
+    s: PipelinedDialerStream, msg: seq[byte]
+): Future[void] {.async: (raises: [CancelledError, LPStreamError], raw: true).} =
+  let fut = newFuture[void]()
+  s.writes.add(msg)
+  let pipelinedPrefix =
+    lpFrame("/multistream/1.0.0\n") & lpFrame("/test/proto/1.0.0\n")
+  if msg.len >= pipelinedPrefix.len and msg[0 ..< pipelinedPrefix.len] == pipelinedPrefix:
+    s.firstProtoWrittenBeforeRead = not s.readStarted
+  fut.complete()
+  fut
+
+method close(s: PipelinedDialerStream): Future[void] {.async: (raises: [], raw: true).} =
+  s.isClosed = true
+  s.isEof = true
+  let fut = newFuture[void]()
+  fut.complete()
+  fut
+
+proc newPipelinedDialerStream(): PipelinedDialerStream =
+  new result
+  result.payload =
+    lpFrame("/multistream/1.0.0\n") &
+    lpFrame("/test/proto/1.0.0\n")
+  result.offset = 0
+  result.writes = @[]
+  result.readStarted = false
+  result.firstProtoWrittenBeforeRead = false
 
 suite "Multistream stability":
   teardown:
@@ -142,6 +199,37 @@ suite "Multistream stability":
     protocol.handler = testHandler
     ms.addHandler("/test/proto/1.0.0", protocol)
     await ms.handle(conn)
+
+  asyncTest "dialer pipelines first v1 protocol before handshake reply":
+    let ms = MultistreamSelect.new()
+    let conn = newPipelinedDialerStream()
+
+    check (await ms.select(conn, "/test/proto/1.0.0")) == true
+    check conn.protocol == "/test/proto/1.0.0"
+    check conn.firstProtoWrittenBeforeRead
+    check conn.writes.len == 1
+    check conn.writes[0] ==
+      lpFrame("/multistream/1.0.0\n") & lpFrame("/test/proto/1.0.0\n")
+
+  asyncTest "dialer can pipeline first app payload with first v1 protocol":
+    let ms = MultistreamSelect.new()
+    let conn = newPipelinedDialerStream()
+    let payload = lpFrame("hello")
+
+    check (
+      await ms.select(
+        conn,
+        @["/test/proto/1.0.0"],
+        firstProtoTrailingBytes = payload,
+      )
+    ) == "/test/proto/1.0.0"
+    check conn.protocol == "/test/proto/1.0.0"
+    check conn.firstProtoWrittenBeforeRead
+    check conn.writes.len == 1
+    check conn.writes[0] ==
+      lpFrame("/multistream/1.0.0\n") &
+      lpFrame("/test/proto/1.0.0\n") &
+      payload
 
   asyncTest "listener preserves coalesced app payload after protocol negotiation":
     let ms = MultistreamSelect.new()
@@ -163,3 +251,6 @@ suite "Multistream stability":
     protocol.handler = testHandler
     ms.addHandler("/test/proto/1.0.0", protocol)
     await ms.handle(conn)
+    check conn.writes.len == 1
+    check conn.writes[0] ==
+      lpFrame("/multistream/1.0.0\n") & lpFrame("/test/proto/1.0.0\n")

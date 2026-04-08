@@ -10,13 +10,32 @@ type
     DirectRoute
     RelayBridge
 
+  TsnetUdpExactDialStage* {.pure.} = enum
+    LocalReady
+    DirectRouteReady
+    RelayBridgeReady
+    RouteMissing
+    RelayPending
+    DirectFailed
+    Unavailable
+
   TsnetDirectRouteTarget* = object
     rawAddress*: MultiAddress
     pathKind*: string
 
+  TsnetUdpExactDialPlan* = object
+    mode*: TsnetProxyDialMode
+    pathKind*: string
+    rawAddress*: MultiAddress
+    ready*: bool
+    stage*: TsnetUdpExactDialStage
+    error*: string
+    updatedUnixMilli*: int64
+
   TsnetProxyDialTarget* = object
     rawAddress*: MultiAddress
     mode*: TsnetProxyDialMode
+    routeKey*: string
 
   TsnetProviderKind* {.pure.} = enum
     BuiltinSynthetic
@@ -107,6 +126,23 @@ proc normalizeTailnetPath*(value: string): string =
     TsnetPathDirect
   else:
     value.strip().toLowerAscii()
+
+proc exactDialStageLabel*(stage: TsnetUdpExactDialStage): string =
+  case stage
+  of TsnetUdpExactDialStage.LocalReady:
+    "local_ready"
+  of TsnetUdpExactDialStage.DirectRouteReady:
+    "direct_route_ready"
+  of TsnetUdpExactDialStage.RelayBridgeReady:
+    "relay_bridge_ready"
+  of TsnetUdpExactDialStage.RouteMissing:
+    "route_missing"
+  of TsnetUdpExactDialStage.RelayPending:
+    "relay_pending"
+  of TsnetUdpExactDialStage.DirectFailed:
+    "direct_failed"
+  of TsnetUdpExactDialStage.Unavailable:
+    "unavailable"
 
 proc tailnetPathUsesRelay*(value: string): bool =
   normalizeTailnetPath(value) == TsnetPathRelay

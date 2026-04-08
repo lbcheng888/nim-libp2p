@@ -1,0 +1,21 @@
+[Unit]
+Description=nim-libp2p dual-stack bootstrap node on port 4001
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/nim-libp2p
+EnvironmentFile=-/etc/default/nim-libp2p-4001
+Environment=PATH=/root/Nim/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
+ExecStart=/root/nim-libp2p/scripts/run_dual_stack_bootstrap_node.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+SyslogIdentifier=nim-libp2p-4001
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

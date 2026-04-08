@@ -140,6 +140,17 @@ type
     sent: int
     fut: Future[void].Raising([CancelledError, LPStreamError])
 
+  Yamux* = ref object of Muxer
+    channels: Table[uint32, YamuxChannel]
+    flushed: Table[uint32, int]
+    currentId: uint32
+    isClosed: bool
+    maxChannCount: int
+    windowSize: int
+    maxSendQueueSize: int
+    inTimeout: Duration
+    outTimeout: Duration
+
   YamuxChannel* = ref object of Connection
     id: uint32
     recvWindow: int
@@ -157,6 +168,8 @@ type
     closedRemotely: AsyncEvent
     closedLocally: bool
     receivedData: AsyncEvent
+    recvWindowUpdatePending: bool
+    recvWindowUpdateRunner: Future[void].Raising([])
 
 proc `$`(channel: YamuxChannel): string =
   result = if channel.conn.dir == Out: "=> " else: "<= "
@@ -256,21 +269,42 @@ proc reset(channel: YamuxChannel, isLocal: bool = false) {.async: (raises: []).}
     # If the reset is remote, there's no reason to flush anything.
     channel.recvWindow = 0
 
-proc updateRecvWindow(
-    channel: YamuxChannel
-) {.async: (raises: [CancelledError, LPStreamError]).} =
-  ## Send to the peer a window update when the recvWindow is empty enough
-  ##
-  # In order to avoid spamming a window update everytime a byte is read,
-  # we send it everytime half of the maxRecvWindow is read.
-  let inWindow = channel.recvWindow + channel.recvQueue.len
-  if inWindow > channel.maxRecvWindow div 2:
-    return
+proc scheduleRecvWindowUpdate(channel: YamuxChannel) {.gcsafe, raises: [].}
 
-  let delta = channel.maxRecvWindow - inWindow
-  channel.recvWindow.inc(delta.int)
-  await channel.conn.write(YamuxHeader.windowUpdate(channel.id, delta.uint32))
-  trace "increasing the recvWindow", delta
+proc runRecvWindowUpdates(channel: YamuxChannel) {.async: (raises: []).} =
+  while channel.recvWindowUpdatePending:
+    channel.recvWindowUpdatePending = false
+    if channel.isReset or channel.conn.isNil or channel.conn.closed or
+        channel.closedRemotely.isSet():
+      break
+
+    # recv hot path must not block on returning a window update control frame.
+    let inWindow = channel.recvWindow + channel.recvQueue.len
+    if inWindow > channel.maxRecvWindow div 2:
+      continue
+
+    let delta = channel.maxRecvWindow - inWindow
+    channel.recvWindow.inc(delta.int)
+    try:
+      await channel.conn.write(YamuxHeader.windowUpdate(channel.id, delta.uint32))
+      trace "increasing the recvWindow", delta
+    except CancelledError:
+      break
+    except LPStreamError:
+      await channel.reset()
+      break
+
+  channel.recvWindowUpdateRunner = nil
+
+proc scheduleRecvWindowUpdate(channel: YamuxChannel) {.gcsafe, raises: [].} =
+  if channel.isNil or channel.isReset or channel.conn.isNil or channel.conn.closed:
+    return
+  channel.recvWindowUpdatePending = true
+  if not channel.recvWindowUpdateRunner.isNil and
+      not channel.recvWindowUpdateRunner.finished():
+    return
+  channel.recvWindowUpdateRunner = channel.runRecvWindowUpdates()
+  asyncSpawn channel.recvWindowUpdateRunner
 
 method readOnce*(
     channel: YamuxChannel, pbytes: pointer, nbytes: int
@@ -310,8 +344,8 @@ method readOnce*(
 
   let consumed = channel.recvQueue.consumeTo(pbytes, nbytes)
 
-  # We made some room in the recv buffer let the peer know
-  await channel.updateRecvWindow()
+  # Returning user payload must not wait on a connection-global control write.
+  channel.scheduleRecvWindowUpdate()
   channel.activity = true
   return consumed
 
@@ -323,7 +357,6 @@ proc gotDataFromRemote(
   channel.receivedData.fire()
   when defined(libp2p_yamux_metrics):
     libp2p_yamux_recv_queue.observe(channel.recvQueue.len.int64)
-  await channel.updateRecvWindow()
 
 proc setMaxRecvWindow*(channel: YamuxChannel, maxRecvWindow: int) =
   channel.maxRecvWindow = maxRecvWindow
@@ -366,7 +399,6 @@ proc sendLoop(channel: YamuxChannel) {.async: (raises: []).} =
     var futures: seq[Future[void].Raising([CancelledError, LPStreamError])]
     while inBuffer < numBytesToSend:
       var toSend = channel.sendQueue[0]
-      # concatenate the different message we try to send into one buffer
       let bufferToSend = min(toSend.data.len - toSend.sent, numBytesToSend - inBuffer)
 
       sendBuffer.toOpenArray(NumBytesHeader, NumBytesHeader + numBytesToSend - 1)[
@@ -376,8 +408,6 @@ proc sendLoop(channel: YamuxChannel) {.async: (raises: []).} =
       channel.sendQueue[0].sent.inc(bufferToSend)
 
       if toSend.sent >= toSend.data.len:
-        # if every byte of the message is in the buffer, add the write future to the
-        # sequence of futures to be completed (or failed) when the buffer is sent
         futures.add(toSend.fut)
         channel.sendQueue.delete(0)
 
@@ -388,8 +418,6 @@ proc sendLoop(channel: YamuxChannel) {.async: (raises: []).} =
       await channel.conn.write(sendBuffer)
       channel.sendWindow.dec(inBuffer)
     except CancelledError:
-      ## Just for compiler. This should never happen as sendLoop is started by asyncSpawn.
-      ## Therefore, no one owns that sendLoop's future and no one can cancel it.
       discard
     except LPStreamError as exc:
       error "failed to send the buffer", description = exc.msg
@@ -450,19 +478,8 @@ proc open(channel: YamuxChannel) {.async: (raises: [CancelledError, LPStreamErro
     )
   )
 
-method getWrapped*(channel: YamuxChannel): Connection =
+method getWrapped*(channel: YamuxChannel): Connection {.gcsafe.} =
   channel.conn
-
-type Yamux* = ref object of Muxer
-  channels: Table[uint32, YamuxChannel]
-  flushed: Table[uint32, int]
-  currentId: uint32
-  isClosed: bool
-  maxChannCount: int
-  windowSize: int
-  maxSendQueueSize: int
-  inTimeout: Duration
-  outTimeout: Duration
 
 proc lenBySrc(m: Yamux, isSrc: bool): int =
   for v in m.channels.values():
@@ -516,6 +533,7 @@ proc createStream(
   stream.peerId = m.connection.peerId
   stream.observedAddr = m.connection.observedAddr
   stream.localAddr = m.connection.localAddr
+  stream.relayPath = m.connection.relayPath
   stream.transportDir = m.connection.transportDir
   when defined(libp2p_agents_metrics):
     stream.shortAgent = m.connection.shortAgent
@@ -550,7 +568,6 @@ method close*(m: Yamux) {.async: (raises: []).} =
   except LPStreamError as exc:
     trace "failed to send goAway", description = exc.msg
   await m.connection.close()
-
   m.isClosed = true
   trace "Closed yamux"
 

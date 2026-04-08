@@ -64,6 +64,29 @@ suite "PeerInfo":
       rec.addresses[0].address == multiAddresses[0]
       rec.addresses[1].address == multiAddresses[1]
 
+  test "Current signed peer record bytes ignore stale cached object":
+    let
+      seckey = PrivateKey.random(rng[]).tryGet()
+      multiAddresses =
+        @[
+          MultiAddress.init("/ip4/0.0.0.0/tcp/24").tryGet(),
+          MultiAddress.init("/ip4/0.0.0.0/tcp/25").tryGet(),
+        ]
+    var peerInfo = PeerInfo.new(seckey, multiAddresses)
+
+    waitFor(peerInfo.update())
+    peerInfo.signedPeerRecord = default(SignedPeerRecord)
+
+    let currentBytes = peerInfo.currentSignedPeerRecordBytes().tryGet()
+    let currentSpr = SignedPeerRecord.decode(currentBytes).tryGet()
+
+    check:
+      currentSpr.envelope.publicKey == peerInfo.publicKey
+      currentSpr.data.peerId == peerInfo.peerId
+      currentSpr.data.addresses.len == 2
+      currentSpr.data.addresses[0].address == multiAddresses[0]
+      currentSpr.data.addresses[1].address == multiAddresses[1]
+
   test "Public address mapping":
     let
       seckey = PrivateKey.random(ECDSA, rng[]).get()

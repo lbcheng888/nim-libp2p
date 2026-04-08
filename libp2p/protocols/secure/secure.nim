@@ -59,6 +59,7 @@ proc new*(
     peerId: peerId,
     observedAddr: observedAddr,
     localAddr: localAddr,
+    relayPath: conn.relayPath,
     closeEvent: conn.closeEvent,
     timeout: timeout,
     dir: conn.dir,
@@ -85,7 +86,7 @@ method readMessage*(
 .} =
   raiseAssert("[SecureConn.readMessage] abstract method not implemented!")
 
-method getWrapped*(s: SecureConn): Connection =
+method getWrapped*(s: SecureConn): Connection {.gcsafe.} =
   s.stream
 
 method handshake*(

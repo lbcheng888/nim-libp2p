@@ -2,12 +2,30 @@ import std/[options, os, strutils]
 
 import pebble/kv
 
+import ../../lsmr
 import ../../rwad/codec
 import ../../rwad/execution/state
 import ../polar
 import ../types
 
+const
+  FabricAntiEntropyBaguaDepth* = 4
+  FabricAntiEntropyRootResolution* = 1'u8
+  FabricAntiEntropyEraResolution* = 2'u8
+  FabricAntiEntropyTickResolution* = 3'u8
+
 type
+  FabricAntiEntropyIndexLeaf* = object
+    clock*: GanzhiClock
+    key*: string
+    payload*: string
+    baguaKey*: LsmrBaguaKey
+
+  AntiEntropyIndexScope = enum
+    aeisRoot
+    aeisEra
+    aeisTick
+
   FabricStore* = ref object
     root*: string
     kv*: PebbleKV
@@ -24,6 +42,84 @@ proc stringOf(data: openArray[byte]): string {.gcsafe.} =
 
 proc keyHeight(height: uint64): string =
   align($height, 20, '0')
+
+proc tickHeight(tick: uint8): string =
+  align($tick, 3, '0')
+
+proc antiEntropyRootPrefix(domain: string): string =
+  "anti-entropy:root:" & domain & ":"
+
+proc antiEntropyEraPrefix(domain: string, era: uint64): string =
+  "anti-entropy:era:" & domain & ":" & keyHeight(era) & ":"
+
+proc antiEntropyTickPrefix(domain: string, era: uint64, tick: uint8): string =
+  "anti-entropy:tick:" & domain & ":" & keyHeight(era) & ":" & tickHeight(tick) & ":"
+
+proc antiEntropyIndexBaguaLabel(key: LsmrBaguaKey): string =
+  var topologyParts: seq[string] = @[]
+  for digit in key.topologyPath:
+    topologyParts.add(align($digit, 2, '0'))
+  let topology =
+    if topologyParts.len > 0:
+      topologyParts.join(".")
+    else:
+      "0"
+  "p=" & topology &
+    ":r=" & align($key.resolution, 3, '0') &
+    ":b=" & key.bagua.label() &
+    ":c=" & key.contentLsh
+
+proc antiEntropyIndexId(
+    scope: AntiEntropyIndexScope, domain: string, leaf: FabricAntiEntropyIndexLeaf
+): string =
+  case scope
+  of aeisRoot:
+    antiEntropyRootPrefix(domain) &
+      keyHeight(leaf.clock.era) & ":" &
+      antiEntropyIndexBaguaLabel(leaf.baguaKey) &
+      ":k:" & leaf.key
+  of aeisEra:
+    antiEntropyEraPrefix(domain, leaf.clock.era) &
+      tickHeight(leaf.clock.tick) & ":" &
+      antiEntropyIndexBaguaLabel(leaf.baguaKey) &
+      ":k:" & leaf.key
+  of aeisTick:
+    antiEntropyTickPrefix(domain, leaf.clock.era, leaf.clock.tick) &
+      antiEntropyIndexBaguaLabel(leaf.baguaKey) &
+      ":k:" & leaf.key
+
+proc persistAntiEntropyIndexLeaves(
+    store: FabricStore,
+    domain: string,
+    clock: GanzhiClock,
+    key: string,
+    tier: LsmrStorageTier,
+) =
+  let coord = objectCoordinate(key, key, FabricAntiEntropyBaguaDepth)
+  for baguaKey in coord.baguaKeys(tier, FabricAntiEntropyRootResolution):
+    let leaf = FabricAntiEntropyIndexLeaf(
+      clock: clock,
+      key: key,
+      payload: key,
+      baguaKey: baguaKey,
+    )
+    store.kv.put(ksIndex, antiEntropyIndexId(aeisRoot, domain, leaf), encodeObj(leaf))
+  for baguaKey in coord.baguaKeys(tier, FabricAntiEntropyEraResolution):
+    let leaf = FabricAntiEntropyIndexLeaf(
+      clock: clock,
+      key: key,
+      payload: key,
+      baguaKey: baguaKey,
+    )
+    store.kv.put(ksIndex, antiEntropyIndexId(aeisEra, domain, leaf), encodeObj(leaf))
+  for baguaKey in coord.baguaKeys(tier, FabricAntiEntropyTickResolution):
+    let leaf = FabricAntiEntropyIndexLeaf(
+      clock: clock,
+      key: key,
+      payload: key,
+      baguaKey: baguaKey,
+    )
+    store.kv.put(ksIndex, antiEntropyIndexId(aeisTick, domain, leaf), encodeObj(leaf))
 
 proc newFabricStore*(root: string): FabricStore =
   createDir(root)
@@ -44,7 +140,7 @@ proc getJson[T](store: FabricStore, space: KeySpace, key: string): Option[T] =
     return none(T)
   some(decodeObj[T](payload.get()))
 
-proc persistEvent*(store: FabricStore, event: FabricEvent) =
+proc persistEventRaw*(store: FabricStore, event: FabricEvent) =
   when defined(fabric_submit_diag):
     stderr.writeLine(
       "store-stage event begin id=", event.eventId,
@@ -58,21 +154,77 @@ proc persistEvent*(store: FabricStore, event: FabricEvent) =
   when defined(fabric_submit_diag):
     stderr.writeLine("store-stage event ksTask id=", event.eventId)
 
-proc persistAttestation*(store: FabricStore, att: EventAttestation) =
+proc persistEventIndex*(store: FabricStore, event: FabricEvent) =
+  store.persistAntiEntropyIndexLeaves(
+    "event",
+    event.clock,
+    "event:" & event.eventId,
+    LsmrStorageTier.lstEdge,
+  )
+  when defined(fabric_submit_diag):
+    stderr.writeLine("store-stage event ksIndex id=", event.eventId)
+
+proc persistEvent*(store: FabricStore, event: FabricEvent) =
+  store.persistEventRaw(event)
+  store.persistEventIndex(event)
+
+proc persistAttestationRaw*(
+    store: FabricStore, eventClock: GanzhiClock, att: EventAttestation
+) =
+  discard eventClock
   store.putJson(
     ksEvent,
     "attestation:" & att.eventId & ":" & $att.role & ":" & att.signer,
     att,
   )
 
-proc persistEventCertificate*(store: FabricStore, cert: EventCertificate) =
+proc persistAttestationIndex*(
+    store: FabricStore, eventClock: GanzhiClock, att: EventAttestation
+) =
+  let domain =
+    case att.role
+    of arParticipant:
+      "att_participant"
+    of arWitness:
+      "att_witness"
+    of arIsolation:
+      ""
+  if domain.len > 0:
+    store.persistAntiEntropyIndexLeaves(
+      domain,
+      eventClock,
+      "attestation:" & att.eventId & ":" & $att.role & ":" & att.signer,
+      LsmrStorageTier.lstEdge,
+    )
+
+proc persistAttestation*(
+    store: FabricStore, eventClock: GanzhiClock, att: EventAttestation
+) =
+  store.persistAttestationRaw(eventClock, att)
+  store.persistAttestationIndex(eventClock, att)
+
+proc persistEventCertificateRaw*(store: FabricStore, cert: EventCertificate) =
   store.putJson(ksEvent, "eventcert:" & keyHeight(cert.clock.era) & ":" & cert.eventId, cert)
   store.putJson(ksTask, "eventcert:" & cert.eventId, cert)
+
+proc persistEventCertificateIndex*(store: FabricStore, cert: EventCertificate) =
+  store.persistAntiEntropyIndexLeaves(
+    "eventcert",
+    cert.clock,
+    "eventcert:" & cert.eventId,
+    LsmrStorageTier.lstFog,
+  )
+
+proc persistEventCertificate*(store: FabricStore, cert: EventCertificate) =
+  store.persistEventCertificateRaw(cert)
+  store.persistEventCertificateIndex(cert)
 
 proc persistIsolation*(store: FabricStore, record: IsolationRecord) =
   store.putJson(ksEvent, "isolation:" & record.eventId, record)
 
-proc persistCheckpointCandidate*(store: FabricStore, candidate: CheckpointCandidate) =
+proc persistCheckpointCandidateRaw*(
+    store: FabricStore, candidate: CheckpointCandidate
+) =
   store.putJson(
     ksEvent,
     "checkpoint_candidate:" & keyHeight(candidate.era) & ":" & candidate.candidateId,
@@ -80,14 +232,52 @@ proc persistCheckpointCandidate*(store: FabricStore, candidate: CheckpointCandid
   )
   store.putJson(ksTask, "checkpoint_candidate:" & candidate.candidateId, candidate)
 
-proc persistCheckpointVote*(store: FabricStore, vote: CheckpointVote) =
+proc persistCheckpointCandidateIndex*(
+    store: FabricStore, candidate: CheckpointCandidate
+) =
+  store.persistAntiEntropyIndexLeaves(
+    "checkpoint_candidate",
+    GanzhiClock(era: candidate.era, tick: 0),
+    "checkpoint-candidate:" & candidate.candidateId,
+    LsmrStorageTier.lstFog,
+  )
+
+proc persistCheckpointCandidate*(store: FabricStore, candidate: CheckpointCandidate) =
+  store.persistCheckpointCandidateRaw(candidate)
+  store.persistCheckpointCandidateIndex(candidate)
+
+proc persistCheckpointVoteRaw*(
+    store: FabricStore, candidateEra: uint64, vote: CheckpointVote
+) =
   store.putJson(ksEvent, "checkpoint_vote:" & vote.candidateId & ":" & vote.validator, vote)
+
+proc persistCheckpointVoteIndex*(
+    store: FabricStore, candidateEra: uint64, vote: CheckpointVote
+) =
+  store.persistAntiEntropyIndexLeaves(
+    "checkpoint_vote",
+    GanzhiClock(era: candidateEra, tick: 0),
+    "checkpoint-vote:" & vote.candidateId & ":" & vote.validator,
+    LsmrStorageTier.lstFog,
+  )
+
+proc persistCheckpointVote*(
+    store: FabricStore, candidateEra: uint64, vote: CheckpointVote
+) =
+  store.persistCheckpointVoteRaw(candidateEra, vote)
+  store.persistCheckpointVoteIndex(candidateEra, vote)
 
 proc persistCheckpoint*(store: FabricStore, cert: CheckpointCertificate, snapshot: ChainStateSnapshot) =
   store.putJson(ksEvent, "checkpoint:" & keyHeight(cert.candidate.era) & ":" & cert.checkpointId, cert)
   store.putJson(ksTask, "checkpoint:" & cert.checkpointId, cert)
   store.kv.putBytes(ksTask, "snapshot:" & cert.checkpointId, encodePolarSnapshot(snapshot))
   store.kv.put(ksIndex, "checkpoint:latest", cert.checkpointId)
+  store.persistAntiEntropyIndexLeaves(
+    "checkpoint_bundle",
+    GanzhiClock(era: cert.candidate.era, tick: 0),
+    "checkpoint-bundle:" & cert.checkpointId,
+    LsmrStorageTier.lstGlobal,
+  )
 
 proc persistCheckpointRaw*(store: FabricStore, cert: CheckpointCertificate, checkpointRaw, snapshotRaw: seq[byte]) {.gcsafe.} =
   let checkpointText = stringOf(checkpointRaw)
@@ -95,6 +285,12 @@ proc persistCheckpointRaw*(store: FabricStore, cert: CheckpointCertificate, chec
   store.kv.put(ksTask, "checkpoint:" & cert.checkpointId, checkpointText)
   store.kv.putBytes(ksTask, "snapshot:" & cert.checkpointId, snapshotRaw)
   store.kv.put(ksIndex, "checkpoint:latest", cert.checkpointId)
+  store.persistAntiEntropyIndexLeaves(
+    "checkpoint_bundle",
+    GanzhiClock(era: cert.candidate.era, tick: 0),
+    "checkpoint-bundle:" & cert.checkpointId,
+    LsmrStorageTier.lstGlobal,
+  )
 
 proc persistAvoProposal*(store: FabricStore, proposal: AvoProposal) =
   store.putJson(ksTask, "avo_proposal:" & proposal.proposalId, proposal)
@@ -196,6 +392,25 @@ proc scanPrefix[T](store: FabricStore, space: KeySpace, prefix: string): seq[T] 
   let page = store.kv.scanPrefix(space, prefix = prefix, limit = 0)
   for item in page.entries:
     result.add(decodeObj[T](item.value))
+
+proc loadAntiEntropyRootLeaves*(
+    store: FabricStore, domain: string
+): seq[FabricAntiEntropyIndexLeaf] =
+  scanPrefix[FabricAntiEntropyIndexLeaf](store, ksIndex, antiEntropyRootPrefix(domain))
+
+proc loadAntiEntropyEraLeaves*(
+    store: FabricStore, domain: string, era: uint64
+): seq[FabricAntiEntropyIndexLeaf] =
+  scanPrefix[FabricAntiEntropyIndexLeaf](store, ksIndex, antiEntropyEraPrefix(domain, era))
+
+proc loadAntiEntropyTickLeaves*(
+    store: FabricStore, domain: string, era, tick: uint64
+): seq[FabricAntiEntropyIndexLeaf] =
+  scanPrefix[FabricAntiEntropyIndexLeaf](
+    store,
+    ksIndex,
+    antiEntropyTickPrefix(domain, era, uint8(min(tick, uint64(high(uint8))))),
+  )
 
 proc loadAllEvents*(store: FabricStore): seq[FabricEvent] =
   scanPrefix[FabricEvent](store, ksEvent, "event:")

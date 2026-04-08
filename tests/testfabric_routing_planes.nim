@@ -298,3 +298,49 @@ suite "Fabric routing planes":
     finally:
       await server.stop()
       await node.stop()
+
+  asyncTest "rpc fabric.quiesce returns drained local frontier":
+    let baseDir = getTempDir() / ("fabric-rpc-quiesce-" & $nowMillis())
+    let cfg = makeConfig(
+      baseDir,
+      RoutingPlaneMode.dualStack,
+      PrimaryRoutingPlane.lsmr,
+      LsmrConfig.init(networkId = "fabric-rpc-quiesce", minWitnessQuorum = 1),
+    )
+    var node: FabricNode
+    {.cast(gcsafe).}:
+      node = mustNewFabricNode(cfg)
+    let port = pickPort()
+    let server = newFabricRpcServer(node, "127.0.0.1", int(port))
+    try:
+      await node.start()
+      await server.start()
+      let url = "http://127.0.0.1:" & $port & "/"
+      let rpcPayload = %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "fabric.quiesce",
+        "params": {}
+      }
+      let rpcResponse = await httpPostJson(url, $rpcPayload)
+      let quiesce = jsonTo(rpcResponse["result"], FabricQuiescenceSnapshot)
+      check quiesce.pendingInbound == 0
+      check quiesce.localOfferedNonce == 0
+      check quiesce.localCommittedNonce == 0
+      check quiesce.pendingEvents == 0
+      check quiesce.pendingAttestations == 0
+      check quiesce.pendingEventCertificates == 0
+      check quiesce.pendingCertificationEvents == 0
+      check quiesce.pendingWitnessPulls == 0
+      check quiesce.pendingIndexFlushes == 0
+      check quiesce.eventOutstanding == 0
+      check quiesce.attOutstanding == 0
+      check quiesce.certOutstanding == 0
+
+      let health = await httpGetJson("http://127.0.0.1:" & $port & "/healthz")
+      let healthStatus = jsonTo(health, FabricStatusSnapshot)
+      check healthStatus.localOfferedNonce == 0
+      check healthStatus.localCommittedNonce == 0
+    finally:
+      await server.stop()
+      await node.stop()

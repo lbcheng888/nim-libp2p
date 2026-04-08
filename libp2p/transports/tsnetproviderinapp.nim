@@ -73,6 +73,10 @@ proc publishedAddrTexts*(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.} =
   inAppSafe:
     result = tsruntime.publishedListenerRoutes(runtime)
 
+proc tailnetIpTexts*(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.} =
+  inAppSafe:
+    result = tsruntime.tailnetIpTexts(runtime)
+
 proc openInAppRuntime*(cfg: TsnetProviderConfig): Result[TsnetInAppRuntime, string] =
   let runtime = tsruntime.TsnetInAppRuntime.new(cfg)
   let started = tsruntime.start(runtime)
@@ -187,6 +191,14 @@ proc dialUdpProxyExactTarget*(
 ): Result[TsnetProxyDialTarget, string] =
   tsruntime.dialUdpProxyExactTarget(runtime, family, ip, port)
 
+proc planUdpExactDialTarget*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int,
+    relayAllowed: bool
+): TsnetUdpExactDialPlan =
+  tsruntime.planUdpExactDialTarget(runtime, family, ip, port, relayAllowed)
+
 proc lookupUdpDirectRouteTarget*(
     runtime: TsnetInAppRuntime,
     family, ip: string,
@@ -217,14 +229,15 @@ proc markFailedDirectProxyRoute*(
 
 proc udpDialState*(
     runtime: TsnetInAppRuntime,
-    rawAddress: MultiAddress
+    rawKey: string,
+    routeKey = ""
 ): tuple[
     known, ready: bool,
     error, phase, detail: string,
     attempts: int,
     updatedUnixMilli: int64
   ] =
-  tsruntime.udpDialState(runtime, rawAddress)
+  tsruntime.udpDialState(runtime, rawKey, routeKey)
 
 proc resolveRemote*(
     runtime: TsnetInAppRuntime,

@@ -129,7 +129,38 @@ proc dialUdpProxyExactTarget*(
   ok(TsnetProxyDialTarget(
     rawAddress: rawAddress,
     mode: TsnetProxyDialMode.Local,
+    routeKey: "",
   ))
+
+proc planUdpExactDialTarget*(
+    bridge: TsnetLegacyBridgeHandle,
+    family, ip: string,
+    port: int,
+    relayAllowed: bool
+): TsnetUdpExactDialPlan =
+  let rawAddress = tsbridge.dialUdpProxy(bridge, family, ip, port).valueOr:
+    return TsnetUdpExactDialPlan(
+      mode:
+        if relayAllowed:
+          TsnetProxyDialMode.RelayBridge
+        else:
+          TsnetProxyDialMode.DirectRoute,
+      pathKind: "",
+      rawAddress: MultiAddress(),
+      ready: false,
+      stage: TsnetUdpExactDialStage.Unavailable,
+      error: error,
+      updatedUnixMilli: 0,
+    )
+  TsnetUdpExactDialPlan(
+    mode: TsnetProxyDialMode.Local,
+    pathKind: "local",
+    rawAddress: rawAddress,
+    ready: true,
+    stage: TsnetUdpExactDialStage.LocalReady,
+    error: "",
+    updatedUnixMilli: 0,
+  )
 
 proc dialUdpProxyRelayFallbackTarget*(
     bridge: TsnetLegacyBridgeHandle,
@@ -141,6 +172,7 @@ proc dialUdpProxyRelayFallbackTarget*(
   ok(TsnetProxyDialTarget(
     rawAddress: rawAddress,
     mode: TsnetProxyDialMode.Local,
+    routeKey: "",
   ))
 
 proc resolveRemote*(

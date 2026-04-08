@@ -23,6 +23,9 @@ logScope:
 const
   ConnectionTrackerName* = "Connection"
   DefaultConnectionTimeout* = 5.minutes
+  ReadLpPrefixProbeChunkSize = 64
+  ReadLpBodyChunkCap = 16 * 1024
+  ReadLpMaxVarintBytes = 10
 
 type
   MultistreamVersion* = enum
@@ -43,6 +46,7 @@ type
     protocol*: string # protocol used by the connection, used as metrics tag
     negotiatedMuxer*: string # optional preselected muxer from secure handshake
     transportDir*: Direction # underlying transport (usually socket) direction
+    relayPath*: bool # transport-level relay truth for non-RelayConnection paths
     bandwidthManager*: BandwidthManager
     memoryManager*: MemoryManager
     multistreamVersion*: MultistreamVersion
@@ -150,7 +154,7 @@ proc timeoutMonitor(s: Connection) {.async: (raises: []).} =
     if not await s.pollActivity():
       return
 
-method getWrapped*(s: Connection): Connection {.base.} =
+method getWrapped*(s: Connection): Connection {.base, gcsafe.} =
   raiseAssert("[Connection.getWrapped] abstract method not implemented!")
 
 when defined(libp2p_agents_metrics):
@@ -215,16 +219,12 @@ proc connectionReadLpAsync(
     s: Connection, maxSize: int
 ): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError]).} =
   let maxLen = uint64(if maxSize < 0: int.high else: maxSize)
-  let readChunkSize =
-    if maxSize < 0:
-      16 * 1024
-    else:
-      max(maxSize + 10, 64)
   var buffer: seq[byte] = @[]
   if s.pendingReadReplay.len > 0:
     swap(buffer, s.pendingReadReplay)
 
   while true:
+    var nextReadChunkSize = ReadLpPrefixProbeChunkSize
     if buffer.len > 0:
       var consumed = 0
       var length = 0'u64
@@ -280,10 +280,14 @@ proc connectionReadLpAsync(
               continue
 
           return payload
+        let remaining = total - buffer.len
+        nextReadChunkSize = min(max(remaining, 1), ReadLpBodyChunkCap)
       elif decodeRes.error() != VarintError.Incomplete:
         raise (ref LPStreamError)(msg: "Invalid length prefix")
+      else:
+        nextReadChunkSize = max(ReadLpMaxVarintBytes - buffer.len, 1)
 
-    var chunk = newSeqUninit[byte](readChunkSize)
+    var chunk = newSeqUninit[byte](nextReadChunkSize)
     let readCount = await LPStream(s).readOnce(addr chunk[0], chunk.len)
     if readCount <= 0:
       raise newLPStreamEOFError()

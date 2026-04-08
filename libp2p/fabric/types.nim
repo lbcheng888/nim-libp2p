@@ -174,6 +174,8 @@ type
     routingStatus*: RoutingPlaneStatus
     eventCount*: int
     certifiedEventCount*: int
+    localOfferedNonce*: uint64
+    localCommittedNonce*: uint64
     checkpointCount*: int
     latestCheckpointId*: string
     latestCheckpointEra*: uint64
@@ -181,10 +183,25 @@ type
     activeContractRoots*: seq[string]
     activeAvoSet*: seq[string]
 
+  FabricQuiescenceSnapshot* = object
+    pendingInbound*: int
+    localOfferedNonce*: uint64
+    localCommittedNonce*: uint64
+    pendingEvents*: int
+    pendingAttestations*: int
+    pendingEventCertificates*: int
+    pendingCertificationEvents*: int
+    pendingWitnessPulls*: int
+    pendingIndexFlushes*: int
+    eventOutstanding*: int
+    attOutstanding*: int
+    certOutstanding*: int
+
   SubmitEventResult* = object
     eventId*: string
     accepted*: bool
     certified*: bool
+    committedNonce*: uint64
     checkpointIds*: seq[string]
 
   SystemContractDescriptor* = object

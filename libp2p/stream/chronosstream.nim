@@ -201,7 +201,7 @@ method closeImpl*(s: ChronosStream) {.async: (raises: []).} =
 
   await procCall Connection(s).closeImpl()
 
-method getWrapped*(s: ChronosStream): Connection =
+method getWrapped*(s: ChronosStream): Connection {.gcsafe.} =
   nil
 
 proc transport*(s: ChronosStream): StreamTransport =

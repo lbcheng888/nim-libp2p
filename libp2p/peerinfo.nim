@@ -61,14 +61,31 @@ proc expandAddrs*(
     addrs = await mapper(addrs)
   addrs
 
+proc currentSignedPeerRecord*(p: PeerInfo): Result[SignedPeerRecord, CryptoError] =
+  SignedPeerRecord.init(p.privateKey, PeerRecord.init(p.peerId, p.addrs))
+
+proc currentSignedPeerRecordBytes*(p: PeerInfo): Result[seq[byte], CryptoError] =
+  let currentPublicKey = ?p.privateKey.getPublicKey()
+  var signedPeerRecord =
+    if
+      p.signedPeerRecord.data.peerId == p.peerId and
+      p.signedPeerRecord.envelope.domain == PeerRecord.payloadDomain() and
+      p.signedPeerRecord.envelope.payloadType == PeerRecord.payloadType() and
+      p.signedPeerRecord.envelope.payload.len > 0 and
+      p.signedPeerRecord.envelope.signature.data.len > 0
+    :
+      p.signedPeerRecord
+    else:
+      ?p.currentSignedPeerRecord()
+  signedPeerRecord.envelope.publicKey = currentPublicKey
+  signedPeerRecord.encode()
+
 proc update*(p: PeerInfo) {.async: (raises: [CancelledError]).} =
   p.addrs = p.listenAddrs
   for mapper in p.addressMappers:
     p.addrs = await mapper(p.addrs)
 
-  p.signedPeerRecord = SignedPeerRecord.init(
-    p.privateKey, PeerRecord.init(p.peerId, p.addrs)
-  ).valueOr:
+  p.signedPeerRecord = p.currentSignedPeerRecord().valueOr:
     info "Can't update the signed peer record"
     return
 

@@ -328,7 +328,7 @@ proc gatheringStateCallback(
 
 # ------------------------------ WebRTC stream ------------------------------
 
-method getWrapped*(stream: WebRtcStream): Connection =
+method getWrapped*(stream: WebRtcStream): Connection {.gcsafe.} =
   nil
 
 method readOnce*(

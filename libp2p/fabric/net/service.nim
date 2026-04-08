@@ -7,6 +7,7 @@ import chronicles
 import ../../builders
 import ../../lsmr
 import ../../multiaddress
+import ../../muxers/muxer
 import ../../peerstore
 import ../../services/lsmrservice
 import ../../multistream
@@ -118,6 +119,17 @@ type
     sourcePeerId: string
     envelope: FabricSubmitEnvelope
 
+  FabricSubmitAcceptDisposition {.pure.} = enum
+    fsadReject
+    fsadAcknowledgeOnly
+    fsadHotQueue
+    fsadInboxQueue
+
+  FabricSubmitAcceptPlan = object
+    itemKey: string
+    disposition: FabricSubmitAcceptDisposition
+    item: FabricSubmitInboxItem
+
   FabricSubmitRequest = ref object
     logicalLane: FabricSubmitLane
     transportClass: FabricSubmitSessionClass
@@ -162,7 +174,8 @@ type
     rpcLock: AsyncLock
     streamLock: AsyncLock
     streams: array[FabricSubmitSessionClass, FabricSubmitPeerStreamPool]
-    baseGeneration: uint64
+    liveGeneration: uint64
+    controlGeneration: uint64
     runner: Future[bool]
     probeRunner: Future[bool]
     connectivityRunner: Future[bool]
@@ -180,6 +193,7 @@ type
     transportBlocked: bool
     transportVerified: bool
     connectedBaseOwnerKnown: bool
+    connectedBaseOwnerId: string
     localOwnsConnectedBase: bool
 
   FabricSubmitSession = ref object
@@ -194,6 +208,16 @@ type
     dispatchPending: bool
     dispatchEvent: AsyncEvent
     dispatchRunner: Future[void]
+
+  FabricControlFetchSessionClass {.pure.} = enum
+    fcscSummary
+    fcscPeer
+
+  FabricControlFetchSession = ref object
+    peerId: PeerId
+    sessionClass: FabricControlFetchSessionClass
+    lock: AsyncLock
+    conn: Connection
 
   FabricNetworkRef = ref object
     value: FabricNetwork
@@ -225,15 +249,28 @@ type
     submitSessions: Table[string, FabricSubmitSession]
     submitPeerConnects: Table[string, FabricSubmitPeerConnect]
     submitPeerAddrHints: Table[string, seq[MultiAddress]]
+    controlFetchSessions: Table[string, FabricControlFetchSession]
+    controlFetchResponseLocks: Table[string, AsyncLock]
+    controlFetchResponseFlights: Table[string, Future[FetchResponse]]
+    stopping: bool
     submitWarmRunner: Future[void]
     submitWarmPending: bool
     submitWarmDelayRunner: Future[void]
     submitWarmGeneration: uint64
     submitReadyHook: proc() {.gcsafe, raises: [].}
     submitConnEventHandler: ConnEventHandler
+    submitHotInbox: Deque[FabricSubmitInboxItem]
     submitInbox: Deque[FabricSubmitInboxItem]
     submitInboxRunner: Future[void]
     submitInboxPending: bool
+    submitAcceptDepth: int
+    submitAcceptEpoch: uint64
+    submitHotDrainActive: bool
+    submitHotAckYieldActive: int
+    submitHotResumePending: bool
+    submitHotBackgroundResumePending: bool
+    submitHotAcceptIdleEvent: AsyncEvent
+    submitHotAcceptIdleHook: proc() {.gcsafe, raises: [].}
     lastSubmitConnectElapsedMs: int64
     maxSubmitConnectElapsedMs: int64
     slowSubmitConnectCount: int64
@@ -268,6 +305,10 @@ proc submitPayload(
     timeout: Duration = 1.seconds,
 ): Future[bool] {.async: (raises: []).}
 
+proc submitPeerReadyNow*(
+    network: FabricNetwork, peerIdText: string, lane: FabricSubmitLane
+): bool {.gcsafe, raises: [].}
+
 proc bytesOf(value: string): seq[byte] =
   result = newSeq[byte](value.len)
   if value.len > 0:
@@ -285,6 +326,138 @@ proc stringOf(data: openArray[byte]): string =
 
 proc diagNowMs(): int64 =
   int64(epochTime() * 1000)
+
+proc controlFetchSessionKey(
+    peerId: PeerId, sessionClass: FabricControlFetchSessionClass
+): string {.gcsafe, raises: [].} =
+  $peerId & ":" & $ord(sessionClass)
+
+proc controlFetchSessionClass(
+    key: string
+): FabricControlFetchSessionClass {.gcsafe, raises: [].} =
+  if key.startsWith("summary:"):
+    fcscSummary
+  else:
+    fcscPeer
+
+proc submitPeerInflightCount(
+    network: FabricNetwork, peerId: PeerId
+): int {.gcsafe, raises: [].}
+
+proc submitHasLiveInflight*(
+    network: FabricNetwork
+): bool {.gcsafe, raises: [].}
+
+proc submitHotAcceptBusy*(
+    network: FabricNetwork
+): bool {.gcsafe, raises: [].}
+
+proc controlFetchPeerMustYield*(
+    network: FabricNetwork, peerIdText: string
+): bool {.gcsafe, raises: [].}
+
+proc controlFetchSharedLiveSummaryMustYield(
+    network: FabricNetwork, peerId: PeerId, key: string
+): bool {.gcsafe, raises: [].}
+
+proc controlFetchTargetSummaryMustYield(
+    network: FabricNetwork, peerId: PeerId, key: string
+): bool {.gcsafe, raises: [].}
+
+proc isControlFetchKey(key: string): bool {.gcsafe, raises: [].} =
+  key.startsWith("summary:") or key.startsWith("peer:self") or
+    key.startsWith("peer:table")
+
+proc splitControlFetchRequesterKey(
+    key: string
+): tuple[baseKey: string, requesterPeerId: string] {.gcsafe, raises: [].} =
+  const requesterSuffix = "|requester:"
+  let requesterIdx = key.find(requesterSuffix)
+  if requesterIdx < 0:
+    return (key, "")
+  let requesterStart = requesterIdx + requesterSuffix.len
+  if requesterStart >= key.len:
+    return (key[0 ..< requesterIdx], "")
+  (key[0 ..< requesterIdx], key[requesterStart .. ^1])
+
+proc controlFetchMustYieldToLive(
+    network: FabricNetwork, key: string
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or not key.startsWith("summary:"):
+    return false
+  if network.submitHasLiveInflight():
+    return true
+  let (_, requesterPeerId) = splitControlFetchRequesterKey(key)
+  network.controlFetchPeerMustYield(requesterPeerId)
+
+proc controlFetchServerMustYieldToLive(
+    network: FabricNetwork, key: string
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or not key.startsWith("summary:"):
+    return false
+  if network.submitHotAcceptBusy():
+    return true
+  if network.controlFetchMustYieldToLive(key):
+    return true
+  let (_, requesterPeerId) = splitControlFetchRequesterKey(key)
+  if requesterPeerId.len == 0:
+    return false
+  let requesterPeer = PeerId.init(requesterPeerId).valueOr:
+    return false
+  network.controlFetchTargetSummaryMustYield(requesterPeer, key) or
+    network.controlFetchSharedLiveSummaryMustYield(requesterPeer, key)
+
+proc controlFetchPeerMustYield*(
+    network: FabricNetwork, peerIdText: string
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or peerIdText.len == 0:
+    return false
+  let requesterPeer = PeerId.init(peerIdText).valueOr:
+    return false
+  network.submitPeerInflightCount(requesterPeer) > 0
+
+proc controlFetchSharedLiveSummaryMustYield(
+    network: FabricNetwork, peerId: PeerId, key: string
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or network.switch.isNil or not key.startsWith("summary:"):
+    return false
+  network.switch.connManager.planeSharedWithLive(peerId, ppkControl)
+
+proc controlFetchTargetSummaryMustYield(
+    network: FabricNetwork, peerId: PeerId, key: string
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or peerId.data.len == 0 or not key.startsWith("summary:"):
+    return false
+  network.submitPeerInflightCount(peerId) > 0
+
+proc submitNetworkStopping(network: FabricNetwork): bool {.gcsafe, raises: [].} =
+  not network.isNil and network.stopping
+
+proc controlFetchResponseLockKey(key: string): string {.gcsafe, raises: [].} =
+  let requesterIdx = key.find("|requester:")
+  let baseKey =
+    if requesterIdx >= 0:
+      key[0 ..< requesterIdx]
+    else:
+      key
+  if baseKey == "summary:root" or baseKey == "summary:head" or
+      baseKey.startsWith("summary:era:"):
+    return baseKey
+  ""
+
+proc getOrCreateControlFetchResponseLock(
+    network: FabricNetwork, key: string
+): AsyncLock {.gcsafe, raises: [].} =
+  if network.isNil:
+    return nil
+  let lockKey = controlFetchResponseLockKey(key)
+  if lockKey.len == 0:
+    return nil
+  let existing = network.controlFetchResponseLocks.getOrDefault(lockKey)
+  if not existing.isNil:
+    return existing
+  result = newAsyncLock()
+  network.controlFetchResponseLocks[lockKey] = result
 
 proc closeSubmitConn(conn: Connection): Future[void] {.async: (raises: []).} =
   if conn.isNil:
@@ -315,6 +488,91 @@ proc closeSubmitConnSoon(
       discard
 
   asyncSpawn closeConn()
+
+proc closeControlFetchConn(
+    session: FabricControlFetchSession, reason = ""
+) {.async: (raises: []).} =
+  if session.isNil:
+    return
+  let conn = session.conn
+  session.conn = nil
+  if conn.isNil:
+    return
+  when defined(fabric_lsmr_diag):
+    if reason.len > 0:
+      echo "fabric-fetch close peer=", $session.peerId,
+        " class=", ord(session.sessionClass),
+        " reason=", reason
+  await closeSubmitConn(conn)
+
+proc selectSubmitSessionMuxer(
+    network: FabricNetwork,
+    peerId: PeerId,
+    sessionClass: FabricSubmitSessionClass,
+): Muxer {.gcsafe, raises: [].}
+
+proc openControlFetchConn(
+    network: FabricNetwork, peerId: PeerId
+): Future[Connection] {.async: (raises: [CancelledError, FetchError]).} =
+  if network.submitNetworkStopping():
+    raise (ref FetchError)(
+      msg: "fabric control fetch stopping", kind: FetchErrorKind.feConfig
+    )
+  if network.isNil or network.switch.isNil or network.switch.connManager.isNil or
+      network.switch.dialer.isNil:
+    raise (ref FetchError)(
+      msg: "fabric control fetch dial unavailable", kind: FetchErrorKind.feConfig
+    )
+  let muxer = network.selectSubmitSessionMuxer(peerId, fsscControl)
+  if not muxer.isNil and not muxer.connection.isNil and
+      not muxer.connection.closed and not muxer.connection.atEof:
+    var stream: Connection
+    try:
+      stream = await network.switch.connManager.getStream(muxer)
+      if stream.isNil:
+        raise newException(CatchableError, "control fetch stream open returned nil")
+      return await network.switch.dialer.negotiateStream(stream, @[FetchCodec])
+    except CancelledError as exc:
+      await closeSubmitConn(stream)
+      raise exc
+    except CatchableError as exc:
+      await closeSubmitConn(stream)
+      when defined(fabric_lsmr_diag):
+        echo "fabric-fetch stream-reopen-fail self=",
+          (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+          " peer=", peerIdString(peerId),
+          " err=", exc.msg
+
+  var addrs: seq[MultiAddress] = @[]
+  if not network.switch.peerStore.isNil:
+    for addr in network.switch.peerStore.getAddresses(peerId):
+      if not addrs.contains(addr):
+        addrs.add(addr)
+  for addr in network.submitPeerAddrHints.getOrDefault($peerId):
+    if not addrs.contains(addr):
+      addrs.add(addr)
+  if addrs.len == 0:
+    raise (ref FetchError)(
+      msg: "fetch dial failed: no known addresses",
+      kind: FetchErrorKind.feDialFailure,
+    )
+
+  try:
+    return await network.switch.dial(
+      peerId,
+      addrs,
+      @[FetchCodec],
+      forceDial = true,
+      reuseConnection = false,
+    )
+  except CancelledError as exc:
+    raise exc
+  except CatchableError as exc:
+    raise (ref FetchError)(
+      msg: "fetch dial failed: " & exc.msg,
+      parent: exc,
+      kind: FetchErrorKind.feDialFailure,
+    )
 
 proc submitLaneText(lane: FabricSubmitLane): string {.gcsafe, raises: [].} =
   case lane
@@ -358,13 +616,43 @@ proc submitBatchKindsText(items: openArray[FabricSubmitEnvelope]): string {.gcsa
 
 proc submitSessionKey(peerId: PeerId, sessionClass: FabricSubmitSessionClass): string {.gcsafe, raises: [].}
 proc submitSessionKey(peerId: PeerId, lane: FabricSubmitLane): string {.gcsafe, raises: [].}
+proc submitSessionClassHot(
+    sessionClass: FabricSubmitSessionClass
+): bool {.gcsafe, raises: [].}
+proc submitSessionPlaneKind(
+    sessionClass: FabricSubmitSessionClass
+): PeerPlaneKind {.gcsafe, raises: [].}
+proc submitPeerStreamPoolSize(
+    sessionClass: FabricSubmitSessionClass
+): int {.gcsafe, raises: [].}
+proc submitPeerStreamGeneration(
+    state: FabricSubmitPeerConnect,
+    sessionClass: FabricSubmitSessionClass,
+): uint64 {.gcsafe, raises: [].}
+proc submitPeerStreamSlotReady(
+    state: FabricSubmitPeerConnect,
+    sessionClass: FabricSubmitSessionClass,
+    slotIdx: int,
+): bool {.gcsafe, raises: [].}
 proc desiredSubmitPeers(network: FabricNetwork): seq[PeerId] {.gcsafe, raises: [].}
 proc submitItemsUniformKind(
     items: openArray[FabricSubmitEnvelope]
 ): Option[FabricSubmitKind] {.gcsafe, raises: [].}
+proc submitPeerStoreAddrs(
+    network: FabricNetwork, peerId: PeerId
+): seq[MultiAddress] {.gcsafe, raises: [].}
+proc submitPeerHintAddrs(
+    network: FabricNetwork, peerId: PeerId
+): seq[MultiAddress] {.gcsafe, raises: [].}
+proc submitPeerAddrs(
+    network: FabricNetwork, peerId: PeerId
+): seq[MultiAddress] {.gcsafe, raises: [].}
 proc submitPeerHasDemand(
     network: FabricNetwork, peerId: PeerId
 ): bool {.gcsafe, raises: [].}
+proc scheduleWarmSubmitPeer(
+    network: FabricNetwork, peerId: PeerId
+) {.gcsafe, raises: [].}
 
 proc submitBatchCarriesDemand(
     batch: FabricSubmitRpcBatch
@@ -410,11 +698,30 @@ proc submitPeerLiveBaseOwnerState(
   if network.isNil or network.switch.isNil or network.switch.connManager.isNil or
       peerId.data.len == 0:
     return (false, false)
-  if not network.switch.connManager.selectMuxer(peerId, Direction.Out).isNil:
-    return (true, true)
-  if not network.switch.connManager.selectMuxer(peerId, Direction.In).isNil:
-    return (true, false)
-  (false, false)
+  let plane = network.switch.connManager.reservePlane(peerId, ppkLive, Direction.Out)
+  if not plane.ready:
+    return (false, false)
+  (true, plane.direction == Direction.Out)
+
+proc submitPeerLiveBaseOwnerId(
+    network: FabricNetwork, peerId: PeerId
+): string {.gcsafe, raises: [].} =
+  if network.isNil or network.switch.isNil or network.switch.connManager.isNil or
+      peerId.data.len == 0:
+    return ""
+  network.switch.connManager.planeState(peerId, ppkLive).ownerMuxerId
+
+proc submitPeerLiveBaseOwnerChanged(
+    state: FabricSubmitPeerConnect,
+    ownerId: string,
+    known: bool,
+    localOwns: bool,
+): bool {.gcsafe, raises: [].} =
+  if state.isNil:
+    return true
+  state.connectedBaseOwnerId != ownerId or
+    state.connectedBaseOwnerKnown != known or
+    state.localOwnsConnectedBase != localOwns
 
 proc submitPeerSelectedBaseOutgoing(
     network: FabricNetwork, peerId: PeerId
@@ -423,10 +730,45 @@ proc submitPeerSelectedBaseOutgoing(
     return false
   if network.switch.connManager.isNil:
     return false
-  let muxer = network.switch.connManager.selectMuxer(peerId)
-  if muxer.isNil or muxer.connection.isNil:
-    return false
-  muxer.connection.dir == Direction.Out
+  let plane = network.switch.connManager.planeState(peerId, ppkLive)
+  plane.ready and plane.direction == Direction.Out
+
+proc connectionBaseConn(conn: Connection): Connection {.gcsafe, raises: [].} =
+  result = conn
+  while not result.isNil:
+    let wrapped = result.getWrapped()
+    if wrapped.isNil or wrapped == result:
+      break
+    result = wrapped
+
+proc submitPeerHotBaseConn(
+    network: FabricNetwork, peerId: PeerId
+): Connection {.gcsafe, raises: [].} =
+  if network.isNil or peerId.data.len == 0:
+    return nil
+  let state = network.submitPeerConnects.getOrDefault($peerId)
+  if state.isNil:
+    return nil
+  for sessionClass in [fsscEvent, fsscAttestation]:
+    for slotIdx in 0 ..< submitPeerStreamPoolSize(sessionClass):
+      if state.submitPeerStreamSlotReady(sessionClass, slotIdx):
+        return connectionBaseConn(state.streams[sessionClass].slots[slotIdx].conn)
+  nil
+
+proc selectSubmitSessionMuxer(
+    network: FabricNetwork,
+    peerId: PeerId,
+    sessionClass: FabricSubmitSessionClass,
+): Muxer {.gcsafe, raises: [].} =
+  if network.isNil or network.switch.isNil or network.switch.connManager.isNil or
+      peerId.data.len == 0:
+    return nil
+  let planeKind =
+    if submitSessionClassHot(sessionClass):
+      ppkLive
+    else:
+      ppkControl
+  network.switch.connManager.selectPlaneMuxer(peerId, planeKind)
 
 proc submitSessionClassLane(
     sessionClass: FabricSubmitSessionClass
@@ -438,6 +780,19 @@ proc submitSessionClassLane(
     fslAttestation
   of fsscEventCertificate, fsscControl:
     fslOther
+
+proc submitSessionClassHot(
+    sessionClass: FabricSubmitSessionClass
+): bool {.gcsafe, raises: [].} =
+  sessionClass == fsscEvent or sessionClass == fsscAttestation
+
+proc submitSessionPlaneKind(
+    sessionClass: FabricSubmitSessionClass
+): PeerPlaneKind {.gcsafe, raises: [].} =
+  if submitSessionClassHot(sessionClass):
+    ppkLive
+  else:
+    ppkControl
 
 proc submitSessionClassText(
     sessionClass: FabricSubmitSessionClass
@@ -621,6 +976,79 @@ proc submitPeerInflightCount(
 ): int {.gcsafe, raises: [].} =
   for session in network.submitPeerSessions(peerId):
     inc result, session.inflightCount
+
+proc submitTransportDispatchable(
+    network: FabricNetwork, peerId: PeerId, lane: FabricSubmitLane
+): bool {.gcsafe, raises: [].}
+
+proc submitHasLiveInflight*(
+    network: FabricNetwork
+): bool {.gcsafe, raises: [].} =
+  if network.isNil:
+    return false
+  for session in network.submitSessions.values:
+    if session.isNil or session.inflightCount <= 0:
+      continue
+    case session.transportClass
+    of fsscEvent, fsscAttestation:
+      return true
+    else:
+      discard
+  false
+
+proc submitHotAcceptBusy*(
+    network: FabricNetwork
+): bool {.gcsafe, raises: [].} =
+  if network.isNil:
+    return false
+  network.submitAcceptDepth > 0 or
+    network.submitHotDrainActive or network.submitHotAckYieldActive > 0 or
+    network.submitHotResumePending or network.submitHotInbox.len > 0
+
+proc submitAcceptGateActive(
+    network: FabricNetwork
+): bool {.gcsafe, raises: [].} =
+  if network.isNil:
+    return false
+  network.submitAcceptDepth > 0 or
+    network.submitHotAckYieldActive > 0
+
+proc signalSubmitHotAcceptIdle(network: FabricNetwork) {.gcsafe, raises: [].} =
+  if network.isNil or network.submitHotAcceptBusy() or
+      network.submitHotAcceptIdleHook.isNil and network.submitHotAcceptIdleEvent.isNil:
+    return
+  if not network.submitHotAcceptIdleEvent.isNil:
+    network.submitHotAcceptIdleEvent.fire()
+  if network.submitHotAcceptIdleHook.isNil or
+      network.submitHotBackgroundResumePending:
+    return
+  network.submitHotBackgroundResumePending = true
+
+  proc resumeBackground() {.async: (raises: []).} =
+    try:
+      await sleepAsync(0.seconds)
+    except CancelledError:
+      discard
+    finally:
+      if network.isNil:
+        return
+      network.submitHotBackgroundResumePending = false
+      if network.submitHotAcceptBusy() or network.submitHotAcceptIdleHook.isNil:
+        return
+      network.submitHotAcceptIdleHook()
+
+  asyncSpawn resumeBackground()
+
+proc waitSubmitHotAcceptIdle(
+    network: FabricNetwork
+): Future[void] {.async: (raises: [CancelledError]).} =
+  if network.isNil or network.submitHotAcceptIdleEvent.isNil:
+    return
+  while network.submitHotAcceptBusy():
+    network.submitHotAcceptIdleEvent.clear()
+    if not network.submitHotAcceptBusy():
+      break
+    await network.submitHotAcceptIdleEvent.wait()
 
 proc submitPeerPendingLen(
     network: FabricNetwork, peerId: PeerId
@@ -806,6 +1234,18 @@ proc submitPeerStreamPoolSize(
 ): int {.gcsafe, raises: [].} =
   submitSessionShardCount(sessionClass)
 
+proc submitPeerStreamGeneration(
+    state: FabricSubmitPeerConnect,
+    sessionClass: FabricSubmitSessionClass,
+): uint64 {.gcsafe, raises: [].} =
+  if state.isNil:
+    return 0
+  case submitSessionPlaneKind(sessionClass)
+  of ppkLive:
+    state.liveGeneration
+  of ppkControl:
+    state.controlGeneration
+
 proc submitPeerStreamSlotReady(
     state: FabricSubmitPeerConnect,
     sessionClass: FabricSubmitSessionClass,
@@ -817,7 +1257,8 @@ proc submitPeerStreamSlotReady(
     not state.streams[sessionClass].slots[slotIdx].conn.isNil and
     not state.streams[sessionClass].slots[slotIdx].conn.closed and
     not state.streams[sessionClass].slots[slotIdx].conn.atEof and
-    state.streams[sessionClass].slots[slotIdx].generation == state.baseGeneration
+    state.streams[sessionClass].slots[slotIdx].generation ==
+      state.submitPeerStreamGeneration(sessionClass)
 
 proc submitPeerStreamReady(
     state: FabricSubmitPeerConnect, sessionClass: FabricSubmitSessionClass
@@ -837,10 +1278,34 @@ proc submitPeerStreamReady(
   let state = network.submitPeerConnects.getOrDefault($peerId)
   state.submitPeerStreamReady(sessionClass)
 
-proc submitPeerConnReady(
-    network: FabricNetwork, peerId: PeerId
+proc submitPeerHotSessionNeedsWarm(
+    state: FabricSubmitPeerConnect,
+    wanted: array[FabricSubmitSessionClass, uint32]
 ): bool {.gcsafe, raises: [].} =
-  network.submitPeerStreamReady(peerId, fsscEvent)
+  if state.isNil:
+    return false
+  for sessionClass in [fsscEvent, fsscAttestation]:
+    if wanted[sessionClass] != 0 and
+        not state.submitPeerStreamReady(sessionClass):
+      return true
+  false
+
+proc submitHotSessionNeedsDirectProbe(
+    network: FabricNetwork,
+    peerId: PeerId,
+    sessionClass: FabricSubmitSessionClass,
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or network.switch.isNil or peerId.data.len == 0:
+    return false
+  if not submitSessionClassHot(sessionClass):
+    return false
+  if not network.switch.isConnected(peerId):
+    return false
+  let state = network.submitPeerConnects.getOrDefault($peerId)
+  if state.isNil:
+    return true
+  (not state.transportVerified) or
+    (not state.submitPeerStreamReady(sessionClass))
 
 proc clearSubmitPeerStream(
     network: FabricNetwork,
@@ -872,9 +1337,13 @@ proc clearSubmitPeerStreams(
 proc getOrCreateSubmitPeerConnect(
     network: FabricNetwork, peerId: PeerId
 ): FabricSubmitPeerConnect {.gcsafe, raises: [].}
+proc dialSubmitPeer(
+    network: FabricNetwork, peerId: PeerId, allowRedial: bool
+): Future[Connection] {.async: (raises: [CancelledError]).}
 proc dialSubmitExistingStream(
     network: FabricNetwork,
     peerId: PeerId,
+    sessionClass = fsscEvent,
     escalateBlocked = true,
 ): Future[Connection] {.async: (raises: [CancelledError]).}
 
@@ -889,12 +1358,15 @@ proc reserveSubmitSessionStream(
     return (nil, -1, false)
   let state = network.getOrCreateSubmitPeerConnect(peerId)
   var lockHeld = false
+  var chosenSlot = -1
+  var reservedGeneration = 0'u64
+  var staleConn: Connection = nil
   try:
     if not state.isNil and not state.streamLock.isNil:
       await state.streamLock.acquire()
       lockHeld = true
     let poolSize = submitPeerStreamPoolSize(session.transportClass)
-    let chosenSlot =
+    chosenSlot =
       if session.streamSlot >= 0 and session.streamSlot < poolSize:
         session.streamSlot
       else:
@@ -907,23 +1379,14 @@ proc reserveSubmitSessionStream(
         chosenSlot,
         true,
       )
-    if state.streams[session.transportClass].slots[chosenSlot].busy:
+    elif state.streams[session.transportClass].slots[chosenSlot].busy:
       return (nil, -1, false)
-    let staleConn = state.streams[session.transportClass].slots[chosenSlot].conn
-    state.streams[session.transportClass].slots[chosenSlot].conn = nil
-    state.streams[session.transportClass].slots[chosenSlot].generation = 0
-    state.streams[session.transportClass].slots[chosenSlot].busy = false
-    if not staleConn.isNil:
-      closeSubmitConnSoon(staleConn, "stream-stale")
-    let stream = await network.dialSubmitExistingStream(
-      peerId,
-      escalateBlocked = escalateBlocked,
-    )
-    if not stream.isNil:
-      state.streams[session.transportClass].slots[chosenSlot].conn = stream
-      state.streams[session.transportClass].slots[chosenSlot].generation = state.baseGeneration
+    else:
+      reservedGeneration = state.submitPeerStreamGeneration(session.transportClass)
+      staleConn = state.streams[session.transportClass].slots[chosenSlot].conn
+      state.streams[session.transportClass].slots[chosenSlot].conn = nil
+      state.streams[session.transportClass].slots[chosenSlot].generation = reservedGeneration
       state.streams[session.transportClass].slots[chosenSlot].busy = true
-    return (stream, chosenSlot, false)
   finally:
     if lockHeld:
       try:
@@ -931,6 +1394,45 @@ proc reserveSubmitSessionStream(
           state.streamLock.release()
       except AsyncLockError:
         discard
+  if not staleConn.isNil:
+    closeSubmitConnSoon(staleConn, "stream-stale")
+  let stream = await network.dialSubmitExistingStream(
+    peerId,
+    session.transportClass,
+    escalateBlocked = escalateBlocked,
+  )
+  var installHeld = false
+  var installed = false
+  try:
+    if not state.isNil and not state.streamLock.isNil:
+      await state.streamLock.acquire()
+      installHeld = true
+    if chosenSlot >= 0 and chosenSlot < submitPeerStreamPoolSize(session.transportClass):
+      let slot = addr state.streams[session.transportClass].slots[chosenSlot]
+      let reservationOwned =
+        slot.busy and slot.conn.isNil and slot.generation == reservedGeneration
+      if reservationOwned and not stream.isNil and
+          reservedGeneration == state.submitPeerStreamGeneration(session.transportClass):
+        slot.conn = stream
+        slot.generation = state.submitPeerStreamGeneration(session.transportClass)
+        slot.busy = true
+        installed = true
+      elif reservationOwned:
+        slot.conn = nil
+        slot.generation = 0
+        slot.busy = false
+  finally:
+    if installHeld:
+      try:
+        if state.streamLock.locked():
+          state.streamLock.release()
+      except AsyncLockError:
+        discard
+  if installed:
+    return (stream, chosenSlot, false)
+  if not stream.isNil:
+    closeSubmitConnSoon(stream, "stream-open-abort")
+  (nil, -1, false)
 
 proc releaseSubmitSessionStream(
     network: FabricNetwork,
@@ -1160,6 +1662,7 @@ proc processSubmitInboxItem(
 ): Future[void] {.async: (raises: [CancelledError]).}
 
 proc scheduleSubmitInboxDrain(network: FabricNetwork) {.gcsafe, raises: [].}
+proc scheduleSubmitHotResume(network: FabricNetwork) {.gcsafe, raises: [].}
 proc runSubmitRequestRpc(
     network: FabricNetwork,
     peerId: PeerId,
@@ -1172,7 +1675,14 @@ proc dispatchSubmitSessionDirect(
     peerIdText: string,
     sessionClass: FabricSubmitSessionClass,
     sessionShard: int = 0,
-) {.gcsafe, raises: [].}
+): Future[void] {.async: (raises: [CancelledError]).}
+proc signalSubmitSessionDispatch(
+    network: FabricNetwork,
+    peerId: PeerId,
+    peerIdText: string,
+    sessionClass: FabricSubmitSessionClass,
+    sessionShard: int = 0,
+): Future[void] {.async: (raises: [CancelledError]).}
 proc scheduleSubmitSession(
     network: FabricNetwork,
     peerId: PeerId,
@@ -1316,50 +1826,98 @@ proc decodeSubmitInboxItem(
       envelope: envelope,
     ))
 
-proc enqueueSubmitInboxItem(
+proc submitInboxLen(network: FabricNetwork): int {.gcsafe, raises: [].} =
+  if network.isNil:
+    return 0
+  network.submitHotInbox.len + network.submitInbox.len
+
+proc submitHotAcceptEligible(
     network: FabricNetwork, item: FabricSubmitInboxItem
+): bool {.gcsafe, raises: [].} =
+  if network.isNil or item.sourcePeerId.len == 0:
+    return false
+  case item.envelope.kind
+  of fskEvent:
+    network.submitPeerReadyNow(item.sourcePeerId, fslEvent)
+  of fskAttestation:
+    network.submitPeerReadyNow(item.sourcePeerId, fslAttestation)
+  else:
+    false
+
+proc planSubmitAcceptance(
+    network: FabricNetwork, envelope: FabricSubmitEnvelope, sourcePeerId: string
+): FabricSubmitAcceptPlan {.gcsafe, raises: [].} =
+  result.itemKey = envelope.effectiveSubmitItemKey()
+  if envelope.kind == fskWarm:
+    result.disposition = fsadAcknowledgeOnly
+    return
+  let item = network.decodeSubmitInboxItem(envelope, sourcePeerId)
+  if item.isNone():
+    result.disposition = fsadReject
+    return
+  result.item = item.get()
+  if network.submitHotAcceptEligible(result.item):
+    result.disposition = fsadHotQueue
+  else:
+    result.disposition = fsadInboxQueue
+
+proc enqueueSubmitInboxItem(
+    network: FabricNetwork, item: FabricSubmitInboxItem, hot: bool
 ): bool {.gcsafe, raises: [].} =
   if network.isNil:
     return false
-  if network.submitInbox.len >= FabricSubmitInboxCapacity:
+  let queued = network.submitInboxLen()
+  if queued >= FabricSubmitInboxCapacity:
     when defined(fabric_submit_diag):
       echo "fabric-submit inbox-full self=",
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " item=", item.itemKey,
-        " queued=", network.submitInbox.len
+        " queued=", queued
     return false
-  network.submitInbox.addLast(item)
-  network.scheduleSubmitInboxDrain()
+  if hot:
+    network.submitHotInbox.addLast(item)
+  else:
+    network.submitInbox.addLast(item)
+  if network.submitAcceptDepth > 0:
+    network.submitInboxPending = true
+  else:
+    network.scheduleSubmitInboxDrain()
   true
 
 proc acceptSubmitEnvelope(
     network: FabricNetwork, envelope: FabricSubmitEnvelope, sourcePeerId: string
-): FabricSubmitAckItem {.gcsafe, raises: [].} =
-  let itemKey = envelope.effectiveSubmitItemKey()
-  if envelope.kind == fskWarm:
-    return FabricSubmitAckItem(itemKey: itemKey, accepted: true)
-  let item = network.decodeSubmitInboxItem(envelope, sourcePeerId)
-  if item.isNone():
-    return FabricSubmitAckItem(itemKey: itemKey, accepted: false)
-  FabricSubmitAckItem(
-    itemKey: itemKey,
-    accepted: network.enqueueSubmitInboxItem(item.get()),
-  )
+): Future[FabricSubmitAckItem] {.async: (raises: [CancelledError]).} =
+  let plan = network.planSubmitAcceptance(envelope, sourcePeerId)
+  case plan.disposition
+  of fsadReject:
+    return FabricSubmitAckItem(itemKey: plan.itemKey, accepted: false)
+  of fsadAcknowledgeOnly:
+    return FabricSubmitAckItem(itemKey: plan.itemKey, accepted: true)
+  of fsadHotQueue:
+    return FabricSubmitAckItem(
+      itemKey: plan.itemKey,
+      accepted: network.enqueueSubmitInboxItem(plan.item, hot = true),
+    )
+  of fsadInboxQueue:
+    return FabricSubmitAckItem(
+      itemKey: plan.itemKey,
+      accepted: network.enqueueSubmitInboxItem(plan.item, hot = false),
+    )
 
 proc acceptSubmitFrame(
     network: FabricNetwork, frame: FabricSubmitFrame, sourcePeerId: string
-): FabricSubmitAckFrame {.gcsafe, raises: [].} =
+): Future[FabricSubmitAckFrame] {.async: (raises: [CancelledError]).} =
   if frame.items.len == 0:
     return emptySubmitAckFrame(frame.requestId)
   if not network.isNil and sourcePeerId.len > 0:
-    let sourcePeer = PeerId.init(sourcePeerId).valueOr:
-      PeerId()
-    if sourcePeer.data.len > 0:
-      network.setSubmitPeerTransportVerified(
-        sourcePeer, true, "recv-submit-frame"
-      )
+      let sourcePeer = PeerId.init(sourcePeerId).valueOr:
+        PeerId()
+      if sourcePeer.data.len > 0:
+        network.setSubmitPeerTransportVerified(
+          sourcePeer, true, "recv-submit-frame"
+        )
   for envelope in frame.items:
-    result.items.add(network.acceptSubmitEnvelope(envelope, sourcePeerId))
+    result.items.add(await network.acceptSubmitEnvelope(envelope, sourcePeerId))
   result.requestId = frame.requestId
 
 proc processSubmitInboxItem(
@@ -1460,48 +2018,82 @@ proc drainSubmitInbox(network: FabricNetwork): Future[void] {.async: (raises: []
     return
   let sliceStartedAtMs = diagNowMs()
   var processed = 0
-  while network.submitInbox.len > 0 and processed < FabricSubmitInboxBatchLimit:
-    if processed > 0 and diagNowMs() - sliceStartedAtMs >= FabricSubmitInboxSliceBudgetMs:
-      when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
-        echo "fabric-submit inbox-yield self=",
-          (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-          " processed=", processed,
-          " queued=", network.submitInbox.len
-      break
-    let item = network.submitInbox.popFirst()
-    inc processed
-    try:
-      let itemStartedAtMs = diagNowMs()
-      when defined(fabric_lsmr_diag):
-        echo "t=", itemStartedAtMs,
-          " fabric-submit inbox-item-begin self=",
-          (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-          " kind=", submitKindText(item.envelope.kind),
-          " item=", item.itemKey,
-          " source=", item.sourcePeerId,
-          " queued=", network.submitInbox.len
-      await network.processSubmitInboxItem(item)
-      when defined(fabric_lsmr_diag):
-        echo "t=", diagNowMs(),
-          " fabric-submit inbox-item-done self=",
-          (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-          " kind=", submitKindText(item.envelope.kind),
-          " item=", item.itemKey,
-          " source=", item.sourcePeerId,
-          " elapsedMs=", diagNowMs() - itemStartedAtMs,
-          " queued=", network.submitInbox.len
-      await sleepAsync(FabricSubmitInboxYield)
-    except CancelledError:
-      return
-    except CatchableError as exc:
-      when defined(fabric_submit_diag):
-        echo "fabric-submit inbox-fail self=",
-          (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-          " item=", item.itemKey,
-          " err=", exc.msg
+  var hotResumeNeeded = false
+  try:
+    while network.submitInboxLen() > 0 and processed < FabricSubmitInboxBatchLimit:
+      let acceptEpoch = network.submitAcceptEpoch
+      if network.submitAcceptGateActive():
+        network.submitInboxPending = true
+        break
+      if processed > 0 and diagNowMs() - sliceStartedAtMs >= FabricSubmitInboxSliceBudgetMs:
+        when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+          echo "fabric-submit inbox-yield self=",
+            (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+            " processed=", processed,
+            " queued=", network.submitInboxLen()
+        break
+      let fromHot = network.submitHotInbox.len > 0
+      let item =
+        if fromHot:
+          network.submitHotInbox.popFirst()
+        else:
+          network.submitInbox.popFirst()
+      if network.submitAcceptEpoch != acceptEpoch or network.submitAcceptGateActive():
+        if fromHot:
+          network.submitHotInbox.addFirst(item)
+        else:
+          network.submitInbox.addFirst(item)
+        network.submitInboxPending = true
+        break
+      let hotBatchBoundary = fromHot and network.submitHotInbox.len == 0
+      if fromHot:
+        network.submitHotDrainActive = true
+      inc processed
+      try:
+        let itemStartedAtMs = diagNowMs()
+        when defined(fabric_lsmr_diag):
+          echo "t=", itemStartedAtMs,
+            " fabric-submit inbox-item-begin self=",
+            (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+            " kind=", submitKindText(item.envelope.kind),
+            " item=", item.itemKey,
+            " source=", item.sourcePeerId,
+            " queued=", network.submitInboxLen()
+        await network.processSubmitInboxItem(item)
+        when defined(fabric_lsmr_diag):
+          echo "t=", diagNowMs(),
+            " fabric-submit inbox-item-done self=",
+            (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+            " kind=", submitKindText(item.envelope.kind),
+            " item=", item.itemKey,
+            " source=", item.sourcePeerId,
+            " elapsedMs=", diagNowMs() - itemStartedAtMs,
+            " queued=", network.submitInboxLen()
+        await sleepAsync(FabricSubmitInboxYield)
+      except CancelledError:
+        return
+      except CatchableError as exc:
+        when defined(fabric_submit_diag):
+          echo "fabric-submit inbox-fail self=",
+            (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+            " item=", item.itemKey,
+            " err=", exc.msg
+      if hotBatchBoundary:
+        hotResumeNeeded = true
+        break
+  finally:
+    if not network.isNil:
+      network.submitHotDrainActive = false
+      if hotResumeNeeded:
+        network.scheduleSubmitHotResume()
+      else:
+        network.signalSubmitHotAcceptIdle()
 
 proc scheduleSubmitInboxDrain(network: FabricNetwork) {.gcsafe, raises: [].} =
   if network.isNil:
+    return
+  if network.submitAcceptGateActive():
+    network.submitInboxPending = true
     return
   if not network.submitInboxRunner.isNil and not network.submitInboxRunner.finished():
     network.submitInboxPending = true
@@ -1509,13 +2101,12 @@ proc scheduleSubmitInboxDrain(network: FabricNetwork) {.gcsafe, raises: [].} =
 
   proc drain() {.async, gcsafe.} =
     try:
-      await sleepAsync(FabricSubmitInboxYield)
       await network.drainSubmitInbox()
     except CancelledError:
       discard
     finally:
       if not network.isNil:
-        let rerun = network.submitInboxPending or network.submitInbox.len > 0
+        let rerun = network.submitInboxPending or network.submitInboxLen() > 0
         network.submitInboxPending = false
         network.submitInboxRunner = nil
         if rerun:
@@ -1523,6 +2114,20 @@ proc scheduleSubmitInboxDrain(network: FabricNetwork) {.gcsafe, raises: [].} =
 
   network.submitInboxRunner = drain()
   asyncSpawn network.submitInboxRunner
+
+proc scheduleSubmitHotResume(network: FabricNetwork) {.gcsafe, raises: [].} =
+  if network.isNil:
+    return
+  network.submitHotResumePending = true
+
+proc resumeSubmitHotIfPending(network: FabricNetwork) {.gcsafe, raises: [].} =
+  if network.isNil or not network.submitHotResumePending:
+    return
+  network.submitHotResumePending = false
+  if network.submitInboxLen() == 0:
+    network.signalSubmitHotAcceptIdle()
+    return
+  network.scheduleSubmitInboxDrain()
 
 proc fetchHandlerOf(networkRef: FabricNetworkRef, lookup: FetchLookup): FetchHandler =
   proc(key: string): Future[FetchResponse] {.async.} =
@@ -1635,10 +2240,69 @@ proc fetchHandlerOf(networkRef: FabricNetworkRef, lookup: FetchLookup): FetchHan
       return FetchResponse(status: fsNotFound, data: @[])
     if lookup.isNil:
       return FetchResponse(status: fsNotFound, data: @[])
-    let payload = lookup(key)
-    if payload.isNone():
-      return FetchResponse(status: fsNotFound, data: @[])
-    FetchResponse(status: fsOk, data: payload.get())
+    let network = networkRef.value
+    if network.controlFetchServerMustYieldToLive(key):
+      when defined(fabric_lsmr_diag):
+        echo "fabric-net control-yield self=",
+          (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+          " requester=", splitControlFetchRequesterKey(key).requesterPeerId,
+          " key=", key
+      return FetchResponse(status: fsError, data: @[])
+    let responseLock =
+      if network.isNil:
+        nil
+      else:
+        network.getOrCreateControlFetchResponseLock(key)
+    let flightKey = controlFetchResponseLockKey(key)
+    if responseLock.isNil or flightKey.len == 0:
+      let payload = lookup(key)
+      if payload.isNone():
+        return FetchResponse(status: fsNotFound, data: @[])
+      return FetchResponse(status: fsOk, data: payload.get())
+
+    var responseFlight: Future[FetchResponse]
+    var owner = false
+    await responseLock.acquire()
+    try:
+      responseFlight = network.controlFetchResponseFlights.getOrDefault(flightKey)
+      if responseFlight.isNil or responseFlight.finished():
+        responseFlight = newFuture[FetchResponse]()
+        network.controlFetchResponseFlights[flightKey] = responseFlight
+        owner = true
+    finally:
+      try:
+        if responseLock.locked():
+          responseLock.release()
+      except AsyncLockError:
+        discard
+
+    if not owner:
+      return await responseFlight
+
+    let response =
+      try:
+        let payload = lookup(key)
+        if payload.isNone():
+          FetchResponse(status: fsNotFound, data: @[])
+        else:
+          FetchResponse(status: fsOk, data: payload.get())
+      except CatchableError:
+        FetchResponse(status: fsError, data: @[])
+
+    responseFlight.complete(response)
+
+    await responseLock.acquire()
+    try:
+      if network.controlFetchResponseFlights.getOrDefault(flightKey) == responseFlight:
+        network.controlFetchResponseFlights.del(flightKey)
+    finally:
+      try:
+        if responseLock.locked():
+          responseLock.release()
+      except AsyncLockError:
+        discard
+
+    response
 
 proc buildSubmitProtocol(network: FabricNetwork): LPProtocol =
   proc handle(conn: Connection, proto: string) {.async: (raises: [CancelledError]).} =
@@ -1651,6 +2315,8 @@ proc buildSubmitProtocol(network: FabricNetwork): LPProtocol =
           sourcePeer, true, "recv-submit-stream"
         )
       while true:
+        if not network.isNil:
+          network.resumeSubmitHotIfPending()
         when defined(fabric_lsmr_diag):
           echo "t=", diagNowMs(),
             " fabric-submit handler-read-begin self=",
@@ -1673,61 +2339,80 @@ proc buildSubmitProtocol(network: FabricNetwork): LPProtocol =
             none(FabricSubmitEnvelope)
           else:
             safeDecode[FabricSubmitEnvelope](raw)
-        let ackFrame =
-          if frame.isSome() and frame.get().items.len > 0:
-            network.acceptSubmitFrame(frame.get(), sourcePeerId)
-          elif envelope.isSome():
-            FabricSubmitAckFrame(
-              requestId: 0,
-              items: @[network.acceptSubmitEnvelope(envelope.get(), sourcePeerId)],
-            )
-          else:
-            emptySubmitAckFrame()
-        let processElapsedMs = diagNowMs() - processStartedAtMs
-        when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
-          if processElapsedMs >= 100:
-            echo "fabric-submit handler-slow-process self=",
+        var ackFrame = emptySubmitAckFrame()
+        var submitAcceptHeld = false
+        try:
+          if not network.isNil:
+            inc network.submitAcceptEpoch
+            inc network.submitAcceptDepth
+            submitAcceptHeld = true
+          ackFrame =
+            if frame.isSome() and frame.get().items.len > 0:
+              await network.acceptSubmitFrame(frame.get(), sourcePeerId)
+            elif envelope.isSome():
+              FabricSubmitAckFrame(
+                requestId: 0,
+                items: @[await network.acceptSubmitEnvelope(envelope.get(), sourcePeerId)],
+              )
+            else:
+              emptySubmitAckFrame()
+          let processElapsedMs = diagNowMs() - processStartedAtMs
+          when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+            if processElapsedMs >= 100:
+              echo "fabric-submit handler-slow-process self=",
+                (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+                " codec=", proto,
+                " bytes=", payload.len,
+                " items=", (if frame.isSome() and frame.get().items.len > 0: frame.get().items.len else: 1),
+                " accepted=", ackFrame.items.countIt(it.accepted),
+                "/",
+                ackFrame.items.len,
+                " elapsedMs=", processElapsedMs
+          when defined(fabric_lsmr_diag):
+            echo "t=", diagNowMs(),
+              " fabric-submit handler-processed self=",
               (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
               " codec=", proto,
-              " bytes=", payload.len,
+              " decoded=", (frame.isSome() and frame.get().items.len > 0) or envelope.isSome(),
               " items=", (if frame.isSome() and frame.get().items.len > 0: frame.get().items.len else: 1),
               " accepted=", ackFrame.items.countIt(it.accepted),
               "/",
+              ackFrame.items.len
+          let ackWriteStartedAtMs = diagNowMs()
+          when defined(fabric_lsmr_diag):
+            echo "t=", ackWriteStartedAtMs,
+              " fabric-submit handler-ack-begin self=",
+              (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+              " codec=", proto,
+              " accepted=", ackFrame.items.countIt(it.accepted),
+              "/",
+              ackFrame.items.len
+          let ackPayload = safeEncode(ackFrame)
+          if ackPayload.isSome():
+            await conn.writeLp(bytesOf(ackPayload.get()))
+          else:
+            await conn.writeLp(bytesOf(""))
+          if not network.isNil:
+            if submitAcceptHeld and network.submitAcceptDepth > 0:
+              dec network.submitAcceptDepth
+              submitAcceptHeld = false
+            inc network.submitHotAckYieldActive
+          when defined(fabric_lsmr_diag):
+            echo "t=", diagNowMs(),
+              " fabric-submit handler-ack-done self=",
+              (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+              " codec=", proto,
+              " accepted=", ackFrame.items.countIt(it.accepted),
+              "/",
               ackFrame.items.len,
-              " elapsedMs=", processElapsedMs
-        when defined(fabric_lsmr_diag):
-          echo "t=", diagNowMs(),
-            " fabric-submit handler-processed self=",
-            (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-            " codec=", proto,
-            " decoded=", (frame.isSome() and frame.get().items.len > 0) or envelope.isSome(),
-            " items=", (if frame.isSome() and frame.get().items.len > 0: frame.get().items.len else: 1),
-            " accepted=", ackFrame.items.countIt(it.accepted),
-            "/",
-            ackFrame.items.len
-        let ackWriteStartedAtMs = diagNowMs()
-        when defined(fabric_lsmr_diag):
-          echo "t=", ackWriteStartedAtMs,
-            " fabric-submit handler-ack-begin self=",
-            (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-            " codec=", proto,
-            " accepted=", ackFrame.items.countIt(it.accepted),
-            "/",
-            ackFrame.items.len
-        let ackPayload = safeEncode(ackFrame)
-        if ackPayload.isSome():
-          await conn.writeLp(bytesOf(ackPayload.get()))
-        else:
-          await conn.writeLp(bytesOf(""))
-        when defined(fabric_lsmr_diag):
-          echo "t=", diagNowMs(),
-            " fabric-submit handler-ack-done self=",
-            (if network.isNil or network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-            " codec=", proto,
-            " accepted=", ackFrame.items.countIt(it.accepted),
-            "/",
-            ackFrame.items.len,
-            " elapsedMs=", diagNowMs() - ackWriteStartedAtMs
+              " elapsedMs=", diagNowMs() - ackWriteStartedAtMs
+          if not network.isNil:
+            if network.submitHotAckYieldActive > 0:
+              dec network.submitHotAckYieldActive
+            network.scheduleSubmitHotResume()
+        finally:
+          if submitAcceptHeld and not network.isNil and network.submitAcceptDepth > 0:
+            dec network.submitAcceptDepth
     except CancelledError as exc:
       raise exc
     except LPStreamEOFError:
@@ -1789,6 +2474,25 @@ proc getOrCreateSubmitSession(
 ): FabricSubmitSession {.gcsafe, raises: [].} =
   network.getOrCreateSubmitSession(peerId, submitSessionClassForLane(lane), 0)
 
+proc getOrCreateControlFetchSession(
+    network: FabricNetwork,
+    peerId: PeerId,
+    sessionClass: FabricControlFetchSessionClass,
+): FabricControlFetchSession {.gcsafe, raises: [].} =
+  if network.isNil or peerId.data.len == 0:
+    return nil
+  let key = controlFetchSessionKey(peerId, sessionClass)
+  let existing = network.controlFetchSessions.getOrDefault(key)
+  if not existing.isNil:
+    return existing
+  result = FabricControlFetchSession(
+    peerId: peerId,
+    sessionClass: sessionClass,
+    lock: newAsyncLock(),
+    conn: nil,
+  )
+  network.controlFetchSessions[key] = result
+
 proc getOrCreateSubmitPeerConnect(
     network: FabricNetwork, peerId: PeerId
 ): FabricSubmitPeerConnect {.gcsafe, raises: [].} =
@@ -1803,7 +2507,8 @@ proc getOrCreateSubmitPeerConnect(
     rpcLock: newAsyncLock(),
     streamLock: newAsyncLock(),
     streams: default(array[FabricSubmitSessionClass, FabricSubmitPeerStreamPool]),
-    baseGeneration: 0,
+    liveGeneration: 0,
+    controlGeneration: 0,
     runner: nil,
     probeRunner: nil,
     connectivityRunner: nil,
@@ -1821,6 +2526,7 @@ proc getOrCreateSubmitPeerConnect(
     transportBlocked: false,
     transportVerified: false,
     connectedBaseOwnerKnown: false,
+    connectedBaseOwnerId: "",
     localOwnsConnectedBase: false,
   )
   network.submitPeerConnects[key] = result
@@ -1975,6 +2681,14 @@ proc submitPeerHintAddrs(
     return @[]
   result.mergeUniqueAddrs(network.submitPeerAddrHints.getOrDefault($peerId))
 
+proc submitPeerAddrs(
+    network: FabricNetwork, peerId: PeerId
+): seq[MultiAddress] {.gcsafe, raises: [].} =
+  if network.isNil or peerId.data.len == 0:
+    return @[]
+  result = network.submitPeerStoreAddrs(peerId)
+  result.mergeUniqueAddrs(network.submitPeerHintAddrs(peerId))
+
 proc rememberSubmitPeerAddrs*(
     network: FabricNetwork, peerId: PeerId, addrs: openArray[MultiAddress]
 ) {.gcsafe, raises: [].} =
@@ -2029,13 +2743,19 @@ proc submitTransportDispatchable(
   if not network.switch.isConnected(peerId):
     return false
   let state = network.submitPeerConnects.getOrDefault($peerId)
-  if state.isNil or state.transportBlocked:
+  if state.isNil or state.transportBlocked or network.switch.connManager.isNil:
     return false
   case lane
   of fslEvent:
-    state.transportVerified or state.submitPeerStreamReady(fsscEvent)
-  of fslAttestation, fslOther:
-    state.transportVerified
+    state.submitPeerStreamReady(fsscEvent) and
+      network.switch.connManager.planeReady(peerId, ppkLive)
+  of fslAttestation:
+    state.submitPeerStreamReady(fsscAttestation) and
+      network.switch.connManager.planeReady(peerId, ppkLive)
+  of fslOther:
+    state.transportVerified and
+      network.switch.connManager.planeReady(peerId, ppkControl) and
+      not network.switch.connManager.planeSharedWithLive(peerId, ppkControl)
 
 proc submitTransportReady(
     network: FabricNetwork, peerId: PeerId, lane: FabricSubmitLane
@@ -2064,14 +2784,16 @@ proc submitPeerOwnsRepair(
 ): bool {.gcsafe, raises: [].} =
   if network.isNil or network.switch.isNil or peerId.data.len == 0:
     return false
+  let liveOwnerId = network.submitPeerLiveBaseOwnerId(peerId)
   let liveOwner = network.submitPeerLiveBaseOwnerState(peerId)
   let state = network.submitPeerConnects.getOrDefault($peerId)
   if liveOwner.known:
     if not state.isNil:
       state.connectedBaseOwnerKnown = true
+      state.connectedBaseOwnerId = liveOwnerId
       state.localOwnsConnectedBase = liveOwner.localOwns
     return liveOwner.localOwns
-  if not state.isNil and state.connectedBaseOwnerKnown:
+  if not state.isNil and state.connectedBaseOwnerKnown and state.connectedBaseOwnerId.len > 0:
     return state.localOwnsConnectedBase
   peerIdString(network.switch.peerInfo.peerId) <= peerIdString(peerId)
 
@@ -2079,7 +2801,7 @@ proc waitSubmitPeerDisconnectSettled(
     network: FabricNetwork,
     peerId: PeerId,
 ): Future[bool] {.async: (raises: [CancelledError]).} =
-  if network.isNil or network.switch.isNil or peerId.data.len == 0:
+  if network.isNil or network.switch.isNil or peerId.data.len == 0 or network.stopping:
     return false
   let startedAtMs = diagNowMs()
   while true:
@@ -2238,10 +2960,28 @@ proc runSubmitPeerActor(
         discard
 
     if sawDisconnected:
-      let liveOwner = network.submitPeerLiveBaseOwnerState(peerId)
+      let livePlane = network.switch.connManager.planeState(peerId, ppkLive)
+      let controlPlane = network.switch.connManager.planeState(peerId, ppkControl)
+      let liveOwnerId = livePlane.ownerMuxerId
+      let liveOwner = (
+        known: livePlane.ready,
+        localOwns: livePlane.ready and livePlane.direction == Direction.Out,
+      )
+      var ownerChanged = false
+      var liveChanged = false
+      var controlChanged = false
       await state.lock.acquire()
       try:
-        inc state.baseGeneration
+        ownerChanged = state.submitPeerLiveBaseOwnerChanged(
+          liveOwnerId,
+          liveOwner.known,
+          liveOwner.localOwns,
+        )
+        liveChanged = state.liveGeneration != livePlane.generation
+        controlChanged = state.controlGeneration != controlPlane.generation
+        state.liveGeneration = livePlane.generation
+        state.controlGeneration = controlPlane.generation
+        state.connectedBaseOwnerId = liveOwnerId
         state.connectedBaseOwnerKnown = liveOwner.known
         state.localOwnsConnectedBase = liveOwner.localOwns
       finally:
@@ -2256,21 +2996,46 @@ proc runSubmitPeerActor(
           " peer=", peerIdText,
           " ownerKnown=", liveOwner.known,
           " localOwnsBase=", liveOwner.localOwns,
+          " ownerChanged=", ownerChanged,
+          " liveChanged=", liveChanged,
+          " controlChanged=", controlChanged,
           " actor=true"
-      network.clearSubmitPeerStreams(peerId, "actor-disconnected")
-      await network.clearSubmitPeerRepairWait(
-        peerId,
-        "conn-event-disconnected",
-        preserveVerified = false,
-      )
-      if network.submitPeerHasDemand(peerId):
-        wantRepair = true
+      if ownerChanged:
+        network.clearSubmitPeerStreams(peerId, "actor-disconnected")
+        await network.clearSubmitPeerRepairWait(
+          peerId,
+          "conn-event-disconnected",
+          preserveVerified = false,
+        )
+        if network.submitPeerHasDemand(peerId):
+          wantRepair = true
+      elif controlChanged:
+        network.clearSubmitPeerStream(peerId, fsscEventCertificate, "actor-control-disconnected")
+        network.clearSubmitPeerStream(peerId, fsscControl, "actor-control-disconnected")
 
     if sawConnected:
-      let liveOwner = network.submitPeerLiveBaseOwnerState(peerId)
+      let livePlane = network.switch.connManager.planeState(peerId, ppkLive)
+      let controlPlane = network.switch.connManager.planeState(peerId, ppkControl)
+      let liveOwnerId = livePlane.ownerMuxerId
+      let liveOwner = (
+        known: livePlane.ready,
+        localOwns: livePlane.ready and livePlane.direction == Direction.Out,
+      )
+      var ownerChanged = false
+      var liveChanged = false
+      var controlChanged = false
       await state.lock.acquire()
       try:
-        inc state.baseGeneration
+        ownerChanged = state.submitPeerLiveBaseOwnerChanged(
+          liveOwnerId,
+          liveOwner.known,
+          liveOwner.localOwns,
+        )
+        liveChanged = state.liveGeneration != livePlane.generation
+        controlChanged = state.controlGeneration != controlPlane.generation
+        state.liveGeneration = livePlane.generation
+        state.controlGeneration = controlPlane.generation
+        state.connectedBaseOwnerId = liveOwnerId
         state.connectedBaseOwnerKnown = liveOwner.known
         state.localOwnsConnectedBase = liveOwner.localOwns
       finally:
@@ -2286,6 +3051,9 @@ proc runSubmitPeerActor(
           " incoming=", connectedIncoming,
           " ownerKnown=", liveOwner.known,
           " localOwnsBase=", liveOwner.localOwns,
+          " ownerChanged=", ownerChanged,
+          " liveChanged=", liveChanged,
+          " controlChanged=", controlChanged,
           " actor=true"
       await network.clearSubmitPeerRepairWait(
         peerId,
@@ -2293,7 +3061,11 @@ proc runSubmitPeerActor(
         preserveVerified = true,
       )
       network.setSubmitPeerForceRepairHint(peerId, false, "conn-event-connected")
-      wantWarm = true
+      if ownerChanged:
+        wantWarm = true
+      elif controlChanged:
+        network.clearSubmitPeerStream(peerId, fsscEventCertificate, "actor-control-connected")
+        network.clearSubmitPeerStream(peerId, fsscControl, "actor-control-connected")
       if not network.submitReadyHook.isNil:
         network.submitReadyHook()
 
@@ -2317,10 +3089,11 @@ proc runSubmitPeerActor(
         forceLocalRepair = activeDemand or wantRepair,
       )
 
+    let hotSessionNeedsWarm = state.submitPeerHotSessionNeedsWarm(wantedSessionShards)
     if network.switch.isConnected(peerId) and
         (wantWarm or
         (submitSessionShardsQueued(wantedSessionShards) and
-        not state.transportVerified)):
+        (not state.transportVerified or hotSessionNeedsWarm))):
       discard await network.probeSubmitTransport(peerId)
 
     for sessionClass in FabricSubmitSessionClass:
@@ -2335,7 +3108,7 @@ proc runSubmitPeerActor(
         if session.isNil or not session.submitHasPending():
           continue
         if network.submitTransportDispatchable(peerId, lane):
-          network.dispatchSubmitSessionDirect(
+          await network.signalSubmitSessionDispatch(
             peerId,
             peerIdText,
             sessionClass,
@@ -2347,7 +3120,7 @@ proc enqueueSubmitPeerCommand(
     peerId: PeerId,
     command: FabricSubmitPeerCommand,
 ): Future[void] {.async: (raises: [CancelledError]).} =
-  if network.isNil or peerId.data.len == 0:
+  if network.isNil or peerId.data.len == 0 or network.stopping:
     return
   let state = network.getOrCreateSubmitPeerConnect(peerId)
   if state.isNil or state.lock.isNil:
@@ -2388,7 +3161,7 @@ proc scheduleSubmitPeerCommand(
     peerId: PeerId,
     command: FabricSubmitPeerCommand,
 ) {.gcsafe, raises: [].} =
-  if network.isNil or peerId.data.len == 0:
+  if network.isNil or peerId.data.len == 0 or network.stopping:
     return
   proc enqueue() {.async, gcsafe.} =
     try:
@@ -2400,12 +3173,13 @@ proc scheduleSubmitPeerCommand(
 proc ensureSubmitPeerConnectivity*(
     network: FabricNetwork, peerIdText: string, lane: FabricSubmitLane
 ) {.gcsafe, raises: [].}
+proc prepareStop*(network: FabricNetwork) {.async.}
 
 proc submitPeerReady*(network: FabricNetwork, peerId: PeerId, lane: FabricSubmitLane): bool {.gcsafe, raises: [].} =
   if network.isNil or peerId.data.len == 0:
     return false
   let ready = network.submitTransportDispatchable(peerId, lane)
-  if network.isLsmrSubmitMode() and not ready:
+  if network.isLsmrSubmitMode() and not ready and not network.stopping:
     network.ensureSubmitPeerConnectivity($peerId, lane)
   ready
 
@@ -2485,6 +3259,10 @@ proc invalidateSubmitSession(
     disconnected: bool,
 ) {.async: (raises: [CancelledError]).} =
   if network.isNil or peerId.data.len == 0:
+    return
+  if network.stopping:
+    if disconnected:
+      network.clearSubmitPeerStreams(peerId, "invalidate-stopping")
     return
   let sessions = network.submitPeerSessions(peerId)
   let state = network.getOrCreateSubmitPeerConnect(peerId)
@@ -2568,11 +3346,13 @@ proc desiredSubmitPeers(network: FabricNetwork): seq[PeerId] {.gcsafe, raises: [
 proc dialSubmitExistingStream(
     network: FabricNetwork,
     peerId: PeerId,
+    sessionClass = fsscEvent,
     escalateBlocked = true,
 ): Future[Connection] {.async: (raises: [CancelledError]).} =
   if network.isNil or network.switch.isNil or network.switch.connManager.isNil:
     return nil
   var stream: Connection = nil
+  let muxer = network.selectSubmitSessionMuxer(peerId, sessionClass)
   let startedAtMs = diagNowMs()
   var stage = "get-stream"
   var getStreamMs = 0'i64
@@ -2608,10 +3388,11 @@ proc dialSubmitExistingStream(
       echo "fabric-submit dial-existing-stage self=",
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " peer=", peerIdString(peerId),
+        " session=", submitSessionClassText(sessionClass),
         " stage=", stage,
         " timeoutMs=", FabricSubmitGetStreamTimeout.milliseconds
     stream = await awaitSubmitFutureWithin(
-      network.switch.connManager.getStream(peerId),
+      network.switch.connManager.getStream(muxer),
       FabricSubmitGetStreamTimeout,
       "submit getStream timeout",
     )
@@ -2621,6 +3402,7 @@ proc dialSubmitExistingStream(
         echo "fabric-submit dial-existing-nil-stream self=",
           (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
           " peer=", peerIdString(peerId),
+          " session=", submitSessionClassText(sessionClass),
           " stage=", stage,
           " elapsedMs=", getStreamMs
       if escalateBlocked:
@@ -2635,6 +3417,7 @@ proc dialSubmitExistingStream(
       echo "fabric-submit dial-existing-stage self=",
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " peer=", peerIdString(peerId),
+        " session=", submitSessionClassText(sessionClass),
         " stage=", stage,
         " timeoutMs=", FabricSubmitBeginProtocolTimeout.milliseconds
     await awaitSubmitFutureWithin(
@@ -2650,6 +3433,7 @@ proc dialSubmitExistingStream(
         echo "fabric-submit dial-existing-stage self=",
           (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
           " peer=", peerIdString(peerId),
+          " session=", submitSessionClassText(sessionClass),
           " stage=", stage,
           " warnMs=", FabricSubmitSelectTimeout.milliseconds
       # MultistreamSelect 自己已经有读写超时，这里不能再外包一个更短的总超时，
@@ -2671,6 +3455,7 @@ proc dialSubmitExistingStream(
           echo "fabric-submit dial-existing-slow self=",
             (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
             " peer=", peerIdString(peerId),
+            " session=", submitSessionClassText(sessionClass),
             " totalMs=", totalMs,
             " getStreamMs=", getStreamMs,
             " beginProtocolMs=", beginProtoMs - getStreamMs,
@@ -2679,6 +3464,7 @@ proc dialSubmitExistingStream(
           echo "fabric-submit dial-existing-select-slow self=",
             (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
             " peer=", peerIdString(peerId),
+            " session=", submitSessionClassText(sessionClass),
             " totalMs=", totalMs,
             " selectMs=", selectMs - beginProtoMs,
             " warnMs=", FabricSubmitSelectTimeout.milliseconds
@@ -2696,6 +3482,7 @@ proc dialSubmitExistingStream(
       echo "fabric-submit dial-existing-fail self=",
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " peer=", peerIdString(peerId),
+        " session=", submitSessionClassText(sessionClass),
         " stage=", stage,
         " elapsedMs=", diagNowMs() - startedAtMs,
         " getStreamMs=", getStreamMs,
@@ -2713,10 +3500,6 @@ proc dialSubmitExistingStream(
     if not stream.isNil:
       closeSubmitConnSoon(stream, "dial-existing-fail")
     return nil
-
-proc dialSubmitPeer(
-    network: FabricNetwork, peerId: PeerId, allowRedial: bool, forceFresh = false
-): Future[Connection] {.async: (raises: [CancelledError]).}
 
 proc probeSubmitTransport(
     network: FabricNetwork, peerId: PeerId
@@ -2743,80 +3526,110 @@ proc probeSubmitTransport(
     if session.isNil or session.openLock.isNil:
       network.setSubmitPeerTransportVerified(peerId, false, "probe-session-missing")
       return false
-    var stream: Connection = nil
-    var openLockHeld = false
     let selfPeerText =
       if network.switch.isNil: ""
       else: peerIdString(network.switch.peerInfo.peerId)
-    let probeKey = "warm:" & selfPeerText
-    let encoded = encodeSubmitFrame(0, @[FabricSubmitEnvelope(
-      itemKey: probeKey,
-      kind: fskWarm,
-      payload: selfPeerText,
-      scopePrefix: @[],
-    )])
-    if encoded.isNone():
-      network.setSubmitPeerTransportVerified(peerId, false, "probe-encode-fail")
-      return false
-    try:
-      await session.openLock.acquire()
-      openLockHeld = true
-      if network.submitPeerStreamReady(peerId, fsscEvent):
-        network.setSubmitPeerTransportVerified(peerId, true, "probe-reuse-ready")
-        return true
-      if not state.isNil and not state.streamLock.isNil:
-        await state.streamLock.acquire()
-        try:
-          if network.submitPeerStreamReady(peerId, fsscEvent):
-            network.setSubmitPeerTransportVerified(peerId, true, "probe-reuse-ready")
-            return true
-          network.clearSubmitPeerStream(peerId, fsscEvent, "probe-stale")
-          stream = await network.dialSubmitExistingStream(
-            peerId,
-            escalateBlocked = true,
-          )
-        finally:
-          try:
-            if state.streamLock.locked():
-              state.streamLock.release()
-          except AsyncLockError:
-            discard
-      else:
-        network.clearSubmitPeerStream(peerId, fsscEvent, "probe-stale")
-        stream = await network.dialSubmitExistingStream(
+    proc probeKeepSessionStream(
+        sessionClass: FabricSubmitSessionClass,
+        failReason: string,
+    ): Future[bool] {.async: (raises: [CancelledError]).} =
+      let probeKey = "warm:" & selfPeerText & ":" & submitSessionClassText(sessionClass)
+      let encoded = encodeSubmitFrame(0, @[FabricSubmitEnvelope(
+        itemKey: probeKey,
+        kind: fskWarm,
+        payload: selfPeerText,
+        scopePrefix: @[],
+      )])
+      if encoded.isNone():
+        return false
+      let probeSession = network.getOrCreateSubmitSession(peerId, sessionClass)
+      if probeSession.isNil or probeSession.openLock.isNil:
+        return false
+      let keepWarmStream = true
+      var stream: Connection = nil
+      var openLockHeld = false
+      var reservedSlot = -1
+      var keepStream = false
+      try:
+        await probeSession.openLock.acquire()
+        openLockHeld = true
+        if network.submitPeerStreamReady(peerId, sessionClass):
+          return true
+        let reserved = await network.reserveSubmitSessionStream(
           peerId,
+          probeSession,
           escalateBlocked = true,
         )
-      if stream.isNil or stream.closed or stream.atEof:
+        stream = reserved.conn
+        reservedSlot = reserved.slotIdx
+        if reservedSlot < 0 and network.submitPeerStreamReady(peerId, sessionClass):
+          return true
+        if stream.isNil or stream.closed or stream.atEof:
+          return false
+        await stream.writeLp(bytesOf(encoded.get()))
+        let readFuture = stream.readLp(SubmitAckMaxBytes)
+        let completed = await withTimeout(readFuture, FabricSubmitAckTimeout)
+        if not completed:
+          if not readFuture.finished():
+            readFuture.cancelSoon()
+          return false
+        let ack = readFuture.read()
+        if ack.len == 0:
+          return false
+        let ackFrame = safeDecode[FabricSubmitAckFrame](stringOf(ack))
+        if ackFrame.isNone() or ackFrame.get().requestId != 0 or
+            ackFrame.get().items.len != 1 or
+            ackFrame.get().items[0].itemKey != probeKey or
+            not ackFrame.get().items[0].accepted:
+          return false
+        if keepWarmStream:
+          keepStream = true
+          stream = nil
+          when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+            echo "fabric-submit probe-keep self=",
+              selfPeerText,
+              " peer=", peerIdString(peerId),
+              " session=", submitSessionClassText(sessionClass)
+        return true
+      except CancelledError as exc:
+        raise exc
+      except CatchableError as exc:
+        when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+          echo "fabric-submit probe-fail self=",
+            selfPeerText,
+            " peer=", peerIdString(peerId),
+            " session=", submitSessionClassText(sessionClass),
+            " reason=", failReason,
+            " err=", exc.msg
+        return false
+      finally:
+        if openLockHeld:
+          try:
+            if probeSession.openLock.locked():
+              probeSession.openLock.release()
+          except AsyncLockError:
+            discard
+        if reservedSlot >= 0:
+          network.releaseSubmitSessionStream(
+            peerId,
+            sessionClass,
+            reservedSlot,
+            stream,
+            if keepStream: "" else: "probe-finally",
+          )
+        elif not stream.isNil:
+          closeSubmitConnSoon(stream, "probe-finally")
+    try:
+      if not await probeKeepSessionStream(fsscEvent, "probe-event-stream"):
         network.setSubmitPeerTransportVerified(peerId, false, "probe-stream-invalid")
         return false
-      await stream.writeLp(bytesOf(encoded.get()))
-      let readFuture = stream.readLp(SubmitAckMaxBytes)
-      let completed = await withTimeout(readFuture, FabricSubmitAckTimeout)
-      if not completed:
-        if not readFuture.finished():
-          readFuture.cancelSoon()
-        network.setSubmitPeerTransportVerified(peerId, false, "probe-ack-timeout")
+      if not await probeKeepSessionStream(fsscAttestation, "probe-attestation-stream"):
+        network.setSubmitPeerTransportVerified(peerId, false, "probe-attestation-stream-invalid")
         return false
-      let ack = readFuture.read()
-      if ack.len == 0:
-        network.setSubmitPeerTransportVerified(peerId, false, "probe-ack-empty")
+      if not await probeKeepSessionStream(fsscEventCertificate, "probe-cert-stream"):
+        network.setSubmitPeerTransportVerified(peerId, false, "probe-cert-stream-invalid")
         return false
-      let ackFrame = safeDecode[FabricSubmitAckFrame](stringOf(ack))
-      if ackFrame.isNone() or ackFrame.get().requestId != 0 or
-          ackFrame.get().items.len != 1 or
-          ackFrame.get().items[0].itemKey != probeKey or
-          not ackFrame.get().items[0].accepted:
-        network.setSubmitPeerTransportVerified(peerId, false, "probe-ack-invalid")
-        return false
-      state.streams[fsscEvent].slots[0].conn = stream
-      state.streams[fsscEvent].slots[0].generation = state.baseGeneration
-      state.streams[fsscEvent].slots[0].busy = false
-      stream = nil
-      when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
-        echo "fabric-submit probe-keep self=",
-          selfPeerText,
-          " peer=", peerIdString(peerId)
+      discard await probeKeepSessionStream(fsscControl, "probe-control-stream")
       network.setSubmitPeerTransportVerified(peerId, true, "probe-ok")
       return true
     except CancelledError as exc:
@@ -2829,19 +3642,10 @@ proc probeSubmitTransport(
           " err=", exc.msg
       network.setSubmitPeerTransportVerified(peerId, false, "probe-exception")
       return false
-    finally:
-      if openLockHeld:
-        try:
-          if session.openLock.locked():
-            session.openLock.release()
-        except AsyncLockError:
-          discard
-      if not stream.isNil:
-        closeSubmitConnSoon(stream, "probe-finally")
 
   await state.lock.acquire()
   try:
-    if state.transportVerified and not state.transportBlocked and network.switch.isConnected(peerId):
+    if network.switch.isConnected(peerId) and state.transportVerified:
       return true
     if state.probeRunner.isNil or state.probeRunner.finished():
       state.probeRunner = runProbe()
@@ -2872,7 +3676,7 @@ proc probeSubmitTransport(
         discard
 
 proc dialSubmitPeer(
-    network: FabricNetwork, peerId: PeerId, allowRedial: bool, forceFresh = false
+    network: FabricNetwork, peerId: PeerId, allowRedial: bool
 ): Future[Connection] {.async: (raises: [CancelledError]).} =
   if network.isNil or network.switch.isNil or peerId.data.len == 0:
     return nil
@@ -2891,7 +3695,6 @@ proc dialSubmitPeer(
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " peer=", peerIdString(peerId),
         " stage=dial-submit-peer",
-        " forceFresh=", forceFresh,
         " connected=", connected,
         " selectedBaseOutgoing=", selectedBaseOutgoing,
         " addrs=", addrs.len,
@@ -2900,7 +3703,7 @@ proc dialSubmitPeer(
         " peerStoreList=", peerStoreList,
         " hintList=", hintList,
         " list=", dialList
-    if connected and not forceFresh:
+    if connected:
       return await network.dialSubmitExistingStream(peerId)
     if not allowRedial:
       when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
@@ -2912,15 +3715,12 @@ proc dialSubmitPeer(
       when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
         echo "fabric-submit dial-no-addrs self=",
           (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-          " peer=", peerIdString(peerId),
-          " forceFresh=", forceFresh
+          " peer=", peerIdString(peerId)
       return nil
     return await network.switch.dial(
       peerId,
       addrs,
       @[SubmitFabricCodec],
-      forceDial = forceFresh,
-      reuseConnection = not forceFresh,
     )
   except CancelledError as exc:
     raise exc
@@ -2929,7 +3729,6 @@ proc dialSubmitPeer(
       echo "fabric-submit dial-fail self=",
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " peer=", peerIdString(peerId),
-        " forceFresh=", forceFresh,
         " err=", exc.msg
     return nil
 
@@ -2944,7 +3743,9 @@ proc ensureSubmitPeerConnected*(
   let state = network.getOrCreateSubmitPeerConnect(peerId)
   if state.isNil or state.lock.isNil:
     return false
+  let liveOwnerId = network.submitPeerLiveBaseOwnerId(peerId)
   let liveOwner = network.submitPeerLiveBaseOwnerState(peerId)
+  state.connectedBaseOwnerId = liveOwnerId
   state.connectedBaseOwnerKnown = liveOwner.known
   state.localOwnsConnectedBase = liveOwner.localOwns
   var effectiveForceRepair = forceRepair
@@ -3242,7 +4043,7 @@ proc ensureSubmitPeerConnected*(
 proc schedulePendingSubmitRepair(
     network: FabricNetwork, peerId: PeerId, peerIdText: string
 ) {.gcsafe, raises: [].} =
-  if network.isNil or network.switch.isNil or peerId.data.len == 0:
+  if network.isNil or network.switch.isNil or peerId.data.len == 0 or network.stopping:
     return
   let state = network.getOrCreateSubmitPeerConnect(peerId)
   if state.isNil:
@@ -3264,7 +4065,7 @@ proc schedulePendingSubmitRepair(
 proc ensureSubmitPeerConnectivity*(
     network: FabricNetwork, peerId: PeerId, lane: FabricSubmitLane
 ): Future[bool] {.async: (raises: [CancelledError]).} =
-  if network.isNil or network.switch.isNil or peerId.data.len == 0:
+  if network.isNil or network.switch.isNil or peerId.data.len == 0 or network.stopping:
     return false
   await network.enqueueSubmitPeerCommand(peerId, FabricSubmitPeerCommand(
     kind: fspckEnsureLane,
@@ -3278,7 +4079,7 @@ proc ensureSubmitPeerConnectivity*(
 proc ensureSubmitPeerConnectivity*(
     network: FabricNetwork, peerIdText: string, lane: FabricSubmitLane
 ) {.gcsafe, raises: [].} =
-  if network.isNil or peerIdText.len == 0:
+  if network.isNil or peerIdText.len == 0 or network.stopping:
     return
   let peerId = PeerId.init(peerIdText).valueOr:
     return
@@ -3298,7 +4099,7 @@ proc ensureSubmitPeerConnectivity*(
   network.ensureSubmitPeerConnectivity(peerIdText, fslEvent)
 
 proc warmSubmitConnections*(network: FabricNetwork): Future[void] {.async: (raises: [CancelledError]).} =
-  if network.isNil or not network.isLsmrSubmitMode():
+  if network.isNil or not network.isLsmrSubmitMode() or network.stopping:
     return
   for peerId in network.desiredSubmitPeers():
     if network.switch.isNil:
@@ -3330,7 +4131,7 @@ proc scheduleWarmSubmitPeer(
     network: FabricNetwork, peerId: PeerId
 ) {.gcsafe, raises: [].} =
   if network.isNil or network.switch.isNil or not network.isLsmrSubmitMode() or
-      peerId.data.len == 0:
+      peerId.data.len == 0 or network.stopping:
     return
   network.scheduleSubmitPeerCommand(peerId, FabricSubmitPeerCommand(
     kind: fspckWarm,
@@ -3341,7 +4142,7 @@ proc scheduleWarmSubmitPeer(
   ))
 
 proc scheduleWarmSubmitConnections*(network: FabricNetwork) {.gcsafe, raises: [].} =
-  if network.isNil or not network.isLsmrSubmitMode():
+  if network.isNil or not network.isLsmrSubmitMode() or network.stopping:
     return
   inc network.submitWarmGeneration
   if not network.submitWarmDelayRunner.isNil and not network.submitWarmDelayRunner.finished():
@@ -3419,13 +4220,16 @@ proc runSubmitRequestRpc(
   var drainedInflight = false
   template dropSubmitStream(reason: string) =
     block:
-      network.releaseSubmitSessionStream(
-        peerId,
-        currentBatch.transportClass,
-        reservedSlot,
-        stream,
-        reason,
-      )
+      if reservedSlot >= 0:
+        network.releaseSubmitSessionStream(
+          peerId,
+          currentBatch.transportClass,
+          reservedSlot,
+          stream,
+          reason,
+        )
+      elif not stream.isNil:
+        closeSubmitConnSoon(stream, reason)
       reservedSlot = -1
       stream = nil
   template markSubmitFailure(stage: string) =
@@ -3799,6 +4603,7 @@ proc runSubmitRequestRpc(
         stream,
       )
       reservedSlot = -1
+      stream = nil
     var shouldSchedule = false
     var inflightAfter = 0
     var queuedAfter = 0
@@ -3830,11 +4635,53 @@ proc runSubmitRequestRpc(
     if drainedInflight:
       network.schedulePendingSubmitRepair(peerId, peerIdText)
     if shouldSchedule:
-      network.scheduleSubmitSession(
+      await network.signalSubmitSessionDispatch(
         peerId,
         peerIdText,
         session.transportClass,
+        session.streamSlot,
       )
+
+proc signalSubmitSessionDispatch(
+    network: FabricNetwork,
+    peerId: PeerId,
+    peerIdText: string,
+    sessionClass: FabricSubmitSessionClass,
+    sessionShard = 0,
+): Future[void] {.async: (raises: [CancelledError]).} =
+  if network.isNil or peerId.data.len == 0:
+    return
+  let session = network.getOrCreateSubmitSession(peerId, sessionClass, sessionShard)
+  if session.isNil:
+    return
+  var queued = 0
+  var runnerAlive = false
+  await session.lock.acquire()
+  try:
+    queued = session.submitPendingLen()
+    if queued > 0:
+      session.dispatchPending = true
+    runnerAlive =
+      not session.dispatchRunner.isNil and
+      not session.dispatchRunner.finished()
+  finally:
+    try:
+      if session.lock.locked():
+        session.lock.release()
+    except AsyncLockError:
+      discard
+  if queued == 0:
+    return
+  if runnerAlive:
+    if not session.dispatchEvent.isNil:
+      session.dispatchEvent.fire()
+    return
+  await network.dispatchSubmitSessionDirect(
+    peerId,
+    peerIdText,
+    sessionClass,
+    sessionShard,
+  )
 
 proc dispatchSubmitSessionDirect(
     network: FabricNetwork,
@@ -3842,13 +4689,29 @@ proc dispatchSubmitSessionDirect(
     peerIdText: string,
     sessionClass: FabricSubmitSessionClass,
     sessionShard = 0,
-) {.gcsafe, raises: [].} =
+): Future[void] {.async: (raises: [CancelledError]).} =
   if network.isNil or peerId.data.len == 0:
     return
   let lane = submitSessionClassLane(sessionClass)
   let session = network.getOrCreateSubmitSession(peerId, sessionClass, sessionShard)
   let state = network.getOrCreateSubmitPeerConnect(peerId)
-  if session.isNil or not session.submitHasPending():
+  if session.isNil:
+    return
+  var queued = 0
+  var inflight = 0
+  await session.lock.acquire()
+  try:
+    queued = session.submitPendingLen()
+    inflight = session.inflightCount
+    if queued > 0:
+      session.dispatchPending = true
+  finally:
+    try:
+      if session.lock.locked():
+        session.lock.release()
+    except AsyncLockError:
+      discard
+  if queued == 0:
     when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
       echo "fabric-submit dispatch-stop self=",
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
@@ -3856,17 +4719,28 @@ proc dispatchSubmitSessionDirect(
         " reason=no-pending"
     return
   if not network.submitTransportDispatchable(peerId, lane):
-    when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
-      let state = network.submitPeerConnects.getOrDefault($peerId)
-      echo "fabric-submit dispatch-stop self=",
-        (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-        " peer=", peerIdText,
-        " reason=not-dispatchable",
-        " connected=", network.switch.isConnected(peerId),
-        " blocked=", (if state.isNil: false else: state.transportBlocked),
-        " inflight=", session.inflightCount,
-        " queued=", session.submitPendingLen()
-    return
+    if network.submitHotSessionNeedsDirectProbe(peerId, sessionClass):
+      discard await network.probeSubmitTransport(peerId)
+    if network.submitTransportDispatchable(peerId, lane):
+      discard
+    else:
+      network.scheduleSubmitSession(
+        peerId,
+        peerIdText,
+        sessionClass,
+        sessionShard,
+      )
+      when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+        let state = network.submitPeerConnects.getOrDefault($peerId)
+        echo "fabric-submit dispatch-stop self=",
+          (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+          " peer=", peerIdText,
+          " reason=not-dispatchable",
+          " connected=", network.switch.isConnected(peerId),
+          " blocked=", (if state.isNil: false else: state.transportBlocked),
+          " inflight=", inflight,
+          " queued=", queued
+      return
   if not session.dispatchRunner.isNil and not session.dispatchRunner.finished():
     if not session.dispatchEvent.isNil:
       session.dispatchEvent.fire()
@@ -3875,20 +4749,37 @@ proc dispatchSubmitSessionDirect(
         (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
         " peer=", peerIdText,
         " reason=runner-alive",
-        " inflight=", session.inflightCount,
-        " queued=", session.submitPendingLen()
+        " inflight=", inflight,
+        " queued=", queued
     return
 
   proc launch() {.async, gcsafe.} =
     while not network.isNil:
-      if session.dispatchEvent.isNil:
-        return
-      await session.dispatchEvent.wait()
-      session.dispatchEvent.clear()
+      var shouldWait = false
+      await session.lock.acquire()
+      try:
+        if session.dispatchPending:
+          session.dispatchPending = false
+        else:
+          shouldWait = true
+      finally:
+        try:
+          if session.lock.locked():
+            session.lock.release()
+        except AsyncLockError:
+          discard
+      if shouldWait:
+        if session.dispatchEvent.isNil:
+          return
+        await session.dispatchEvent.wait()
+        session.dispatchEvent.clear()
+        continue
       while not network.isNil:
         var launchBatch: FabricSubmitRpcBatch
         var hasBatch = false
         var dispatchReason = "none"
+        var dispatchQueued = 0
+        var dispatchInflight = 0
         await session.lock.acquire()
         try:
           if session.inflightCount >= session.submitMaxInflight():
@@ -3905,6 +4796,8 @@ proc dispatchSubmitSessionDirect(
               inc session.inflightCount
               launchBatch = batch
               hasBatch = true
+          dispatchQueued = session.submitPendingLen()
+          dispatchInflight = session.inflightCount
         finally:
           try:
             if session.lock.locked():
@@ -3912,8 +4805,20 @@ proc dispatchSubmitSessionDirect(
           except AsyncLockError:
             discard
 
-        when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
-          if not hasBatch:
+        if not hasBatch:
+          if dispatchReason == "not-dispatchable" and
+              network.submitHotSessionNeedsDirectProbe(peerId, sessionClass):
+            let repaired = await network.probeSubmitTransport(peerId)
+            if repaired and network.submitTransportDispatchable(peerId, lane):
+              continue
+          if dispatchReason == "not-dispatchable":
+            network.scheduleSubmitSession(
+              peerId,
+              peerIdText,
+              sessionClass,
+              sessionShard,
+            )
+          when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
             let state = network.submitPeerConnects.getOrDefault($peerId)
             echo "fabric-submit dispatch-stop self=",
               (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
@@ -3921,18 +4826,16 @@ proc dispatchSubmitSessionDirect(
               " reason=", dispatchReason,
               " connected=", network.switch.isConnected(peerId),
               " blocked=", (if state.isNil: false else: state.transportBlocked),
-              " inflight=", session.inflightCount,
-              " queued=", session.submitPendingLen()
-          else:
-            echo "fabric-submit dispatch-launch self=",
-              (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
-              " peer=", peerIdText,
-              " batches=1",
-              " inflight=", session.inflightCount,
-              " queued=", session.submitPendingLen()
-
-        if not hasBatch:
+              " inflight=", dispatchInflight,
+              " queued=", dispatchQueued
           break
+        when defined(fabric_submit_diag) or defined(fabric_lsmr_diag):
+          echo "fabric-submit dispatch-launch self=",
+            (if network.switch.isNil: "" else: peerIdString(network.switch.peerInfo.peerId)),
+            " peer=", peerIdText,
+            " batches=1",
+            " inflight=", dispatchInflight,
+            " queued=", dispatchQueued
 
         try:
           await network.runSubmitRequestRpc(peerId, peerIdText, launchBatch)
@@ -4149,6 +5052,7 @@ proc newFabricNetwork*(
     checkpointBundleHandler: CheckpointBundleHandler = nil,
     avoProposalHandler: AvoProposalHandler = nil,
     avoApprovalHandler: AvoApprovalHandler = nil,
+    submitHotAcceptIdleHook: proc() {.gcsafe, raises: [].} = nil,
 ): FabricNetwork =
   if routingMode != RoutingPlaneMode.legacyOnly and lsmrConfig.isNone():
     raise newException(ValueError, "lsmr routing requires lsmrConfig")
@@ -4157,6 +5061,7 @@ proc newFabricNetwork*(
     addrs = addresses,
     secureManagers = [SecureProtocol.Noise],
     maxConnsPerPeer = 2,
+    transportFlags = {ServerFlags.TcpNoDelay},
   ).withPrivateKey(identity.privateKey)
   builder = builder.withRoutingPlanes(routingMode, primaryPlane)
   lsmrConfig.withValue(lsmrCfg):
@@ -4191,11 +5096,24 @@ proc newFabricNetwork*(
     submitSessions: initTable[string, FabricSubmitSession](),
     submitPeerConnects: initTable[string, FabricSubmitPeerConnect](),
     submitPeerAddrHints: initTable[string, seq[MultiAddress]](),
+    controlFetchSessions: initTable[string, FabricControlFetchSession](),
+    controlFetchResponseLocks: initTable[string, AsyncLock](),
+    controlFetchResponseFlights: initTable[string, Future[FetchResponse]](),
+    stopping: false,
     submitWarmRunner: nil,
     submitWarmPending: false,
     submitWarmDelayRunner: nil,
     submitWarmGeneration: 0'u64,
+    submitHotInbox: initDeque[FabricSubmitInboxItem](),
     submitInbox: initDeque[FabricSubmitInboxItem](),
+    submitInboxPending: false,
+    submitAcceptEpoch: 0'u64,
+    submitHotDrainActive: false,
+    submitHotAckYieldActive: 0,
+    submitHotResumePending: false,
+    submitHotBackgroundResumePending: false,
+    submitHotAcceptIdleEvent: newAsyncEvent(),
+    submitHotAcceptIdleHook: submitHotAcceptIdleHook,
     peerHandler: peerHandler,
     eventHandler: eventHandler,
     attestationHandler: attestationHandler,
@@ -4332,7 +5250,10 @@ proc start*(network: FabricNetwork) {.async.} =
       warn "fabric bootstrap connect failed", addr = raw, err = exc.msg
 
 proc stop*(network: FabricNetwork) {.async.} =
-  if not network.isNil and not network.switch.isNil:
+  if network.isNil:
+    return
+  await network.prepareStop()
+  if not network.switch.isNil:
     if not network.submitConnEventHandler.isNil:
       network.switch.removeConnEventHandler(
         network.submitConnEventHandler,
@@ -4349,6 +5270,24 @@ proc publishPayload(network: FabricNetwork, topic: string, payload: string): Fut
     discard await network.gossip.publish(topic, bytesOf(payload))
   except CatchableError:
     discard
+
+proc prepareStop*(network: FabricNetwork) {.async.} =
+  if network.isNil or network.stopping:
+    return
+  network.stopping = true
+  network.submitWarmPending = false
+  for session in network.controlFetchSessions.values():
+    if session.isNil or session.lock.isNil:
+      continue
+    await session.lock.acquire()
+    try:
+      await session.closeControlFetchConn("network-prepare-stop")
+    finally:
+      try:
+        if session.lock.locked():
+          session.lock.release()
+      except AsyncLockError:
+        discard
 
 proc publishPeerAnnouncement*(network: FabricNetwork, item: PeerAnnouncement): Future[void] =
   let payload = safeEncode(item)
@@ -4551,12 +5490,30 @@ proc submitFramePayloadAcked(
     for shardIdx in 0 ..< submitSessionShardCount(sessionClass):
       if (shardBits and submitSessionShardBit(shardIdx)) == 0:
         continue
-      network.scheduleSubmitSession(
-        peerId,
-        peerIdText,
-        sessionClass,
-        shardIdx,
-      )
+      let lane = submitSessionClassLane(sessionClass)
+      if not network.submitTransportDispatchable(peerId, lane) and
+          network.submitHotSessionNeedsDirectProbe(peerId, sessionClass):
+        try:
+          discard await network.probeSubmitTransport(peerId)
+        except CancelledError:
+          discard
+      if network.submitTransportDispatchable(peerId, lane):
+        try:
+          await network.signalSubmitSessionDispatch(
+            peerId,
+            peerIdText,
+            sessionClass,
+            shardIdx,
+          )
+        except CancelledError:
+          discard
+      else:
+        network.scheduleSubmitSession(
+          peerId,
+          peerIdText,
+          sessionClass,
+          shardIdx,
+        )
 
   for idx, request in requests:
     let chunkAcked =
@@ -4838,6 +5795,94 @@ proc submitCheckpointBundle*(
     timeout = timeout,
   )
 
+proc fetchControlRaw(
+    network: FabricNetwork,
+    peerId: PeerId,
+    key: string,
+    timeout: Duration,
+    maxAttempts: int,
+): Future[FetchResponse] {.async: (raises: [CancelledError, FetchError]).} =
+  if network.isNil or network.switch.isNil or network.stopping:
+    raise (ref FetchError)(
+      msg: "fabric control fetch network unavailable", kind: FetchErrorKind.feConfig
+    )
+  if network.controlFetchMustYieldToLive(key):
+    raise (ref FetchError)(
+      msg: "fabric control fetch requester live-inflight busy",
+      kind: FetchErrorKind.feConfig,
+    )
+  let session = network.getOrCreateControlFetchSession(
+    peerId,
+    controlFetchSessionClass(key),
+  )
+  if session.isNil:
+    raise (ref FetchError)(
+      msg: "fabric control fetch session unavailable", kind: FetchErrorKind.feConfig
+    )
+  if network.controlFetchTargetSummaryMustYield(peerId, key):
+    raise (ref FetchError)(
+      msg: "fabric control fetch live-inflight busy",
+      kind: FetchErrorKind.feConfig,
+    )
+  if network.controlFetchSharedLiveSummaryMustYield(peerId, key):
+    raise (ref FetchError)(
+      msg: "fabric control fetch shared-live-plane busy",
+      kind: FetchErrorKind.feConfig,
+    )
+
+  var attempt = 0
+  var lastErr: ref FetchError
+  while attempt < maxAttempts:
+    inc attempt
+    await session.lock.acquire()
+    try:
+      if not session.conn.isNil:
+        await session.closeControlFetchConn("single-shot")
+      let conn = await network.openControlFetchConn(peerId)
+      try:
+        if network.controlFetchMustYieldToLive(key):
+          raise (ref FetchError)(
+            msg: "fabric control fetch requester live-inflight busy",
+            kind: FetchErrorKind.feConfig,
+          )
+        if network.controlFetchTargetSummaryMustYield(peerId, key):
+          raise (ref FetchError)(
+            msg: "fabric control fetch live-inflight busy",
+            kind: FetchErrorKind.feConfig,
+          )
+        if network.controlFetchSharedLiveSummaryMustYield(peerId, key):
+          raise (ref FetchError)(
+            msg: "fabric control fetch shared-live-plane busy",
+            kind: FetchErrorKind.feConfig,
+          )
+        return await fetchOnConn(
+          conn,
+          key,
+          timeout,
+          DefaultFetchMessageSize,
+        )
+      finally:
+        await closeSubmitConn(conn)
+    except CancelledError as exc:
+      raise exc
+    except FetchError as err:
+      lastErr = err
+    finally:
+      try:
+        if session.lock.locked():
+          session.lock.release()
+      except AsyncLockError:
+        discard
+
+    if lastErr.isNil or attempt >= maxAttempts:
+      break
+
+  if lastErr.isNil:
+    raise (ref FetchError)(
+      msg: "fabric control fetch failed without error", kind: FetchErrorKind.feConfig
+    )
+  raise lastErr
+
 proc fetchRaw*(
     network: FabricNetwork,
     peerIdText: string,
@@ -4845,6 +5890,8 @@ proc fetchRaw*(
     timeout: Duration = 1.seconds,
     maxAttempts = 1,
 ): Future[Option[seq[byte]]] {.async: (raises: []).} =
+  if network.isNil or network.stopping:
+    return none(seq[byte])
   try:
     let peerId = PeerId.init(peerIdText).valueOr:
       when defined(fabric_lsmr_diag):
@@ -4876,13 +5923,23 @@ proc fetchRaw*(
         " connected=", connected,
         " addrs=", addrCount,
         " list=", addrList
-    let response = await fetch(
-      network.switch,
-      peerId,
-      key,
-      timeout = timeout,
-      maxAttempts = max(1, maxAttempts),
-    )
+    let attempts = max(1, maxAttempts)
+    let response =
+      if key.isControlFetchKey():
+        await network.fetchControlRaw(
+          peerId,
+          key,
+          timeout,
+          attempts,
+        )
+      else:
+        await fetch(
+          network.switch,
+          peerId,
+          key,
+          timeout = timeout,
+          maxAttempts = attempts,
+        )
     when defined(fabric_lsmr_diag):
       echo "fabric-net fetch-end self=", peerIdString(network.switch.peerInfo.peerId),
         " t=", diagNowMs(),

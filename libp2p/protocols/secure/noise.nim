@@ -92,6 +92,7 @@ type
   NoiseConnection* = ref object of SecureConn
     readCs: CipherState
     writeCs: CipherState
+    writeLock: AsyncLock
 
   NoiseError* = object of LPStreamError
   NoiseHandshakeError* = object of NoiseError
@@ -535,11 +536,20 @@ proc encryptFrame(
 
   cipherFrame[2 + src.len() ..< cipherFrame.len] = tag
 
-method write*(
+proc writeSerialized(
     sconn: NoiseConnection, message: seq[byte]
-): Future[void] {.async: (raises: [CancelledError, LPStreamError], raw: true).} =
-  # Fast path: `{.async.}` would introduce a copy of `message`
+): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
   const FramingSize = 2 + sizeof(ChaChaPolyTag)
+
+  try:
+    await sconn.writeLock.acquire()
+  except AsyncLockError as exc:
+    raiseAssert("failed to acquire NoiseConnection write lock: " & exc.msg)
+  defer:
+    try:
+      sconn.writeLock.release()
+    except AsyncLockError as exc:
+      raiseAssert("NoiseConnection write lock must be held: " & exc.msg)
 
   let frames = (message.len + MaxPlainSize - 1) div MaxPlainSize
 
@@ -560,9 +570,7 @@ method write*(
       )
     except NoiseNonceMaxError as exc:
       debug "Noise nonce exceeded"
-      let fut = newFuture[void]("noise.write.nonce")
-      fut.fail(exc)
-      return fut
+      raise exc
 
     when defined(libp2p_dump):
       dumpMessage(
@@ -577,9 +585,17 @@ method write*(
 
   sconn.activity = true
 
-  # Write all `cipherFrames` in a single write, to avoid interleaving /
-  # sequencing issues
-  sconn.stream.write(cipherFrames)
+  # `writeCs` is connection-global state, so encrypt+write must be serialized.
+  await sconn.stream.write(cipherFrames)
+
+method write*(
+    sconn: NoiseConnection, message: seq[byte]
+): Future[void] {.async: (raises: [CancelledError, LPStreamError], raw: true).} =
+  if message.len == 0:
+    let fut = newFuture[void]("noise.write.empty")
+    fut.complete()
+    return fut
+  sconn.writeSerialized(message)
 
 method handshake*(
     p: Noise, conn: Connection, initiator: bool, peerId: Opt[PeerId]
@@ -701,6 +717,7 @@ method handshake*(
 
       var tmp =
         NoiseConnection.new(conn, conn.peerId, conn.observedAddr, conn.localAddr)
+      tmp.writeLock = newAsyncLock()
       if initiator:
         tmp.readCs = handshakeRes.cs2
         tmp.writeCs = handshakeRes.cs1

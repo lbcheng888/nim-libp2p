@@ -484,6 +484,7 @@ suite "Tsnet proxy runtime":
     let dir = tempRuntimeDir("direct-paths")
     let cfg = TsnetProviderConfig(
       controlUrl: "http://headscale.local",
+      relayEndpoint: "quic://relay.local",
       authKey: "tskey-client",
       hostname: "client-node",
       stateDir: dir,
@@ -657,6 +658,91 @@ suite "Tsnet proxy runtime":
     check exactTarget.isOk()
     check exactTarget.get().rawAddress == localRaw
     check exactTarget.get().mode == TsnetProxyDialMode.Local
+
+    runtime.stop()
+
+  test "udp exact dial plan returns direct route without relay side effects":
+    let dir = tempRuntimeDir("exact-udp-plan-direct")
+    let cfg = TsnetProviderConfig(
+      controlUrl: "http://headscale.local",
+      authKey: "tskey-client",
+      hostname: "client-node",
+      stateDir: dir,
+      wireguardPort: 41642,
+      bridgeLibraryPath: "",
+      logLevel: "",
+      enableDebug: false,
+      bridgeExtraJson: ""
+    )
+    let runtime = TsnetInAppRuntime.new(
+      cfg,
+      mockMappedTransport(
+        "client-node",
+        2,
+        "100.64.0.11",
+        "fd7a:115c:a1e0::11",
+        "server-node",
+        1,
+        "100.64.0.10"
+      )
+    )
+
+    check runtime.start().isOk()
+    check runtime.ready()
+
+    let advertised = MultiAddress.init("/ip4/100.64.0.10/udp/4001/quic-v1/tsnet").tryGet()
+    let directRaw = MultiAddress.init("/ip4/198.51.100.10/udp/42014/quic-v1").tryGet()
+    check runtime.registerDirectProxyRoute(advertised, directRaw, punched = true).isOk()
+
+    let plan = runtime.planUdpExactDialTarget("ip4", "100.64.0.10", 4001, relayAllowed = false)
+    check plan.ready
+    check plan.mode == TsnetProxyDialMode.DirectRoute
+    check plan.stage == TsnetUdpExactDialStage.DirectRouteReady
+    check plan.rawAddress == directRaw
+
+    runtime.stop()
+
+  test "udp exact dial plan keeps direct and relay independent":
+    let dir = tempRuntimeDir("exact-udp-plan-missing")
+    let cfg = TsnetProviderConfig(
+      controlUrl: "http://headscale.local",
+      authKey: "tskey-client",
+      hostname: "client-node",
+      stateDir: dir,
+      wireguardPort: 41642,
+      bridgeLibraryPath: "",
+      logLevel: "",
+      enableDebug: false,
+      bridgeExtraJson: ""
+    )
+    let runtime = TsnetInAppRuntime.new(
+      cfg,
+      mockMappedTransport(
+        "client-node",
+        2,
+        "100.64.0.11",
+        "fd7a:115c:a1e0::11",
+        "server-node",
+        1,
+        "100.64.0.10"
+      )
+    )
+
+    check runtime.start().isOk()
+    check runtime.ready()
+
+    let directPlan = runtime.planUdpExactDialTarget("ip4", "100.64.0.10", 4001, relayAllowed = false)
+    check not directPlan.ready
+    check directPlan.mode == TsnetProxyDialMode.DirectRoute
+    check directPlan.stage == TsnetUdpExactDialStage.RouteMissing
+
+    let relayPlan = runtime.planUdpExactDialTarget("ip4", "100.64.0.10", 4001, relayAllowed = true)
+    check not relayPlan.ready
+    if relayPlan.stage == TsnetUdpExactDialStage.RelayPending:
+      check relayPlan.mode == TsnetProxyDialMode.RelayBridge
+    else:
+      check relayPlan.mode == TsnetProxyDialMode.DirectRoute
+      check relayPlan.stage == TsnetUdpExactDialStage.RouteMissing
 
     runtime.stop()
 

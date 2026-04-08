@@ -18,6 +18,9 @@ import stream/connection, protocols/protocol, resourcemanager, protobuf/minproto
 logScope:
   topics = "libp2p multistream"
 
+proc multistreamDiagNowMs(): int64 =
+  int64(epochTime() * 1000)
+
 const
   MsgSize = 1024
   CodecV1* = "/multistream/1.0.0"
@@ -43,6 +46,22 @@ proc awaitFutureWithin[T](
     stage: string,
     op: string
 ): Future[T] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).}
+
+proc stageTimeoutWithinBudget(
+    deadline: Moment,
+    budgeted: bool,
+    fallback: Duration,
+    stage: string,
+    op: string
+): Duration {.gcsafe, raises: [MultiStreamError].} =
+  if not budgeted:
+    return fallback
+  let remaining = deadline - Moment.now()
+  if remaining <= ZeroDuration:
+    raise (ref MultiStreamError)(
+      msg: "MultistreamSelect " & stage & " " & op & " timeout"
+    )
+  min(remaining, fallback)
 
 type
   Matcher* = proc(proto: string): bool {.gcsafe, raises: [].}
@@ -93,6 +112,15 @@ proc awaitFutureWithin[T](
       parent: exc,
     )
 
+proc writeBytesWithin(
+    conn: Connection,
+    payload: seq[byte],
+    timeout: Duration,
+    stage: string,
+): Future[void] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
+  let writeFuture = conn.write(payload)
+  await awaitFutureWithin(writeFuture, timeout, stage, "write")
+
 template writeLpWithin(
     conn: Connection,
     payload: untyped,
@@ -111,12 +139,30 @@ proc readSmallLpWithin(
 ): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
   let deadline = Moment.now() + timeout
   let maxLen = uint64(if maxSize < 0: int.high else: maxSize)
+  let diagLpRead =
+    stage.startsWith("handshake") or
+    stage.startsWith("select_first_proto") or
+    stage.startsWith("listener post-handshake")
+  let diagStartedAtMs =
+    if diagLpRead:
+      multistreamDiagNowMs()
+    else:
+      0'i64
   let readChunkSize =
     if maxSize < 0:
       MsgSize + 10
     else:
       max(maxSize + 10, 64)
   var buffer = conn.takePendingReadReplay()
+  var readAttempt = 0
+
+  if diagLpRead:
+    warn "multistream lp read start",
+      conn,
+      stage,
+      bufferedBytes = buffer.len,
+      chunkBytes = readChunkSize,
+      timeoutMs = timeout.milliseconds
 
   while true:
     if buffer.len > 0:
@@ -138,6 +184,16 @@ proc readSmallLpWithin(
           )
         let total = consumed + int(length)
         if buffer.len >= total:
+          let replayBytes = max(buffer.len - total, 0)
+          if diagLpRead:
+            warn "multistream lp read frame ready",
+              conn,
+              stage,
+              frameBytes = int(length),
+              bufferedBytes = buffer.len,
+              replayBytes,
+              attempts = readAttempt,
+              elapsedMs = multistreamDiagNowMs() - diagStartedAtMs
           if buffer.len > total:
             conn.restorePendingReadReplay(buffer[total ..< buffer.len])
           return buffer[consumed ..< total]
@@ -152,13 +208,37 @@ proc readSmallLpWithin(
         msg: "MultistreamSelect " & stage & " read timeout"
       )
 
+    let nextAttempt = readAttempt + 1
+    let chunkReadStartedAtMs =
+      if diagLpRead:
+        multistreamDiagNowMs()
+      else:
+        0'i64
+    if diagLpRead:
+      warn "multistream lp read chunk begin",
+        conn,
+        stage,
+        attempt = nextAttempt,
+        requestedBytes = readChunkSize,
+        bufferedBytes = buffer.len,
+        remainingMs = remaining.milliseconds
     var chunk = newSeqUninit[byte](readChunkSize)
     let readFuture = conn.readOnce(addr chunk[0], chunk.len)
     let readCount = await awaitFutureWithin(readFuture, remaining, stage, "read")
+    inc readAttempt
     if readCount <= 0:
       raise (ref MultiStreamError)(
         msg: "MultistreamSelect " & stage & " empty read"
       )
+    if diagLpRead:
+      warn "multistream lp read chunk done",
+        conn,
+        stage,
+        attempt = readAttempt,
+        bytes = readCount,
+        bufferedBytes = buffer.len + readCount,
+        chunkElapsedMs = multistreamDiagNowMs() - chunkReadStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - diagStartedAtMs
     chunk.setLen(readCount)
     buffer.add(chunk)
 
@@ -169,6 +249,63 @@ proc readLpMessageWithin(
     stage: string,
 ): Future[seq[byte]] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
   await readSmallLpWithin(conn, maxSize, timeout, stage)
+
+proc encodeLpFrameBytes*(payload: openArray[byte]): seq[byte] =
+  let prefix = PB.toBytes(payload.len.uint64)
+  result = newSeqOfCap[byte](prefix.len + payload.len)
+  for b in prefix:
+    result.add(b)
+  for b in payload:
+    result.add(b)
+
+proc encodeLpFrameBytes*(payload: string): seq[byte] =
+  encodeLpFrameBytes(payload.toBytes())
+
+proc tryTakePendingLpMessage(
+    conn: Connection,
+    maxSize: int,
+    stage: string,
+): tuple[ok: bool, payload: seq[byte]] {.raises: [MultiStreamError].} =
+  var buffer = conn.takePendingReadReplay()
+  if buffer.len == 0:
+    return (false, @[])
+
+  let maxLen = uint64(if maxSize < 0: int.high else: maxSize)
+  var consumed = 0
+  var length = 0'u64
+  let decodeRes = PB.getUVarint(buffer.toOpenArray(0, buffer.high), consumed, length)
+  if decodeRes.isErr():
+    conn.restorePendingReadReplay(buffer)
+    if decodeRes.error() == VarintError.Incomplete:
+      return (false, @[])
+    raise (ref MultiStreamError)(
+      msg: "MultistreamSelect " & stage & " invalid length prefix"
+    )
+
+  if length > maxLen:
+    conn.restorePendingReadReplay(buffer)
+    raise (ref MultiStreamError)(
+      msg: "MultistreamSelect " & stage & " exceeds maximum length"
+    )
+
+  if length > uint64(high(int)):
+    conn.restorePendingReadReplay(buffer)
+    raise (ref MultiStreamError)(
+      msg: "MultistreamSelect " & stage & " exceeds host allocation capacity"
+    )
+
+  let total = consumed + int(length)
+  if buffer.len < total:
+    conn.restorePendingReadReplay(buffer)
+    return (false, @[])
+
+  if buffer.len > total:
+    conn.restorePendingReadReplay(buffer[total ..< buffer.len])
+
+  if length == 0'u64:
+    return (true, @[])
+
+  (true, buffer[consumed ..< total])
 
 template readLpWithin(
     conn: Connection,
@@ -314,10 +451,21 @@ proc releasePermit(permit: var ResourcePermit) =
     permit = nil
 
 proc performDialerHandshake(
-    conn: Connection, attemptV2: bool
+    conn: Connection,
+    attemptV2: bool,
+    pipelinedV1Proto: string = "",
+    pipelinedV1TrailingBytes: seq[byte] = @[],
+    totalTimeout: Duration = ZeroDuration,
 ): Future[MultistreamVersion] {.
     async: (raises: [CancelledError, LPStreamError, MultiStreamError])
 .} =
+  let handshakeStartedAtMs = multistreamDiagNowMs()
+  let handshakeDeadline =
+    if totalTimeout > ZeroDuration:
+      Moment.now() + totalTimeout
+    else:
+      Moment.now()
+  let handshakeBudgeted = totalTimeout > ZeroDuration
   let handshakeWriteTimeout =
     when defined(ohos):
       chronos.milliseconds(1500)
@@ -333,7 +481,18 @@ proc performDialerHandshake(
   .} =
     let writeFuture = conn.writeLp(payload)
     try:
-      await awaitFutureWithin(writeFuture, handshakeWriteTimeout, stage, "write")
+      await awaitFutureWithin(
+        writeFuture,
+        stageTimeoutWithinBudget(
+          handshakeDeadline,
+          handshakeBudgeted,
+          handshakeWriteTimeout,
+          stage,
+          "write",
+        ),
+        stage,
+        "write",
+      )
     except MultiStreamError as exc:
       when defined(ohos):
         warn "multistream dialer handshake write timeout", conn, stage,
@@ -341,7 +500,51 @@ proc performDialerHandshake(
       raise exc
 
   warn "multistream dialer handshake begin", conn, attemptV2
-  await writeHandshakeWithTimeout(CodecV1 & "\n", "response1")
+  if not attemptV2 and pipelinedV1Proto.len > 0:
+    let stage =
+      if pipelinedV1TrailingBytes.len > 0:
+        "response1_select_first_proto_app_payload_coalesced"
+      else:
+        "response1_select_first_proto_coalesced"
+    var combined =
+      encodeLpFrameBytes(CodecV1 & "\n") &
+      encodeLpFrameBytes(pipelinedV1Proto & "\n")
+    if pipelinedV1TrailingBytes.len > 0:
+      combined.add(pipelinedV1TrailingBytes)
+    warn "multistream dialer handshake write begin",
+      conn,
+      stage = stage,
+      requested = pipelinedV1Proto,
+      pipelined = true,
+      trailingBytes = pipelinedV1TrailingBytes.len
+    let combinedWriteStartedAtMs = multistreamDiagNowMs()
+    await writeBytesWithin(
+      conn,
+      combined,
+      stageTimeoutWithinBudget(
+        handshakeDeadline,
+        handshakeBudgeted,
+        handshakeWriteTimeout,
+        stage,
+        "write",
+      ),
+      stage,
+    )
+    warn "multistream dialer handshake write done",
+      conn,
+      stage = stage,
+      requested = pipelinedV1Proto,
+      pipelined = true,
+      trailingBytes = pipelinedV1TrailingBytes.len,
+      elapsedMs = multistreamDiagNowMs() - combinedWriteStartedAtMs
+  else:
+    warn "multistream dialer handshake write begin", conn, stage = "response1"
+    let response1WriteStartedAtMs = multistreamDiagNowMs()
+    await writeHandshakeWithTimeout(CodecV1 & "\n", "response1")
+    warn "multistream dialer handshake write done",
+      conn,
+      stage = "response1",
+      elapsedMs = multistreamDiagNowMs() - response1WriteStartedAtMs
   when defined(ohos):
     warn "multistream dialer sent handshake v1", conn
   when defined(libp2p_msquic_debug):
@@ -349,7 +552,26 @@ proc performDialerHandshake(
 
   let response1 =
     try:
-      await readLpMessageWithin(conn, MsgSize, handshakeReadTimeout, "handshake response1")
+      warn "multistream dialer handshake read begin", conn, stage = "response1"
+      let response1ReadStartedAtMs = multistreamDiagNowMs()
+      let payload = await readLpMessageWithin(
+        conn,
+        MsgSize,
+        stageTimeoutWithinBudget(
+          handshakeDeadline,
+          handshakeBudgeted,
+          handshakeReadTimeout,
+          "handshake response1",
+          "read",
+        ),
+        "handshake response1",
+      )
+      warn "multistream dialer handshake read done",
+        conn,
+        stage = "response1",
+        elapsedMs = multistreamDiagNowMs() - response1ReadStartedAtMs,
+        bytes = payload.len
+      payload
     except MultiStreamError as exc:
       when defined(ohos):
         warn "multistream dialer handshake response1 timeout", conn,
@@ -371,7 +593,12 @@ proc performDialerHandshake(
     trace "requesting multistream v2", conn
     when defined(lsmr_diag):
       echo "ms-diag t=", int64(epochTime() * 1000), " ms-handshake-v2-write-begin peer=", $conn.peerId
+    let response2WriteStartedAtMs = multistreamDiagNowMs()
     await writeHandshakeWithTimeout(CodecV2 & "\n", "response2")
+    warn "multistream dialer handshake write done",
+      conn,
+      stage = "response2",
+      elapsedMs = multistreamDiagNowMs() - response2WriteStartedAtMs
     when defined(ohos):
       warn "multistream dialer sent handshake v2", conn
     when defined(libp2p_msquic_debug):
@@ -380,7 +607,24 @@ proc performDialerHandshake(
       try:
         when defined(lsmr_diag):
           echo "ms-diag t=", int64(epochTime() * 1000), " ms-handshake-v2-read-begin peer=", $conn.peerId
-        let hr = await readLpMessageWithin(conn, MsgSize, handshakeReadTimeout, "handshake response2")
+        let response2ReadStartedAtMs = multistreamDiagNowMs()
+        let hr = await readLpMessageWithin(
+          conn,
+          MsgSize,
+          stageTimeoutWithinBudget(
+            handshakeDeadline,
+            handshakeBudgeted,
+            handshakeReadTimeout,
+            "handshake response2",
+            "read",
+          ),
+          "handshake response2",
+        )
+        warn "multistream dialer handshake read done",
+          conn,
+          stage = "response2",
+          elapsedMs = multistreamDiagNowMs() - response2ReadStartedAtMs,
+          bytes = hr.len
         when defined(lsmr_diag):
           echo "ms-diag t=", int64(epochTime() * 1000), " ms-handshake-v2-read-end peer=", $conn.peerId
         hr
@@ -407,6 +651,10 @@ proc performDialerHandshake(
       version = msv1
 
   conn.multistreamVersion = version
+  warn "multistream dialer handshake done",
+    conn,
+    version = $version,
+    elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
   trace "multistream handshake success", conn, version = version
   version
 
@@ -415,6 +663,7 @@ proc attemptProtocolSelectDialer(
     manager: ResourceManager,
     proto: seq[string],
     firstPermit: ResourcePermit,
+    totalTimeout: Duration = ZeroDuration,
 ): Future[
     tuple[
       status: ProtocolSelectStatus,
@@ -423,6 +672,12 @@ proc attemptProtocolSelectDialer(
     ]
   ] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
   var currentPermit = firstPermit
+  let selectDeadline =
+    if totalTimeout > ZeroDuration:
+      Moment.now() + totalTimeout
+    else:
+      Moment.now()
+  let selectBudgeted = totalTimeout > ZeroDuration
 
   if proto.len == 0:
     return (psNoMatch, "", currentPermit)
@@ -431,14 +686,26 @@ proc attemptProtocolSelectDialer(
   writeLpWithin(
     conn,
     psMessage.buffer,
-    protocolSelectWriteTimeout(),
+    stageTimeoutWithinBudget(
+      selectDeadline,
+      selectBudgeted,
+      protocolSelectWriteTimeout(),
+      "protocol_select",
+      "write",
+    ),
     "protocol_select",
   )
 
   let response = readLpWithin(
     conn,
     MsgSize,
-    protocolSelectReadTimeout(),
+    stageTimeoutWithinBudget(
+      selectDeadline,
+      selectBudgeted,
+      protocolSelectReadTimeout(),
+      "protocol_select",
+      "read",
+    ),
     "protocol_select",
   )
   if response.len == 0 or response[0] == byte('/'):
@@ -498,7 +765,11 @@ proc attemptProtocolSelectDialer(
   (psSuccess, selected, currentPermit)
 
 proc select*(
-    m: MultistreamSelect | type MultistreamSelect, conn: Connection, proto: seq[string]
+    m: MultistreamSelect | type MultistreamSelect,
+    conn: Connection,
+    proto: seq[string],
+    firstProtoTrailingBytes: seq[byte] = @[],
+    totalTimeout: Duration = ZeroDuration,
 ): Future[string] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
   when defined(lsmr_diag):
     echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-begin peer=", $conn.peerId, " hasprotos=", proto.len
@@ -528,10 +799,33 @@ proc select*(
   ## Product path stays on multistream v1 until builtin QUIC proves
   ## same-stream multi-flight handshakes stable across desktop and Android.
   let attemptV2 = false
+  let firstProtoPipelined = firstUsed and not attemptV2 and proto[0].len > 0
+  let selectDeadline =
+    if totalTimeout > ZeroDuration:
+      Moment.now() + totalTimeout
+    else:
+      Moment.now()
+  let selectBudgeted = totalTimeout > ZeroDuration
 
   when defined(lsmr_diag):
     echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-performDialerHandshake-begin peer=", $conn.peerId
-  let negotiatedVersion = await performDialerHandshake(conn, attemptV2)
+  let negotiatedVersion = await performDialerHandshake(
+    conn,
+    attemptV2,
+    if firstProtoPipelined: proto[0] else: "",
+    if firstProtoPipelined: firstProtoTrailingBytes else: @[],
+    totalTimeout =
+      if selectBudgeted:
+        stageTimeoutWithinBudget(
+          selectDeadline,
+          selectBudgeted,
+          totalTimeout,
+          "handshake",
+          "total",
+        )
+      else:
+        ZeroDuration,
+  )
   when defined(lsmr_diag):
     echo "ms-diag t=", int64(epochTime() * 1000), " ms-select-performDialerHandshake-end peer=", $conn.peerId, " ver=", $negotiatedVersion
 
@@ -540,7 +834,23 @@ proc select*(
 
   if negotiatedVersion == msv2:
     let psResult =
-      await attemptProtocolSelectDialer(conn, manager, proto, firstPermit)
+      await attemptProtocolSelectDialer(
+        conn,
+        manager,
+        proto,
+        firstPermit,
+        totalTimeout =
+          if selectBudgeted:
+            stageTimeoutWithinBudget(
+              selectDeadline,
+              selectBudgeted,
+              totalTimeout,
+              "protocol_select",
+              "total",
+            )
+          else:
+            ZeroDuration,
+      )
     firstPermit = psResult.firstPermit
     case psResult.status
     of psSuccess:
@@ -555,28 +865,69 @@ proc select*(
   if firstUsed:
     let firstProto = proto[0]
     trace "selecting proto", conn, proto = firstProto
-    try:
-      writeLpWithin(
+    if firstProtoPipelined:
+      warn "multistream dialer select_first_proto write skipped",
         conn,
-        firstProto & "\n",
-        protocolSelectWriteTimeout(),
-        "select_first_proto",
-      )
-    except CancelledError as exc:
-      releasePermit(firstPermit)
-      raise exc
-    except LPStreamError as exc:
-      releasePermit(firstPermit)
-      raise exc
+        requested = firstProto,
+        pipelined = true,
+        trailingBytes = firstProtoTrailingBytes.len
+    else:
+      try:
+        warn "multistream dialer select_first_proto write begin",
+          conn, requested = firstProto
+        let firstProtoWriteStartedAtMs = multistreamDiagNowMs()
+        writeLpWithin(
+          conn,
+          firstProto & "\n",
+          stageTimeoutWithinBudget(
+            selectDeadline,
+            selectBudgeted,
+            protocolSelectWriteTimeout(),
+            "select_first_proto",
+            "write",
+          ),
+          "select_first_proto",
+        )
+        warn "multistream dialer select_first_proto write done",
+          conn,
+          requested = firstProto,
+          elapsedMs = multistreamDiagNowMs() - firstProtoWriteStartedAtMs
+      except CancelledError as exc:
+        releasePermit(firstPermit)
+        raise exc
+      except LPStreamError as exc:
+        releasePermit(firstPermit)
+        raise exc
 
-    var response = string.fromBytes(
-      readLpWithin(
+    var response = ""
+    try:
+      warn "multistream dialer select_first_proto read begin",
+        conn, requested = firstProto
+      let firstProtoReadStartedAtMs = multistreamDiagNowMs()
+      response = string.fromBytes(
+          readLpWithin(
+            conn,
+            MsgSize,
+            stageTimeoutWithinBudget(
+              selectDeadline,
+              selectBudgeted,
+              protocolSelectReadTimeout(),
+              "select_first_proto",
+              "read",
+            ),
+            "select_first_proto",
+          )
+        )
+      warn "multistream dialer select_first_proto read done",
         conn,
-        MsgSize,
-        protocolSelectReadTimeout(),
-        "select_first_proto",
-      )
-    )
+        requested = firstProto,
+        elapsedMs = multistreamDiagNowMs() - firstProtoReadStartedAtMs,
+        bytes = response.len
+    except MultiStreamError as exc:
+      warn "multistream dialer select_first_proto failed",
+        conn, requested = firstProto, err = exc.msg
+      releasePermit(firstPermit)
+      raise exc
     warn "multistream dialer got select_first_proto response",
       conn, requested = firstProto, bytes = response.len
     validateSuffix(response)
@@ -613,12 +964,25 @@ proc select*(
       var permit = permitAttempt.permit
       trace "selecting proto", conn, proto = p
       try:
+        warn "multistream dialer select_proto write begin",
+          conn, requested = p
+        let selectProtoWriteStartedAtMs = multistreamDiagNowMs()
         writeLpWithin(
           conn,
           p & "\n",
-          protocolSelectWriteTimeout(),
+          stageTimeoutWithinBudget(
+            selectDeadline,
+            selectBudgeted,
+            protocolSelectWriteTimeout(),
+            "select_proto",
+            "write",
+          ),
           "select_proto",
         )
+        warn "multistream dialer select_proto write done",
+          conn,
+          requested = p,
+          elapsedMs = multistreamDiagNowMs() - selectProtoWriteStartedAtMs
       except CancelledError as exc:
         releasePermit(permit)
         raise exc
@@ -626,14 +990,35 @@ proc select*(
         releasePermit(permit)
         raise exc
 
-      var response = string.fromBytes(
-        readLpWithin(
-          conn,
-          MsgSize,
-          protocolSelectReadTimeout(),
-          "select_proto",
+      var response = ""
+      try:
+        warn "multistream dialer select_proto read begin",
+          conn, requested = p
+        let selectProtoReadStartedAtMs = multistreamDiagNowMs()
+        response = string.fromBytes(
+          readLpWithin(
+            conn,
+            MsgSize,
+            stageTimeoutWithinBudget(
+              selectDeadline,
+              selectBudgeted,
+              protocolSelectReadTimeout(),
+              "select_proto",
+              "read",
+            ),
+            "select_proto",
+          )
         )
-      )
+        warn "multistream dialer select_proto read done",
+          conn,
+          requested = p,
+          elapsedMs = multistreamDiagNowMs() - selectProtoReadStartedAtMs,
+          bytes = response.len
+      except MultiStreamError as exc:
+        warn "multistream dialer select_proto failed",
+          conn, requested = p, err = exc.msg
+        releasePermit(permit)
+        raise exc
       warn "multistream dialer got select_proto response",
         conn, requested = p, bytes = response.len
       validateSuffix(response)
@@ -650,12 +1035,15 @@ proc select*(
   ""
 
 proc select*(
-    m: MultistreamSelect | type MultistreamSelect, conn: Connection, proto: string
+    m: MultistreamSelect | type MultistreamSelect,
+    conn: Connection,
+    proto: string,
+    totalTimeout: Duration = ZeroDuration,
 ): Future[bool] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
   if proto.len > 0:
-    (await m.select(conn, @[proto])) == proto
+    (await m.select(conn, @[proto], totalTimeout = totalTimeout)) == proto
   else:
-    let negotiated = await m.select(conn, @[])
+    let negotiated = await m.select(conn, @[], totalTimeout = totalTimeout)
     negotiated == CodecV1 or negotiated == CodecV2
 
 proc select*(
@@ -692,6 +1080,7 @@ proc handleMultistreamV1Loop(
 ): Future[string] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
   var messages: seq[seq[byte]]
   var isHandshaked = handshaked
+  let loopStartedAtMs = multistreamDiagNowMs()
 
   if pending.len > 0:
     messages.add(pending)
@@ -719,19 +1108,57 @@ proc handleMultistreamV1Loop(
       await conn.writeLp(encodeProtocolListing(protos))
     of CodecV1:
       if not isHandshaked:
+        warn "multistream listener handshake write begin",
+          conn,
+          stage = "duplicate_v1",
+          elapsedMs = multistreamDiagNowMs() - loopStartedAtMs
+        let duplicateHandshakeWriteStartedAtMs = multistreamDiagNowMs()
         await conn.writeLp(CodecV1 & "\n")
+        warn "multistream listener handshake write done",
+          conn,
+          stage = "duplicate_v1",
+          elapsedMs = multistreamDiagNowMs() - duplicateHandshakeWriteStartedAtMs
         isHandshaked = true
       else:
         trace "handle: acknowledging duplicate handshake while handshaked", conn
+        warn "multistream listener handshake write begin",
+          conn,
+          stage = "already_handshaked_v1",
+          elapsedMs = multistreamDiagNowMs() - loopStartedAtMs
+        let ackHandshakeWriteStartedAtMs = multistreamDiagNowMs()
         await conn.writeLp(CodecV1 & "\n")
+        warn "multistream listener handshake write done",
+          conn,
+          stage = "already_handshaked_v1",
+          elapsedMs = multistreamDiagNowMs() - ackHandshakeWriteStartedAtMs
     elif ms in protos or matchers.anyIt(it(ms)):
       warn "multistream v1 found handler", conn, protocol = ms
+      warn "multistream listener protocol_ack write begin",
+        conn,
+        protocol = ms,
+        elapsedMs = multistreamDiagNowMs() - loopStartedAtMs
+      let protocolAckWriteStartedAtMs = multistreamDiagNowMs()
       await conn.writeLp(ms & "\n")
+      warn "multistream listener protocol_ack write done",
+        conn,
+        protocol = ms,
+        elapsedMs = multistreamDiagNowMs() - protocolAckWriteStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - loopStartedAtMs
       conn.protocol = ms
       return ms
     else:
       warn "multistream v1 no handlers", conn, protocol = ms
+      warn "multistream listener protocol_na write begin",
+        conn,
+        protocol = ms,
+        elapsedMs = multistreamDiagNowMs() - loopStartedAtMs
+      let noHandlerWriteStartedAtMs = multistreamDiagNowMs()
       await conn.writeLp(Na)
+      warn "multistream listener protocol_na write done",
+        conn,
+        protocol = ms,
+        elapsedMs = multistreamDiagNowMs() - noHandlerWriteStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - loopStartedAtMs
 
   ""
 
@@ -747,10 +1174,14 @@ proc handleMultistreamV2(
   await handleProtocolSelect(conn, protos, matchers, message)
 
 proc processListenerHandshake(
-    conn: Connection, firstMessage: seq[byte]
-): Future[tuple[version: MultistreamVersion, pending: seq[byte]]] {.
+    conn: Connection,
+    protos: seq[string],
+    matchers: seq[Matcher],
+    firstMessage: seq[byte]
+): Future[tuple[version: MultistreamVersion, pending: seq[byte], negotiated: string]] {.
     async: (raises: [CancelledError, LPStreamError, MultiStreamError])
 .} =
+  let handshakeStartedAtMs = multistreamDiagNowMs()
   warn "multistream listener handshake begin", conn, bytes = firstMessage.len
   if firstMessage.len == 0:
     raise (ref MultiStreamError)(
@@ -767,16 +1198,112 @@ proc processListenerHandshake(
       msg: "MultistreamSelect handling failed, invalid first message"
     )
 
+  var pending: seq[byte] = @[]
+  var version = msv1
+  var negotiated = ""
+
+  let bufferedNext = tryTakePendingLpMessage(conn, MsgSize, "listener pending post-handshake")
+  if bufferedNext.ok and bufferedNext.payload.len > 0:
+    var nextStr = string.fromBytes(bufferedNext.payload)
+    let preview = nextStr.replace("\n", "\\n").replace("\r", "\\r")
+    warn "multistream listener pending post-handshake content", conn, msg = preview
+    validateSuffix(nextStr)
+    if nextStr == CodecV2:
+      let combined = encodeLpFrameBytes(CodecV1 & "\n") & encodeLpFrameBytes(CodecV2 & "\n")
+      warn "multistream listener handshake write begin",
+        conn,
+        stage = "response1_response2_coalesced",
+        elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
+      let combinedWriteStartedAtMs = multistreamDiagNowMs()
+      let writeFuture = conn.write(combined)
+      await awaitFutureWithin(
+        writeFuture,
+        protocolSelectWriteTimeout(),
+        "listener response1_response2_coalesced",
+        "write",
+      )
+      warn "multistream listener handshake write done",
+        conn,
+        stage = "response1_response2_coalesced",
+        elapsedMs = multistreamDiagNowMs() - combinedWriteStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
+      version = msv2
+      conn.multistreamVersion = version
+      return (version, @[], "")
+    elif nextStr in protos or matchers.anyIt(it(nextStr)):
+      let combined =
+        encodeLpFrameBytes(CodecV1 & "\n") &
+        encodeLpFrameBytes(nextStr & "\n")
+      warn "multistream listener handshake write begin",
+        conn,
+        stage = "response1_protocol_ack_coalesced",
+        elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs,
+        protocol = nextStr
+      let combinedWriteStartedAtMs = multistreamDiagNowMs()
+      let writeFuture = conn.write(combined)
+      await awaitFutureWithin(
+        writeFuture,
+        protocolSelectWriteTimeout(),
+        "listener response1_protocol_ack_coalesced",
+        "write",
+      )
+      warn "multistream listener handshake write done",
+        conn,
+        stage = "response1_protocol_ack_coalesced",
+        elapsedMs = multistreamDiagNowMs() - combinedWriteStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs,
+        protocol = nextStr
+      conn.protocol = nextStr
+      negotiated = nextStr
+      conn.multistreamVersion = version
+      return (version, @[], negotiated)
+    else:
+      let combined =
+        encodeLpFrameBytes(CodecV1 & "\n") &
+        encodeLpFrameBytes(Na)
+      warn "multistream listener handshake write begin",
+        conn,
+        stage = "response1_protocol_na_coalesced",
+        elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs,
+        protocol = nextStr
+      let combinedWriteStartedAtMs = multistreamDiagNowMs()
+      let writeFuture = conn.write(combined)
+      await awaitFutureWithin(
+        writeFuture,
+        protocolSelectWriteTimeout(),
+        "listener response1_protocol_na_coalesced",
+        "write",
+      )
+      warn "multistream listener handshake write done",
+        conn,
+        stage = "response1_protocol_na_coalesced",
+        elapsedMs = multistreamDiagNowMs() - combinedWriteStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs,
+        protocol = nextStr
+      conn.multistreamVersion = version
+      return (version, @[], "")
+
+  warn "multistream listener handshake write begin",
+    conn,
+    stage = "response1",
+    elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
+  let handshakeWriteStartedAtMs = multistreamDiagNowMs()
   await conn.writeLp(CodecV1 & "\n")
+  warn "multistream listener handshake write done",
+    conn,
+    stage = "response1",
+    elapsedMs = multistreamDiagNowMs() - handshakeWriteStartedAtMs,
+    totalElapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
   warn "multistream listener sent handshake v1", conn
   when defined(libp2p_msquic_debug):
     debug "multistream listener sent v1", conn
 
-  var pending: seq[byte] = @[]
-  var version = msv1
-
   when defined(lsmr_diag):
     echo "ms-diag t=", int64(epochTime() * 1000), " ms-listener-next-read-begin peer=", $conn.peerId
+  warn "multistream listener post_handshake read begin",
+    conn,
+    elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
+  let nextReadStartedAtMs = multistreamDiagNowMs()
   let nextMessage =
     await readLpMessageWithin(
       conn,
@@ -786,6 +1313,11 @@ proc processListenerHandshake(
     )
   when defined(lsmr_diag):
     echo "ms-diag t=", int64(epochTime() * 1000), " ms-listener-next-read-end peer=", $conn.peerId
+  warn "multistream listener post_handshake read done",
+    conn,
+    elapsedMs = multistreamDiagNowMs() - nextReadStartedAtMs,
+    totalElapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs,
+    bytes = nextMessage.len
   warn "multistream listener got post-handshake message", conn, bytes = nextMessage.len
   if nextMessage.len > 0:
     var nextStr = string.fromBytes(nextMessage)
@@ -796,7 +1328,17 @@ proc processListenerHandshake(
     validateSuffix(nextStr)
     if nextStr == CodecV2:
       trace "acknowledging multistream v2", conn
+      warn "multistream listener handshake write begin",
+        conn,
+        stage = "response2",
+        elapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
+      let v2HandshakeWriteStartedAtMs = multistreamDiagNowMs()
       await conn.writeLp(CodecV2 & "\n")
+      warn "multistream listener handshake write done",
+        conn,
+        stage = "response2",
+        elapsedMs = multistreamDiagNowMs() - v2HandshakeWriteStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - handshakeStartedAtMs
       when defined(libp2p_msquic_debug):
         debug "multistream listener sent v2", conn
       version = msv2
@@ -804,7 +1346,7 @@ proc processListenerHandshake(
       pending = nextMessage
 
   conn.multistreamVersion = version
-  (version, pending)
+  (version, pending, negotiated)
 
 proc handleProtocolSelect(
     conn: Connection, protos: seq[string], matchers: seq[Matcher], first: seq[byte]
@@ -857,6 +1399,7 @@ proc handle*(
     matchers = newSeq[Matcher](),
     active: bool = false,
 ): Future[string] {.async: (raises: [CancelledError, LPStreamError, MultiStreamError]).} =
+  let handleStartedAtMs = multistreamDiagNowMs()
   warn "multistream handle begin", conn, handshaked = active
 
   let negotiated =
@@ -869,14 +1412,25 @@ proc handle*(
     else:
       when defined(lsmr_diag):
         echo "ms-diag t=", int64(epochTime() * 1000), " ms-listener-handle-begin peer=", $conn.peerId
+      warn "multistream listener first_read begin", conn
+      let firstReadStartedAtMs = multistreamDiagNowMs()
       let first = await conn.readLp(MsgSize)
+      warn "multistream listener first_read done",
+        conn,
+        elapsedMs = multistreamDiagNowMs() - firstReadStartedAtMs,
+        totalElapsedMs = multistreamDiagNowMs() - handleStartedAtMs,
+        bytes = first.len
       if first.len > 0 and first[0] == byte('/'):
-        let (version, pending) = await processListenerHandshake(conn, first)
-        case version
-        of msv2:
-          await handleMultistreamV2(conn, protos, matchers, pending)
+        let (version, pending, negotiated) =
+          await processListenerHandshake(conn, protos, matchers, first)
+        if negotiated.len > 0:
+          negotiated
         else:
-          await handleMultistreamV1Loop(conn, protos, matchers, pending, handshaked = true)
+          case version
+          of msv2:
+            await handleMultistreamV2(conn, protos, matchers, pending)
+          else:
+            await handleMultistreamV1Loop(conn, protos, matchers, pending, handshaked = true)
       else:
         await handleProtocolSelect(conn, protos, matchers, first)
 

@@ -280,6 +280,51 @@ suite "Mobile FFI host network status and muxer preference":
     check snapshot["transportHealth"]["hostNetworkStatus"]["reason"].getStr() == "capabilities_changed"
     check snapshot["hostNetworkStatus"]["ssid"].getStr() == "lab-ssid"
 
+  test "seeded bootstrap accepts global ipv6 from host status without local seed addrs":
+    let handle = newTestNode("host-network-seeded-bootstrap")
+    defer:
+      stopAndFreeNode(handle)
+
+    startNode(handle)
+
+    let statusPayload = %* {
+      "type": "HostNetworkStatus",
+      "networkType": "cellular",
+      "transport": "cellular",
+      "localIpv4": "10.67.35.137",
+      "preferredIpv4": "10.67.35.137",
+      "localIpv6": "240e:43d:682c:222:a0b5:23ff:fe8e:a9d3",
+      "preferredIpv6": "240e:43d:682c:222:a0b5:23ff:fe8e:a9d3",
+      "publicIpv4": "106.34.150.71",
+      "publicIpv6": "240e:43d:682c:222:a0b5:23ff:fe8e:a9d3",
+      "isConnected": true,
+      "isMetered": true,
+      "timestampMs": 1_775_547_616_637'i64,
+      "reason": "manual",
+    }
+    check libp2p_update_host_network_status(handle, ($statusPayload).cstring)
+
+    let bootstrapStatus = safeJsonExpr(libp2p_get_bootstrap_status(handle))
+    check bootstrapStatus["localHasGlobalIpv6"].getBool()
+    check bootstrapStatus["hostPreferredIpv6"].getStr() == "240e:43d:682c:222:a0b5:23ff:fe8e:a9d3"
+    check bootstrapStatus["hostPublicIpv6"].getStr() == "240e:43d:682c:222:a0b5:23ff:fe8e:a9d3"
+
+    let remotePeerId = testIdentity()["peerId"].getStr()
+    let seedAddrs = %*[
+      "/ip6/2001:db8::1/udp/4001/quic-v1/p2p/" & remotePeerId
+    ]
+    let joinResult = safeJsonExpr(
+      libp2p_join_via_seed_bootstrap(
+        handle,
+        remotePeerId.cstring,
+        ($seedAddrs).cstring,
+        "test_host_status_ipv6".cstring,
+        1,
+      )
+    )
+    check joinResult["error"].getStr() != "no_matching_wan_path:local_global_ipv6_unavailable"
+    check joinResult["seedPeerId"].getStr() == remotePeerId
+
   test "tcp peers negotiate yamux first and connectedPeersInfo exposes muxers":
     let nodeA = newTestNode("muxer-a")
     let nodeB = newTestNode("muxer-b")

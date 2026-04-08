@@ -121,12 +121,12 @@ type
     clientTlsBinding*: mstls.TlsCredentialBinding
     retainLock: Lock
     retainLockInit: bool
-    activeConnectionStates: seq[MsQuicConnectionState]
-    activeListenerStates: seq[MsQuicListenerState]
-    activeStreamStates: seq[MsQuicStreamState]
-    retainedConnectionStates: seq[MsQuicConnectionState]
-    retainedListenerStates: seq[MsQuicListenerState]
-    retainedStreamStates: seq[MsQuicStreamState]
+    activeConnectionRoots: Table[pointer, bool]
+    activeListenerRoots: Table[pointer, bool]
+    activeStreamRoots: Table[pointer, bool]
+    retainedConnectionRoots: Table[pointer, bool]
+    retainedListenerRoots: Table[pointer, bool]
+    retainedStreamRoots: Table[pointer, bool]
     closed*: bool
 
   MsQuicConnectionHandler* = proc(event: msevents.ConnectionEvent) {.gcsafe.}
@@ -200,7 +200,8 @@ type
     droppedEvents*: uint64
     readQueue*: Deque[MsQuicReadChunk]
     readWaiters*: seq[Future[seq[byte]]]
-    pendingSends*: seq[MsQuicPendingSend]
+    pendingSendRoots: Table[pointer, bool]
+    pendingSendOrder: seq[pointer]
     localInitiated: bool
     startComplete: bool
     startWaiters: seq[Future[void]]
@@ -318,68 +319,193 @@ template withRetainLock(handle: MsQuicTransportHandle; body: untyped) =
     finally:
       release(handle.retainLock)
 
+proc snapshotRootStates[T](roots: Table[pointer, bool]): seq[T] {.raises: [].} =
+  if roots.len == 0:
+    return @[]
+  result = newSeqOfCap[T](roots.len)
+  for raw in roots.keys:
+    if raw.isNil:
+      continue
+    result.add(cast[T](raw))
+
+proc takeRootStates[T](roots: var Table[pointer, bool]): seq[T] {.raises: [].} =
+  result = snapshotRootStates[T](roots)
+  roots.clear()
+
+proc unrootStates[T](states: seq[T]) {.gcsafe, raises: [].} =
+  for state in states:
+    if state.isNil:
+      continue
+    GC_unref(state)
+
+proc unrootPendingSend(pending: MsQuicPendingSend) {.gcsafe, raises: [].} =
+  if pending.isNil:
+    return
+  GC_unref(pending)
+
+proc unrootPendingSends(pendings: seq[MsQuicPendingSend]) {.gcsafe, raises: [].} =
+  for pending in pendings:
+    unrootPendingSend(pending)
+
+proc rebuildPendingSendOrder(state: MsQuicStreamState) {.raises: [].} =
+  if state.isNil:
+    return
+  if state.pendingSendOrder.len == 0:
+    return
+  var filtered = newSeqOfCap[pointer](state.pendingSendOrder.len)
+  for raw in state.pendingSendOrder:
+    if raw.isNil:
+      continue
+    if not state.pendingSendRoots.contains(raw):
+      continue
+    filtered.add(raw)
+  state.pendingSendOrder = move(filtered)
+
+proc registerPendingSend(state: MsQuicStreamState; pending: MsQuicPendingSend): bool {.gcsafe, raises: [].} =
+  if state.isNil or pending.isNil:
+    return false
+  let raw = cast[pointer](pending)
+  state.withStateLock:
+    if state.closed:
+      return false
+    if state.pendingSendRoots.contains(raw):
+      return true
+    GC_ref(pending)
+    state.pendingSendRoots[raw] = true
+    state.pendingSendOrder.add(raw)
+    return true
+
+proc takePendingSendByRaw(
+    state: MsQuicStreamState;
+    raw: pointer
+): MsQuicPendingSend {.gcsafe, raises: [].} =
+  if state.isNil or raw.isNil:
+    return nil
+  state.withStateLock:
+    if not state.pendingSendRoots.contains(raw):
+      return nil
+    state.pendingSendRoots.del(raw)
+    result = cast[MsQuicPendingSend](raw)
+    rebuildPendingSendOrder(state)
+
+proc takeFirstPendingSend(state: MsQuicStreamState): MsQuicPendingSend {.gcsafe, raises: [].} =
+  if state.isNil:
+    return nil
+  state.withStateLock:
+    rebuildPendingSendOrder(state)
+    while state.pendingSendOrder.len > 0:
+      let raw = state.pendingSendOrder[0]
+      state.pendingSendOrder.delete(0)
+      if raw.isNil:
+        continue
+      if not state.pendingSendRoots.contains(raw):
+        continue
+      state.pendingSendRoots.del(raw)
+      return cast[MsQuicPendingSend](raw)
+
+proc takePendingSends(state: MsQuicStreamState): seq[MsQuicPendingSend] {.gcsafe, raises: [].} =
+  if state.isNil:
+    return @[]
+  state.withStateLock:
+    result = snapshotRootStates[MsQuicPendingSend](state.pendingSendRoots)
+    state.pendingSendRoots.clear()
+    state.pendingSendOrder.setLen(0)
+
 proc retainForLateCallbacks(handle: MsQuicTransportHandle; state: MsQuicConnectionState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    handle.retainedConnectionStates.add(state)
+    let raw = cast[pointer](state)
+    if handle.retainedConnectionRoots.contains(raw):
+      return
+    if not handle.activeConnectionRoots.contains(raw):
+      GC_ref(state)
+    handle.retainedConnectionRoots[raw] = true
 
 proc retainForLateCallbacks(handle: MsQuicTransportHandle; state: MsQuicListenerState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    handle.retainedListenerStates.add(state)
+    let raw = cast[pointer](state)
+    if handle.retainedListenerRoots.contains(raw):
+      return
+    if not handle.activeListenerRoots.contains(raw):
+      GC_ref(state)
+    handle.retainedListenerRoots[raw] = true
 
 proc retainForLateCallbacks(handle: MsQuicTransportHandle; state: MsQuicStreamState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    handle.retainedStreamStates.add(state)
+    let raw = cast[pointer](state)
+    if handle.retainedStreamRoots.contains(raw):
+      return
+    if not handle.activeStreamRoots.contains(raw):
+      GC_ref(state)
+    handle.retainedStreamRoots[raw] = true
 
 proc registerActiveState(handle: MsQuicTransportHandle; state: MsQuicConnectionState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    if handle.activeConnectionStates.find(state) < 0:
-      handle.activeConnectionStates.add(state)
+    let raw = cast[pointer](state)
+    if handle.activeConnectionRoots.contains(raw) or handle.retainedConnectionRoots.contains(raw):
+      return
+    GC_ref(state)
+    handle.activeConnectionRoots[raw] = true
 
 proc registerActiveState(handle: MsQuicTransportHandle; state: MsQuicListenerState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    if handle.activeListenerStates.find(state) < 0:
-      handle.activeListenerStates.add(state)
+    let raw = cast[pointer](state)
+    if handle.activeListenerRoots.contains(raw) or handle.retainedListenerRoots.contains(raw):
+      return
+    GC_ref(state)
+    handle.activeListenerRoots[raw] = true
 
 proc registerActiveState(handle: MsQuicTransportHandle; state: MsQuicStreamState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    if handle.activeStreamStates.find(state) < 0:
-      handle.activeStreamStates.add(state)
+    let raw = cast[pointer](state)
+    if handle.activeStreamRoots.contains(raw) or handle.retainedStreamRoots.contains(raw):
+      return
+    GC_ref(state)
+    handle.activeStreamRoots[raw] = true
 
 proc unregisterActiveState(handle: MsQuicTransportHandle; state: MsQuicConnectionState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    let idx = handle.activeConnectionStates.find(state)
-    if idx >= 0:
-      handle.activeConnectionStates.delete(idx)
+    let raw = cast[pointer](state)
+    if not handle.activeConnectionRoots.contains(raw):
+      return
+    handle.activeConnectionRoots.del(raw)
+    if not handle.retainedConnectionRoots.contains(raw):
+      GC_unref(state)
 
 proc unregisterActiveState(handle: MsQuicTransportHandle; state: MsQuicListenerState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    let idx = handle.activeListenerStates.find(state)
-    if idx >= 0:
-      handle.activeListenerStates.delete(idx)
+    let raw = cast[pointer](state)
+    if not handle.activeListenerRoots.contains(raw):
+      return
+    handle.activeListenerRoots.del(raw)
+    if not handle.retainedListenerRoots.contains(raw):
+      GC_unref(state)
 
 proc unregisterActiveState(handle: MsQuicTransportHandle; state: MsQuicStreamState) =
   if handle.isNil or state.isNil:
     return
   handle.withRetainLock:
-    let idx = handle.activeStreamStates.find(state)
-    if idx >= 0:
-      handle.activeStreamStates.delete(idx)
+    let raw = cast[pointer](state)
+    if not handle.activeStreamRoots.contains(raw):
+      return
+    handle.activeStreamRoots.del(raw)
+    if not handle.retainedStreamRoots.contains(raw):
+      GC_unref(state)
 
 proc resolvedAlpns(cfg: MsQuicTransportConfig): seq[string] =
   if cfg.alpns.len == 0:
@@ -1509,8 +1635,11 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
   forwarded.userContext = state.userContext
   var completedSend: MsQuicPendingSend = nil
   if forwarded.kind == msevents.seSendComplete and not forwarded.clientContext.isNil:
-    completedSend = cast[MsQuicPendingSend](forwarded.clientContext)
-    forwarded.clientContext = completedSend.clientContext
+    completedSend = takePendingSendByRaw(state, forwarded.clientContext)
+    if not completedSend.isNil:
+      forwarded.clientContext = completedSend.clientContext
+    else:
+      forwarded.clientContext = nil
   if forwarded.kind == msevents.seStartComplete:
     when defined(ohos):
       warn "MsQuic stream start complete", stream = cast[uint64](state.stream)
@@ -1603,27 +1732,19 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
     if shouldNotify:
       triggerStreamDelivery(state)
   elif forwarded.kind == msevents.seSendComplete:
-    var matchedPending = false
-    state.withStateLock:
-      if not completedSend.isNil:
-        for idx in 0 ..< state.pendingSends.len:
-          if state.pendingSends[idx] == completedSend:
-            state.pendingSends.delete(idx)
-            matchedPending = true
-            break
-      if not matchedPending:
-        completedSend = nil
-      if completedSend.isNil and state.pendingSends.len > 0:
-        completedSend = state.pendingSends[0]
-        state.pendingSends.delete(0)
+    if completedSend.isNil:
+      completedSend = takeFirstPendingSend(state)
     if completedSend.isNil or completedSend.waiter.isNil:
+      unrootPendingSend(completedSend)
       return
     var waiterFinished = false
     try:
       waiterFinished = completedSend.waiter.finished()
     except CatchableError:
+      unrootPendingSend(completedSend)
       return
     except Exception:
+      unrootPendingSend(completedSend)
       return
     if not waiterFinished:
       if forwarded.cancelled or forwarded.status != msapi.QUIC_STATUS_SUCCESS:
@@ -1635,6 +1756,7 @@ proc handleIncomingStreamEvent(state: MsQuicStreamState;
         )
       else:
         completedSend.waiter.complete()
+    unrootPendingSend(completedSend)
   elif forwarded.kind == msevents.sePeerSendShutdown:
     var shouldNotify = false
     state.withStateLock:
@@ -1717,15 +1839,15 @@ proc markStreamStartComplete*(state: MsQuicStreamState) {.raises: [].} =
 proc failPendingSendWaiters(state: MsQuicStreamState; msg: string) {.gcsafe, raises: [].} =
   if state.isNil:
     return
+  var pendings = takePendingSends(state)
   var waiters: seq[Future[void]] = @[]
-  state.withStateLock:
-    for pending in state.pendingSends:
-      if pending.isNil or pending.waiter.isNil or pending.waiter.finished():
-        continue
-      waiters.add(pending.waiter)
-    state.pendingSends.setLen(0)
+  for pending in pendings:
+    if pending.isNil or pending.waiter.isNil or pending.waiter.finished():
+      continue
+    waiters.add(pending.waiter)
   for fut in waiters:
     fut.fail(newException(CatchableError, msg))
+  unrootPendingSends(pendings)
 
 proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC;
     queueLimit: int; pollInterval: Duration;
@@ -1750,7 +1872,8 @@ proc newMsQuicStreamState(handle: MsQuicTransportHandle; connection: msapi.HQUIC
     droppedEvents: 0,
     readQueue: initDeque[MsQuicReadChunk](),
     readWaiters: @[],
-    pendingSends: @[],
+    pendingSendRoots: initTable[pointer, bool](),
+    pendingSendOrder: @[],
     localInitiated: localInitiated,
     startComplete: not localInitiated,
     startWaiters: @[],
@@ -2318,7 +2441,6 @@ proc enqueueStreamWrite(
   let sendContext = cast[pointer](pending)
 
   state.withStateLock:
-    state.pendingSends.add(pending)
     if pending.payload.len > 0:
       pending.buffer = msapi.QuicBuffer(
         Length: uint32(pending.payload.len),
@@ -2326,6 +2448,10 @@ proc enqueueStreamWrite(
       )
       bufferPtr = addr pending.buffer
       bufferCount = 1
+  if not registerPendingSend(state, pending):
+    if not pending.waiter.isNil and not pending.waiter.finished():
+      pending.waiter.fail(newException(CatchableError, "MsQuic stream closed"))
+    return ("MsQuic stream closed", nil)
 
   let status =
     try:
@@ -2339,26 +2465,20 @@ proc enqueueStreamWrite(
           sendContext
         )
     except CatchableError as exc:
-      state.withStateLock:
-        for idx in 0 ..< state.pendingSends.len:
-          if state.pendingSends[idx] == pending:
-            state.pendingSends.delete(idx)
-            break
+      let removedPending = takePendingSendByRaw(state, sendContext)
       if not pending.waiter.isNil and not pending.waiter.finished():
         pending.waiter.fail(
           newException(CatchableError, "MsQuic StreamSend raised: " & exc.msg)
         )
+      unrootPendingSend(removedPending)
       return ("MsQuic StreamSend raised: " & exc.msg, nil)
     except Exception as exc:
-      state.withStateLock:
-        for idx in 0 ..< state.pendingSends.len:
-          if state.pendingSends[idx] == pending:
-            state.pendingSends.delete(idx)
-            break
+      let removedPending = takePendingSendByRaw(state, sendContext)
       if not pending.waiter.isNil and not pending.waiter.finished():
         pending.waiter.fail(
           newException(CatchableError, "MsQuic StreamSend raised: " & exc.msg)
         )
+      unrootPendingSend(removedPending)
       return ("MsQuic StreamSend raised: " & exc.msg, nil)
   when defined(ohos):
     warn "MsQuic StreamSend status", stream = cast[uint64](state.stream),
@@ -2370,15 +2490,12 @@ proc enqueueStreamWrite(
       status = status
 
   if status != msapi.QUIC_STATUS_SUCCESS and status != QuicStatusPending:
-    state.withStateLock:
-      for idx in 0 ..< state.pendingSends.len:
-        if state.pendingSends[idx] == pending:
-          state.pendingSends.delete(idx)
-          break
+    let removedPending = takePendingSendByRaw(state, sendContext)
     if not pending.waiter.isNil and not pending.waiter.finished():
       pending.waiter.fail(
         newException(CatchableError, fmt"MsQuic StreamSend failed: 0x{status:08x}")
       )
+    unrootPendingSend(removedPending)
     return (fmt"MsQuic StreamSend failed: 0x{status:08x}", nil)
   ("", pending.waiter)
 
@@ -2444,13 +2561,19 @@ proc shutdown*(handle: MsQuicTransportHandle) {.raises: [].} =
   var retainedConnections: seq[MsQuicConnectionState] = @[]
   var retainedListeners: seq[MsQuicListenerState] = @[]
   var retainedStreams: seq[MsQuicStreamState] = @[]
+  var rootedActiveConnections: seq[MsQuicConnectionState] = @[]
+  var rootedActiveListeners: seq[MsQuicListenerState] = @[]
+  var rootedActiveStreams: seq[MsQuicStreamState] = @[]
+  var rootedRetainedConnections: seq[MsQuicConnectionState] = @[]
+  var rootedRetainedListeners: seq[MsQuicListenerState] = @[]
+  var rootedRetainedStreams: seq[MsQuicStreamState] = @[]
   handle.withRetainLock:
-    activeConnections = handle.activeConnectionStates
-    activeListeners = handle.activeListenerStates
-    activeStreams = handle.activeStreamStates
-    retainedConnections = handle.retainedConnectionStates
-    retainedListeners = handle.retainedListenerStates
-    retainedStreams = handle.retainedStreamStates
+    activeConnections = snapshotRootStates[MsQuicConnectionState](handle.activeConnectionRoots)
+    activeListeners = snapshotRootStates[MsQuicListenerState](handle.activeListenerRoots)
+    activeStreams = snapshotRootStates[MsQuicStreamState](handle.activeStreamRoots)
+    retainedConnections = snapshotRootStates[MsQuicConnectionState](handle.retainedConnectionRoots)
+    retainedListeners = snapshotRootStates[MsQuicListenerState](handle.retainedListenerRoots)
+    retainedStreams = snapshotRootStates[MsQuicStreamState](handle.retainedStreamRoots)
   for state in activeStreams:
     if state.isNil:
       continue
@@ -2490,12 +2613,18 @@ proc shutdown*(handle: MsQuicTransportHandle) {.raises: [].} =
     releaseMsQuicBridge(handle.bridge)
     handle.bridge = nil
   handle.withRetainLock:
-    handle.activeConnectionStates.setLen(0)
-    handle.activeListenerStates.setLen(0)
-    handle.activeStreamStates.setLen(0)
-    handle.retainedConnectionStates.setLen(0)
-    handle.retainedListenerStates.setLen(0)
-    handle.retainedStreamStates.setLen(0)
+    rootedActiveConnections = takeRootStates[MsQuicConnectionState](handle.activeConnectionRoots)
+    rootedActiveListeners = takeRootStates[MsQuicListenerState](handle.activeListenerRoots)
+    rootedActiveStreams = takeRootStates[MsQuicStreamState](handle.activeStreamRoots)
+    rootedRetainedConnections = takeRootStates[MsQuicConnectionState](handle.retainedConnectionRoots)
+    rootedRetainedListeners = takeRootStates[MsQuicListenerState](handle.retainedListenerRoots)
+    rootedRetainedStreams = takeRootStates[MsQuicStreamState](handle.retainedStreamRoots)
+  unrootStates(rootedActiveConnections)
+  unrootStates(rootedActiveListeners)
+  unrootStates(rootedActiveStreams)
+  unrootStates(rootedRetainedConnections)
+  unrootStates(rootedRetainedListeners)
+  unrootStates(rootedRetainedStreams)
 
 proc buildMsQuicSettings(cfg: MsQuicTransportConfig): MsQuicSettings =
   var settings: MsQuicSettings
@@ -2650,12 +2779,12 @@ proc initMsQuicTransport*(cfg: MsQuicTransportConfig = MsQuicTransportConfig()):
     tlsBinding: nil,
     clientTlsBinding: nil,
     retainLockInit: false,
-    activeConnectionStates: @[],
-    activeListenerStates: @[],
-    activeStreamStates: @[],
-    retainedConnectionStates: @[],
-    retainedListenerStates: @[],
-    retainedStreamStates: @[],
+    activeConnectionRoots: initTable[pointer, bool](),
+    activeListenerRoots: initTable[pointer, bool](),
+    activeStreamRoots: initTable[pointer, bool](),
+    retainedConnectionRoots: initTable[pointer, bool](),
+    retainedListenerRoots: initTable[pointer, bool](),
+    retainedStreamRoots: initTable[pointer, bool](),
     closed: false
   )
   initLock(handle.retainLock)

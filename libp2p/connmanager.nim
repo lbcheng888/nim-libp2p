@@ -33,6 +33,17 @@ type
   TooManyConnectionsError* = object of LPError
   AlreadyExpectingConnectionError* = object of LPError
 
+  PeerPlaneKind* {.pure.} = enum
+    ppkLive
+    ppkControl
+
+  PeerPlaneState* = object
+    ownerMuxerId*: string
+    generation*: uint64
+    direction*: Direction
+    ready*: bool
+    busyReason*: string
+
   ConnEventKind* {.pure.} = enum
     Connected
       # A connection was made and securely upgraded - there may be
@@ -74,6 +85,7 @@ type
     inSema*: lpSemaphore.AsyncSemaphore
     outSema*: lpSemaphore.AsyncSemaphore
     muxed: Table[PeerId, seq[Muxer]]
+    peerPlanes: Table[PeerId, array[PeerPlaneKind, PeerPlaneState]]
     connEvents: array[ConnEventKind, OrderedSet[ConnEventHandler]]
     peerEvents: array[PeerEventKind, OrderedSet[PeerEventHandler]]
     expectedConnectionsOverLimit*: Table[(PeerId, Direction), Future[Muxer]]
@@ -84,20 +96,142 @@ type
     connManager: ConnManager
     direction: Direction
 
-proc isActiveMuxer(muxer: Muxer): bool {.inline.} =
+proc isActiveMuxer(muxer: Muxer): bool {.inline, gcsafe, raises: [].} =
   not muxer.isNil and
     not muxer.connection.isNil and
     not muxer.connection.closed and
     not muxer.connection.atEof
 
-proc effectiveMaxConnsPerPeer(c: ConnManager): int {.inline.} =
+proc effectiveMaxConnsPerPeer(c: ConnManager): int {.inline, gcsafe, raises: [].} =
   if c.maxConnsPerPeer <= 0:
     1
   else:
     c.maxConnsPerPeer
 
-proc liveMuxers(c: ConnManager, peerId: PeerId): seq[Muxer] =
+proc liveMuxers(c: ConnManager, peerId: PeerId): seq[Muxer] {.gcsafe, raises: [].} =
   c.muxed.getOrDefault(peerId).filterIt(isActiveMuxer(it))
+
+proc planeOwnerId(muxer: Muxer): string {.inline, gcsafe, raises: [].} =
+  if muxer.isNil or muxer.connection.isNil:
+    ""
+  else:
+    $muxer.connection.oid
+
+proc selectMuxer*(c: ConnManager, peerId: PeerId, dir: Direction): Muxer {.gcsafe, raises: [].}
+proc selectMuxer*(c: ConnManager, peerId: PeerId): Muxer {.gcsafe, raises: [].}
+
+proc selectLivePlaneMuxer(c: ConnManager, peerId: PeerId): Muxer {.gcsafe, raises: [].} =
+  var mux = c.selectMuxer(peerId, Direction.Out)
+  if mux.isNil:
+    mux = c.selectMuxer(peerId, Direction.In)
+  mux
+
+proc selectControlPlaneMuxer(c: ConnManager, peerId: PeerId, liveOwner: Muxer): Muxer {.gcsafe, raises: [].} =
+  if liveOwner.isNil:
+    return nil
+  var fallback: Muxer = nil
+  for mux in c.liveMuxers(peerId):
+    if mux == liveOwner:
+      continue
+    if mux.connection.dir == Direction.Out:
+      return mux
+    if fallback.isNil:
+      fallback = mux
+  if not fallback.isNil:
+    return fallback
+  liveOwner
+
+proc buildPeerPlaneState(
+    previous: PeerPlaneState,
+    owner: Muxer,
+    busyReason: string,
+): PeerPlaneState {.gcsafe, raises: [].} =
+  let ownerMuxerId = planeOwnerId(owner)
+  let ready = ownerMuxerId.len > 0
+  result = PeerPlaneState(
+    ownerMuxerId: ownerMuxerId,
+    generation: previous.generation,
+    direction:
+      if ready and not owner.connection.isNil:
+        owner.connection.dir
+      else:
+        previous.direction,
+    ready: ready,
+    busyReason:
+      if ready:
+        busyReason
+      elif busyReason.len > 0:
+        busyReason
+      else:
+        "no-muxer",
+  )
+  if previous.ownerMuxerId != result.ownerMuxerId or previous.ready != result.ready or
+      previous.direction != result.direction or previous.busyReason != result.busyReason:
+    inc result.generation
+
+proc refreshPeerPlanes(c: ConnManager, peerId: PeerId) {.gcsafe, raises: [].} =
+  if c.isNil or peerId.len == 0:
+    return
+  let previous = c.peerPlanes.getOrDefault(peerId)
+  let liveOwner = c.selectLivePlaneMuxer(peerId)
+  let controlOwner = c.selectControlPlaneMuxer(peerId, liveOwner)
+  let controlShared =
+    not controlOwner.isNil and planeOwnerId(controlOwner) == planeOwnerId(liveOwner)
+  var next = previous
+  next[ppkLive] = buildPeerPlaneState(
+    previous[ppkLive],
+    liveOwner,
+    if liveOwner.isNil: "no-live-plane" else: "",
+  )
+  next[ppkControl] = buildPeerPlaneState(
+    previous[ppkControl],
+    controlOwner,
+    if liveOwner.isNil:
+      "no-live-plane"
+    elif c.effectiveMaxConnsPerPeer() < 2 or controlShared:
+      "shared-live-plane"
+    else:
+      "",
+  )
+  c.peerPlanes[peerId] = next
+
+proc planeState*(
+    c: ConnManager, peerId: PeerId, kind: PeerPlaneKind
+): PeerPlaneState =
+  if c.isNil or peerId.len == 0:
+    return PeerPlaneState(busyReason: "invalid-peer")
+  c.refreshPeerPlanes(peerId)
+  c.peerPlanes.getOrDefault(peerId)[kind]
+
+proc reservePlane*(
+    c: ConnManager, peerId: PeerId, kind: PeerPlaneKind, dir: Direction
+): PeerPlaneState =
+  result = c.planeState(peerId, kind)
+  if result.ready and result.direction != dir and result.busyReason.len == 0:
+    result.busyReason = "direction-mismatch"
+
+proc planeReady*(
+    c: ConnManager, peerId: PeerId, kind: PeerPlaneKind
+): bool =
+  c.planeState(peerId, kind).ready
+
+proc planeSharedWithLive*(
+    c: ConnManager, peerId: PeerId, kind: PeerPlaneKind
+): bool =
+  c.planeState(peerId, kind).busyReason == "shared-live-plane"
+
+proc selectPlaneMuxer*(
+    c: ConnManager, peerId: PeerId, kind: PeerPlaneKind
+): Muxer =
+  if c.isNil or peerId.len == 0:
+    return nil
+  c.refreshPeerPlanes(peerId)
+  let target = c.peerPlanes.getOrDefault(peerId)[kind].ownerMuxerId
+  if target.len == 0:
+    return nil
+  for mux in c.liveMuxers(peerId):
+    if planeOwnerId(mux) == target:
+      return mux
 
 proc closeMuxer(muxer: Muxer) {.async: (raises: [CancelledError]).}
 
@@ -166,7 +300,12 @@ proc new*(
   else:
     raiseAssert "Invalid connection counts!"
 
-  C(maxConnsPerPeer: maxConnsPerPeer, inSema: inSema, outSema: outSema)
+  C(
+    maxConnsPerPeer: maxConnsPerPeer,
+    inSema: inSema,
+    outSema: outSema,
+    peerPlanes: initTable[PeerId, array[PeerPlaneKind, PeerPlaneState]](),
+  )
 
 proc connCount*(c: ConnManager, peerId: PeerId): int =
   c.liveMuxers(peerId).len
@@ -312,6 +451,7 @@ proc muxCleanup(c: ConnManager, mux: Muxer) {.async: (raises: []).} =
 
       if not (c.peerStore.isNil):
         c.peerStore.cleanup(peerId)
+    c.refreshPeerPlanes(peerId)
 
     await c.triggerConnEvent(peerId, ConnEvent(kind: ConnEventKind.Disconnected))
   except CatchableError as exc:
@@ -333,7 +473,7 @@ proc onClose(c: ConnManager, mux: Muxer) {.async: (raises: []).} =
   finally:
     await c.muxCleanup(mux)
 
-proc selectMuxer*(c: ConnManager, peerId: PeerId, dir: Direction): Muxer =
+proc selectMuxer*(c: ConnManager, peerId: PeerId, dir: Direction): Muxer {.gcsafe, raises: [].} =
   ## Select a connection for the provided peer and direction
   ##
   let conns = c.liveMuxers(peerId).filterIt(it.connection.dir == dir)
@@ -341,7 +481,7 @@ proc selectMuxer*(c: ConnManager, peerId: PeerId, dir: Direction): Muxer =
   if conns.len > 0:
     return conns[0]
 
-proc selectMuxer*(c: ConnManager, peerId: PeerId): Muxer =
+proc selectMuxer*(c: ConnManager, peerId: PeerId): Muxer {.gcsafe, raises: [].} =
   ## Select a connection for the provided giving priority
   ## to outgoing connections
   ##
@@ -352,6 +492,15 @@ proc selectMuxer*(c: ConnManager, peerId: PeerId): Muxer =
   if isNil(mux):
     trace "connection not found", peerId
   return mux
+
+proc selectAlternateMuxer*(
+    c: ConnManager, peerId: PeerId, reserved: Muxer
+): Muxer =
+  ## Select a live muxer different from the reserved one.
+  ##
+  for mux in c.liveMuxers(peerId):
+    if mux != reserved:
+      return mux
 
 proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnectionsError].} =
   ## store the connection and muxer
@@ -401,6 +550,7 @@ proc storeMuxer*(c: ConnManager, muxer: Muxer) {.raises: [LPError, TooManyConnec
 
     liveMuxers.add(muxer)
     c.muxed[peerId] = liveMuxers
+    c.refreshPeerPlanes(peerId)
     libp2p_peers.set(c.muxed.len.int64)
 
     asyncSpawn c.triggerConnEvent(
@@ -470,6 +620,9 @@ proc reindexMuxerPeerId*(
       muxers[].add(muxer)
   do:
     c.muxed[currentPeerId] = @[muxer]
+
+  c.refreshPeerPlanes(previousPeerId)
+  c.refreshPeerPlanes(currentPeerId)
 
   libp2p_peers.set(c.muxed.len.int64)
   trace "Reindexed muxer peer id",
@@ -569,6 +722,7 @@ proc close*(c: ConnManager) {.async: (raises: [CancelledError]).} =
   trace "Closing ConnManager"
   let muxed = c.muxed
   c.muxed.clear()
+  c.peerPlanes.clear()
 
   let expected = c.expectedConnectionsOverLimit
   c.expectedConnectionsOverLimit.clear()

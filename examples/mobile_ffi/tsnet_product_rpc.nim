@@ -18,8 +18,15 @@ type
     text: string
     messageId: string
     replyTo: string
+    peerIp: string
+    pingTarget: string
+    pingType: string
+    sampleCount: int
+    sessionConnKey: int
     requestAck: bool
     requestAckSet: bool
+    relayOnly: bool
+    relayOnlySet: bool
     maxEvents: int
     listenAddrs: seq[string]
     listenAddrsJson: string
@@ -197,6 +204,56 @@ proc parseArgs(): RpcOptions =
       result.replyTo = args[i + 1]
       inc(i, 2)
       continue
+    if arg.startsWith("--peer-ip="):
+      result.peerIp = arg.split("=", 1)[1]
+      inc i
+      continue
+    if arg == "--peer-ip":
+      if i + 1 >= args.len:
+        raise newException(ValueError, "--peer-ip requires a value")
+      result.peerIp = args[i + 1]
+      inc(i, 2)
+      continue
+    if arg.startsWith("--ping-target="):
+      result.pingTarget = arg.split("=", 1)[1]
+      inc i
+      continue
+    if arg == "--ping-target":
+      if i + 1 >= args.len:
+        raise newException(ValueError, "--ping-target requires a value")
+      result.pingTarget = args[i + 1]
+      inc(i, 2)
+      continue
+    if arg.startsWith("--ping-type="):
+      result.pingType = arg.split("=", 1)[1]
+      inc i
+      continue
+    if arg == "--ping-type":
+      if i + 1 >= args.len:
+        raise newException(ValueError, "--ping-type requires a value")
+      result.pingType = args[i + 1]
+      inc(i, 2)
+      continue
+    if arg.startsWith("--sample-count="):
+      result.sampleCount = max(1, parseInt(arg.split("=", 1)[1]))
+      inc i
+      continue
+    if arg == "--sample-count":
+      if i + 1 >= args.len:
+        raise newException(ValueError, "--sample-count requires a value")
+      result.sampleCount = max(1, parseInt(args[i + 1]))
+      inc(i, 2)
+      continue
+    if arg.startsWith("--session-conn-key="):
+      result.sessionConnKey = max(0, parseInt(arg.split("=", 1)[1]))
+      inc i
+      continue
+    if arg == "--session-conn-key":
+      if i + 1 >= args.len:
+        raise newException(ValueError, "--session-conn-key requires a value")
+      result.sessionConnKey = max(0, parseInt(args[i + 1]))
+      inc(i, 2)
+      continue
     if arg == "--request-ack":
       result.requestAck = true
       result.requestAckSet = true
@@ -210,6 +267,21 @@ proc parseArgs(): RpcOptions =
     if arg.startsWith("--request-ack="):
       result.requestAck = parseBoolText(arg.split("=", 1)[1])
       result.requestAckSet = true
+      inc i
+      continue
+    if arg == "--relay-only":
+      result.relayOnly = true
+      result.relayOnlySet = true
+      inc i
+      continue
+    if arg == "--no-relay-only":
+      result.relayOnly = false
+      result.relayOnlySet = true
+      inc i
+      continue
+    if arg.startsWith("--relay-only="):
+      result.relayOnly = parseBoolText(arg.split("=", 1)[1])
+      result.relayOnlySet = true
       inc i
       continue
     if arg.startsWith("--max-events="):
@@ -311,8 +383,20 @@ proc buildPayload(opts: RpcOptions): string =
     payload["messageId"] = %opts.messageId
   if opts.replyTo.len > 0:
     payload["replyTo"] = %opts.replyTo
+  if opts.peerIp.len > 0:
+    payload["peerIP"] = %opts.peerIp
+  if opts.pingTarget.len > 0:
+    payload["target"] = %opts.pingTarget
+  if opts.pingType.len > 0:
+    payload["pingType"] = %opts.pingType
+  if opts.sampleCount > 0:
+    payload["sampleCount"] = %opts.sampleCount
+  if opts.sessionConnKey > 0:
+    payload["sessionConnKey"] = %opts.sessionConnKey
   if opts.requestAckSet:
     payload["requestAck"] = %opts.requestAck
+  if opts.relayOnlySet:
+    payload["relayOnly"] = %opts.relayOnly
   if opts.maxEvents > 0:
     payload["maxEvents"] = %opts.maxEvents
   if opts.listenAddrsJson.len > 0:
@@ -364,8 +448,20 @@ proc remoteRpcArgs(opts: RpcOptions): seq[string] =
     result.add(@["--message-id", opts.messageId])
   if opts.replyTo.len > 0:
     result.add(@["--reply-to", opts.replyTo])
+  if opts.peerIp.len > 0:
+    result.add(@["--peer-ip", opts.peerIp])
+  if opts.pingTarget.len > 0:
+    result.add(@["--ping-target", opts.pingTarget])
+  if opts.pingType.len > 0:
+    result.add(@["--ping-type", opts.pingType])
+  if opts.sampleCount > 0:
+    result.add(@["--sample-count", $opts.sampleCount])
+  if opts.sessionConnKey > 0:
+    result.add(@["--session-conn-key", $opts.sessionConnKey])
   if opts.requestAckSet:
     result.add(if opts.requestAck: "--request-ack" else: "--no-request-ack")
+  if opts.relayOnlySet:
+    result.add(if opts.relayOnly: "--relay-only" else: "--no-relay-only")
   if opts.maxEvents > 0:
     result.add(@["--max-events", $opts.maxEvents])
   if opts.listenAddrsJson.len > 0:

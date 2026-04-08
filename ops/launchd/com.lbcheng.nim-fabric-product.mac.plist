@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lbcheng.nim-fabric-product.mac</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/lbcheng/nim-libp2p</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/lbcheng/nim-libp2p/ops/cluster/run_fabric_product_node.sh</string>
+    <string>mac</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/lbcheng/nim-libp2p/build/prod-mac/fabric/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lbcheng/nim-libp2p/build/prod-mac/fabric/stderr.log</string>
+</dict>
+</plist>

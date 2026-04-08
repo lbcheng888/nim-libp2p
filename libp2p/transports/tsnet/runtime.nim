@@ -27,6 +27,11 @@ proc ownedText(text: string): string {.gcsafe, raises: [].} =
   result = newStringOfCap(text.len)
   result.add(text)
 
+proc ownedTextSeq(items: openArray[string]): seq[string] {.gcsafe, raises: [].} =
+  result = newSeqOfCap[string](items.len)
+  for item in items:
+    result.add(ownedText(item))
+
 when defined(libp2p_msquic_experimental):
   type TsnetRelayListenerDiagnosticImpl = qrelay.TsnetRelayListenerDiagnostic
 else:
@@ -48,10 +53,6 @@ type
     transport: TsnetControlTransport
     endpoint: string
 
-  TsnetListenerRouteTarget = object
-    advertisedText*: string
-    rawText*: string
-
   TsnetInAppRuntime* = ref object
     cfg*: TsnetProviderConfig
     status*: TsnetInAppRuntimeStatus
@@ -68,8 +69,8 @@ type
     oracleFixturePresent*: bool
     tcpListenerRoutes*: seq[string]
     udpListenerRoutes*: seq[string]
-    tcpListenerRouteTargets*: seq[TsnetListenerRouteTarget]
-    udpListenerRouteTargets*: seq[TsnetListenerRouteTarget]
+    tcpListenerRawByRoute*: OrderedTable[string, string]
+    udpListenerRawByRoute*: OrderedTable[string, string]
     relayListenerProjectionCache*: OrderedTable[string, TsnetRelayListenerDiagnosticImpl]
 
 const
@@ -207,51 +208,14 @@ proc listenerRouteSnapshot(routes: seq[string]): seq[string] {.gcsafe.} =
   for route in routes.items():
     result.add(route)
 
-proc listenerRouteTargetSnapshot(
-    routeTargets: seq[TsnetListenerRouteTarget]
-): seq[string] {.gcsafe.} =
-  result = newSeqOfCap[string](routeTargets.len)
-  for target in routeTargets.items:
-    let route = target.advertisedText.strip()
-    if route.len > 0:
-      result.add(route)
-
-proc listenerRouteTargetRaw(
-    routeTargets: seq[TsnetListenerRouteTarget],
+proc listenerRouteRaw(
+    routeTargets: OrderedTable[string, string],
     routeText: string
 ): string {.gcsafe.} =
   let normalizedRoute = routeText.strip()
   if normalizedRoute.len == 0:
     return ""
-  for target in routeTargets.items:
-    if target.advertisedText == normalizedRoute:
-      return target.rawText
-  ""
-
-proc upsertListenerRouteTarget(
-    routeTargets: seq[TsnetListenerRouteTarget],
-    advertisedText: string,
-    rawText: string
-): seq[TsnetListenerRouteTarget] {.gcsafe.} =
-  let normalizedAdvertised = advertisedText.strip()
-  let normalizedRaw = rawText.strip()
-  result = newSeqOfCap[TsnetListenerRouteTarget](routeTargets.len + 1)
-  var replaced = false
-  for target in routeTargets.items:
-    if target.advertisedText == normalizedAdvertised:
-      if not replaced:
-        result.add(TsnetListenerRouteTarget(
-          advertisedText: normalizedAdvertised,
-          rawText: normalizedRaw
-        ))
-        replaced = true
-      continue
-    result.add(target)
-  if not replaced and normalizedAdvertised.len > 0:
-    result.add(TsnetListenerRouteTarget(
-      advertisedText: normalizedAdvertised,
-      rawText: normalizedRaw
-    ))
+  routeTargets.getOrDefault(normalizedRoute)
 
 proc runtimeListenerRoutes(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.}
 proc liveQuicRelayMode(runtime: TsnetInAppRuntime): bool {.gcsafe.}
@@ -346,8 +310,8 @@ when defined(libp2p_msquic_experimental):
 proc runtimeListenerRoutes(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.} =
   if runtime.isNil:
     return @[]
-  let tcpRoutes = listenerRouteTargetSnapshot(runtime.tcpListenerRouteTargets)
-  let udpRoutes = listenerRouteTargetSnapshot(runtime.udpListenerRouteTargets)
+  let tcpRoutes = listenerRouteSnapshot(runtime.tcpListenerRoutes)
+  let udpRoutes = listenerRouteSnapshot(runtime.udpListenerRoutes)
   result = newSeqOfCap[string](tcpRoutes.len + udpRoutes.len)
   for route in tcpRoutes:
     if route.len > 0 and route notin result:
@@ -355,13 +319,6 @@ proc runtimeListenerRoutes(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.} =
   for route in udpRoutes:
     if route.len > 0 and route notin result:
       result.add(route)
-
-proc rememberListenerRouteCopy(routes: seq[string], route: string): seq[string] {.gcsafe.} =
-  result = listenerRouteSnapshot(routes)
-  if route.len == 0:
-    return
-  if route notin result:
-    result.add(route)
 
 proc hasVisibleAsciiText(text: string): bool {.gcsafe.} =
   for ch in text:
@@ -456,8 +413,8 @@ proc clearListenerRoutes(runtime: TsnetInAppRuntime) {.gcsafe.} =
     return
   runtime.tcpListenerRoutes = @[]
   runtime.udpListenerRoutes = @[]
-  runtime.tcpListenerRouteTargets = @[]
-  runtime.udpListenerRouteTargets = @[]
+  runtime.tcpListenerRawByRoute = initOrderedTable[string, string]()
+  runtime.udpListenerRawByRoute = initOrderedTable[string, string]()
   runtime.relayListenerProjectionCache = initOrderedTable[string, TsnetRelayListenerDiagnosticImpl]()
 
 proc rememberListenerRoute(routes: var seq[string], route: string) {.gcsafe.} =
@@ -490,8 +447,8 @@ proc proxyListenerReadiness(runtime: TsnetInAppRuntime): tuple[expected, ready: 
     if runtime.liveQuicRelayMode():
       let projection = relayListenerProjection(runtime)
       return (projection.expected, projection.ready)
-  let tcpRoutes = listenerRouteTargetSnapshot(runtime.tcpListenerRouteTargets)
-  let udpRoutes = listenerRouteTargetSnapshot(runtime.udpListenerRouteTargets)
+  let tcpRoutes = listenerRouteSnapshot(runtime.tcpListenerRoutes)
+  let udpRoutes = listenerRouteSnapshot(runtime.udpListenerRoutes)
   result.expected = tcpRoutes.len + udpRoutes.len
   result.ready = tcpRoutes.len + udpRoutes.len
 
@@ -505,9 +462,9 @@ proc publishedListenerRoutes*(runtime: TsnetInAppRuntime): seq[string] {.gcsafe.
       for route in routes:
         let stage = relayRouteStage(runtime, route)
         if relayStageCountsAsPublished(stage):
-          result.add(route)
+          result.add(ownedText(route))
       return
-  runtimeListenerRoutes(runtime)
+  ownedTextSeq(runtimeListenerRoutes(runtime))
 
 proc proxyListenersReady*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
   if runtime.isNil:
@@ -520,12 +477,14 @@ proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
     return false
   when defined(libp2p_msquic_experimental):
     if runtime.liveQuicRelayMode():
-      let tcpRoutes = listenerRouteTargetSnapshot(runtime.tcpListenerRouteTargets)
-      let udpRoutes = listenerRouteTargetSnapshot(runtime.udpListenerRouteTargets)
-      for route in tcpRoutes:
-        if route.len == 0:
-          continue
+      proc routeNeedsRepair(route: string, kind: string): bool {.gcsafe.} =
         let repairRequested = qrelay.relayRouteRepairRequested(runtime.runtimeId, route)
+        let currentStage = qrelay.relayRouteStateLabel(runtime.runtimeId, route)
+        let stageText =
+          if currentStage.len > 0:
+            currentStage
+          else:
+            "missing"
         if qrelay.relayRouteServingStage(runtime.runtimeId, route):
           if repairRequested:
             qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, route)
@@ -533,9 +492,9 @@ proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
             "listenerNeedsRepair=false reason=serving_stage owner=" &
             $runtime.runtimeId &
             " route=" & route &
-            " kind=tcp"
+            " kind=" & kind
           )
-          continue
+          return false
         if qrelay.relayRouteLocallyReady(runtime.runtimeId, route):
           if repairRequested:
             qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, route)
@@ -543,9 +502,9 @@ proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
             "listenerNeedsRepair=false reason=locally_ready owner=" &
             $runtime.runtimeId &
             " route=" & route &
-            " kind=tcp"
+            " kind=" & kind
           )
-          continue
+          return false
         if qrelay.relayOwnerHasRunningRouteTask(runtime.runtimeId, route):
           if repairRequested:
             qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, route)
@@ -553,58 +512,32 @@ proc listenerNeedsRepair*(runtime: TsnetInAppRuntime): bool {.gcsafe.} =
             "listenerNeedsRepair=false reason=active_route_task owner=" &
             $runtime.runtimeId &
             " route=" & route &
-            " kind=tcp"
+            " kind=" & kind
           )
+          return false
+        if not repairRequested:
+          qrelay.requestRelayRouteRepair(runtime.runtimeId, route)
+        runtimeTrace(
+          "listenerNeedsRepair=true reason=" &
+          (if repairRequested: "repair_requested" else: "unhealthy_route") &
+          " owner=" & $runtime.runtimeId &
+          " route=" & route &
+          " kind=" & kind &
+          " stage=" & stageText
+        )
+        true
+
+      let tcpRoutes = listenerRouteSnapshot(runtime.tcpListenerRoutes)
+      let udpRoutes = listenerRouteSnapshot(runtime.udpListenerRoutes)
+      for route in tcpRoutes:
+        if route.len == 0:
           continue
-        if repairRequested:
-          runtimeTrace(
-            "listenerNeedsRepair=true reason=repair_requested owner=" &
-            $runtime.runtimeId &
-            " route=" & route &
-            " kind=tcp"
-          )
+        if routeNeedsRepair(route, "tcp"):
           return true
       for route in udpRoutes:
         if route.len == 0:
           continue
-        let repairRequested = qrelay.relayRouteRepairRequested(runtime.runtimeId, route)
-        if qrelay.relayRouteServingStage(runtime.runtimeId, route):
-          if repairRequested:
-            qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, route)
-          runtimeTrace(
-            "listenerNeedsRepair=false reason=serving_stage owner=" &
-            $runtime.runtimeId &
-            " route=" & route &
-            " kind=udp"
-          )
-          continue
-        if qrelay.relayRouteLocallyReady(runtime.runtimeId, route):
-          if repairRequested:
-            qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, route)
-          runtimeTrace(
-            "listenerNeedsRepair=false reason=locally_ready owner=" &
-            $runtime.runtimeId &
-            " route=" & route &
-            " kind=udp"
-          )
-          continue
-        if qrelay.relayOwnerHasRunningRouteTask(runtime.runtimeId, route):
-          if repairRequested:
-            qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, route)
-          runtimeTrace(
-            "listenerNeedsRepair=false reason=active_route_task owner=" &
-            $runtime.runtimeId &
-            " route=" & route &
-            " kind=udp"
-          )
-          continue
-        if repairRequested:
-          runtimeTrace(
-            "listenerNeedsRepair=true reason=repair_requested owner=" &
-            $runtime.runtimeId &
-            " route=" & route &
-            " kind=udp"
-          )
+        if routeNeedsRepair(route, "udp"):
           return true
     return false
   let readiness = runtime.proxyListenerReadiness()
@@ -776,8 +709,8 @@ proc new*(_: type[TsnetInAppRuntime], cfg: TsnetProviderConfig): TsnetInAppRunti
     oracleFixturePresent: false,
     tcpListenerRoutes: @[],
     udpListenerRoutes: @[],
-    tcpListenerRouteTargets: @[],
-    udpListenerRouteTargets: @[],
+    tcpListenerRawByRoute: initOrderedTable[string, string](),
+    udpListenerRawByRoute: initOrderedTable[string, string](),
     relayListenerProjectionCache: initOrderedTable[string, TsnetRelayListenerDiagnosticImpl]()
   )
 
@@ -1562,8 +1495,8 @@ proc reconcileProxyListeners*(
   when defined(libp2p_msquic_experimental):
     if not runtime.liveQuicRelayMode():
       return ok()
-    let currentTcpRoutes = listenerRouteTargetSnapshot(runtime.tcpListenerRouteTargets)
-    let currentUdpRoutes = listenerRouteTargetSnapshot(runtime.udpListenerRouteTargets)
+    let currentTcpRoutes = listenerRouteSnapshot(runtime.tcpListenerRoutes)
+    let currentUdpRoutes = listenerRouteSnapshot(runtime.udpListenerRoutes)
     if currentTcpRoutes.len == 0 and currentUdpRoutes.len == 0:
       return ok()
     var repairRoutes: seq[TsnetRepairRoute] = @[]
@@ -1573,7 +1506,7 @@ proc reconcileProxyListeners*(
     proc rememberRepairRoute(
         routeText: string,
         kind: TsnetProxyKind,
-        routeTargets: seq[TsnetListenerRouteTarget]
+        routeTargets: OrderedTable[string, string]
     ) =
       if routeText.len == 0:
         return
@@ -1588,7 +1521,7 @@ proc reconcileProxyListeners*(
       if qrelay.relayOwnerHasRunningRouteTask(runtime.runtimeId, routeText):
         qrelay.clearRelayRouteRepairRequest(runtime.runtimeId, routeText)
         return
-      let rawRoute = listenerRouteTargetRaw(routeTargets, routeText).strip()
+      let rawRoute = listenerRouteRaw(routeTargets, routeText).strip()
       if rawRoute.len == 0:
         missingMappings.rememberListenerRoute(routeText)
         return
@@ -1603,9 +1536,9 @@ proc reconcileProxyListeners*(
       of TsnetProxyKind.Quic:
         repairUdpRoutes.rememberListenerRoute(routeText)
     for routeText in currentTcpRoutes:
-      rememberRepairRoute(routeText, TsnetProxyKind.Tcp, runtime.tcpListenerRouteTargets)
+      rememberRepairRoute(routeText, TsnetProxyKind.Tcp, runtime.tcpListenerRawByRoute)
     for routeText in currentUdpRoutes:
-      rememberRepairRoute(routeText, TsnetProxyKind.Quic, runtime.udpListenerRouteTargets)
+      rememberRepairRoute(routeText, TsnetProxyKind.Quic, runtime.udpListenerRawByRoute)
     if missingMappings.len > 0:
       runtimeTrace(
         "reconcileProxyListeners missing_mapping owner=" & $runtime.runtimeId &
@@ -1713,6 +1646,20 @@ proc requestString(node: JsonNode, key: string): string =
     return value.getStr().strip()
   ""
 
+proc tailnetIpTexts*(runtime: TsnetInAppRuntime): seq[string] {.gcsafe, raises: [].} =
+  if runtime.isNil:
+    return @[]
+  result = newSeqOfCap[string](runtime.state.tailnetIPs.len)
+  for ip in runtime.state.tailnetIPs:
+    let value = ip.strip()
+    if value.len > 0:
+      result.add(value)
+  if result.len == 0:
+    for ip in runtime.session.status.tailnetIPs:
+      let value = ip.strip()
+      if value.len > 0:
+        result.add(value)
+
 proc pingPayload*(runtime: TsnetInAppRuntime, request: JsonNode): Result[JsonNode, string] =
   if runtime.isNil:
     return err("tsnet in-app runtime is nil")
@@ -1774,10 +1721,8 @@ proc listenTcpProxy*(
   if registered.isErr():
     return err(registered.error)
   let advertisedText = $advertised
-  runtime.tcpListenerRoutes =
-    rememberListenerRouteCopy(runtime.tcpListenerRoutes, advertisedText)
-  runtime.tcpListenerRouteTargets =
-    upsertListenerRouteTarget(runtime.tcpListenerRouteTargets, advertisedText, $localAddress)
+  runtime.tcpListenerRoutes.rememberListenerRoute(advertisedText)
+  runtime.tcpListenerRawByRoute[advertisedText] = ownedText($localAddress)
   if runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):
       let relayStarted = qrelay.startRelayListener(
@@ -1813,10 +1758,8 @@ proc listenUdpProxy*(
   if registered.isErr():
     return err(registered.error)
   let advertisedText = $advertised
-  runtime.udpListenerRoutes =
-    rememberListenerRouteCopy(runtime.udpListenerRoutes, advertisedText)
-  runtime.udpListenerRouteTargets =
-    upsertListenerRouteTarget(runtime.udpListenerRouteTargets, advertisedText, $localAddress)
+  runtime.udpListenerRoutes.rememberListenerRoute(advertisedText)
+  runtime.udpListenerRawByRoute[advertisedText] = ownedText($localAddress)
   if runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):
       let relayStarted = qrelay.startUdpRelayListener(
@@ -1861,6 +1804,114 @@ proc lookupUdpDirectRouteTarget*(
     rawAddress: directRoute.get().raw,
     pathKind: directRoute.get().pathKind,
   ))
+
+proc currentUnixMilli(): int64 =
+  int64(epochTime() * 1000.0)
+
+proc udpExactDialPlan(
+    mode: TsnetProxyDialMode,
+    stage: TsnetUdpExactDialStage,
+    rawAddress: MultiAddress = MultiAddress(),
+    pathKind = "",
+    ready = false,
+    error = "",
+    updatedUnixMilli = 0'i64
+): TsnetUdpExactDialPlan =
+  TsnetUdpExactDialPlan(
+    mode: mode,
+    pathKind: normalizeTailnetPath(pathKind),
+    rawAddress: rawAddress,
+    ready: ready,
+    stage: stage,
+    error: error.strip(),
+    updatedUnixMilli:
+      if updatedUnixMilli > 0:
+        updatedUnixMilli
+      else:
+        currentUnixMilli(),
+  )
+
+proc suspendedDirectPlan(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int
+): Option[TsnetUdpExactDialPlan] =
+  if runtime.isNil or runtime.runtimeId <= 0:
+    return
+  let advertised = buildAdvertisedAddress(family, ip, port, TsnetProxyKind.Quic).valueOr:
+    return
+  let advertisedText = $advertised
+  let nowUnixMilli = currentUnixMilli()
+  for snapshot in directRouteSnapshots(runtime.runtimeId):
+    if $snapshot.advertised != advertisedText:
+      continue
+    if snapshot.suspendedUntilUnixMilli <= nowUnixMilli:
+      continue
+    return some(udpExactDialPlan(
+      TsnetProxyDialMode.DirectRoute,
+      TsnetUdpExactDialStage.DirectFailed,
+      rawAddress = snapshot.raw,
+      pathKind = snapshot.pathKind,
+      error = "direct route suspended",
+      updatedUnixMilli = snapshot.suspendedUntilUnixMilli,
+    ))
+
+proc planUdpExactDialTarget*(
+    runtime: TsnetInAppRuntime,
+    family, ip: string,
+    port: int,
+    relayAllowed: bool
+): TsnetUdpExactDialPlan =
+  let unavailableMode =
+    if relayAllowed:
+      TsnetProxyDialMode.RelayBridge
+    else:
+      TsnetProxyDialMode.DirectRoute
+  if runtime.isNil:
+    return udpExactDialPlan(
+      unavailableMode,
+      TsnetUdpExactDialStage.Unavailable,
+      error = "tsnet in-app runtime is nil",
+    )
+  if not runtime.ready() or not runtime.session.supportsProxyRouting():
+    return udpExactDialPlan(
+      unavailableMode,
+      TsnetUdpExactDialStage.Unavailable,
+      error = unavailablePayloadError(),
+    )
+  let localRoute = lookupRawTarget(family, ip, port, TsnetProxyKind.Quic)
+  if localRoute.isOk():
+    return udpExactDialPlan(
+      TsnetProxyDialMode.Local,
+      TsnetUdpExactDialStage.LocalReady,
+      rawAddress = localRoute.get(),
+      pathKind = "local",
+      ready = true,
+    )
+  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Quic)
+  if directRoute.isOk():
+    return udpExactDialPlan(
+      TsnetProxyDialMode.DirectRoute,
+      TsnetUdpExactDialStage.DirectRouteReady,
+      rawAddress = directRoute.get().raw,
+      pathKind = directRoute.get().pathKind,
+      ready = true,
+    )
+  let suspended = suspendedDirectPlan(runtime, family, ip, port)
+  if suspended.isSome():
+    return suspended.get()
+  if relayAllowed and runtime.liveQuicRelayMode():
+    return udpExactDialPlan(
+      TsnetProxyDialMode.RelayBridge,
+      TsnetUdpExactDialStage.RelayPending,
+      pathKind = TsnetPathRelay,
+      error = "",
+    )
+  udpExactDialPlan(
+    TsnetProxyDialMode.DirectRoute,
+    TsnetUdpExactDialStage.RouteMissing,
+    error = directRoute.error,
+  )
 
 proc markFailedDirectProxyRoute*(
     runtime: TsnetInAppRuntime,
@@ -1986,24 +2037,16 @@ proc dialUdpProxyExactTarget*(
     family, ip: string,
     port: int
 ): Result[TsnetProxyDialTarget, string] =
-  if runtime.isNil:
-    return err("tsnet in-app runtime is nil")
-  if not runtime.ready() or not runtime.session.supportsProxyRouting():
-    return err(unavailablePayloadError())
-  let localRoute = lookupRawTarget(family, ip, port, TsnetProxyKind.Quic)
-  if localRoute.isOk():
+  let plan = runtime.planUdpExactDialTarget(family, ip, port, relayAllowed = true)
+  if plan.ready and plan.mode != TsnetProxyDialMode.RelayBridge:
+    if plan.mode == TsnetProxyDialMode.DirectRoute and plan.pathKind.len > 0:
+      runtime.setTailnetPathState(plan.pathKind)
     return ok(TsnetProxyDialTarget(
-      rawAddress: localRoute.get(),
-      mode: TsnetProxyDialMode.Local,
+      rawAddress: plan.rawAddress,
+      mode: plan.mode,
+      routeKey: "",
     ))
-  let directRoute = lookupDirectTarget(runtime.runtimeId, family, ip, port, TsnetProxyKind.Quic)
-  if directRoute.isOk():
-    runtime.setTailnetPathState(directRoute.get().pathKind)
-    return ok(TsnetProxyDialTarget(
-      rawAddress: directRoute.get().raw,
-      mode: TsnetProxyDialMode.DirectRoute,
-    ))
-  if runtime.liveQuicRelayMode():
+  if plan.mode == TsnetProxyDialMode.RelayBridge and runtime.liveQuicRelayMode():
     when defined(libp2p_msquic_experimental):
       runtime.demoteRelayPath()
       let remoteAdvertised = buildAdvertisedAddress(family, ip, port, TsnetProxyKind.Quic).valueOr:
@@ -2021,8 +2064,14 @@ proc dialUdpProxyExactTarget*(
       return ok(TsnetProxyDialTarget(
         rawAddress: rawAddress,
         mode: TsnetProxyDialMode.RelayBridge,
+        routeKey: qrelay.relayUdpDialRouteKey($remoteAdvertised),
       ))
-  err(localRoute.error)
+  err(
+    if plan.error.len > 0:
+      plan.error
+    else:
+      exactDialStageLabel(plan.stage)
+  )
 
 proc dialUdpProxyRelayFallbackTarget*(
     runtime: TsnetInAppRuntime,
@@ -2067,17 +2116,20 @@ proc dialUdpProxyRelayFallbackTarget*(
       return ok(TsnetProxyDialTarget(
         rawAddress: rawAddress,
         mode: TsnetProxyDialMode.RelayBridge,
+        routeKey: qrelay.relayUdpDialRouteKey($remoteAdvertised),
       ))
   let rawAddress = dialUdpProxy(runtime, family, ip, port).valueOr:
     return err(error)
   ok(TsnetProxyDialTarget(
     rawAddress: rawAddress,
     mode: TsnetProxyDialMode.Local,
+    routeKey: "",
   ))
 
 proc udpDialState*(
     runtime: TsnetInAppRuntime,
-    rawAddress: MultiAddress
+    rawKey: string,
+    routeKey = ""
 ): tuple[
     known, ready: bool,
     error, phase, detail: string,
@@ -2088,7 +2140,7 @@ proc udpDialState*(
     return
   when defined(libp2p_msquic_experimental):
     if runtime.liveQuicRelayMode():
-      return qrelay.udpDialState(runtime.runtimeId, $rawAddress)
+      return qrelay.udpDialState(runtime.runtimeId, routeKey, rawKey)
 
 proc resolveRemote*(
     runtime: TsnetInAppRuntime,

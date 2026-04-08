@@ -2,11 +2,13 @@ import std/[algorithm, json, options, sequtils, sets, strutils, tables]
 from std/times import epochTime
 import chronicles
 import chronos
+import results
 import ../../peerid
 import ../../peerstore
 import ../../multistream
 import ../../muxers/muxer
 import ../../switch
+import ../../connmanager
 import ../protocol
 import ../connectivity/relay/relay
 import ../../stream/connection
@@ -16,6 +18,7 @@ const
   DirectMessageCodec* = "/unimaker/dm/1.0.0"
   DefaultDirectMessageMaxBytes* = 2 * 1024 * 1024
   DefaultDirectAckMaxBytes* = 64 * 1024
+  DirectAuthoritativeAckTimeoutMs* = 3_000
 
 type
   DirectMessage* = object
@@ -86,6 +89,7 @@ type
   DirectMessageWarmResult* = object
     ok*: bool
     err*: string
+    stage*: string
     connKey*: int
     reusedLiveConnection*: bool
     readerActive*: bool
@@ -137,6 +141,33 @@ proc awaitFutureWithin[T](
     raise exc
   except CatchableError as exc:
     raise exc
+
+proc classifyWarmFailureStage(err: string): string =
+  let normalized = err.strip().toLowerAscii()
+  if normalized.len == 0:
+    return ""
+  if "route_missing" in normalized or "no tsnet direct route is registered" in normalized:
+    return "route_missing"
+  if "udp target not ready" in normalized or "relay readiness" in normalized:
+    return "udp_target_not_ready"
+  if
+      "protocol select" in normalized or
+      "multistreamselect" in normalized or
+      "select_first_proto" in normalized or
+      "select_proto" in normalized:
+    return "protocol_select_timeout"
+  if
+      "stream open" in normalized or
+      "stream unavailable" in normalized or
+      "muxer unavailable" in normalized:
+    return "stream_open_timeout"
+  if "fresh dial timeout" in normalized or "connect timeout" in normalized or "dial timeout" in normalized:
+    return "quic_dial_timeout"
+  if "identify" in normalized:
+    return "identify_timeout"
+  if "session attach" in normalized or "reader ready" in normalized:
+    return "session_attach_timeout"
+  ""
 
 proc payloadPreview(data: seq[byte], maxChars = 160): string =
   if data.len == 0:
@@ -552,8 +583,29 @@ proc storeOrRefreshSession(
 
 proc getLiveSession(
     svc: DirectMessageService,
-    peer: PeerId
+    peer: PeerId,
+    relayOnly = false,
+    directOnly = false,
 ): DirectMessageSession =
+  proc sessionPathKind(session: DirectMessageSession): string =
+    if session.isNil or session.conn.isNil or session.conn.closed:
+      return ""
+    if isRelayed(session.conn):
+      return "relay"
+    "direct"
+
+  proc sessionMatchesRouting(session: DirectMessageSession): bool =
+    if relayOnly and directOnly:
+      return false
+    if not isLiveSession(session):
+      return false
+    let pathKind = sessionPathKind(session)
+    if relayOnly:
+      return pathKind == "relay"
+    if directOnly:
+      return pathKind == "direct"
+    true
+
   if svc.isNil:
     return nil
   let peerKey = directPeerKey(peer)
@@ -562,9 +614,43 @@ proc getLiveSession(
   let sessions = svc.sessions.getOrDefault(peerKey)
   for _, session in sessions.pairs:
     svc.refreshSessionPeerIndex(session)
-    if result.isNil:
-      if isLiveSession(session):
-        result = session
+    if sessionMatchesRouting(session):
+      return session
+
+proc muxerMatchesRouting(
+    muxer: Muxer,
+    relayOnly = false,
+    directOnly = false,
+): bool {.raises: [].} =
+  if muxer.isNil or muxer.connection.isNil or muxer.connection.closed:
+    return false
+  if relayOnly and directOnly:
+    return false
+  let relayed = isRelayed(muxer.connection)
+  if relayOnly:
+    return relayed
+  if directOnly:
+    return not relayed
+  true
+
+proc selectLiveMuxer(
+    svc: DirectMessageService,
+    peer: PeerId,
+    relayOnly = false,
+    directOnly = false,
+): Muxer {.raises: [].} =
+  if svc.isNil or svc.switch.isNil or svc.switch.connManager.isNil:
+    return nil
+  let outbound = svc.switch.connManager.selectMuxer(peer, Direction.Out)
+  if muxerMatchesRouting(outbound, relayOnly, directOnly):
+    return outbound
+  let anyMuxer = svc.switch.connManager.selectMuxer(peer)
+  if muxerMatchesRouting(anyMuxer, relayOnly, directOnly):
+    return anyMuxer
+  let muxers = svc.switch.connManager.getConnections().getOrDefault(peer)
+  for muxer in muxers:
+    if muxerMatchesRouting(muxer, relayOnly, directOnly):
+      return muxer
 
 proc getLiveSessionByConnKey(
     svc: DirectMessageService,
@@ -764,6 +850,14 @@ proc directDialAddrPriority(addrText: string): int =
     return 2
   3
 
+proc canonicalDirectDialAddrKey(addrText: string): string =
+  result = addrText.strip().toLowerAscii()
+  for marker in ["/p2p/", "/ipfs/"]:
+    let idx = result.rfind(marker)
+    if idx >= 0:
+      result = result[0 ..< idx]
+      break
+
 proc orderDirectDialAddrs*(addrs: seq[MultiAddress]): seq[MultiAddress] =
   var expanded: seq[MultiAddress] = @[]
   var seen = initHashSet[string]()
@@ -771,9 +865,10 @@ proc orderDirectDialAddrs*(addrs: seq[MultiAddress]): seq[MultiAddress] =
     let text = $ma
     if text.len == 0:
       continue
-    if not seen.contains(text):
+    let canonical = canonicalDirectDialAddrKey(text)
+    if not seen.contains(canonical):
       expanded.add(ma)
-      seen.incl(text)
+      seen.incl(canonical)
   if expanded.len <= 1:
     return expanded
   var indexed: seq[(int, int, MultiAddress)] = @[]
@@ -909,6 +1004,7 @@ proc sendFrameOnSession(
     return (false, "direct message session unavailable")
   if timeout <= ZeroDuration:
     return (false, timeoutMsg)
+  let writeStartMs = nowMillis()
   enterSessionActivity(session, DmActivityWritingFrame, messageId)
   if frameKind != DmFrameNone:
     recordOutboundFrame(session, frameKind, messageId)
@@ -917,15 +1013,39 @@ proc sendFrameOnSession(
     let activeConn = session.conn
     if activeConn.isNil or activeConn.closed:
       return (false, "direct message session closed")
+    warn "direct message session frame write begin",
+      peer = session.peerKey,
+      connKey = session.connKey,
+      carrierConnKey = session.carrierConnKey,
+      frameKind = $frameKind,
+      bytes = payload.len,
+      mid = messageId
     await awaitFutureWithin(
       activeConn.writeLp(payload),
       timeout,
       timeoutMsg,
     )
+    warn "direct message session frame write done",
+      peer = session.peerKey,
+      connKey = session.connKey,
+      carrierConnKey = session.carrierConnKey,
+      frameKind = $frameKind,
+      bytes = payload.len,
+      mid = messageId,
+      elapsedMs = nowMillis() - writeStartMs
     (true, "")
   except CancelledError as exc:
     raise exc
   except CatchableError as exc:
+    warn "direct message session frame write failed",
+      peer = session.peerKey,
+      connKey = session.connKey,
+      carrierConnKey = session.carrierConnKey,
+      frameKind = $frameKind,
+      bytes = payload.len,
+      mid = messageId,
+      elapsedMs = nowMillis() - writeStartMs,
+      err = exc.msg
     failSession(session, exc.msg, messageId)
     try:
       await closeSessionConn(session)
@@ -1042,7 +1162,12 @@ proc handleIncomingPayload(
         let ackBytes = buildAckPayload(svc, messageId, false, exc.msg)
         try:
           warn "direct message sending failure ack", peer = remotePeer, mid = messageId
-          let ackSend = await svc.sendAuthoritativeAck(session, ackBytes, messageId, 3.seconds)
+          let ackSend = await svc.sendAuthoritativeAck(
+            session,
+            ackBytes,
+            messageId,
+            chronos.milliseconds(DirectAuthoritativeAckTimeoutMs),
+          )
           if ackSend[0]:
             warn "direct message failure ack sent", peer = remotePeer, mid = messageId
           else:
@@ -1063,7 +1188,12 @@ proc handleIncomingPayload(
       let ackBytes = buildAckPayload(svc, messageId, true, "")
       try:
         warn "direct message sending ack", peer = remotePeer, mid = messageId
-        let ackSend = await svc.sendAuthoritativeAck(session, ackBytes, messageId, 3.seconds)
+        let ackSend = await svc.sendAuthoritativeAck(
+          session,
+          ackBytes,
+          messageId,
+          chronos.milliseconds(DirectAuthoritativeAckTimeoutMs),
+        )
         if ackSend[0]:
           warn "direct message ack sent", peer = remotePeer, mid = messageId
         else:
@@ -1088,6 +1218,10 @@ proc runSession(
   svc.refreshSessionPeerIndex(session)
   session.readerActive = true
   enterSessionActivity(session, DmActivityReaderAttached)
+  warn "direct message session run start",
+    peer = remotePeer,
+    connKey = session.connKey,
+    carrierConnKey = session.carrierConnKey
   if not session.readerReady.isNil and not session.readerReady.finished():
     session.readerReady.complete()
   try:
@@ -1129,6 +1263,11 @@ proc runSession(
 proc handleIncoming(
     svc: DirectMessageService, conn: Connection
 ) {.async: (raises: [CancelledError]).} =
+  warn "direct message incoming handler begin",
+    peer = (if conn.isNil: default(PeerId) else: conn.peerId),
+    connKey = directConnKey(conn),
+    protocol = (if conn.isNil: "" else: conn.protocol),
+    negotiated = (if conn.isNil: "" else: conn.negotiatedMuxer)
   let session = svc.storeSession(conn)
   if session.isNil:
     try:
@@ -1136,6 +1275,11 @@ proc handleIncoming(
     except CatchableError:
       discard
     return
+  warn "direct message incoming handler stored session",
+    peer = session.peerKey,
+    connKey = session.connKey,
+    carrierConnKey = session.carrierConnKey,
+    readerActive = session.readerActive
   await svc.runSession(session)
 
 proc newDirectMessageService*(
@@ -1225,11 +1369,20 @@ proc establishOutboundSession(
     messageId = "",
     allowExisting = true,
     startReaderDetached = false,
+    startReaderAsync = false,
     intent = DmEstablishSend,
     relayOnly = false,
-): Future[tuple[session: DirectMessageSession, connFromLive: bool, dialErr: string]] {.async.} =
+    directOnly = false,
+    initialProtocolPayload: seq[byte] = @[],
+): Future[tuple[
+    session: DirectMessageSession,
+    connFromLive: bool,
+    dialErr: string,
+    dialStage: string,
+    initialFrameSent: bool
+  ]] {.async.} =
   if svc.isNil or svc.switch.isNil:
-    return (nil, false, "direct message service unavailable")
+    return (nil, false, "direct message service unavailable", "unavailable", false)
 
   let establishDeadline = Moment.now() + timeout
 
@@ -1264,7 +1417,15 @@ proc establishOutboundSession(
   let hasVerifiedMuxer =
     not verifiedMuxer.isNil and
     not verifiedMuxer.connection.isNil and
-    not verifiedMuxer.connection.closed
+    not verifiedMuxer.connection.closed and
+    muxerMatchesRouting(verifiedMuxer, relayOnly, directOnly)
+  let routedLiveMuxer =
+    if hasVerifiedMuxer:
+      verifiedMuxer
+    elif relayOnly or directOnly:
+      svc.selectLiveMuxer(peer, relayOnly = relayOnly, directOnly = directOnly)
+    else:
+      nil
   let allowVerifiedExistingSession =
     preferredAddrs.len > 0 and
     reuseVerifiedLiveConnection
@@ -1285,6 +1446,8 @@ proc establishOutboundSession(
   if preferredConnKey > 0:
     let preferredSession = svc.getLiveSessionByConnKey(preferredConnKey)
     if not preferredSession.isNil:
+      if startReaderAsync and not sessionReaderRunning(preferredSession):
+        svc.startSessionReader(preferredSession)
       if startReaderDetached:
         await svc.ensureSessionReaderReady(
           preferredSession,
@@ -1298,11 +1461,13 @@ proc establishOutboundSession(
         "reason": "preferred_conn_key",
         "connKey": preferredConnKey,
       })
-      return (preferredSession, false, "")
+      return (preferredSession, false, "", "session_reuse", false)
 
   if hasVerifiedMuxer:
     let verifiedSession = svc.getLiveSessionByConn(verifiedMuxer.connection)
     if not verifiedSession.isNil:
+      if startReaderAsync and not sessionReaderRunning(verifiedSession):
+        svc.startSessionReader(verifiedSession)
       if startReaderDetached:
         await svc.ensureSessionReaderReady(
           verifiedSession,
@@ -1315,11 +1480,17 @@ proc establishOutboundSession(
         "messageId": messageId,
         "reason": "verified_muxer_conn",
       })
-      return (verifiedSession, true, "")
+      return (verifiedSession, true, "", "session_reuse", false)
 
   if allowVerifiedExistingSession:
-    let verifiedPeerSession = svc.getLiveSession(peer)
+    let verifiedPeerSession = svc.getLiveSession(
+      peer,
+      relayOnly = relayOnly,
+      directOnly = directOnly,
+    )
     if not verifiedPeerSession.isNil:
+      if startReaderAsync and not sessionReaderRunning(verifiedPeerSession):
+        svc.startSessionReader(verifiedPeerSession)
       if startReaderDetached:
         await svc.ensureSessionReaderReady(
           verifiedPeerSession,
@@ -1332,11 +1503,17 @@ proc establishOutboundSession(
         "messageId": messageId,
         "reason": "verified_peer_session",
       })
-      return (verifiedPeerSession, true, "")
+      return (verifiedPeerSession, true, "", "session_reuse", false)
 
   if allowGenericExisting:
-    let existing = svc.getLiveSession(peer)
+    let existing = svc.getLiveSession(
+      peer,
+      relayOnly = relayOnly,
+      directOnly = directOnly,
+    )
     if not existing.isNil:
+      if startReaderAsync and not sessionReaderRunning(existing):
+        svc.startSessionReader(existing)
       if startReaderDetached:
         await svc.ensureSessionReaderReady(
           existing,
@@ -1348,63 +1525,246 @@ proc establishOutboundSession(
         "peer": $peer,
         "messageId": messageId,
       })
-      return (existing, false, "")
+      return (existing, false, "", "session_reuse", false)
 
   let dialLock = svc.getOrCreateDialLock(peer, intent, relayOnly)
   var conn: Connection = nil
   var connFromLive = false
   var dialErr = ""
+  var dialStage = ""
+  var initialFrameSent = false
 
   proc dialFreshConnection() {.async.} =
     if orderedAddrs.len == 0:
       return
+    var freshFailureStage = "transport_connect"
     try:
+      var freshMuxer: Muxer = nil
+      var freshConn: Connection = nil
+      var adoptedFreshConn = false
+      let freshDialBudget = remainingEstablishBudget()
       notifySendProgress(progress, "dm_fresh_dial_begin", %*{
         "dmPhase": "fresh_dial",
         "peer": $peer,
         "codec": svc.codec,
         "addressCount": orderedAddrs.len,
+        "timeoutMs": freshDialBudget.milliseconds.int,
         "source": (if preferredAddrs.len > 0: "preferred" else: "peerstore"),
       })
       debug "direct message fresh dial begin",
         peer = $peer, codec = svc.codec, addrs = orderedAddrs.len,
         source = (if preferredAddrs.len > 0: "preferred" else: "peerstore")
-      conn = await svc.switch.dial(
-        peer,
-        orderedAddrs,
-        @[svc.codec],
-        forceDial = true,
-        reuseConnection = false,
-        options = DialOptions(
-          routing:
-            if relayOnly:
-              dppRelayOnly
-            else:
-              dppDefault
-        ),
-      )
-      notifySendProgress(progress, "dm_fresh_dial_ready", %*{
-        "dmPhase": "fresh_dial_ready",
-        "peer": $peer,
-        "codec": svc.codec,
-        "addressCount": orderedAddrs.len,
-      })
-      debug "direct message fresh dial succeeded",
-        peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
-      connFromLive = false
-      dialErr = ""
+      warn "direct message fresh dial addresses",
+        peer = $peer,
+        codec = svc.codec,
+        addrs = orderedAddrs.len,
+        source = (if preferredAddrs.len > 0: "preferred" else: "peerstore"),
+        ordered = orderedAddrs.mapIt($it).join(",")
+      if freshDialBudget <= ZeroDuration:
+        raise (ref LPError)(msg: "direct message fresh dial timeout")
+      try:
+        let dialRouting =
+          if relayOnly:
+            dppRelayOnly
+          elif directOnly:
+            dppDirectOnly
+          else:
+            dppDefault
+        let connectBudget = remainingEstablishBudget()
+        notifySendProgress(progress, "dm_transport_connect_begin", %*{
+          "dmPhase": "transport_connect_begin",
+          "peer": $peer,
+          "codec": svc.codec,
+          "addressCount": orderedAddrs.len,
+          "timeoutMs": connectBudget.milliseconds.int,
+          "relayOnly": relayOnly,
+          "directOnly": directOnly,
+        })
+        warn "direct message fresh dial transport connect begin",
+          peer = $peer,
+          codec = svc.codec,
+          addrs = orderedAddrs.len,
+          relayOnly = relayOnly,
+          directOnly = directOnly
+        if connectBudget <= ZeroDuration:
+          raise (ref LPError)(msg: "direct message fresh dial connect timeout")
+        freshMuxer = await awaitFutureWithin(
+          svc.switch.dialer.dialAndUpgrade(
+            Opt.some(peer),
+            orderedAddrs,
+            options = DialOptions(routing: dialRouting),
+          ),
+          connectBudget,
+          "direct message fresh dial connect timeout",
+        )
+        if freshMuxer.isNil or freshMuxer.connection.isNil:
+          raise (ref LPError)(msg: "direct message fresh dial muxer unavailable")
+        notifySendProgress(progress, "dm_transport_connect_done", %*{
+          "dmPhase": "transport_connect_done",
+          "peer": $peer,
+          "codec": svc.codec,
+          "addressCount": orderedAddrs.len,
+          "muxerProtocol": freshMuxer.connection.protocol,
+          "negotiatedMuxer": freshMuxer.connection.negotiatedMuxer,
+        })
+        warn "direct message fresh dial transport connect done",
+          peer = $peer,
+          codec = svc.codec,
+          addrs = orderedAddrs.len,
+          relayOnly = relayOnly,
+          directOnly = directOnly,
+          protocol = freshMuxer.connection.protocol,
+          negotiated = freshMuxer.connection.negotiatedMuxer
+
+        freshFailureStage = "stream_open"
+        let streamBudget = remainingEstablishBudget()
+        notifySendProgress(progress, "dm_stream_open_begin", %*{
+          "dmPhase": "stream_open_begin",
+          "peer": $peer,
+          "codec": svc.codec,
+          "timeoutMs": streamBudget.milliseconds.int,
+          "addressCount": orderedAddrs.len,
+        })
+        warn "direct message fresh dial stream open begin",
+          peer = $peer,
+          codec = svc.codec,
+          addrs = orderedAddrs.len
+        if streamBudget <= ZeroDuration:
+          raise (ref LPError)(msg: "direct message fresh dial stream open timeout")
+        freshConn = await awaitFutureWithin(
+          svc.switch.connManager.getStream(freshMuxer),
+          streamBudget,
+          "direct message fresh dial stream open timeout",
+        )
+        if freshConn.isNil:
+          raise (ref LPError)(msg: "direct message fresh dial stream unavailable")
+        notifySendProgress(progress, "dm_stream_open_done", %*{
+          "dmPhase": "stream_open_done",
+          "peer": $peer,
+          "codec": svc.codec,
+          "connKey": directConnKey(freshConn),
+        })
+        warn "direct message fresh dial stream open done",
+          peer = $peer,
+          codec = svc.codec,
+          connKey = directConnKey(freshConn),
+          protocol = freshConn.protocol,
+          negotiated = freshConn.negotiatedMuxer
+
+        freshFailureStage = "protocol_select"
+        let selectBudget = remainingEstablishBudget()
+        notifySendProgress(progress, "dm_protocol_select_begin", %*{
+          "dmPhase": "protocol_select_begin",
+          "peer": $peer,
+          "codec": svc.codec,
+          "timeoutMs": selectBudget.milliseconds.int,
+          "addressCount": orderedAddrs.len,
+        })
+        warn "direct message fresh dial protocol select begin",
+          peer = $peer,
+          codec = svc.codec,
+          connKey = directConnKey(freshConn),
+          timeoutMs = selectBudget.milliseconds.int
+        if selectBudget <= ZeroDuration:
+          raise (ref LPError)(msg: "direct message fresh dial protocol select timeout")
+        conn = await svc.switch.dialer.negotiateStream(
+          freshConn,
+          @[svc.codec],
+          firstProtoTrailingBytes = initialProtocolPayload,
+          totalTimeout = selectBudget,
+        )
+        if conn.isNil:
+          raise (ref LPError)(msg: "direct message fresh dial protocol select rejected")
+        initialFrameSent = initialProtocolPayload.len > 0
+        notifySendProgress(progress, "dm_protocol_select_done", %*{
+          "dmPhase": "protocol_select_done",
+          "peer": $peer,
+          "codec": svc.codec,
+          "connKey": directConnKey(conn),
+          "protocol": conn.protocol,
+          "negotiatedMuxer": conn.negotiatedMuxer,
+          "pipelinedPayloadBytes": initialProtocolPayload.len,
+        })
+        warn "direct message fresh dial protocol select done",
+          peer = $peer,
+          codec = svc.codec,
+          connKey = directConnKey(conn),
+          protocol = conn.protocol,
+          negotiated = conn.negotiatedMuxer,
+          pipelinedPayloadBytes = initialProtocolPayload.len
+        if initialFrameSent:
+          notifySendProgress(progress, "dm_write_pipelined", %*{
+            "dmPhase": "write_pipelined",
+            "peer": $peer,
+            "codec": svc.codec,
+            "connKey": directConnKey(conn),
+            "messageId": messageId,
+            "payloadBytes": initialProtocolPayload.len,
+          })
+          warn "direct message fresh dial initial payload pipelined",
+            peer = $peer,
+            codec = svc.codec,
+            connKey = directConnKey(conn),
+            mid = messageId,
+            payloadBytes = initialProtocolPayload.len
+        notifySendProgress(progress, "dm_session_bind_begin", %*{
+          "dmPhase": "session_bind_begin",
+          "peer": $peer,
+          "codec": svc.codec,
+          "connKey": directConnKey(conn),
+        })
+        warn "direct message fresh dial session bind begin",
+          peer = $peer,
+          codec = svc.codec,
+          connKey = directConnKey(conn),
+          protocol = (if conn.isNil: "" else: conn.protocol),
+          negotiated = (if conn.isNil: "" else: conn.negotiatedMuxer)
+        adoptedFreshConn = true
+        dialStage = "fresh_dial_ready"
+        notifySendProgress(progress, "dm_fresh_dial_ready", %*{
+          "dmPhase": "fresh_dial_ready",
+          "peer": $peer,
+          "codec": svc.codec,
+          "addressCount": orderedAddrs.len,
+        })
+        debug "direct message fresh dial succeeded",
+          peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
+        connFromLive = false
+        dialErr = ""
+      finally:
+        if not adoptedFreshConn:
+          if not freshConn.isNil:
+            try:
+              await freshConn.close()
+            except CatchableError:
+              discard
+          if not freshMuxer.isNil:
+            try:
+              await freshMuxer.close()
+            except CatchableError:
+              discard
     except CancelledError as exc:
       raise exc
     except CatchableError as exc:
       dialErr = exc.msg
+      let classified = classifyWarmFailureStage(dialErr)
+      dialStage =
+        if classified.len > 0:
+          classified
+        else:
+          freshFailureStage & "_failed"
       notifySendProgress(progress, "dm_fresh_dial_failed", %*{
         "dmPhase": "fresh_dial_failed",
         "peer": $peer,
         "codec": svc.codec,
         "addressCount": orderedAddrs.len,
         "error": dialErr,
+        "failureStage": freshFailureStage,
       })
-      warn "direct message fresh dial failed", peer = $peer, err = dialErr
+      warn "direct message fresh dial failed",
+        peer = $peer,
+        err = dialErr,
+        failureStage = freshFailureStage
 
   if not dialLock.isNil:
     let lockWaitBudget = remainingEstablishBudget()
@@ -1418,7 +1778,7 @@ proc establishOutboundSession(
         of DmEstablishSend: "send"),
     })
     if lockWaitBudget <= ZeroDuration:
-      return (nil, false, "direct message dial lock timeout")
+      return (nil, false, "direct message dial lock timeout", "dial_lock_timeout", false)
     await awaitFutureWithin(
       dialLock.acquire(),
       lockWaitBudget,
@@ -1441,7 +1801,7 @@ proc establishOutboundSession(
           "reason": "preferred_conn_key",
           "connKey": preferredConnKey,
         })
-        return (preferredSession, false, "")
+        return (preferredSession, false, "", "session_reuse", false)
 
     if hasVerifiedMuxer:
       let verifiedSession = svc.getLiveSessionByConn(verifiedMuxer.connection)
@@ -1458,10 +1818,14 @@ proc establishOutboundSession(
           "messageId": messageId,
           "reason": "verified_muxer_conn",
         })
-        return (verifiedSession, true, "")
+        return (verifiedSession, true, "", "session_reuse", false)
 
     if allowVerifiedExistingSession:
-      let verifiedPeerSession = svc.getLiveSession(peer)
+      let verifiedPeerSession = svc.getLiveSession(
+        peer,
+        relayOnly = relayOnly,
+        directOnly = directOnly,
+      )
       if not verifiedPeerSession.isNil:
         if startReaderDetached:
           await svc.ensureSessionReaderReady(
@@ -1475,10 +1839,14 @@ proc establishOutboundSession(
           "messageId": messageId,
           "reason": "verified_peer_session",
         })
-        return (verifiedPeerSession, true, "")
+        return (verifiedPeerSession, true, "", "session_reuse", false)
 
     if allowGenericExisting:
-      let existing = svc.getLiveSession(peer)
+      let existing = svc.getLiveSession(
+        peer,
+        relayOnly = relayOnly,
+        directOnly = directOnly,
+      )
       if not existing.isNil:
         if startReaderDetached:
           await svc.ensureSessionReaderReady(
@@ -1491,9 +1859,11 @@ proc establishOutboundSession(
           "peer": $peer,
           "messageId": messageId,
         })
-        return (existing, false, "")
+        return (existing, false, "", "session_reuse", false)
 
-    if (hasLiveConn() or hasVerifiedMuxer) and not useExplicitFreshDial:
+    let allowGenericLiveConnectionReuse = not relayOnly and not directOnly
+    if not routedLiveMuxer.isNil or
+        ((hasLiveConn() and allowGenericLiveConnectionReuse) and not useExplicitFreshDial):
       let liveDialBudget =
         if timeout <= 4.seconds:
           timeout
@@ -1503,6 +1873,13 @@ proc establishOutboundSession(
       let liveDirection =
         if hasVerifiedMuxer:
           "exact_verified_muxer"
+        elif not routedLiveMuxer.isNil:
+          if relayOnly:
+            "routing_specific_relay"
+          elif directOnly:
+            "routing_specific_direct"
+          else:
+            "routing_specific_live"
         elif preferredAddrs.len > 0 and reuseVerifiedLiveConnection:
           "outbound_verified"
         else:
@@ -1523,6 +1900,12 @@ proc establishOutboundSession(
         if hasVerifiedMuxer:
           debug "direct message reusing exact verified muxer for explicit route",
             peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
+        elif not routedLiveMuxer.isNil:
+          debug "direct message reusing routing-specific live muxer",
+            peer = $peer,
+            codec = svc.codec,
+            relayOnly = relayOnly,
+            directOnly = directOnly
         elif preferredAddrs.len > 0 and reuseVerifiedLiveConnection:
           debug "direct message reusing verified live connection for explicit route",
             peer = $peer, codec = svc.codec, addrs = orderedAddrs.len
@@ -1542,9 +1925,9 @@ proc establishOutboundSession(
           })
           if streamTimeoutMs <= 0:
             raise (ref LPError)(msg: "live connection dial timeout")
-          if hasVerifiedMuxer:
+          if not routedLiveMuxer.isNil:
             liveConn = await awaitFutureWithin(
-              svc.switch.connManager.getStream(verifiedMuxer),
+              svc.switch.connManager.getStream(routedLiveMuxer),
               liveDialDeadline - Moment.now(),
               "live connection dial timeout",
             )
@@ -1578,21 +1961,13 @@ proc establishOutboundSession(
           })
           if selectTimeoutMs <= 0:
             raise (ref LPError)(msg: "live connection dial timeout")
-          await awaitFutureWithin(
-            liveConn.beginProtocolNegotiation(),
-            liveDialDeadline - Moment.now(),
-            "live connection negotiation begin timeout",
+          liveConn = await svc.switch.dialer.negotiateStream(
+            liveConn,
+            @[svc.codec],
+            totalTimeout = liveDialDeadline - Moment.now(),
           )
-          try:
-            let selected = await awaitFutureWithin(
-              MultistreamSelect.select(liveConn, svc.codec),
-              liveDialDeadline - Moment.now(),
-              "live connection protocol select timeout",
-            )
-            if not selected:
-              raise (ref LPError)(msg: "live connection protocol select rejected")
-          finally:
-            liveConn.endProtocolNegotiation()
+          if liveConn.isNil:
+            raise (ref LPError)(msg: "live connection protocol select rejected")
           notifySendProgress(progress, "dm_conn_live_select_ready", %*{
             "dmPhase": "reuse_live_connection_select_ready",
             "peer": $peer,
@@ -1602,6 +1977,7 @@ proc establishOutboundSession(
           adoptedLiveConn = true
           connFromLive = true
           dialErr = ""
+          dialStage = "live_connection_ready"
           notifySendProgress(progress, "dm_conn_live_ready", %*{
             "dmPhase": "reuse_live_connection_ready",
             "peer": $peer,
@@ -1624,6 +2000,12 @@ proc establishOutboundSession(
         raise exc
       except CatchableError as exc:
         dialErr = exc.msg
+        let classified = classifyWarmFailureStage(dialErr)
+        dialStage =
+          if classified.len > 0:
+            classified
+          else:
+            "live_connection_failed"
         notifySendProgress(progress, "dm_conn_live_failed", %*{
           "dmPhase": "reuse_live_connection_failed",
           "peer": $peer,
@@ -1647,7 +2029,7 @@ proc establishOutboundSession(
     if conn.isNil and orderedAddrs.len > 0 and not forbidFreshDialAfterVerifiedReuse:
       await dialFreshConnection()
 
-    if conn.isNil and dialErr.len == 0 and not hasLiveConn():
+    if conn.isNil and dialErr.len == 0:
       dialErr =
         if orderedAddrs.len == 0:
           "no stored addresses"
@@ -1655,6 +2037,12 @@ proc establishOutboundSession(
           "verified live muxer unavailable"
         else:
           "no existing connection"
+      if dialStage.len == 0:
+        dialStage =
+          if orderedAddrs.len == 0:
+            "route_missing"
+          else:
+            "connection_missing"
 
     if conn.isNil:
       notifySendProgress(progress, "dm_connection_missing", %*{
@@ -1663,23 +2051,50 @@ proc establishOutboundSession(
         "addressCount": orderedAddrs.len,
         "error": (if dialErr.len > 0: dialErr else: "dial failed without fallback"),
       })
-      return (nil, connFromLive, dialErr)
+      return (nil, connFromLive, dialErr, dialStage, false)
 
     let created = svc.ensureSessionFromConnection(
       conn,
       (if hasVerifiedMuxer: verifiedMuxer.connection else: nil),
       startReaderDetached,
     )
+    notifySendProgress(progress, "dm_session_bind_done", %*{
+      "dmPhase": "session_bind_done",
+      "peer": $peer,
+      "codec": svc.codec,
+      "connKey": (if created.isNil: 0 else: created.connKey),
+      "readerDetached": startReaderDetached,
+      "readerActive": (if created.isNil: false else: created.readerActive),
+    })
+    warn "direct message fresh dial session bind done",
+      peer = $peer,
+      codec = svc.codec,
+      connKey = (if created.isNil: 0 else: created.connKey),
+      readerDetached = startReaderDetached,
+      readerActive = (if created.isNil: false else: created.readerActive)
     if created.isNil:
       dialErr = "direct message session unavailable"
-      return (nil, connFromLive, dialErr)
-    if startReaderDetached:
+      return (nil, connFromLive, dialErr, "session_attach_timeout", initialFrameSent)
+    if initialFrameSent:
+      recordOutboundFrame(created, DmFrameMessage, messageId)
+      touchSession(created, messageId)
+    if startReaderAsync and not initialFrameSent and not sessionReaderRunning(created):
+      svc.startSessionReader(created)
+      notifySendProgress(progress, "dm_reader_async_start", %*{
+        "dmPhase": "reader_async_start",
+        "peer": $peer,
+        "codec": svc.codec,
+        "connKey": created.connKey,
+      })
+    if startReaderDetached and not initialFrameSent:
       await svc.ensureSessionReaderReady(
         created,
         remainingEstablishBudget(),
         messageId,
       )
-    (created, connFromLive, dialErr)
+    if dialStage.len == 0:
+      dialStage = "session_ready"
+    (created, connFromLive, dialErr, dialStage, initialFrameSent)
   finally:
     releaseAsyncLock(dialLock)
 
@@ -1693,11 +2108,13 @@ proc warmSessionDetailed*(
     reuseVerifiedLiveConnection = false,
     progress: DirectMessageSendProgress = nil,
     relayOnly = false,
+    directOnly = false,
 ): Future[DirectMessageWarmResult] {.async.} =
   if svc.isNil or svc.switch.isNil:
     return DirectMessageWarmResult(
       ok: false,
       err: "direct message service unavailable",
+      stage: "unavailable",
     )
   let warmRes = await svc.establishOutboundSession(
     peer,
@@ -1709,8 +2126,10 @@ proc warmSessionDetailed*(
     progress = progress,
     allowExisting = preferredAddrs.len == 0 and verifiedMuxer.isNil,
     startReaderDetached = false,
+    startReaderAsync = true,
     intent = DmEstablishWarm,
     relayOnly = relayOnly,
+    directOnly = directOnly,
   )
   if warmRes.session.isNil:
     let errMsg =
@@ -1726,6 +2145,11 @@ proc warmSessionDetailed*(
     return DirectMessageWarmResult(
       ok: false,
       err: errMsg,
+      stage:
+        if warmRes.dialStage.len > 0:
+          warmRes.dialStage
+        else:
+          classifyWarmFailureStage(errMsg),
     )
   notifySendProgress(progress, "dm_session_warm_ready", %*{
     "dmPhase": "session_warm_ready",
@@ -1740,6 +2164,11 @@ proc warmSessionDetailed*(
   DirectMessageWarmResult(
     ok: true,
     err: "",
+    stage:
+      if warmRes.dialStage.len > 0:
+        warmRes.dialStage
+      else:
+        "session_ready",
     connKey: warmRes.session.connKey,
     reusedLiveConnection: warmRes.connFromLive,
     readerActive: warmRes.session.readerActive,
@@ -1789,6 +2218,7 @@ proc send*(
   var session: DirectMessageSession = nil
   var dialErr = ""
   var connFromLive = false
+  var initialFrameSent = false
 
   proc sendOnSession(activeSession: DirectMessageSession): Future[(bool, string, bool)] {.async.} =
     proc remainingSendBudget(): Duration =
@@ -1809,38 +2239,62 @@ proc send*(
 
     try:
       let writeBudget = remainingSendBudget()
-      notifySendProgress(progress, "dm_write_begin", %*{
-        "dmPhase": "write_begin",
-        "peer": $peer,
-        "bytes": payload.len,
-        "ackRequested": ackRequested,
-        "messageId": messageId,
-        "timeoutMs": writeBudget.milliseconds.int,
-      })
-      debug "direct message writeLp begin",
-        peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
-      if writeBudget <= ZeroDuration:
-        raise (ref LPError)(msg: "direct message write timeout")
-      let writeRes = await sendFrameOnSession(
-        activeSession,
-        payload,
-        writeBudget,
-        "direct message write timeout",
-        frameKind = DmFrameMessage,
-        messageId = messageId,
-      )
-      if not writeRes[0]:
-        raise (ref LPError)(msg: writeRes[1])
-      notifySendProgress(progress, "dm_write_done", %*{
-        "dmPhase": "write_done",
-        "peer": $peer,
-        "bytes": payload.len,
-        "ackRequested": ackRequested,
-        "messageId": messageId,
-      })
-      debug "direct message writeLp done",
-        peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
-      debug "direct message payload sent", peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+      if initialFrameSent:
+        notifySendProgress(progress, "dm_write_begin", %*{
+          "dmPhase": "write_begin",
+          "peer": $peer,
+          "bytes": payload.len,
+          "ackRequested": ackRequested,
+          "messageId": messageId,
+          "timeoutMs": writeBudget.milliseconds.int,
+          "pipelined": true,
+        })
+        notifySendProgress(progress, "dm_write_done", %*{
+          "dmPhase": "write_done",
+          "peer": $peer,
+          "bytes": payload.len,
+          "ackRequested": ackRequested,
+          "messageId": messageId,
+          "pipelined": true,
+        })
+        warn "direct message writeLp already pipelined",
+          peer = $peer,
+          bytes = payload.len,
+          ackRequested = ackRequested,
+          mid = messageId
+      else:
+        notifySendProgress(progress, "dm_write_begin", %*{
+          "dmPhase": "write_begin",
+          "peer": $peer,
+          "bytes": payload.len,
+          "ackRequested": ackRequested,
+          "messageId": messageId,
+          "timeoutMs": writeBudget.milliseconds.int,
+        })
+        debug "direct message writeLp begin",
+          peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+        if writeBudget <= ZeroDuration:
+          raise (ref LPError)(msg: "direct message write timeout")
+        let writeRes = await sendFrameOnSession(
+          activeSession,
+          payload,
+          writeBudget,
+          "direct message write timeout",
+          frameKind = DmFrameMessage,
+          messageId = messageId,
+        )
+        if not writeRes[0]:
+          raise (ref LPError)(msg: writeRes[1])
+        notifySendProgress(progress, "dm_write_done", %*{
+          "dmPhase": "write_done",
+          "peer": $peer,
+          "bytes": payload.len,
+          "ackRequested": ackRequested,
+          "messageId": messageId,
+        })
+        debug "direct message writeLp done",
+          peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
+        debug "direct message payload sent", peer = $peer, bytes = payload.len, ackRequested = ackRequested, mid = messageId
       if not sessionReaderRunning(activeSession):
         svc.startSessionReader(activeSession)
         notifySendProgress(progress, "dm_reader_attach", %*{
@@ -1980,10 +2434,12 @@ proc send*(
     startReaderDetached = true,
     intent = DmEstablishSend,
     relayOnly = relayOnly,
+    initialProtocolPayload = encodeLpFrameBytes(payload),
   )
   session = established.session
   connFromLive = established.connFromLive
   dialErr = established.dialErr
+  initialFrameSent = established.initialFrameSent
   if session.isNil:
     debug "direct message dial aborted without fallback", peer = $peer, err = dialErr
     return (false, if dialErr.len > 0: dialErr else: "dial failed without fallback")

@@ -1439,29 +1439,38 @@ proc connectionMaintenanceDeadlineUs(conn: ConnectionState): uint64 {.gcsafe, ra
   earliest
 
 proc connectionMaintenancePump(conn: ConnectionState): Future[void] {.async.} =
+  var waitFuture: Future[void] = nil
   try:
     while true:
       if conn.isNil or conn.maintenanceClosed:
         break
-      let deadlineUs = conn.connectionMaintenanceDeadlineUs()
-      if conn.maintenanceSignal.isNil:
+      let signal = conn.maintenanceSignal
+      if signal.isNil:
         break
+      if waitFuture.isNil or waitFuture.finished():
+        waitFuture = signal.wait()
+      let deadlineUs = conn.connectionMaintenanceDeadlineUs()
       try:
         if deadlineUs == 0'u64:
-          await conn.maintenanceSignal.wait()
+          await waitFuture
+          waitFuture = nil
           continue
         let nowUs = nowMicros()
         if deadlineUs <= nowUs:
           conn.detectTimedOutLosses()
           continue
-        let waitFuture = conn.maintenanceSignal.wait()
         let sleepFuture = sleepAsync(chronos.nanoseconds(int64((deadlineUs - nowUs) * 1000'u64)))
         let winner = await race(cast[FutureBase](waitFuture), cast[FutureBase](sleepFuture))
         if winner == cast[FutureBase](sleepFuture):
-          waitFuture.cancel()
           conn.detectTimedOutLosses()
         else:
-          sleepFuture.cancel()
+          await waitFuture
+          waitFuture = nil
+          # The maintenance timer future is request-local and has no shared side
+          # effects. Let it expire naturally instead of canceling it here; this
+          # path was crashing on Chronos cancel scheduling during post-send
+          # maintenance churn.
+          discard
       except CancelledError:
         break
       except Exception as exc:
@@ -2344,20 +2353,79 @@ proc appendUniqueLostStream(streams: var seq[StreamState];
       return
   streams.add(stream)
 
+proc detachStreamFromConnection(state: StreamState) {.gcsafe.} =
+  if state.isNil or state.connection.isNil:
+    return
+  let conn = state.connection
+  var idx = 0
+  while idx < conn.localStreams.len:
+    if conn.localStreams[idx] == state:
+      conn.localStreams.delete(idx)
+    else:
+      inc idx
+  var staleIncomingIds: seq[uint64] = @[]
+  for streamId, stream in conn.incomingStreams.pairs:
+    if stream == state:
+      staleIncomingIds.add(streamId)
+  for streamId in staleIncomingIds:
+    conn.incomingStreams.del(streamId)
+
+proc pruneClosedConnectionStreams(conn: ConnectionState) {.gcsafe.} =
+  if conn.isNil:
+    return
+  var retainedLocal: seq[StreamState] = @[]
+  if conn.localStreams.len > 0:
+    retainedLocal = newSeqOfCap[StreamState](conn.localStreams.len)
+    for stream in conn.localStreams:
+      if stream.isNil:
+        continue
+      if stream.closed:
+        continue
+      retainedLocal.add(stream)
+  conn.localStreams = retainedLocal
+  var retainedIncoming = initTable[uint64, StreamState]()
+  if conn.incomingStreams.len > 0:
+    var incomingIds: seq[uint64] = @[]
+    incomingIds = newSeqOfCap[uint64](conn.incomingStreams.len)
+    for streamId in conn.incomingStreams.keys:
+      incomingIds.add(streamId)
+    for streamId in incomingIds:
+      if not conn.incomingStreams.hasKey(streamId):
+        continue
+      let stream = conn.incomingStreams[streamId]
+      if stream.isNil:
+        continue
+      if stream.closed:
+        continue
+      retainedIncoming[streamId] = stream
+  conn.incomingStreams = retainedIncoming
+
 proc flushStream(state: StreamState) {.gcsafe.}
 proc scheduleFlushStreamRetry(state: StreamState; reason: string) {.gcsafe.}
 
 proc flushAllConnectionStreams(conn: ConnectionState) {.gcsafe.} =
   if conn.isNil:
     return
-  for stream in conn.localStreams:
+  let localStreams = conn.localStreams
+  for stream in localStreams:
     if stream.isNil:
       continue
-    flushStream(stream)
-  for stream in conn.incomingStreams.values:
-    if stream.isNil:
+    if stream.closed:
       continue
     flushStream(stream)
+  var incomingIds: seq[uint64] = @[]
+  for streamId in conn.incomingStreams.keys:
+    incomingIds.add(streamId)
+  for streamId in incomingIds:
+    if not conn.incomingStreams.hasKey(streamId):
+      continue
+    let stream = conn.incomingStreams[streamId]
+    if stream.isNil:
+      continue
+    if stream.closed:
+      continue
+    flushStream(stream)
+  conn.pruneClosedConnectionStreams()
 
 proc detectAckDrivenLosses(conn: ConnectionState; ack: proto.AckFrame; epoch: CryptoEpoch;
     nowUs: uint64; lostBytes: var uint32; largestLost: var uint64;
@@ -2528,8 +2596,22 @@ proc detectTimedOutLosses(conn: ConnectionState) {.gcsafe.} =
 
 proc flushPendingDatagrams(conn: ConnectionState) {.gcsafe.}
 
+var
+  gHandleRegistry: SharedTable[HQUIC, bool]
+  gNextConnectionId: uint32 = 1
+  gApiStateLock: Lock
+
 proc getHandleFast(handle: HQUIC): QuicHandleState {.quicApiHot.} =
   if handle.isNil:
+    return nil
+  var registered = false
+  acquire(gApiStateLock)
+  try:
+    gHandleRegistry.withValue(handle, value):
+      registered = value[]
+  finally:
+    release(gApiStateLock)
+  if not registered:
     return nil
   cast[QuicHandleState](handle)
 
@@ -2654,11 +2736,8 @@ proc algorithmNote(algorithm: CongestionAlgorithm): string {.inline.} =
     "congestion=BBR"
 
 var
-  gHandleRegistry: SharedTable[HQUIC, bool]
   gApiTableInstance: QuicApiTable
   gApiTableRefCount: int
-  gNextConnectionId: uint32 = 1
-  gApiStateLock: Lock
 type
   GlobalExecutionConfigState* = object
     flags*: uint32
@@ -3001,6 +3080,12 @@ proc sendOneRttPacketAsync(conn: ConnectionState; remote: TransportAddress;
     packet: seq[byte]; frameKind: SentFrameKind) {.async.} =
   if conn.isNil or conn.transport.isNil:
     return
+  let sendStartMs = int64(epochTime() * 1000)
+  if frameKind == sfkStream:
+    warn "MsQuic UDP stream packet send begin",
+      connection = cast[uint64](conn),
+      bytes = packet.len,
+      remote = $remote
   when defined(ohos):
     safeEmitConnDiag(
       cast[pointer](conn),
@@ -3010,6 +3095,12 @@ proc sendOneRttPacketAsync(conn: ConnectionState; remote: TransportAddress;
     )
   try:
     await conn.transport.sendTo(remote, packet)
+    if frameKind == sfkStream:
+      warn "MsQuic UDP stream packet send done",
+        connection = cast[uint64](conn),
+        bytes = packet.len,
+        remote = $remote,
+        elapsedMs = int64(epochTime() * 1000) - sendStartMs
     when defined(ohos):
       safeEmitConnDiag(
         cast[pointer](conn),
@@ -3018,6 +3109,13 @@ proc sendOneRttPacketAsync(conn: ConnectionState; remote: TransportAddress;
           " remote=" & $remote
       )
   except CatchableError as exc:
+    if frameKind == sfkStream:
+      warn "MsQuic UDP stream packet send failed",
+        connection = cast[uint64](conn),
+        bytes = packet.len,
+        remote = $remote,
+        elapsedMs = int64(epochTime() * 1000) - sendStartMs,
+        err = exc.msg
     safeEmitConnectionDiagnostic(
       conn,
       "UDP send failed kind=" & $frameKind &
@@ -3034,6 +3132,13 @@ proc sendOneRttPacketAsync(conn: ConnectionState; remote: TransportAddress;
           " err=" & exc.msg
       )
   except Exception as exc:
+    if frameKind == sfkStream:
+      warn "MsQuic UDP stream packet send exception",
+        connection = cast[uint64](conn),
+        bytes = packet.len,
+        remote = $remote,
+        elapsedMs = int64(epochTime() * 1000) - sendStartMs,
+        err = exc.msg
     safeEmitConnectionDiagnostic(
       conn,
       "UDP send exception kind=" & $frameKind &
@@ -3136,6 +3241,14 @@ proc emitReceiveBufferNeeded(state: StreamState; needed: uint64) =
 proc emitOrderedStreamReceive(state: StreamState; offset: uint64; payloadData: seq[byte]; fin: bool) =
   if state.isNil:
     return
+  if payloadData.len > 0:
+    warn "MsQuic ordered stream receive",
+      connection = cast[uint64](state.connection),
+      stream = cast[uint64](state),
+      streamId = state.streamId,
+      offset = offset,
+      bytes = payloadData.len,
+      fin = fin
   if not state.callback.isNil:
     var native = QuicStreamEvent(Type: QUIC_STREAM_EVENT_RECEIVE, Padding: 0)
     var buffer = QuicBuffer(
@@ -3369,7 +3482,7 @@ proc sendOneRttPacket(conn: ConnectionState; payload: seq[byte];
     emitDiagnostics(DiagnosticsEvent(
       kind: diagConnectionEvent,
       handle: cast[pointer](conn),
-      note: "TX 1-RTT pn=" & $pn & " kind=" & $frameKind
+      note: "TX 1-RTT"
     ))
   pn
 
@@ -3473,7 +3586,7 @@ proc sendZeroRttPacket(conn: ConnectionState; payload: seq[byte];
     emitDiagnostics(DiagnosticsEvent(
       kind: diagConnectionEvent,
       handle: cast[pointer](conn),
-      note: "TX 0-RTT pn=" & $pn & " kind=" & $frameKind
+      note: "TX 0-RTT"
     ))
   conn.zeroRttSentBytes += uint64(payload.len)
   pn
@@ -3627,7 +3740,7 @@ proc sendInitialPacket(conn: ConnectionState; payload: seq[byte];
     emitDiagnostics(DiagnosticsEvent(
       kind: diagConnectionEvent,
       handle: cast[pointer](conn),
-      note: "TX Initial pn=" & $pn & " kind=" & $frameKind
+      note: "TX Initial"
     ))
   pn
 
@@ -3699,7 +3812,7 @@ proc sendHandshakePacket(conn: ConnectionState; payload: seq[byte];
     emitDiagnostics(DiagnosticsEvent(
       kind: diagConnectionEvent,
       handle: cast[pointer](conn),
-      note: "TX Handshake pn=" & $pn & " kind=" & $frameKind
+      note: "TX Handshake"
     ))
   pn
 
@@ -6640,7 +6753,7 @@ proc msquicStreamShutdown(stream: HQUIC;
   QUIC_STATUS_SUCCESS
 
 proc flushStream(state: StreamState) {.gcsafe.} =
-  if state.isNil or state.connection.isNil:
+  if state.isNil or state.closed or state.connection.isNil:
     return
   let conn = state.connection
 

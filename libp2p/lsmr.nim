@@ -1,6 +1,6 @@
 {.push raises: [].}
 
-import std/[algorithm, options, sequtils, strutils]
+import std/[algorithm, options, sequtils, strutils, tables]
 
 import chronos
 import results
@@ -42,10 +42,149 @@ type
 
   LsmrPath* = seq[uint8]
 
+  LsmrBagua* {.pure.} = enum
+    lbgQian
+    lbgDui
+    lbgLi
+    lbgZhen
+    lbgXun
+    lbgKan
+    lbgGen
+    lbgKun
+
+  LsmrStorageTier* {.pure.} = enum
+    lstEdge
+    lstFog
+    lstGlobal
+
+  LsmrBaguaKey* = object
+    topologyPath*: LsmrPath
+    resolution*: uint8
+    bagua*: LsmrBagua
+    contentLsh*: string
+
+  LsmrBaguaCursor* = object
+    topologyPrefix*: LsmrPath
+    resolution*: Option[uint8]
+    bagua*: Option[LsmrBagua]
+    contentPrefix*: string
+
+  LsmrBaguaLeaf* = object
+    key*: LsmrBaguaKey
+    payload*: seq[byte]
+    version*: uint64
+    digest*: string
+
+  LsmrBaguaDiffKind* {.pure.} = enum
+    lbdMissingLocal
+    lbdMissingRemote
+    lbdPayloadMismatch
+
+  LsmrBaguaDiff* = object
+    key*: LsmrBaguaKey
+    kind*: LsmrBaguaDiffKind
+    localDigest*: string
+    remoteDigest*: string
+
+  LsmrBaguaPrefixNode = ref object
+    label: string
+    digest: string
+    leafCount: int
+    hasLeaf: bool
+    leaf: LsmrBaguaLeaf
+    children: Table[string, LsmrBaguaPrefixNode]
+
+  LsmrBaguaPrefixTree* = object
+    root: LsmrBaguaPrefixNode
+
   ObjectCoordinate* = object
     objectId*: string
     path*: LsmrPath
     depth*: uint8
+    contentLsh*: string
+
+  LsmrDaYanMode* {.pure.} = enum
+    ldymZhen
+    ldymXun
+
+  LsmrDaYanStage* {.pure.} = enum
+    ldysKunLocal
+    ldysDuiRegional
+    ldysLiGlobal
+
+  LsmrDaYanPayloadKind* {.pure.} = enum
+    ldypkCsgDelta
+    ldypkSemanticFingerprint
+
+  LsmrDaYanFilterResult* {.pure.} = enum
+    ldyfAccept
+    ldyfBlockMode
+    ldyfBlockResolution
+    ldyfBlockTopology
+    ldyfBlockSemantic
+    ldyfBlockGuard
+
+  LsmrDaYanTopic* = object
+    center*: LsmrPath
+    resolution*: uint8
+    semanticFingerprint*: string
+    guardDigest*: string
+    mode*: LsmrDaYanMode
+
+  LsmrDaYanSubscription* = object
+    topologyPrefix*: LsmrPath
+    minResolution*: uint8
+    maxResolution*: uint8
+    semanticPrefix*: string
+    guardPrefix*: string
+    acceptUrgent*: bool
+    acceptBackground*: bool
+
+  LsmrDaYanPeer* = object
+    peerId*: PeerId
+    prefix*: LsmrPath
+    subscriptions*: seq[LsmrDaYanSubscription]
+
+  LsmrDaYanFlowConfig* = object
+    regionalFanout*: int
+    globalFanout*: int
+    minGlobalResolution*: uint8
+
+  LsmrDaYanRoute* = object
+    peerId*: PeerId
+    stage*: LsmrDaYanStage
+    mode*: LsmrDaYanMode
+    payloadKind*: LsmrDaYanPayloadKind
+    resolution*: uint8
+    topologyPrefix*: LsmrPath
+    distance*: int
+    semanticFingerprint*: string
+
+  LsmrDaYanMessage* = object
+    messageId*: string
+    originPeerId*: PeerId
+    topic*: LsmrDaYanTopic
+    stage*: LsmrDaYanStage
+    mode*: LsmrDaYanMode
+    payloadKind*: LsmrDaYanPayloadKind
+    resolution*: uint8
+    payload*: seq[byte]
+    semanticFingerprint*: string
+
+  LsmrDaYanEnvelope* = object
+    messageId*: string
+    originPeerId*: PeerId
+    topic*: LsmrDaYanTopic
+    stage*: LsmrDaYanStage
+    mode*: LsmrDaYanMode
+    payloadKind*: LsmrDaYanPayloadKind
+    resolution*: uint8
+    payload*: seq[byte]
+    semanticFingerprint*: string
+
+  LsmrDaYanHandler* = proc(message: LsmrDaYanMessage): Future[void] {.
+    gcsafe, raises: [], closure
+  .}
 
   TopologyNeighborBucket* = object
     directionDigit*: uint8
@@ -262,6 +401,20 @@ proc objectPathForText*(digestText: string, depth = 4): LsmrPath =
     digest[idx] = byte(ch.ord and 0xff)
   objectPathForDigest(digest, depth)
 
+proc contentLshText*(digest: openArray[byte]): string =
+  result = newStringOfCap(digest.len * 2)
+  for b in digest:
+    result.add(int(b).toHex(2))
+
+proc storageBaguas*(tier: LsmrStorageTier): seq[LsmrBagua] =
+  case tier
+  of LsmrStorageTier.lstEdge:
+    @[LsmrBagua.lbgZhen, LsmrBagua.lbgXun]
+  of LsmrStorageTier.lstFog:
+    @[LsmrBagua.lbgKan, LsmrBagua.lbgLi]
+  of LsmrStorageTier.lstGlobal:
+    @[LsmrBagua.lbgKun, LsmrBagua.lbgGen]
+
 proc objectCoordinate*(
     objectId: string, digest: openArray[byte], depth = 4
 ): ObjectCoordinate =
@@ -270,6 +423,7 @@ proc objectCoordinate*(
     objectId: objectId,
     path: objectPathForDigest(digest, resolvedDepth),
     depth: uint8(min(255, resolvedDepth)),
+    contentLsh: digest.contentLshText(),
   )
 
 proc objectCoordinate*(
@@ -280,7 +434,141 @@ proc objectCoordinate*(
     objectId: objectId,
     path: objectPathForText(digestText, resolvedDepth),
     depth: uint8(min(255, resolvedDepth)),
+    contentLsh: digestText,
   )
+
+proc init*(
+    _: type LsmrDaYanTopic,
+    center: LsmrPath,
+    resolution: uint8,
+    semanticFingerprint: string,
+    guardDigest = "",
+    mode = LsmrDaYanMode.ldymXun,
+): LsmrDaYanTopic =
+  LsmrDaYanTopic(
+    center: center,
+    resolution: resolution,
+    semanticFingerprint: semanticFingerprint,
+    guardDigest: guardDigest,
+    mode: mode,
+  )
+
+proc init*(
+    _: type LsmrDaYanSubscription,
+    topologyPrefix: LsmrPath,
+    minResolution = 1'u8,
+    maxResolution = high(uint8),
+    semanticPrefix = "",
+    guardPrefix = "",
+    acceptUrgent = true,
+    acceptBackground = true,
+): LsmrDaYanSubscription =
+  LsmrDaYanSubscription(
+    topologyPrefix: topologyPrefix,
+    minResolution: minResolution,
+    maxResolution: max(maxResolution, minResolution),
+    semanticPrefix: semanticPrefix,
+    guardPrefix: guardPrefix,
+    acceptUrgent: acceptUrgent,
+    acceptBackground: acceptBackground,
+  )
+
+proc init*(
+    _: type LsmrDaYanPeer,
+    peerId: PeerId,
+    prefix: LsmrPath,
+    subscriptions: seq[LsmrDaYanSubscription] = @[],
+): LsmrDaYanPeer =
+  LsmrDaYanPeer(peerId: peerId, prefix: prefix, subscriptions: subscriptions)
+
+proc init*(
+    _: type LsmrDaYanFlowConfig,
+    regionalFanout = 3,
+    globalFanout = 2,
+    minGlobalResolution = 1'u8,
+): LsmrDaYanFlowConfig =
+  LsmrDaYanFlowConfig(
+    regionalFanout: max(0, regionalFanout),
+    globalFanout: max(0, globalFanout),
+    minGlobalResolution: max(1'u8, minGlobalResolution),
+  )
+
+proc init*(
+    _: type LsmrDaYanMessage,
+    messageId: string,
+    originPeerId: PeerId,
+    topic: LsmrDaYanTopic,
+    stage: LsmrDaYanStage,
+    payloadKind: LsmrDaYanPayloadKind,
+    resolution: uint8,
+    payload: seq[byte] = @[],
+    semanticFingerprint = "",
+): LsmrDaYanMessage =
+  let normalizedSemantic =
+    if semanticFingerprint.len > 0:
+      semanticFingerprint
+    else:
+      topic.semanticFingerprint
+  LsmrDaYanMessage(
+    messageId: messageId,
+    originPeerId: originPeerId,
+    topic: topic,
+    stage: stage,
+    mode: topic.mode,
+    payloadKind: payloadKind,
+    resolution: resolution,
+    payload: payload,
+    semanticFingerprint: normalizedSemantic,
+  )
+
+proc init*(
+    _: type LsmrDaYanEnvelope,
+    messageId: string,
+    originPeerId: PeerId,
+    topic: LsmrDaYanTopic,
+    stage: LsmrDaYanStage,
+    payloadKind: LsmrDaYanPayloadKind,
+    resolution: uint8,
+    payload: seq[byte] = @[],
+    semanticFingerprint = "",
+): LsmrDaYanEnvelope =
+  let normalizedSemantic =
+    if semanticFingerprint.len > 0:
+      semanticFingerprint
+    else:
+      topic.semanticFingerprint
+  LsmrDaYanEnvelope(
+    messageId: messageId,
+    originPeerId: originPeerId,
+    topic: topic,
+    stage: stage,
+    mode: topic.mode,
+    payloadKind: payloadKind,
+    resolution: resolution,
+    payload: payload,
+    semanticFingerprint: normalizedSemantic,
+  )
+
+proc baguaKey*(
+    coord: ObjectCoordinate, resolution: uint8, bagua: LsmrBagua
+): LsmrBaguaKey =
+  LsmrBaguaKey(
+    topologyPath: coord.path,
+    resolution: resolution,
+    bagua: bagua,
+    contentLsh: coord.contentLsh,
+  )
+
+proc baguaKeys*(
+    coord: ObjectCoordinate, tier: LsmrStorageTier, resolution = 0'u8
+): seq[LsmrBaguaKey] =
+  let resolvedResolution =
+    if resolution == 0'u8:
+      uint8(max(1, int(coord.depth)))
+    else:
+      resolution
+  for bagua in tier.storageBaguas():
+    result.add(coord.baguaKey(resolvedResolution, bagua))
 
 proc pathStartsWith*(path, prefix: LsmrPath): bool =
   if prefix.len > path.len:
@@ -294,6 +582,9 @@ proc parentPrefix*(path: LsmrPath): LsmrPath =
   if path.len <= 1:
     return @[]
   path[0 ..< path.len - 1]
+
+proc prefixesIntersect*(a, b: LsmrPath): bool =
+  pathStartsWith(a, b) or pathStartsWith(b, a)
 
 proc isValidLsmrDigit*(digit: uint8): bool =
   digit in {1'u8, 2'u8, 3'u8, 4'u8, 5'u8, 6'u8, 7'u8, 8'u8, 9'u8}
@@ -401,6 +692,268 @@ proc commonPrefixLen*(a, b: LsmrPath): int =
   while result < count and a[result] == b[result]:
     inc result
 
+proc effectivePrefix*(
+    topic: LsmrDaYanTopic, resolution = 0'u8
+): LsmrPath =
+  let effectiveResolution =
+    if resolution == 0'u8:
+      topic.resolution
+    else:
+      resolution
+  let takeCount = min(topic.center.len, int(effectiveResolution))
+  if takeCount <= 0:
+    return @[]
+  topic.center[0 ..< takeCount]
+
+proc isValid*(topic: LsmrDaYanTopic): bool =
+  topic.resolution > 0'u8 and topic.semanticFingerprint.len > 0 and
+    topic.center.isValidLsmrPath() and int(topic.resolution) <= topic.center.len
+
+proc isValid*(subscription: LsmrDaYanSubscription): bool =
+  subscription.topologyPrefix.isValidLsmrPath() and
+    subscription.minResolution > 0'u8 and
+    subscription.maxResolution >= subscription.minResolution and
+    (subscription.acceptUrgent or subscription.acceptBackground)
+
+proc isValid*(peer: LsmrDaYanPeer): bool =
+  peer.peerId.data.len > 0 and peer.prefix.isValidLsmrPath() and
+    peer.subscriptions.allIt(it.isValid())
+
+proc allowsMode(
+    subscription: LsmrDaYanSubscription, mode: LsmrDaYanMode
+): bool =
+  case mode
+  of LsmrDaYanMode.ldymZhen:
+    subscription.acceptUrgent
+  of LsmrDaYanMode.ldymXun:
+    subscription.acceptBackground
+
+proc evaluate*(
+    subscription: LsmrDaYanSubscription,
+    topic: LsmrDaYanTopic,
+    resolution = 0'u8,
+): LsmrDaYanFilterResult =
+  if not subscription.isValid() or not topic.isValid():
+    return LsmrDaYanFilterResult.ldyfBlockTopology
+  let effectiveResolution =
+    if resolution == 0'u8:
+      topic.resolution
+    else:
+      resolution
+  if effectiveResolution < subscription.minResolution or
+      effectiveResolution > subscription.maxResolution:
+    return LsmrDaYanFilterResult.ldyfBlockResolution
+  if not subscription.allowsMode(topic.mode):
+    return LsmrDaYanFilterResult.ldyfBlockMode
+  let prefix = topic.effectivePrefix(effectiveResolution)
+  if prefix.len == 0 or
+      not prefixesIntersect(prefix, subscription.topologyPrefix):
+    return LsmrDaYanFilterResult.ldyfBlockTopology
+  if subscription.semanticPrefix.len > 0 and
+      not topic.semanticFingerprint.startsWith(subscription.semanticPrefix):
+    return LsmrDaYanFilterResult.ldyfBlockSemantic
+  if subscription.guardPrefix.len > 0 and
+      not topic.guardDigest.startsWith(subscription.guardPrefix):
+    return LsmrDaYanFilterResult.ldyfBlockGuard
+  LsmrDaYanFilterResult.ldyfAccept
+
+proc matches*(
+    subscription: LsmrDaYanSubscription,
+    topic: LsmrDaYanTopic,
+    resolution = 0'u8,
+): bool =
+  subscription.evaluate(topic, resolution) == LsmrDaYanFilterResult.ldyfAccept
+
+proc prefixDistance*(path, targetPrefix: LsmrPath): int =
+  if path.len == 0 or targetPrefix.len == 0:
+    return high(int)
+  let count = min(path.len, targetPrefix.len)
+  lsmrDistance(path[0 ..< count], targetPrefix[0 ..< count])
+
+proc selectDaYanCandidates(
+    peers: openArray[LsmrDaYanPeer],
+    topic: LsmrDaYanTopic,
+    resolution: uint8,
+    exclude: Table[string, bool],
+): seq[LsmrDaYanPeer] =
+  let targetPrefix = topic.effectivePrefix(resolution)
+  for peer in peers:
+    if not peer.isValid():
+      continue
+    if exclude.getOrDefault($peer.peerId):
+      continue
+    if peer.subscriptions.anyIt(it.matches(topic, resolution)):
+      result.add(peer)
+  result.sort(proc(a, b: LsmrDaYanPeer): int =
+    let sharedA = commonPrefixLen(a.prefix, targetPrefix)
+    let sharedB = commonPrefixLen(b.prefix, targetPrefix)
+    result = cmp(sharedB, sharedA)
+    if result != 0:
+      return result
+    let distA = prefixDistance(a.prefix, targetPrefix)
+    let distB = prefixDistance(b.prefix, targetPrefix)
+    result = cmp(distA, distB)
+    if result != 0:
+      return result
+    return cmp($a.peerId, $b.peerId)
+  )
+
+proc appendDaYanRoutes(
+    routes: var seq[LsmrDaYanRoute],
+    peers: openArray[LsmrDaYanPeer],
+    topic: LsmrDaYanTopic,
+    resolution: uint8,
+    stage: LsmrDaYanStage,
+    payloadKind: LsmrDaYanPayloadKind,
+    limit: int,
+    selected: var Table[string, bool],
+) =
+  if limit == 0:
+    return
+  let prefix = topic.effectivePrefix(resolution)
+  let candidates = selectDaYanCandidates(peers, topic, resolution, selected)
+  let capped =
+    if limit < 0:
+      candidates.len
+    else:
+      min(limit, candidates.len)
+  for idx in 0 ..< capped:
+    let peer = candidates[idx]
+    selected[$peer.peerId] = true
+    routes.add(LsmrDaYanRoute(
+      peerId: peer.peerId,
+      stage: stage,
+      mode: topic.mode,
+      payloadKind: payloadKind,
+      resolution: resolution,
+      topologyPrefix: prefix,
+      distance: prefixDistance(peer.prefix, prefix),
+      semanticFingerprint: topic.semanticFingerprint,
+    ))
+
+proc planDaYanFlow*(
+    peers: openArray[LsmrDaYanPeer],
+    topic: LsmrDaYanTopic,
+    cfg = LsmrDaYanFlowConfig.init(),
+    excludePeerId = none(PeerId),
+): seq[LsmrDaYanRoute] =
+  if not topic.isValid():
+    return @[]
+  var selected = initTable[string, bool]()
+  if excludePeerId.isSome():
+    selected[$excludePeerId.get()] = true
+
+  let localPrefix = topic.effectivePrefix()
+  var localPeers: seq[LsmrDaYanPeer] = @[]
+  for peer in peers:
+    if not peer.isValid():
+      continue
+    if selected.getOrDefault($peer.peerId):
+      continue
+    if not peer.subscriptions.anyIt(it.matches(topic, topic.resolution)):
+      continue
+    if commonPrefixLen(peer.prefix, localPrefix) >= int(topic.resolution):
+      localPeers.add(peer)
+  localPeers.sort(proc(a, b: LsmrDaYanPeer): int = cmp($a.peerId, $b.peerId))
+  for peer in localPeers:
+    selected[$peer.peerId] = true
+    result.add(LsmrDaYanRoute(
+      peerId: peer.peerId,
+      stage: LsmrDaYanStage.ldysKunLocal,
+      mode: topic.mode,
+      payloadKind: LsmrDaYanPayloadKind.ldypkCsgDelta,
+      resolution: topic.resolution,
+      topologyPrefix: localPrefix,
+      distance: 0,
+      semanticFingerprint: topic.semanticFingerprint,
+    ))
+
+  if topic.resolution > 1'u8:
+    let regionalResolution = topic.resolution - 1'u8
+    result.appendDaYanRoutes(
+      peers,
+      topic,
+      regionalResolution,
+      LsmrDaYanStage.ldysDuiRegional,
+      LsmrDaYanPayloadKind.ldypkCsgDelta,
+      cfg.regionalFanout,
+      selected,
+    )
+
+    var globalResolution = regionalResolution
+    while globalResolution >= cfg.minGlobalResolution and globalResolution > 0'u8:
+      result.appendDaYanRoutes(
+        peers,
+        topic,
+        globalResolution,
+        LsmrDaYanStage.ldysLiGlobal,
+        LsmrDaYanPayloadKind.ldypkSemanticFingerprint,
+        cfg.globalFanout,
+        selected,
+      )
+      if globalResolution == cfg.minGlobalResolution or globalResolution == 1'u8:
+        break
+      dec globalResolution
+
+proc planDaYanRelay*(
+    peers: openArray[LsmrDaYanPeer],
+    topic: LsmrDaYanTopic,
+    stage: LsmrDaYanStage,
+    resolution: uint8,
+    cfg = LsmrDaYanFlowConfig.init(),
+    excludePeerId = none(PeerId),
+): seq[LsmrDaYanRoute] =
+  if not topic.isValid() or resolution == 0'u8:
+    return @[]
+
+  var selected = initTable[string, bool]()
+  if excludePeerId.isSome():
+    selected[$excludePeerId.get()] = true
+
+  case stage
+  of LsmrDaYanStage.ldysKunLocal:
+    if resolution > 1'u8:
+      result.appendDaYanRoutes(
+        peers,
+        topic,
+        resolution - 1'u8,
+        LsmrDaYanStage.ldysDuiRegional,
+        LsmrDaYanPayloadKind.ldypkCsgDelta,
+        cfg.regionalFanout,
+        selected,
+      )
+    elif resolution >= cfg.minGlobalResolution:
+      result.appendDaYanRoutes(
+        peers,
+        topic,
+        resolution,
+        LsmrDaYanStage.ldysLiGlobal,
+        LsmrDaYanPayloadKind.ldypkSemanticFingerprint,
+        cfg.globalFanout,
+        selected,
+      )
+  of LsmrDaYanStage.ldysDuiRegional:
+    result.appendDaYanRoutes(
+      peers,
+      topic,
+      resolution,
+      LsmrDaYanStage.ldysLiGlobal,
+      LsmrDaYanPayloadKind.ldypkSemanticFingerprint,
+      cfg.globalFanout,
+      selected,
+    )
+  of LsmrDaYanStage.ldysLiGlobal:
+    if resolution > cfg.minGlobalResolution and resolution > 1'u8:
+      result.appendDaYanRoutes(
+        peers,
+        topic,
+        resolution - 1'u8,
+        LsmrDaYanStage.ldysLiGlobal,
+        LsmrDaYanPayloadKind.ldypkSemanticFingerprint,
+        cfg.globalFanout,
+        selected,
+      )
+
 proc divergenceDistance*(candidate, target: LsmrPath): int =
   let shared = commonPrefixLen(candidate, target)
   if shared >= candidate.len or shared >= target.len:
@@ -476,6 +1029,389 @@ proc computeIsolationDigest*(evidence: LsmrIsolationEvidence): string =
   acc = acc xor evidence.epochId xor uint64(evidence.issuedAtMs)
   acc = acc xor uint64(ord(evidence.reason))
   acc.toHex(16)
+
+proc digestMix(seed: uint64, value: uint64): uint64 =
+  (seed shl 5) xor (seed shr 3) xor value xor 0x517C_C1B7_2722_0A95'u64
+
+proc digestMix(seed: uint64, value: openArray[byte]): uint64 =
+  result = seed xor 0xD6E8_FD9D_53E1_7D4B'u64 xor uint64(value.len)
+  for idx, b in value:
+    result = (result shl 7) xor (result shr 2) xor uint64((idx + 1) * int(b))
+
+proc label*(bagua: LsmrBagua): string =
+  case bagua
+  of LsmrBagua.lbgQian:
+    "qian"
+  of LsmrBagua.lbgDui:
+    "dui"
+  of LsmrBagua.lbgLi:
+    "li"
+  of LsmrBagua.lbgZhen:
+    "zhen"
+  of LsmrBagua.lbgXun:
+    "xun"
+  of LsmrBagua.lbgKan:
+    "kan"
+  of LsmrBagua.lbgGen:
+    "gen"
+  of LsmrBagua.lbgKun:
+    "kun"
+
+proc init*(
+    _: type LsmrBaguaKey,
+    topologyPath: LsmrPath,
+    resolution: uint8,
+    bagua: LsmrBagua,
+    contentLsh: string,
+): LsmrBaguaKey =
+  LsmrBaguaKey(
+    topologyPath: topologyPath,
+    resolution: resolution,
+    bagua: bagua,
+    contentLsh: contentLsh,
+  )
+
+proc init*(
+    _: type LsmrBaguaCursor,
+    topologyPrefix: LsmrPath = @[],
+    resolution = none(uint8),
+    bagua = none(LsmrBagua),
+    contentPrefix = "",
+): LsmrBaguaCursor =
+  LsmrBaguaCursor(
+    topologyPrefix: topologyPrefix,
+    resolution: resolution,
+    bagua: bagua,
+    contentPrefix: contentPrefix,
+  )
+
+proc isValid*(key: LsmrBaguaKey): bool =
+  key.resolution > 0'u8 and key.contentLsh.len > 0 and key.topologyPath.isValidLsmrPath()
+
+proc isValid*(cursor: LsmrBaguaCursor): bool =
+  if not cursor.topologyPrefix.isValidLsmrPath():
+    return false
+  if cursor.resolution.isSome() and cursor.resolution.get() == 0'u8:
+    return false
+  if cursor.bagua.isSome() and cursor.resolution.isNone():
+    return false
+  if cursor.contentPrefix.len > 0 and
+      (cursor.resolution.isNone() or cursor.bagua.isNone()):
+    return false
+  true
+
+proc cmp(a, b: LsmrBaguaKey): int =
+  let count = min(a.topologyPath.len, b.topologyPath.len)
+  for idx in 0 ..< count:
+    result = cmp(int(a.topologyPath[idx]), int(b.topologyPath[idx]))
+    if result != 0:
+      return result
+  result = cmp(a.topologyPath.len, b.topologyPath.len)
+  if result != 0:
+    return result
+  result = cmp(int(a.resolution), int(b.resolution))
+  if result != 0:
+    return result
+  result = cmp(ord(a.bagua), ord(b.bagua))
+  if result != 0:
+    return result
+  result = cmp(a.contentLsh, b.contentLsh)
+
+proc baguaResolutionLabel(resolution: uint8): string =
+  "r:" & $resolution
+
+proc baguaBranchLabel(bagua: LsmrBagua): string =
+  "b:" & bagua.label()
+
+proc topologySegmentLabel(digit: uint8): string =
+  "t:" & $digit
+
+proc contentSegmentLabel(ch: char): string =
+  "c:" & int(ch.ord and 0xff).toHex(2)
+
+proc keySegments(key: LsmrBaguaKey): seq[string] =
+  result = newSeqOfCap[string](key.topologyPath.len + key.contentLsh.len + 2)
+  for digit in key.topologyPath:
+    result.add(topologySegmentLabel(digit))
+  result.add(baguaResolutionLabel(key.resolution))
+  result.add(baguaBranchLabel(key.bagua))
+  for ch in key.contentLsh:
+    result.add(contentSegmentLabel(ch))
+
+proc cursorSegments(cursor: LsmrBaguaCursor): seq[string] =
+  result = newSeqOfCap[string](cursor.topologyPrefix.len + cursor.contentPrefix.len + 2)
+  for digit in cursor.topologyPrefix:
+    result.add(topologySegmentLabel(digit))
+  if cursor.resolution.isSome():
+    result.add(baguaResolutionLabel(cursor.resolution.get()))
+  if cursor.bagua.isSome():
+    result.add(baguaBranchLabel(cursor.bagua.get()))
+  for ch in cursor.contentPrefix:
+    result.add(contentSegmentLabel(ch))
+
+proc newBaguaPrefixNode(label: string): LsmrBaguaPrefixNode =
+  new(result)
+  result.label = label
+  result.children = initTable[string, LsmrBaguaPrefixNode]()
+
+proc computeBaguaLeafDigest*(leaf: LsmrBaguaLeaf): string =
+  var acc = 0xC2B2_AE35_79B9_1D6D'u64
+  acc = digestMix(acc, leaf.key.topologyPath)
+  acc = digestMix(acc, uint64(leaf.key.resolution))
+  acc = digestMix(acc, uint64(ord(leaf.key.bagua)))
+  acc = digestMix(acc, leaf.key.contentLsh)
+  acc = digestMix(acc, leaf.payload)
+  acc = digestMix(acc, leaf.version)
+  acc.toHex(16)
+
+proc refreshBaguaNode(node: LsmrBaguaPrefixNode) =
+  if node.isNil:
+    return
+  var acc = 0x6A09_E667_F3BC_C909'u64
+  acc = digestMix(acc, node.label)
+  node.leafCount = 0
+  if node.hasLeaf:
+    inc node.leafCount
+    acc = digestMix(acc, node.leaf.digest)
+  var labels = toSeq(node.children.keys)
+  labels.sort(system.cmp[string])
+  for label in labels:
+    let child = node.children.getOrDefault(label)
+    if child.isNil:
+      continue
+    node.leafCount += child.leafCount
+    acc = digestMix(acc, label)
+    acc = digestMix(acc, child.digest)
+  node.digest = acc.toHex(16)
+
+proc ensureBaguaRoot(tree: var LsmrBaguaPrefixTree) =
+  if tree.root.isNil:
+    tree.root = newBaguaPrefixNode("root")
+    refreshBaguaNode(tree.root)
+
+proc init*(_: type LsmrBaguaPrefixTree): LsmrBaguaPrefixTree =
+  result.ensureBaguaRoot()
+
+proc len*(tree: LsmrBaguaPrefixTree): int =
+  if tree.root.isNil:
+    return 0
+  tree.root.leafCount
+
+proc rootDigest*(tree: LsmrBaguaPrefixTree): string =
+  if tree.root.isNil:
+    return LsmrBaguaPrefixTree.init().rootDigest()
+  tree.root.digest
+
+proc resolveNode(tree: LsmrBaguaPrefixTree, segments: openArray[string]): LsmrBaguaPrefixNode =
+  if tree.root.isNil:
+    return nil
+  result = tree.root
+  for label in segments:
+    if not result.children.contains(label):
+      return nil
+    result = result.children.getOrDefault(label)
+    if result.isNil:
+      return nil
+
+proc contains*(tree: LsmrBaguaPrefixTree, key: LsmrBaguaKey): bool =
+  if not key.isValid():
+    return false
+  let node = tree.resolveNode(key.keySegments())
+  not node.isNil and node.hasLeaf
+
+proc get*(tree: LsmrBaguaPrefixTree, key: LsmrBaguaKey): Option[LsmrBaguaLeaf] =
+  if not key.isValid():
+    return none(LsmrBaguaLeaf)
+  let node = tree.resolveNode(key.keySegments())
+  if node.isNil or not node.hasLeaf:
+    return none(LsmrBaguaLeaf)
+  some(node.leaf)
+
+proc put*(
+    tree: var LsmrBaguaPrefixTree,
+    key: LsmrBaguaKey,
+    payload: openArray[byte],
+    version = 0'u64,
+) =
+  if not key.isValid():
+    return
+  tree.ensureBaguaRoot()
+  let segments = key.keySegments()
+  var stack = @[tree.root]
+  var node = tree.root
+  for label in segments:
+    var child = node.children.getOrDefault(label)
+    if child.isNil:
+      child = newBaguaPrefixNode(label)
+      node.children[label] = child
+    node = child
+    stack.add(node)
+  node.hasLeaf = true
+  node.leaf = LsmrBaguaLeaf(
+    key: key,
+    payload: @payload,
+    version: version,
+    digest: "",
+  )
+  node.leaf.digest = computeBaguaLeafDigest(node.leaf)
+  for idx in countdown(stack.high, 0):
+    refreshBaguaNode(stack[idx])
+
+proc delete*(tree: var LsmrBaguaPrefixTree, key: LsmrBaguaKey): bool =
+  if not key.isValid() or tree.root.isNil:
+    return false
+  let segments = key.keySegments()
+  var nodes = @[tree.root]
+  var labels: seq[string] = @[]
+  var node = tree.root
+  for label in segments:
+    if not node.children.contains(label):
+      return false
+    labels.add(label)
+    node = node.children.getOrDefault(label)
+    if node.isNil:
+      return false
+    nodes.add(node)
+  if not node.hasLeaf:
+    return false
+  node.hasLeaf = false
+  node.leaf = default(LsmrBaguaLeaf)
+  for idx in countdown(nodes.high, 1):
+    let current = nodes[idx]
+    refreshBaguaNode(current)
+    let parent = nodes[idx - 1]
+    let label = labels[idx - 1]
+    if current.leafCount == 0:
+      parent.children.del(label)
+    refreshBaguaNode(parent)
+  true
+
+proc collectLeaves(node: LsmrBaguaPrefixNode, acc: var seq[LsmrBaguaLeaf]) =
+  if node.isNil:
+    return
+  if node.hasLeaf:
+    acc.add(node.leaf)
+  var labels = toSeq(node.children.keys)
+  labels.sort(system.cmp[string])
+  for label in labels:
+    collectLeaves(node.children.getOrDefault(label), acc)
+
+proc items*(tree: LsmrBaguaPrefixTree): seq[LsmrBaguaLeaf] =
+  if tree.root.isNil:
+    return @[]
+  collectLeaves(tree.root, result)
+  result.sort(proc(a, b: LsmrBaguaLeaf): int = cmp(a.key, b.key))
+
+proc prefixDigest*(tree: LsmrBaguaPrefixTree, cursor: LsmrBaguaCursor): string =
+  if not cursor.isValid():
+    return ""
+  let node = tree.resolveNode(cursor.cursorSegments())
+  if node.isNil:
+    return ""
+  node.digest
+
+proc prefixLeaves*(tree: LsmrBaguaPrefixTree, cursor: LsmrBaguaCursor): seq[LsmrBaguaLeaf] =
+  if not cursor.isValid():
+    return @[]
+  let node = tree.resolveNode(cursor.cursorSegments())
+  if node.isNil:
+    return @[]
+  collectLeaves(node, result)
+  result.sort(proc(a, b: LsmrBaguaLeaf): int = cmp(a.key, b.key))
+
+proc appendMissingBaguaLeaves(
+    node: LsmrBaguaPrefixNode,
+    kind: LsmrBaguaDiffKind,
+    result: var seq[LsmrBaguaDiff],
+) =
+  if node.isNil:
+    return
+  var leaves: seq[LsmrBaguaLeaf] = @[]
+  collectLeaves(node, leaves)
+  for leaf in leaves:
+    result.add(
+      LsmrBaguaDiff(
+        key: leaf.key,
+        kind: kind,
+        localDigest: if kind == LsmrBaguaDiffKind.lbdMissingLocal: "" else: leaf.digest,
+        remoteDigest: if kind == LsmrBaguaDiffKind.lbdMissingRemote: "" else: leaf.digest,
+      )
+    )
+
+proc diffBaguaNodes(
+    localNode, remoteNode: LsmrBaguaPrefixNode, result: var seq[LsmrBaguaDiff]
+) =
+  if localNode.isNil and remoteNode.isNil:
+    return
+  if localNode.isNil:
+    appendMissingBaguaLeaves(remoteNode, LsmrBaguaDiffKind.lbdMissingLocal, result)
+    return
+  if remoteNode.isNil:
+    appendMissingBaguaLeaves(localNode, LsmrBaguaDiffKind.lbdMissingRemote, result)
+    return
+  if localNode.digest == remoteNode.digest:
+    return
+  if localNode.hasLeaf or remoteNode.hasLeaf:
+    if localNode.hasLeaf and remoteNode.hasLeaf:
+      if localNode.leaf.digest != remoteNode.leaf.digest:
+        result.add(
+          LsmrBaguaDiff(
+            key: localNode.leaf.key,
+            kind: LsmrBaguaDiffKind.lbdPayloadMismatch,
+            localDigest: localNode.leaf.digest,
+            remoteDigest: remoteNode.leaf.digest,
+          )
+        )
+    elif localNode.hasLeaf:
+      result.add(
+        LsmrBaguaDiff(
+          key: localNode.leaf.key,
+          kind: LsmrBaguaDiffKind.lbdMissingRemote,
+          localDigest: localNode.leaf.digest,
+          remoteDigest: "",
+        )
+      )
+    else:
+      result.add(
+        LsmrBaguaDiff(
+          key: remoteNode.leaf.key,
+          kind: LsmrBaguaDiffKind.lbdMissingLocal,
+          localDigest: "",
+          remoteDigest: remoteNode.leaf.digest,
+        )
+      )
+  var labels = toSeq(localNode.children.keys)
+  for label in remoteNode.children.keys:
+    if label notin labels:
+      labels.add(label)
+  labels.sort(system.cmp[string])
+  var uniqueLabels: seq[string] = @[]
+  for label in labels:
+    if uniqueLabels.len == 0 or uniqueLabels[^1] != label:
+      uniqueLabels.add(label)
+  for label in uniqueLabels:
+    diffBaguaNodes(
+      if localNode.children.contains(label): localNode.children.getOrDefault(label) else: nil,
+      if remoteNode.children.contains(label): remoteNode.children.getOrDefault(label) else: nil,
+      result,
+    )
+
+proc diff*(localTree, remoteTree: LsmrBaguaPrefixTree): seq[LsmrBaguaDiff] =
+  diffBaguaNodes(localTree.root, remoteTree.root, result)
+  result.sort(proc(a, b: LsmrBaguaDiff): int = cmp(a.key, b.key))
+
+proc putObject*(
+    tree: var LsmrBaguaPrefixTree,
+    coord: ObjectCoordinate,
+    tier: LsmrStorageTier,
+    payload: openArray[byte],
+    version = 0'u64,
+    resolution = 0'u8,
+): seq[LsmrBaguaKey] =
+  let keys = coord.baguaKeys(tier, resolution)
+  for key in keys:
+    tree.put(key, payload, version)
+    result.add(key)
 
 proc encodePath(path: LsmrPath): seq[byte] =
   @path

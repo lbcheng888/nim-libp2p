@@ -32,7 +32,7 @@ method closeImpl*(s: BridgeStream): Future[void] {.async: (raises: [], raw: true
 
   procCall BufferStream(s).closeImpl()
 
-method getWrapped*(s: BridgeStream): Connection =
+method getWrapped*(s: BridgeStream): Connection {.gcsafe.} =
   nil
 
 proc bridgedConnections*(

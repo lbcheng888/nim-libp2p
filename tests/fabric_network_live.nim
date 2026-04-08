@@ -119,6 +119,21 @@ proc waitUntilCheckpoint(nodes: seq[FabricNode], observer: FabricNode, rounds = 
       return checkpoint
   none(CheckpointCertificate)
 
+proc assertQuiesced(node: FabricNode, expectedCommittedNonce: uint64) =
+  let snapshot = node.submitFence()
+  check snapshot.pendingInbound == 0
+  check snapshot.localOfferedNonce == expectedCommittedNonce
+  check snapshot.localCommittedNonce == expectedCommittedNonce
+  check snapshot.pendingEvents == 0
+  check snapshot.pendingAttestations == 0
+  check snapshot.pendingEventCertificates == 0
+  check snapshot.pendingCertificationEvents == 0
+  check snapshot.pendingWitnessPulls == 0
+  check snapshot.pendingIndexFlushes == 0
+  check snapshot.eventOutstanding == 0
+  check snapshot.attOutstanding == 0
+  check snapshot.certOutstanding == 0
+
 suite "Fabric live network":
   test "observer catches up over real libp2p fabric network":
     let v0 = newNodeIdentity()
@@ -189,6 +204,11 @@ suite "Fabric live network":
       check certified
 
     when not defined(fabric_diag):
+      n0.assertQuiesced(nonce)
+      n1.assertQuiesced(0'u64)
+      n2.assertQuiesced(0'u64)
+      n3.assertQuiesced(0'u64)
+
       let checkpoint = waitUntilCheckpoint(nodes, n3)
       check checkpoint.isSome()
       check checkpoint.get().candidate.era == 0

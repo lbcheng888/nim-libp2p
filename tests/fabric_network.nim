@@ -33,32 +33,21 @@ proc makeGenesis(validators: seq[NodeIdentity], observer: NodeIdentity): Genesis
     result.balances.add(KeyValueU64(key: identity.account, value: 1_000_000))
   result.balances.add(KeyValueU64(key: observer.account, value: 1_000_000))
 
-proc signedTx(identity: NodeIdentity, nonce: uint64, suffix: string): Tx =
-  result = Tx(
-    txId: "",
-    kind: txContentPublishIntent,
-    sender: "",
-    senderPublicKey: "",
-    nonce: nonce,
-    epoch: 0,
-    timestamp: int64(nonce),
-    payload: %*{
-      "intent": {
-        "contentId": "net-post-" & suffix,
-        "author": identity.account,
-        "title": "net-post-" & suffix,
-        "body": "network body " & suffix,
-        "kind": "text",
-        "manifestCid": "net-manifest-" & suffix,
-        "createdAt": int(nonce),
-        "accessPolicy": "public",
-        "previewCid": "net-preview-" & suffix,
-        "seqNo": int(nonce)
-      }
-    },
-    signature: "",
-  )
-  signTx(identity, result)
+proc publishPayload(identity: NodeIdentity, nonce: uint64, suffix: string): JsonNode =
+  %*{
+    "intent": {
+      "contentId": "net-post-" & suffix,
+      "author": identity.account,
+      "title": "net-post-" & suffix,
+      "body": "network body " & suffix,
+      "kind": "text",
+      "manifestCid": "net-manifest-" & suffix,
+      "createdAt": int(nonce),
+      "accessPolicy": "public",
+      "previewCid": "net-preview-" & suffix,
+      "seqNo": int(nonce)
+    }
+  }
 
 proc waitUntil(
     predicate: proc(): bool {.closure, gcsafe.}, timeoutMs = 30_000, intervalMs = 100
@@ -77,11 +66,65 @@ proc stopAll(nodes: seq[FabricNode]) {.async.} =
     except CatchableError:
       discard
 
+proc assertQuiesced(node: FabricNode, expectedCommittedNonce: uint64) =
+  let snapshot = node.submitFence()
+  check snapshot.pendingInbound == 0
+  check snapshot.localOfferedNonce == expectedCommittedNonce
+  check snapshot.localCommittedNonce == expectedCommittedNonce
+  check snapshot.pendingEvents == 0
+  check snapshot.pendingAttestations == 0
+  check snapshot.pendingEventCertificates == 0
+  check snapshot.pendingCertificationEvents == 0
+  check snapshot.pendingWitnessPulls == 0
+  check snapshot.pendingIndexFlushes == 0
+  check snapshot.eventOutstanding == 0
+  check snapshot.attOutstanding == 0
+  check snapshot.certOutstanding == 0
+
+proc submitCommittedLocalTx(
+    node: FabricNode,
+    payload: JsonNode,
+    nonce: uint64,
+    timestamp: int64,
+): SubmitEventResult =
+  result = node.submitLocalTx(
+    txContentPublishIntent,
+    payload,
+    timestamp = timestamp,
+  )
+  check result.accepted
+  waitFor waitUntil(
+    proc(): bool {.gcsafe.} =
+      {.cast(gcsafe).}:
+        node.fabricStatus().localCommittedNonce >= nonce
+    ,
+    timeoutMs = 30_000,
+  )
+
 proc rawAddrs(node: FabricNode): seq[string] =
   if node.isNil or node.network.isNil or node.network.switch.isNil:
     return @[]
   for addr in node.network.switch.peerInfo.addrs:
     result.add($addr)
+
+proc makeLegacyNodeConfig(
+    baseDir: string,
+    identity: NodeIdentity,
+    genesis: GenesisSpec,
+    lsmrPath: LsmrPath,
+    bootstrapAddrs: seq[string],
+): FabricNodeConfig =
+  createDir(baseDir)
+  saveIdentity(baseDir / "identity.json", identity)
+  saveGenesis(baseDir / "genesis.json", genesis)
+  FabricNodeConfig(
+    dataDir: baseDir,
+    identityPath: baseDir / "identity.json",
+    genesisPath: baseDir / "genesis.json",
+    listenAddrs: @["/ip4/127.0.0.1/tcp/0"],
+    bootstrapAddrs: bootstrapAddrs,
+    lsmrPath: lsmrPath,
+  )
 
 proc rootAnchor(identity: NodeIdentity, operatorId: string): LsmrAnchor =
   LsmrAnchor(
@@ -143,67 +186,110 @@ suite "Fabric 3 validators + 1 observer":
     let v2 = newNodeIdentity()
     let observerId = newNodeIdentity()
     let genesis = makeGenesis(@[v0, v1, v2], observerId)
+    let baseDir = getTempDir() / ("fabric-network-legacy-" & $getTime().toUnix())
+    createDir(baseDir)
+    var nodes: seq[FabricNode] = @[]
+    try:
+      let n0 = newFabricNode(makeLegacyNodeConfig(baseDir / "node-0", v0, genesis, @[5'u8], @[]))
+      nodes.add(n0)
+      waitFor n0.start()
 
-    let n0 = newFabricNode(v0, genesis, @[5'u8])
-    let n1 = newFabricNode(v1, genesis, @[1'u8])
-    let n2 = newFabricNode(v2, genesis, @[9'u8])
-    let n3 = newFabricNode(observerId, genesis, @[3'u8])
+      let bootstrap = n0.rawAddrs()
+      let n1 = newFabricNode(makeLegacyNodeConfig(baseDir / "node-1", v1, genesis, @[1'u8], bootstrap))
+      let n2 = newFabricNode(makeLegacyNodeConfig(baseDir / "node-2", v2, genesis, @[9'u8], bootstrap))
+      let n3 = newFabricNode(makeLegacyNodeConfig(baseDir / "node-3", observerId, genesis, @[3'u8], bootstrap))
+      nodes.add(n1)
+      nodes.add(n2)
+      nodes.add(n3)
 
-    for pair in @[(n0, n1), (n0, n2), (n0, n3), (n1, n2), (n1, n3), (n2, n3)]:
-      connectPeer(pair[0], pair[1])
+      waitFor n1.start()
+      waitFor n2.start()
+      waitFor n3.start()
+      waitFor sleepAsync(2000)
 
-    var nonce0 = 0'u64
-    var nonce1 = 0'u64
-    var nonce2 = 0'u64
+      var nonce0 = 0'u64
+      var nonce1 = 0'u64
+      var nonce2 = 0'u64
 
-    for idx in 0 ..< 20:
+      for idx in 0 ..< 20:
+        inc nonce0
+        discard n0.submitCommittedLocalTx(
+          publishPayload(v0, nonce0, "v0-" & $idx),
+          nonce0,
+          timestamp = int64(nonce0),
+        )
+
+        inc nonce1
+        discard n1.submitCommittedLocalTx(
+          publishPayload(v1, nonce1, "v1-" & $idx),
+          nonce1,
+          timestamp = int64(nonce1),
+        )
+
+        inc nonce2
+        discard n2.submitCommittedLocalTx(
+          publishPayload(v2, nonce2, "v2-" & $idx),
+          nonce2,
+          timestamp = int64(nonce2),
+        )
+
       inc nonce0
-      let tx0 = signedTx(v0, nonce0, "v0-" & $idx)
-      let out0 = n0.submitTx(tx0)
-      check out0.accepted
-      check out0.certified
+      discard n0.submitCommittedLocalTx(
+        publishPayload(v0, nonce0, "v0-final"),
+        nonce0,
+        timestamp = int64(nonce0),
+      )
 
-      inc nonce1
-      let tx1 = signedTx(v1, nonce1, "v1-" & $idx)
-      let out1 = n1.submitTx(tx1)
-      check out1.accepted
-      check out1.certified
+      waitFor waitUntil(
+        proc(): bool {.gcsafe.} =
+          var ready = true
+          {.cast(gcsafe).}:
+            for node in nodes:
+              if node.getCheckpoint().isNone():
+                ready = false
+                break
+            if ready:
+              let projection = nodes[^1].queryProjection("content")
+              ready = projection.kind == JObject and
+                projection.hasKey("contents") and
+                projection["contents"].kind == JArray and
+                projection["contents"].len == 60
+          ready,
+        timeoutMs = 90_000,
+      )
 
-      inc nonce2
-      let tx2 = signedTx(v2, nonce2, "v2-" & $idx)
-      let out2 = n2.submitTx(tx2)
-      check out2.accepted
-      check out2.certified
+      n0.assertQuiesced(nonce0)
+      n1.assertQuiesced(nonce1)
+      n2.assertQuiesced(nonce2)
+      n3.assertQuiesced(0'u64)
 
-    inc nonce0
-    let last = n0.submitTx(signedTx(v0, nonce0, "v0-final"))
-    check last.accepted
-    check last.certified
+      let checkpoint0 = n0.getCheckpoint()
+      let checkpoint1 = n1.getCheckpoint()
+      let checkpoint2 = n2.getCheckpoint()
+      let checkpoint3 = n3.getCheckpoint()
+      check checkpoint0.isSome()
+      check checkpoint1.isSome()
+      check checkpoint2.isSome()
+      check checkpoint3.isSome()
+      check checkpoint0.get().checkpointId == checkpoint1.get().checkpointId
+      check checkpoint0.get().checkpointId == checkpoint2.get().checkpointId
+      check checkpoint0.get().checkpointId == checkpoint3.get().checkpointId
+      check checkpoint3.get().candidate.era == 0
 
-    let checkpoint0 = n0.getCheckpoint()
-    let checkpoint1 = n1.getCheckpoint()
-    let checkpoint2 = n2.getCheckpoint()
-    let checkpoint3 = n3.getCheckpoint()
-    check checkpoint0.isSome()
-    check checkpoint1.isSome()
-    check checkpoint2.isSome()
-    check checkpoint3.isSome()
-    check checkpoint0.get().checkpointId == checkpoint1.get().checkpointId
-    check checkpoint0.get().checkpointId == checkpoint2.get().checkpointId
-    check checkpoint0.get().checkpointId == checkpoint3.get().checkpointId
-    check checkpoint3.get().candidate.era == 0
+      let observerProjection = n3.queryProjection("content")
+      check observerProjection.kind == JObject
+      check observerProjection["contents"].kind == JArray
+      check observerProjection["contents"].len == 60
 
-    let observerProjection = n3.queryProjection("content")
-    check observerProjection.kind == JObject
-    check observerProjection["contents"].kind == JArray
-    check observerProjection["contents"].len == 60
+      let observerDetail = n3.contentDetail("net-post-v0-0")
+      check observerDetail.isSome()
+      check observerDetail.get().title == "net-post-v0-0"
 
-    let observerDetail = n3.contentDetail("net-post-v0-0")
-    check observerDetail.isSome()
-    check observerDetail.get().title == "net-post-v0-0"
-
-    let observerFeed = n3.feedSnapshot(10)
-    check observerFeed.len == 10
+      let observerFeed = n3.feedSnapshot(10)
+      check observerFeed.len == 10
+    finally:
+      if nodes.len > 0:
+        waitFor stopAll(nodes)
 
   test "lsmr only real network converges without kad or rendezvous":
     let baseDir = getTempDir() / ("fabric-network-lsmr-" & $getTime().toUnix())
@@ -245,7 +331,11 @@ suite "Fabric 3 validators + 1 observer":
       var nonce0 = 0'u64
       for idx in 0 ..< 61:
         inc nonce0
-        check n0.submitTx(signedTx(v0, nonce0, "lsmr-v0-" & $idx)).accepted
+        check n0.submitLocalTx(
+          txContentPublishIntent,
+          publishPayload(v0, nonce0, "lsmr-v0-" & $idx),
+          timestamp = int64(nonce0),
+        ).accepted
 
       waitFor waitUntil(
         proc(): bool {.gcsafe.} =
@@ -265,6 +355,11 @@ suite "Fabric 3 validators + 1 observer":
           ready,
         timeoutMs = 90_000,
       )
+
+      nodes[0].assertQuiesced(nonce0)
+      nodes[1].assertQuiesced(0'u64)
+      nodes[2].assertQuiesced(0'u64)
+      nodes[3].assertQuiesced(0'u64)
 
       let checkpoint0 = nodes[0].getCheckpoint()
       let checkpoint1 = nodes[1].getCheckpoint()

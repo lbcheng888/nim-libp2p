@@ -1334,3 +1334,99 @@ suite "WAN bootstrap service":
     check selected.len == 1
     check selected[0].peerId == trustedPeer
     check selected[0].selectionReason == "lsmr_certified"
+
+  asyncTest "lsmr primary falls back to bootstrap candidates before any certificate exists":
+    let rng = newRng()
+    let networkId = "wan-bootstrap-lsmr-fallback-" & $nowMillis()
+    let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeer = PeerId.init(anchorKey).tryGet()
+    let lsmrCfg = LsmrConfig.init(
+      networkId = networkId,
+      anchors = @[LsmrAnchor(peerId: anchorPeer, operatorId: "op-root", regionDigit: 5'u8)],
+      minWitnessQuorum = 1,
+    )
+    let sw = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withLsmr(lsmrCfg)
+      .withWanBootstrapService(
+        WanBootstrapConfig.init(
+          networkId = networkId,
+          routingMode = RoutingPlaneMode.dualStack,
+          primaryPlane = PrimaryRoutingPlane.lsmr,
+          lsmrConfig = some(lsmrCfg),
+          authoritativePeerIds = @[$anchorPeer],
+        )
+      )
+      .build()
+    await sw.start()
+    defer:
+      await sw.stop()
+
+    let svc = getWanBootstrapService(sw)
+    check not svc.isNil
+    check svc.registerBootstrapHint(
+      anchorPeer,
+      @[MultiAddress.init("/ip4/10.0.9.9/tcp/4001/p2p/" & $anchorPeer).tryGet()],
+      source = "journal",
+    )
+
+    let selected = svc.selectBootstrapCandidates(1)
+    check selected.len == 1
+    check selected[0].peerId == anchorPeer
+    check selected[0].selectionReason == "hint"
+
+  asyncTest "lsmr primary promotes connected authoritative bootstrap into join state":
+    let rng = newRng()
+    let networkId = "wan-bootstrap-lsmr-promote-" & $nowMillis()
+    let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeer = PeerId.init(anchorKey).tryGet()
+    let lsmrCfg = LsmrConfig.init(
+      networkId = networkId,
+      anchors = @[LsmrAnchor(peerId: anchorPeer, operatorId: "op-root", regionDigit: 5'u8)],
+      minWitnessQuorum = 1,
+    )
+    let anchor = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(anchorKey)
+      .withLsmr(
+        LsmrConfig.init(
+          networkId = networkId,
+          serveWitness = true,
+          operatorId = "op-root",
+          regionDigit = 5'u8,
+          minWitnessQuorum = 1,
+        )
+      )
+      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withLsmr(lsmrCfg)
+      .withWanBootstrapService(
+        WanBootstrapConfig.init(
+          networkId = networkId,
+          role = WanBootstrapRole.mobileEdge,
+          routingMode = RoutingPlaneMode.dualStack,
+          primaryPlane = PrimaryRoutingPlane.lsmr,
+          lsmrConfig = some(lsmrCfg),
+          authoritativePeerIds = @[$anchorPeer],
+        )
+      )
+      .build()
+
+    await anchor.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await anchor.stop()
+
+    let clientSvc = getWanBootstrapService(client)
+    check not clientSvc.isNil
+    let anchorSeed = withPeerId(anchor.peerInfo.addrs[0], anchorPeer)
+    check clientSvc.registerBootstrapHint(anchorPeer, @[anchorSeed], source = "journal")
+
+    await client.connect(anchor.peerInfo.peerId, anchor.peerInfo.addrs)
+
+    checkUntilTimeoutCustom(10.seconds, 50.milliseconds):
+      block:
+        let snapshot = clientSvc.bootstrapStateSnapshot()
+        snapshot.metrics.joinRuns >= 1 and
+          snapshot.hasLastJoinResult and
+          snapshot.lastJoinResult.ok and
+          snapshot.lastJoinResult.connectedCount >= 1

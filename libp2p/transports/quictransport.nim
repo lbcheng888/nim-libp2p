@@ -973,7 +973,7 @@ proc buildLpStreamError(
     exc.streamId,
   )
 
-method getWrapped*(self: QuicStream): P2PConnection =
+method getWrapped*(self: QuicStream): P2PConnection {.gcsafe.} =
   self
 
 method readOnce*(
@@ -1122,7 +1122,7 @@ proc recvDatagram*(
   else:
     return @[]
 
-method getWrapped*(self: QuicSession): P2PConnection =
+method getWrapped*(self: QuicSession): P2PConnection {.gcsafe.} =
   self
 
 proc performWebtransportHandshake(
