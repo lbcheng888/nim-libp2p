@@ -83,6 +83,46 @@ proc buildDialLockKey(
 ): string =
   dialLockIdentity(peerId, addrs) & "|" & dialLockDomain(addrs, options)
 
+proc shouldDeferAutoIdentify(
+    protos: openArray[string], options: DialOptions
+): bool {.inline.} =
+  protos.len > 0 and not options.skipAutoIdentify
+
+proc runOutgoingIdentify(self: Dialer, muxed: Muxer) {.async: (raises: []).} =
+  if isNil(self) or isNil(muxed) or isNil(muxed.connection):
+    return
+  try:
+    let previousPeerId = muxed.connection.peerId
+    warn "internalConnect async identify begin",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
+    await self.peerStore.identify(muxed)
+    self.connManager.reindexMuxerPeerId(
+      muxed,
+      previousPeerId,
+      muxed.connection.peerId,
+    )
+    warn "internalConnect async identify done",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer
+    await self.connManager.triggerPeerEvents(
+      muxed.connection.peerId,
+      PeerEvent(kind: PeerEventKind.Identified, initiator: true),
+    )
+  except CancelledError:
+    discard
+  except CatchableError as exc:
+    warn "internalConnect async identify failed",
+      peerId = muxed.connection.peerId,
+      protocol = muxed.connection.protocol,
+      negotiated = muxed.connection.negotiatedMuxer,
+      description = exc.msg
+
+proc startOutgoingIdentify(self: Dialer, muxed: Muxer) {.inline.} =
+  asyncSpawn self.runOutgoingIdentify(muxed)
+
 proc addrStablePriority(ma: MultiAddress): int =
   let lower = ($ma).toLowerAscii()
   if lower.contains("/tcp/"):
@@ -627,36 +667,13 @@ proc internalConnect(
           peerId = muxed.connection.peerId,
           protocol = muxed.connection.protocol,
           negotiated = muxed.connection.negotiatedMuxer
-        proc finishOutgoingIdentify() {.async: (raises: []).} =
-          try:
-            let previousPeerId = muxed.connection.peerId
-            warn "internalConnect async identify begin",
-              peerId = muxed.connection.peerId,
-              protocol = muxed.connection.protocol,
-              negotiated = muxed.connection.negotiatedMuxer
-            await self.peerStore.identify(muxed)
-            self.connManager.reindexMuxerPeerId(
-              muxed,
-              previousPeerId,
-              muxed.connection.peerId,
-            )
-            warn "internalConnect async identify done",
-              peerId = muxed.connection.peerId,
-              protocol = muxed.connection.protocol,
-              negotiated = muxed.connection.negotiatedMuxer
-            await self.connManager.triggerPeerEvents(
-              muxed.connection.peerId,
-              PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-            )
-          except CancelledError:
-            discard
-          except CatchableError as exc:
-            warn "internalConnect async identify failed",
-              peerId = muxed.connection.peerId,
-              protocol = muxed.connection.protocol,
-              negotiated = muxed.connection.negotiatedMuxer,
-              description = exc.msg
-        asyncSpawn finishOutgoingIdentify()
+        if options.skipAutoIdentify:
+          warn "internalConnect auto identify skipped by options",
+            peerId = muxed.connection.peerId,
+            protocol = muxed.connection.protocol,
+            negotiated = muxed.connection.negotiatedMuxer
+        else:
+          self.startOutgoingIdentify(muxed)
     else:
       debug "internalConnect storeMuxer begin",
         peerId = muxed.connection.peerId,
@@ -667,36 +684,13 @@ proc internalConnect(
         peerId = muxed.connection.peerId,
         protocol = muxed.connection.protocol,
         negotiated = muxed.connection.negotiatedMuxer
-      proc finishOutgoingIdentify() {.async: (raises: []).} =
-        try:
-          let previousPeerId = muxed.connection.peerId
-          warn "internalConnect async identify begin",
-            peerId = muxed.connection.peerId,
-            protocol = muxed.connection.protocol,
-            negotiated = muxed.connection.negotiatedMuxer
-          await self.peerStore.identify(muxed)
-          self.connManager.reindexMuxerPeerId(
-            muxed,
-            previousPeerId,
-            muxed.connection.peerId,
-          )
-          warn "internalConnect async identify done",
-            peerId = muxed.connection.peerId,
-            protocol = muxed.connection.protocol,
-            negotiated = muxed.connection.negotiatedMuxer
-          await self.connManager.triggerPeerEvents(
-            muxed.connection.peerId,
-            PeerEvent(kind: PeerEventKind.Identified, initiator: true),
-          )
-        except CancelledError:
-          discard
-        except CatchableError as exc:
-          warn "internalConnect async identify failed",
-            peerId = muxed.connection.peerId,
-            protocol = muxed.connection.protocol,
-            negotiated = muxed.connection.negotiatedMuxer,
-            description = exc.msg
-      asyncSpawn finishOutgoingIdentify()
+      if options.skipAutoIdentify:
+        warn "internalConnect auto identify skipped by options",
+          peerId = muxed.connection.peerId,
+          protocol = muxed.connection.protocol,
+          negotiated = muxed.connection.negotiatedMuxer
+      else:
+        self.startOutgoingIdentify(muxed)
     return muxed
   except CancelledError as exc:
     await muxed.close()
@@ -928,7 +922,11 @@ method dial*(
   var
     conn: Muxer
     stream: Connection
+    connectOptions = options
   let tsnetDial = hasTsnetAddr(addrs)
+  let deferAutoIdentify = shouldDeferAutoIdentify(protos, options)
+  if deferAutoIdentify:
+    connectOptions.skipAutoIdentify = true
 
   proc cleanup() {.async: (raises: []).} =
     if not (isNil(stream)):
@@ -947,7 +945,7 @@ method dial*(
       addrs,
       forceDial,
       reuseConnection,
-      options = options,
+      options = connectOptions,
     )
     if tsnetDial:
       warn "dialer stream dial muxer ready",
@@ -985,6 +983,14 @@ method dial*(
         routing = $options.routing,
         protocolCount = protos.len
     let negotiated = await self.negotiateStream(stream, protos)
+    if deferAutoIdentify:
+      warn "dialer explicit-proto auto identify deferred until first protocol selected",
+        peerId = peerId,
+        addrs = addrs.len,
+        routing = $options.routing,
+        protocolCount = protos.len,
+        firstProto = protos[0]
+      self.startOutgoingIdentify(conn)
     if tsnetDial:
       warn "dialer protocol select done",
         peerId = peerId,

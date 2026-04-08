@@ -1386,29 +1386,8 @@ suite "WAN bootstrap service":
     )
     let anchor = newStandardSwitchBuilder(transport = TransportType.Memory)
       .withPrivateKey(anchorKey)
-      .withLsmr(
-        LsmrConfig.init(
-          networkId = networkId,
-          serveWitness = true,
-          operatorId = "op-root",
-          regionDigit = 5'u8,
-          minWitnessQuorum = 1,
-        )
-      )
       .build()
-    let client = newStandardSwitchBuilder(transport = TransportType.Memory)
-      .withLsmr(lsmrCfg)
-      .withWanBootstrapService(
-        WanBootstrapConfig.init(
-          networkId = networkId,
-          role = WanBootstrapRole.mobileEdge,
-          routingMode = RoutingPlaneMode.dualStack,
-          primaryPlane = PrimaryRoutingPlane.lsmr,
-          lsmrConfig = some(lsmrCfg),
-          authoritativePeerIds = @[$anchorPeer],
-        )
-      )
-      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory).build()
 
     await anchor.start()
     await client.start()
@@ -1416,17 +1395,142 @@ suite "WAN bootstrap service":
       await client.stop()
       await anchor.stop()
 
-    let clientSvc = getWanBootstrapService(client)
+    let anchorSvc = await startWanBootstrapService(
+      anchor,
+      bootstrapRoleConfig(
+        WanBootstrapRole.anchor,
+        networkId = networkId,
+        authoritativePeerIds = @[$anchorPeer],
+      ),
+    )
+    let clientSvc = await startWanBootstrapService(
+      client,
+      WanBootstrapConfig.init(
+        networkId = networkId,
+        role = WanBootstrapRole.mobileEdge,
+        routingMode = RoutingPlaneMode.dualStack,
+        primaryPlane = PrimaryRoutingPlane.lsmr,
+        lsmrConfig = some(lsmrCfg),
+        authoritativePeerIds = @[$anchorPeer],
+        enableRendezvous = false,
+        enableSnapshotProtocol = false,
+        enableKadAfterJoin = false,
+      ),
+    )
+    check not anchorSvc.isNil
     check not clientSvc.isNil
     let anchorSeed = withPeerId(anchor.peerInfo.addrs[0], anchorPeer)
     check clientSvc.registerBootstrapHint(anchorPeer, @[anchorSeed], source = "journal")
 
     await client.connect(anchor.peerInfo.peerId, anchor.peerInfo.addrs)
+    let joinResult = await clientSvc.promoteConnectedBootstrapPeer(
+      anchorPeer,
+      @[anchorSeed],
+      "manual_connected_seed",
+    )
+    check joinResult.ok
+    check joinResult.attemptedCount == 1
+    check joinResult.connectedCount == 1
 
-    checkUntilTimeoutCustom(10.seconds, 50.milliseconds):
-      block:
-        let snapshot = clientSvc.bootstrapStateSnapshot()
-        snapshot.metrics.joinRuns >= 1 and
-          snapshot.hasLastJoinResult and
-          snapshot.lastJoinResult.ok and
-          snapshot.lastJoinResult.connectedCount >= 1
+    let snapshot = clientSvc.bootstrapStateSnapshot()
+    check snapshot.metrics.joinRuns >= 1
+    check snapshot.hasLastJoinResult
+    check snapshot.lastJoinResult.ok
+    check snapshot.lastJoinResult.connectedCount >= 1
+
+  asyncTest "lsmr bootstrap handoff installs local cert and publishes it to anchor":
+    let rng = newRng()
+    let networkId = "wan-bootstrap-lsmr-handoff-" & $nowMillis()
+    let anchorKey = PrivateKey.random(ECDSA, rng[]).tryGet()
+    let anchorPeer = PeerId.init(anchorKey).tryGet()
+    let anchorLsmrCfg =
+      LsmrConfig.init(
+        networkId = networkId,
+        serveWitness = true,
+        operatorId = "unimaker-root",
+        regionDigit = 5'u8,
+        minWitnessQuorum = 1,
+      )
+    let clientLsmrCfg =
+      LsmrConfig.init(
+        networkId = networkId,
+        minWitnessQuorum = 1,
+        anchors = @[
+          LsmrAnchor(
+            peerId: anchorPeer,
+            addrs: @[],
+            operatorId: "unimaker-root",
+            regionDigit: 5'u8,
+            attestedPrefix: @[5'u8],
+            serveDepth: 2'u8,
+            directionMask: 0x1ff'u32,
+            canIssueRootCert: true,
+          )
+        ],
+      )
+    let anchor = newStandardSwitchBuilder(transport = TransportType.Memory)
+      .withPrivateKey(anchorKey)
+      .build()
+    let client = newStandardSwitchBuilder(transport = TransportType.Memory).build()
+
+    await anchor.start()
+    await client.start()
+    defer:
+      await client.stop()
+      await anchor.stop()
+
+    let anchorCfg =
+      bootstrapDualStackRoleConfig(
+        role = WanBootstrapRole.anchor,
+        lsmrConfig = anchorLsmrCfg,
+        networkId = networkId,
+        authoritativePeerIds = @[$anchorPeer],
+        primaryPlane = PrimaryRoutingPlane.lsmr,
+      )
+    var clientCfg =
+      bootstrapDualStackRoleConfig(
+        role = WanBootstrapRole.mobileEdge,
+        lsmrConfig = clientLsmrCfg,
+        networkId = networkId,
+        authoritativePeerIds = @[$anchorPeer],
+        primaryPlane = PrimaryRoutingPlane.lsmr,
+      )
+    clientCfg.enableRendezvous = false
+    clientCfg.enableSnapshotProtocol = false
+    clientCfg.enableKadAfterJoin = false
+
+    let anchorSvc = await startWanBootstrapService(anchor, anchorCfg)
+    let clientSvc = await startWanBootstrapService(client, clientCfg)
+    let anchorLsmrSvc = getLsmrService(anchor)
+    let clientLsmrSvc = getLsmrService(client)
+    check not anchorSvc.isNil
+    check not clientSvc.isNil
+    check not anchorLsmrSvc.isNil
+    check not clientLsmrSvc.isNil
+
+    let anchorSeed = withPeerId(anchor.peerInfo.addrs[0], anchorPeer)
+    check clientSvc.registerBootstrapHint(anchorPeer, @[anchorSeed], source = "journal")
+
+    await client.connect(anchor.peerInfo.peerId, anchor.peerInfo.addrs)
+    let joinResult = await clientSvc.promoteConnectedBootstrapPeer(
+      anchorPeer,
+      @[anchorSeed],
+      "manual_connected_seed",
+    )
+    check joinResult.ok
+    check joinResult.attemptedCount == 1
+    check joinResult.connectedCount == 1
+
+    checkUntilTimeout:
+      localCoordinateRecord(client).isSome()
+    let clientLocal = localCoordinateRecord(client)
+    check clientLocal.isSome()
+    check clientLocal.get().data.certifiedPrefix() == @[5'u8]
+    check client.peerStore[ActiveLsmrBook].contains(client.peerInfo.peerId)
+    check clientLsmrSvc.routingPlaneStatus().lsmrLocalCertReady
+    check clientLsmrSvc.routingPlaneStatus().lsmrWitnessSuccess >= 1
+    check clientSvc.bootstrapStateSnapshot().routingStatus.lsmrLastRefreshReason == "ok"
+
+    checkUntilTimeout:
+      anchor.peerStore[ActiveLsmrBook].contains(client.peerInfo.peerId)
+    check anchor.peerStore[ActiveLsmrBook][client.peerInfo.peerId].data.certifiedPrefix() == @[5'u8]

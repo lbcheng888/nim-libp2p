@@ -1,0 +1,74 @@
+{
+  "params": {
+    "chainId": "lsmr-cluster",
+    "epochLengthRounds": 32,
+    "quorumNumerator": 2,
+    "quorumDenominator": 3,
+    "maxBatchTxs": 128,
+    "maxBatchBytes": 1048576,
+    "checkpointEveryBlocks": 1,
+    "nameTtlSeconds": 31536000,
+    "nameGraceSeconds": 2592000,
+    "reviewDeposit": 10,
+    "blueReviewDeposit": 1,
+    "goldPendingHaircutBp": 5000,
+    "mintFeeBp": 50,
+    "rewardPoolAccount": "reward_pool"
+  },
+  "validators": [
+    {
+      "address": "CED9A88C29E504222F17859EC4D3677882877A53",
+      "peerId": "12D3KooWNE1E71rdMeQfqMoMDLpkVcJzPs4GJHsVuPj9ZGgFH333",
+      "publicKey": "08011220B85A80D5CFF7EFC851AA6EFA7C1F4898B0DF5D015623B3BB64A8546B5627B13E",
+      "stake": 10000,
+      "delegatedStake": 0,
+      "active": true,
+      "jailed": false,
+      "slashedAmount": 0,
+      "lastUpdatedAt": 0
+    },
+    {
+      "address": "3AD3D1ED7BCD4BCD773C3BEB8FDB625116DC3B42",
+      "peerId": "12D3KooWCeZk2pCQe6rHJ8hZasEnZB6S5VMkemtaGJYDCkk3V1bA",
+      "publicKey": "080112202A1056E0BE14D94D9787CC2B6602713B39300F1EDE570C710DEED081DE547E5D",
+      "stake": 10000,
+      "delegatedStake": 0,
+      "active": true,
+      "jailed": false,
+      "slashedAmount": 0,
+      "lastUpdatedAt": 0
+    },
+    {
+      "address": "3316E2D5EDCEB83D9373836E902663E869227B49",
+      "peerId": "12D3KooWAuR8fEQ4kGXrdKU35ZrH4v7mWT8w2ntYRQZBjVEM4skP",
+      "publicKey": "080112201026F1442206196ED4D87026883EEE7216615BB7BB83B00235ED5F3AA19585B4",
+      "stake": 10000,
+      "delegatedStake": 0,
+      "active": true,
+      "jailed": false,
+      "slashedAmount": 0,
+      "lastUpdatedAt": 0
+    }
+  ],
+  "balances": [
+    {
+      "key": "reward_pool",
+      "value": 500000
+    },
+    {
+      "key": "CED9A88C29E504222F17859EC4D3677882877A53",
+      "value": 500000
+    },
+    {
+      "key": "3AD3D1ED7BCD4BCD773C3BEB8FDB625116DC3B42",
+      "value": 500000
+    },
+    {
+      "key": "3316E2D5EDCEB83D9373836E902663E869227B49",
+      "value": 500000
+    }
+  ],
+  "names": [],
+  "contents": [],
+  "mintedSupply": 2000000
+}

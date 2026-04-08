@@ -1101,6 +1101,7 @@ proc getStream*(
     QuicStream.new(
       stream, session.observedAddr, session.localAddr, session.peerId, initialCache
     )
+  qs.inheritInboundProtocolSelectionState(session)
   when defined(libp2p_agents_metrics):
     qs.shortAgent = session.shortAgent
 

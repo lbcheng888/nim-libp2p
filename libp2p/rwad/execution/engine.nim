@@ -108,6 +108,35 @@ proc coerceObj[T](payload: JsonNode, key = ""): T =
   else:
     jsonTo(payload, T)
 
+proc decodePublishIntent(tx: Tx): PublishIntent =
+  let payload =
+    if tx.payload.kind == JObject and
+        tx.payload.hasKey("intent") and
+        tx.payload["intent"].kind == JObject:
+      tx.payload["intent"]
+    else:
+      tx.payload
+  if payload.kind != JObject:
+    raise newException(ValueError, "invalid content publish payload")
+  result = PublishIntent(
+    contentId: jStr(payload, "contentId"),
+    author: jStr(payload, "author", tx.sender),
+    title: jStr(payload, "title"),
+    body: jStr(payload, "body"),
+    kind: jStr(payload, "kind", "text"),
+    manifestCid: jStr(payload, "manifestCid"),
+    createdAt: jInt(payload, "createdAt", tx.timestamp),
+    accessPolicy: jStr(payload, "accessPolicy", "public"),
+    previewCid: jStr(payload, "previewCid"),
+    seqNo: jU64(payload, "seqNo"),
+  )
+  if result.contentId.len == 0:
+    result.contentId = tx.txId
+  if result.manifestCid.len == 0:
+    result.manifestCid = result.contentId
+  if result.previewCid.len == 0:
+    result.previewCid = result.contentId
+
 proc validateNonce*(state: ChainState, tx: Tx) =
   let expected = state.nonceOf(tx.sender) + 1
   if tx.nonce != expected:
@@ -121,12 +150,7 @@ proc applyTx*(state: ChainState, tx: Tx): seq[AuditEvent] =
 
   case tx.kind
   of txContentPublishIntent:
-    var intent = coerceObj[PublishIntent](tx.payload, "intent")
-    intent.author = tx.sender
-    if intent.contentId.len == 0:
-      intent.contentId = tx.txId
-    if intent.createdAt == 0:
-      intent.createdAt = tx.timestamp
+    let intent = decodePublishIntent(tx)
     let sourceGraph =
       if tx.payload.kind == JObject and tx.payload.hasKey("sourceGraph"):
         some(coerceObj[SourceGraph](tx.payload, "sourceGraph"))

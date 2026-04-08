@@ -698,6 +698,8 @@ proc identifyImpl(
         protos = info.protos.len
       if not muxer.isNil and not muxer.connection.isNil and info.peerId.len > 0:
         muxer.connection.peerId = info.peerId
+        for liveStream in muxer.getStreams():
+          liveStream.syncConnectionIdentity(muxer.connection)
       if info.peerId.len > 0:
         stream.peerId = info.peerId
 

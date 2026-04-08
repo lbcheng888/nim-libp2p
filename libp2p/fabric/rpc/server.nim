@@ -123,6 +123,8 @@ proc dispatch(server: FabricRpcServer, methodName: string, params: JsonNode): Js
   case methodName
   of "fabric.status":
     toJson(server.node.fabricStatus())
+  of "fabric.quiescence_snapshot":
+    toJson(server.node.quiescenceSnapshot())
   of "fabric.quiesce":
     toJson(server.node.submitFence())
   of "fabric.submit_event":

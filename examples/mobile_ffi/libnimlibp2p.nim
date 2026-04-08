@@ -11431,6 +11431,20 @@ proc configuredLsmrServeDepth(cfg: NodeConfig): int =
       return int(raw)
   2
 
+proc configuredLsmrMinWitnessQuorum(cfg: NodeConfig): int =
+  if cfg.extra.kind == JObject:
+    let raw = max(
+      0'i64,
+      jsonGetInt64(
+        cfg.extra,
+        "lsmrMinWitnessQuorum",
+        jsonGetInt64(cfg.extra, "lsmr_min_witness_quorum", 0)
+      )
+    )
+    if raw > 0:
+      return int(raw)
+  2
+
 proc configuredLsmrNetworkId(cfg: NodeConfig): string =
   if cfg.extra.kind == JObject:
     let raw = jsonGetStr(
@@ -11466,6 +11480,8 @@ proc hasRequestedLsmrConfig(cfg: NodeConfig): bool =
     "lsmr_network_id",
     "lsmrServeDepth",
     "lsmr_serve_depth",
+    "lsmrMinWitnessQuorum",
+    "lsmr_min_witness_quorum",
     "enableNearFieldBootstrap",
     "enable_near_field_bootstrap",
   ]:
@@ -11591,6 +11607,7 @@ proc configuredLsmrConfig(cfg: NodeConfig): Option[LsmrConfig] =
       anchors = anchors,
       localSuffix = configuredLsmrPath(cfg),
       serveDepth = configuredLsmrServeDepth(cfg),
+      minWitnessQuorum = configuredLsmrMinWitnessQuorum(cfg),
       enableNearFieldBootstrap = configuredNearFieldBootstrapEnabled(cfg),
       nearFieldProviders = configuredNearFieldProviders(cfg),
     )
@@ -11603,9 +11620,18 @@ proc routingStatusToJson(status: RoutingPlaneStatus): JsonNode =
     "shadowMode": status.shadowMode,
     "legacyCandidates": status.legacyCandidates,
     "legacyTrusted": status.legacyTrusted,
+    "lsmrMinWitnessQuorum": status.lsmrMinWitnessQuorum,
     "lsmrActiveCertificates": status.lsmrActiveCertificates,
     "lsmrMigrations": status.lsmrMigrations,
     "lsmrIsolations": status.lsmrIsolations,
+    "lsmrWitnessRequests": status.lsmrWitnessRequests,
+    "lsmrWitnessSuccess": status.lsmrWitnessSuccess,
+    "lsmrWitnessQuorumFailure": status.lsmrWitnessQuorumFailure,
+    "lsmrKnownSyncPeers": status.lsmrKnownSyncPeers,
+    "lsmrDialableSyncPeers": status.lsmrDialableSyncPeers,
+    "lsmrOverlayDesiredPeers": status.lsmrOverlayDesiredPeers,
+    "lsmrLocalCertReady": status.lsmrLocalCertReady,
+    "lsmrLastRefreshReason": status.lsmrLastRefreshReason,
   }
 
 proc lsmrPathToJson(path: LsmrPath): JsonNode =
@@ -11621,6 +11647,8 @@ proc buildRoutingStatusPayload(node: NimNode): JsonNode {.gcsafe.} =
     result["lsmrPathDerived"] = %false
     result["lsmrServeDepth"] = %0
     result["lsmrAnchorCount"] = %0
+    result["lsmrUndialableSyncPeers"] = newJArray()
+    result["lsmrOverlayDesiredPeerIds"] = newJArray()
     return
 
   let configuredMode = configuredRoutingPlaneMode(node.cfg)
@@ -11629,20 +11657,37 @@ proc buildRoutingStatusPayload(node: NimNode): JsonNode {.gcsafe.} =
   let configuredPath = configuredLsmrPath(node.cfg)
   let explicitPath = configuredExplicitLsmrPath(node.cfg)
   let configuredServeDepth = configuredLsmrServeDepth(node.cfg)
+  let configuredMinWitnessQuorum = configuredLsmrMinWitnessQuorum(node.cfg)
   let configuredAnchors = configuredLsmrAnchors(node.cfg)
   var status = RoutingPlaneStatus(
     mode: configuredMode,
     primary: configuredPrimary,
     shadowMode: configuredMode == RoutingPlaneMode.dualStack,
+    lsmrMinWitnessQuorum: configuredMinWitnessQuorum,
   )
 
   if not node.switchInstance.isNil and not node.switchInstance.peerStore.isNil:
     let observed = routingPlaneStatus(node.switchInstance)
     status.legacyCandidates = observed.legacyCandidates
     status.legacyTrusted = observed.legacyTrusted
-    status.lsmrActiveCertificates = node.switchInstance.peerStore[ActiveLsmrBook].len
-    status.lsmrMigrations = node.switchInstance.peerStore[LsmrMigrationBook].len
-    status.lsmrIsolations = node.switchInstance.peerStore[LsmrIsolationBook].len
+    status.lsmrMinWitnessQuorum =
+      if observed.lsmrMinWitnessQuorum > 0:
+        observed.lsmrMinWitnessQuorum
+      else:
+        configuredMinWitnessQuorum
+    status.lsmrActiveCertificates = observed.lsmrActiveCertificates
+    status.lsmrMigrations = observed.lsmrMigrations
+    status.lsmrIsolations = observed.lsmrIsolations
+    status.lsmrWitnessRequests = observed.lsmrWitnessRequests
+    status.lsmrWitnessSuccess = observed.lsmrWitnessSuccess
+    status.lsmrWitnessQuorumFailure = observed.lsmrWitnessQuorumFailure
+    status.lsmrKnownSyncPeers = observed.lsmrKnownSyncPeers
+    status.lsmrDialableSyncPeers = observed.lsmrDialableSyncPeers
+    status.lsmrOverlayDesiredPeers = observed.lsmrOverlayDesiredPeers
+    status.lsmrLocalCertReady = observed.lsmrLocalCertReady
+    status.lsmrLastRefreshReason = observed.lsmrLastRefreshReason
+    status.lsmrUndialableSyncPeers = observed.lsmrUndialableSyncPeers
+    status.lsmrOverlayDesiredPeerIds = observed.lsmrOverlayDesiredPeerIds
     if observed.mode != RoutingPlaneMode.legacyOnly or
         configuredMode == RoutingPlaneMode.legacyOnly:
       status.mode = observed.mode
@@ -11658,6 +11703,8 @@ proc buildRoutingStatusPayload(node: NimNode): JsonNode {.gcsafe.} =
   result["lsmrPathDerived"] = %(configuredPath.len > 0 and explicitPath.len == 0 and hasRequestedLsmrConfig(node.cfg))
   result["lsmrServeDepth"] = %configuredServeDepth
   result["lsmrAnchorCount"] = %configuredAnchors.len
+  result["lsmrUndialableSyncPeers"] = %status.lsmrUndialableSyncPeers
+  result["lsmrOverlayDesiredPeerIds"] = %status.lsmrOverlayDesiredPeerIds
 
 proc parseNearFieldObservation(payload: string): Result[NearFieldObservation, string] =
   let node =
@@ -19320,34 +19367,26 @@ proc libp2p_update_host_network_status*(
     return false
   let statusSnapshot = parseHostNetworkStatusSnapshot($payloadJson).valueOr:
     return false
-  when defined(ohos):
-    let previousHost = currentHostNetworkStatusSnapshot(node)
-    let normalizedSnapshot = applyHostNetworkStatus(node, statusSnapshot)
-    let previousMdnsAllowed = mdnsAllowedForHostStatus(previousHost)
-    let currentMdnsAllowed = mdnsAllowedForHostStatus(normalizedSnapshot)
-    let mdnsTransportChanged =
-      previousMdnsAllowed != currentMdnsAllowed or
-      previousHost.networkType != normalizedSnapshot.networkType or
-      previousHost.transport != normalizedSnapshot.transport or
-      previousHost.preferredIpv4 != normalizedSnapshot.preferredIpv4 or
-      previousHost.localIpv4 != normalizedSnapshot.localIpv4
-    scheduleHostNetworkStatusSideEffects(
-      node,
-      normalizedSnapshot,
-      mdnsTransportChanged,
-      currentMdnsAllowed,
-      "libp2p_update_host_network_status_ohos",
-    )
-    recordEvent(node, "network_event", buildHostNetworkEventText(normalizedSnapshot))
-    clearRuntimeError()
-    return true
-  let cmd = makeCommand(cmdUpdateHostNetworkStatus)
-  cmd.hostNetworkStatusParam = statusSnapshot
-  cmd.hostNetworkStatusParamSet = true
-  let result = submitCommand(node, cmd)
-  let ok = result.resultCode == NimResultOk
-  destroyCommand(cmd)
-  ok
+  let previousHost = currentHostNetworkStatusSnapshot(node)
+  let normalizedSnapshot = applyHostNetworkStatus(node, statusSnapshot)
+  let previousMdnsAllowed = mdnsAllowedForHostStatus(previousHost)
+  let currentMdnsAllowed = mdnsAllowedForHostStatus(normalizedSnapshot)
+  let mdnsTransportChanged =
+    previousMdnsAllowed != currentMdnsAllowed or
+    previousHost.networkType != normalizedSnapshot.networkType or
+    previousHost.transport != normalizedSnapshot.transport or
+    previousHost.preferredIpv4 != normalizedSnapshot.preferredIpv4 or
+    previousHost.localIpv4 != normalizedSnapshot.localIpv4
+  scheduleHostNetworkStatusSideEffects(
+    node,
+    normalizedSnapshot,
+    mdnsTransportChanged,
+    currentMdnsAllowed,
+    "libp2p_update_host_network_status",
+  )
+  recordEvent(node, "network_event", buildHostNetworkEventText(normalizedSnapshot))
+  clearRuntimeError()
+  true
 
 proc libp2p_submit_near_field_observation*(
     handle: pointer, payloadJson: cstring

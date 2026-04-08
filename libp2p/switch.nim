@@ -35,6 +35,7 @@ import
   protocols/datatransfer/channelmanager,
   protocols/datatransfer/datatransfer,
   peerinfo,
+  lsmr,
   ./muxers/muxer,
   connmanager,
   nameresolving/nameresolver,
@@ -1072,37 +1073,54 @@ proc upgrader(
       peerId = muxed.connection.peerId,
       protocol = muxed.connection.protocol,
       negotiated = muxed.connection.negotiatedMuxer
-    proc finishIncomingIdentify() {.async: (raises: []).} =
-      try:
-        let previousPeerId = muxed.connection.peerId
-        warn "incoming upgrader identify begin",
+    proc finishIncomingIdentify(
+        _: Connection, firstProto: string
+    ) {.async: (raises: []).} =
+      if firstProto == DefaultLsmrWitnessCodec or
+          firstProto == DefaultLsmrControlCodec:
+        warn "incoming upgrader identify skipped for lsmr control-plane first protocol",
           peerId = muxed.connection.peerId,
           protocol = muxed.connection.protocol,
-          negotiated = muxed.connection.negotiatedMuxer
-        await switch.peerStore.identify(muxed)
+          negotiated = muxed.connection.negotiatedMuxer,
+          firstProto = firstProto
+        return
+      let muxer = muxed
+      if muxer.isNil or muxer.connection.isNil:
+        return
+      try:
+        let previousPeerId = muxer.connection.peerId
+        warn "incoming upgrader identify begin",
+          peerId = muxer.connection.peerId,
+          protocol = muxer.connection.protocol,
+          negotiated = muxer.connection.negotiatedMuxer
+        await switch.peerStore.identify(muxer)
         switch.connManager.reindexMuxerPeerId(
-          muxed,
+          muxer,
           previousPeerId,
-          muxed.connection.peerId,
+          muxer.connection.peerId,
         )
         warn "incoming upgrader identify done",
-          peerId = muxed.connection.peerId,
-          protocol = muxed.connection.protocol,
-          negotiated = muxed.connection.negotiatedMuxer
+          peerId = muxer.connection.peerId,
+          protocol = muxer.connection.protocol,
+          negotiated = muxer.connection.negotiatedMuxer
         await switch.connManager.triggerPeerEvents(
-          muxed.connection.peerId,
+          muxer.connection.peerId,
           PeerEvent(kind: PeerEventKind.Identified, initiator: false),
         )
       except CancelledError:
         discard
       except CatchableError as exc:
         warn "incoming upgrader identify failed",
-          peerId = muxed.connection.peerId,
-          protocol = muxed.connection.protocol,
-          negotiated = muxed.connection.negotiatedMuxer,
+          peerId = muxer.connection.peerId,
+          protocol = muxer.connection.protocol,
+          negotiated = muxer.connection.negotiatedMuxer,
           description = exc.msg
     if shouldAutoIdentifyIncoming(muxed.connection):
-      asyncSpawn finishIncomingIdentify()
+      muxed.connection.setInboundProtocolSelectedHandler(finishIncomingIdentify)
+      warn "incoming upgrader identify deferred until first inbound protocol selected",
+        peerId = muxed.connection.peerId,
+        protocol = muxed.connection.protocol,
+        negotiated = muxed.connection.negotiatedMuxer
     else:
       warn "incoming upgrader auto identify skipped",
         peerId = muxed.connection.peerId,

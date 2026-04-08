@@ -13,6 +13,8 @@ switch("path", "vendor/NimYAML")
 switch("path", "vendor/jsonschema/src")
 switch("path", "nim-pebble")
 switch("passC", "-I" & thisDir())
+when defined(macosx):
+  switch("passC", "-Wno-incompatible-function-pointer-types")
 import strutils
 var hasExplicitChroniclesEnabled = false
 for param in 0 ..< system.paramCount():

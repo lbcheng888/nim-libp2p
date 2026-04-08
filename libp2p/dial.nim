@@ -24,6 +24,7 @@ type
     dppDirectOnly
   DialOptions* = object
     routing*: DialPathPreference
+    skipAutoIdentify*: bool
 
 method connect*(
     self: Dial,

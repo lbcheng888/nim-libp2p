@@ -196,6 +196,12 @@ type
     eventOutstanding*: int
     attOutstanding*: int
     certOutstanding*: int
+    pendingWitnessPullState*: string
+    pendingWitnessPullPeerId*: string
+    pendingWitnessPullDomain*: string
+    pendingWitnessPullKey*: string
+    pendingWitnessPullEventId*: string
+    pendingWitnessPullFetchReady*: bool
 
   SubmitEventResult* = object
     eventId*: string

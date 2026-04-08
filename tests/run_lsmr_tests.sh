@@ -84,7 +84,7 @@ compile_test() {
   local src="$1"
   local name="${src%.nim}"
   echo "[lsmr-tests] compile $src"
-  nim c --out:"$bin_dir/$name" "$tests_dir/$src"
+  nim c -d:chronicles_enabled=off --out:"$bin_dir/$name" "$tests_dir/$src"
 }
 
 run_test() {

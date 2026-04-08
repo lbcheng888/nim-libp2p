@@ -1,4 +1,4 @@
-import json, uri
+import json, strutils, uri
 from times import DateTime, parse
 import chronos/apps/http/httpclient, results, chronicles
 
@@ -291,7 +291,15 @@ when defined(libp2p_autotls_support):
       let derPrivKey = key.seckey.rsakey.getBytes.get
       let pemPrivKey: string = pemEncode(derPrivKey, "PRIVATE KEY")
       token.sign(pemPrivKey)
-      $token.toFlattenedJson()
+      let compact = $token
+      let parts = compact.split(".")
+      if parts.len != 3:
+        raise newException(ACMEError, "invalid acme jwt serialization")
+      let flattened = newJObject()
+      flattened["protected"] = %parts[0]
+      flattened["payload"] = %parts[1]
+      flattened["signature"] = %parts[2]
+      $flattened
 
   proc requestRegister*(
       self: ACMEApi, key: KeyPair

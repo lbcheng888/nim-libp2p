@@ -56,6 +56,15 @@ proc deterministicPrivateKeyFromSeed(seedText: string): PrivateKey =
     raise newException(CatchableError, "failed to derive bootstrap keypair: " & $pairRes.error)
   pairRes.get().seckey
 
+proc parseEnvInt(name: string, defaultValue: int): int =
+  let raw = getEnv(name).strip()
+  if raw.len == 0:
+    return defaultValue
+  try:
+    parseInt(raw)
+  except ValueError:
+    raise newException(ValueError, "invalid integer in " & name & ": " & raw)
+
 proc main() {.async: (raises: [CatchableError, Exception]).} =
   let
     rng = newRng()
@@ -63,6 +72,23 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
     identitySeed = getEnv("BOOTSTRAP_IDENTITY_SEED").strip()
     networkId = getEnv("BOOTSTRAP_NETWORK_ID", "unimaker-mobile").strip()
     journalPath = getEnv("BOOTSTRAP_JOURNAL_PATH").strip()
+    resolvedNetworkId = if networkId.len > 0: networkId else: "unimaker-mobile"
+    lsmrOperatorId =
+      block:
+        let raw = getEnv("BOOTSTRAP_LSMR_OPERATOR_ID", "unimaker-root").strip()
+        if raw.len > 0: raw else: "unimaker-root"
+    lsmrRegionDigit = uint8(min(9, max(1, parseEnvInt("BOOTSTRAP_LSMR_REGION_DIGIT", 5))))
+    lsmrServeDepth = max(1, parseEnvInt("BOOTSTRAP_LSMR_SERVE_DEPTH", 2))
+    lsmrMinWitnessQuorum = max(1, parseEnvInt("BOOTSTRAP_LSMR_MIN_WITNESS_QUORUM", 1))
+    lsmrConfig =
+      LsmrConfig.init(
+        networkId = resolvedNetworkId,
+        serveWitness = true,
+        operatorId = lsmrOperatorId,
+        regionDigit = lsmrRegionDigit,
+        serveDepth = lsmrServeDepth,
+        minWitnessQuorum = lsmrMinWitnessQuorum,
+      )
   var listenAddrs = parseListenAddrs(
     getEnv("BOOTSTRAP_TCP_LISTEN", DefaultTcpListen)
   )
@@ -74,11 +100,14 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
     .new()
     .withRng(rng)
     .withAddresses(listenAddrs)
+    .withLsmr(lsmrConfig)
     .withWanBootstrapProfile(
-      bootstrapRoleConfig(
+      bootstrapDualStackRoleConfig(
         role = WanBootstrapRole.anchor,
-        networkId = if networkId.len > 0: networkId else: "unimaker-mobile",
+        lsmrConfig = lsmrConfig,
+        networkId = resolvedNetworkId,
         journalPath = journalPath,
+        primaryPlane = PrimaryRoutingPlane.lsmr,
       )
     )
     .withTcpTransport()
@@ -106,6 +135,10 @@ proc main() {.async: (raises: [CatchableError, Exception]).} =
   echo "[bootstrap] peerId: ", $sw.peerInfo.peerId
   if identitySeed.len > 0:
     echo "[bootstrap] identity source: env BOOTSTRAP_IDENTITY_SEED"
+  echo "[bootstrap] lsmr root anchor: operator=", lsmrOperatorId,
+    " regionDigit=", int(lsmrRegionDigit),
+    " serveDepth=", lsmrServeDepth,
+    " minWitnessQuorum=", lsmrMinWitnessQuorum
   echo "[bootstrap] listening on:"
   for addr in sw.peerInfo.addrs:
     echo "  ", $addr, "/p2p/", $sw.peerInfo.peerId

@@ -105,7 +105,8 @@ suite "mobile ffi routing status":
         },
         "legacyOnly",
         "legacy",
-        false
+        false,
+        2
       ),
       (
         "dual-legacy",
@@ -118,7 +119,8 @@ suite "mobile ffi routing status":
         },
         "dualStack",
         "legacy",
-        true
+        true,
+        2
       ),
       (
         "dual-lsmr",
@@ -131,7 +133,8 @@ suite "mobile ffi routing status":
         },
         "dualStack",
         "lsmr",
-        true
+        true,
+        2
       ),
       (
         "lsmr-only",
@@ -144,11 +147,12 @@ suite "mobile ffi routing status":
         },
         "lsmrOnly",
         "lsmr",
-        false
+        false,
+        2
       ),
     ]
 
-    for (label, extra, expectedMode, expectedPrimary, expectedShadow) in cases:
+    for (label, extra, expectedMode, expectedPrimary, expectedShadow, expectedQuorum) in cases:
       let handle = newTestNode(label, extra)
       defer:
         stopAndFreeNode(handle)
@@ -162,6 +166,18 @@ suite "mobile ffi routing status":
       check status.hasKey("lsmrActiveCertificates")
       check status.hasKey("lsmrMigrations")
       check status.hasKey("lsmrIsolations")
+      check status.hasKey("lsmrMinWitnessQuorum")
+      check status["lsmrMinWitnessQuorum"].getInt() == expectedQuorum
+      check status.hasKey("lsmrWitnessRequests")
+      check status.hasKey("lsmrWitnessSuccess")
+      check status.hasKey("lsmrWitnessQuorumFailure")
+      check status.hasKey("lsmrKnownSyncPeers")
+      check status.hasKey("lsmrDialableSyncPeers")
+      check status.hasKey("lsmrOverlayDesiredPeers")
+      check status.hasKey("lsmrLocalCertReady")
+      check status.hasKey("lsmrLastRefreshReason")
+      check status.hasKey("lsmrUndialableSyncPeers")
+      check status.hasKey("lsmrOverlayDesiredPeerIds")
       check status.hasKey("lsmrNetworkId")
       check status.hasKey("lsmrPath")
       check status.hasKey("lsmrPathDerived")
@@ -180,6 +196,7 @@ suite "mobile ffi routing status":
         "primaryRoutingPlane": "lsmr",
         "lsmrNetworkId": "mobile-ffi-routing-derived",
         "lsmrServeDepth": 2,
+        "lsmrMinWitnessQuorum": 1,
         "lsmrAnchors": [
           {
             "peerId": "12D3KooWMJmRGksDpUMeaDSsJikJNgBs9M5fsJihHf8kPptSaUun",
@@ -204,6 +221,7 @@ suite "mobile ffi routing status":
     check status["primary"].getStr() == "lsmr"
     check status["lsmrNetworkId"].getStr() == "mobile-ffi-routing-derived"
     check status["lsmrServeDepth"].getInt() == 2
+    check status["lsmrMinWitnessQuorum"].getInt() == 1
     check status["lsmrAnchorCount"].getInt() == 1
     check status["lsmrPathDerived"].getBool()
     check status["lsmrPath"].kind == JArray
@@ -221,6 +239,7 @@ suite "mobile ffi routing status":
         "primaryRoutingPlane": "lsmr",
         "lsmrNetworkId": "mobile-ffi-routing-bootstrap",
         "lsmrServeDepth": 2,
+        "lsmrMinWitnessQuorum": 1,
         "lsmrAnchors": [
           {
             "peerId": "12D3KooWMJmRGksDpUMeaDSsJikJNgBs9M5fsJihHf8kPptSaUun",
@@ -246,10 +265,19 @@ suite "mobile ffi routing status":
     check bootstrap["routingMode"].getStr() == "dualStack"
     check bootstrap["primaryPlane"].getStr() == "lsmr"
     check bootstrap["shadowMode"].getBool()
+    check bootstrap["lsmrMinWitnessQuorum"].getInt() == 1
+    check bootstrap.hasKey("lsmrKnownSyncPeers")
+    check bootstrap.hasKey("lsmrDialableSyncPeers")
+    check bootstrap.hasKey("lsmrOverlayDesiredPeers")
+    check bootstrap.hasKey("lsmrLocalCertReady")
+    check bootstrap.hasKey("lsmrLastRefreshReason")
+    check bootstrap.hasKey("lsmrUndialableSyncPeers")
+    check bootstrap.hasKey("lsmrOverlayDesiredPeerIds")
     check bootstrap.hasKey("routingStatus")
     check bootstrap["routingStatus"]["mode"].getStr() == "dualStack"
     check bootstrap["routingStatus"]["primary"].getStr() == "lsmr"
     check bootstrap["routingStatus"]["shadowMode"].getBool()
+    check bootstrap["routingStatus"]["lsmrMinWitnessQuorum"].getInt() == 1
     check bootstrap["routingStatus"]["lsmrNetworkId"].getStr() == "mobile-ffi-routing-bootstrap"
     check bootstrap["routingStatus"]["lsmrServeDepth"].getInt() == 2
     check bootstrap["routingStatus"]["lsmrAnchorCount"].getInt() == 1

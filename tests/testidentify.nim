@@ -210,6 +210,13 @@ suite "Identify":
         switch1.peerInfo.peerId, switch1.peerInfo.addrs, IdentifyPushCodec
       )
 
+      checkUntilTimeout:
+        switch1.peerStore[SPRBook][switch2.peerInfo.peerId] ==
+          switch2.peerInfo.signedPeerRecord.envelope
+      checkUntilTimeout:
+        switch2.peerStore[SPRBook][switch1.peerInfo.peerId] ==
+          switch1.peerInfo.signedPeerRecord.envelope
+
       check:
         switch1.peerStore.getAddresses(switch2.peerInfo.peerId) == switch2.peerInfo.addrs
         switch2.peerStore.getAddresses(switch1.peerInfo.peerId) == switch1.peerInfo.addrs

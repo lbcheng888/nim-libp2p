@@ -1,5 +1,7 @@
 mode = ScriptMode.Verbose
 
+import hashes, strutils, os
+
 packageName = "libp2p"
 version = "1.13.0"
 author = "Status Research & Development GmbH"
@@ -11,7 +13,10 @@ requires "nim >= 2.0.0",
   "nimcrypto >= 0.6.0 & < 0.7.0", "dnsclient >= 0.3.0 & < 0.4.0", "bearssl >= 0.2.5",
   "chronicles >= 0.11.0 & < 0.12.0", "chronos >= 4.0.4", "metrics", "secp256k1",
   "stew >= 0.4.2", "websock >= 0.2.1", "unittest2", "results", "libdatachannel >= 0.1.0",
-  "jwt >= 0.2", "pebble >= 0.1.0"
+  "jwt >= 0.2"
+
+if not (dirExists("nim-pebble") and fileExists("nim-pebble/pebble.nimble")):
+  requires "pebble >= 0.1.0"
 
 let nimc = getEnv("NIMC", "nim") # Which nim compiler to use
 let lang = getEnv("NIMLANG", "c") # Which backend (c/cpp/js)
@@ -22,8 +27,6 @@ let cfg =
   " --styleCheck:usages --styleCheck:error" &
   (if verbose: " --verbosity:2" else: " --verbosity:1 --hints:off") &
   " --skipUserCfg -f --threads:on --opt:speed"
-
-import hashes, strutils, os
 
 proc runTest(filename: string, moreoptions: string = "") =
   var excstr = nimc & " " & lang & " -d:debug " & cfg & " " & flags

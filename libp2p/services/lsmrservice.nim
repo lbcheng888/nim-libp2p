@@ -20,6 +20,12 @@ import ../switch
 logScope:
   topics = "libp2p lsmr"
 
+const
+  LsmrProtocolDialTimeout = 5.seconds
+  LsmrWitnessRequestTimeout = 5.seconds
+  LsmrControlRequestTimeout = 5.seconds
+  LsmrConnectionCloseTimeout = 1.seconds
+
 type
   LsmrControlApplyKind = enum
     lcakSync
@@ -104,10 +110,12 @@ type
     witnessMounted: bool
     controlMounted: bool
     connectedHandler: ConnEventHandler
+    identifiedHandler: PeerEventHandler
     witnessRequests*: int64
     witnessSuccess*: int64
     witnessQuorumSuccess*: int64
     witnessQuorumFailure*: int64
+    lastRefreshReason*: string
     validationTrusted*: int64
     validationQuarantine*: int64
     validationRejected*: int64
@@ -154,6 +162,65 @@ proc controlApplyKindName(kind: LsmrControlApplyKind): string {.gcsafe, raises: 
 proc durationToMillis(value: Duration): int64 =
   value.nanoseconds div 1_000_000
 
+proc lsmrControlDialOptions(): DialOptions {.inline.} =
+  DialOptions(skipAutoIdentify: true)
+
+proc remainingDuration(deadlineMs: int64): Duration =
+  let remainingMs = deadlineMs - nowMillis()
+  if remainingMs <= 0:
+    0.milliseconds
+  else:
+    int(remainingMs).milliseconds
+
+proc awaitFutureWithin[T](
+    fut: Future[T], timeout: Duration
+): Future[Option[T]] {.async: (raises: [CancelledError]).} =
+  let completed = await withTimeout(fut, timeout)
+  if not completed:
+    if not fut.finished():
+      fut.cancelSoon()
+    return none(T)
+  try:
+    some(await fut)
+  except CancelledError as exc:
+    raise exc
+  except CatchableError:
+    none(T)
+
+proc awaitCompletionWithin(
+    fut: Future[void], timeout: Duration
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  let completed = await withTimeout(fut, timeout)
+  if not completed:
+    if not fut.finished():
+      fut.cancelSoon()
+    return false
+  try:
+    await fut
+    true
+  except CancelledError as exc:
+    raise exc
+  except CatchableError:
+    false
+
+proc closeConnectionWithin(
+    conn: Connection, timeout: Duration = LsmrConnectionCloseTimeout
+): Future[void] {.async: (raises: [CancelledError]).} =
+  if conn.isNil:
+    return
+  let closeFuture = conn.close()
+  let completed = await withTimeout(closeFuture, timeout)
+  if not completed:
+    if not closeFuture.finished():
+      closeFuture.cancelSoon()
+    return
+  try:
+    await closeFuture
+  except CancelledError as exc:
+    raise exc
+  except CatchableError:
+    discard
+
 proc bytesToString(data: openArray[byte]): string =
   string.fromBytes(@data)
 
@@ -190,6 +257,14 @@ proc localCoordinateRecord*(
 ): Option[SignedLsmrCoordinateRecord] {.gcsafe.}
 proc shouldAutoConnectPeer(svc: LsmrService, peerId: PeerId): bool {.gcsafe.}
 proc schedulePeerConnect(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].}
+proc desiredOverlayPeers(svc: LsmrService): seq[PeerId] {.gcsafe.}
+proc downgradePendingFullPublish(
+    svc: LsmrService, peerId: PeerId
+) {.gcsafe, raises: [].}
+proc preferIncrementalPublish(
+    svc: LsmrService, peerId: PeerId
+): bool {.gcsafe, raises: [].}
+proc scheduleImmediateRefreshHint(svc: LsmrService) {.gcsafe, raises: [].}
 
 proc applyPeerAddressEntries(svc: LsmrService, node: JsonNode) =
   if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or node.kind != JArray:
@@ -1511,12 +1586,7 @@ proc closeControlSession(
     return
   let conn = session.conn
   session.conn = nil
-  try:
-    await conn.close()
-  except CancelledError as exc:
-    raise exc
-  except CatchableError:
-    discard
+  await closeConnectionWithin(conn)
 
 proc coordinateRecordOrder(
     a, b: SignedLsmrCoordinateRecord
@@ -2392,6 +2462,11 @@ proc promoteValidatedCoordinateRecord*(
       " changed=", changed
   if changed:
     switch.notifyTopologyChanged()
+    let svc = getLsmrService(switch)
+    if not svc.isNil:
+      svc.queueStrongTopologyConvergence([peerId])
+      if localCoordinateRecord(svc.switch).isSome():
+        svc.scheduleOverlayMaintenance()
   true
 
 proc currentCertifiedPrefix(svc: LsmrService): LsmrPath =
@@ -2401,6 +2476,37 @@ proc currentCertifiedPrefix(svc: LsmrService): LsmrPath =
   if local.isNone():
     return @[]
   local.get().data.certifiedPrefix()
+
+proc peerIdTexts(peerIds: openArray[PeerId]): seq[string] {.gcsafe, raises: [].} =
+  for peerId in peerIds:
+    if peerId.data.len == 0:
+      continue
+    result.add($peerId)
+
+proc routingPlaneStatus*(svc: LsmrService): RoutingPlaneStatus {.gcsafe.} =
+  if svc.isNil:
+    return RoutingPlaneStatus()
+  result.lsmrMinWitnessQuorum = max(1, svc.config.minWitnessQuorum)
+  result.lsmrWitnessRequests = svc.witnessRequests
+  result.lsmrWitnessSuccess = svc.witnessSuccess
+  result.lsmrWitnessQuorumFailure = svc.witnessQuorumFailure
+  result.lsmrLastRefreshReason = svc.lastRefreshReason
+  if svc.switch.isNil or svc.switch.peerStore.isNil:
+    return
+  result.lsmrActiveCertificates = svc.switch.peerStore[ActiveLsmrBook].len
+  result.lsmrMigrations = svc.switch.peerStore[LsmrMigrationBook].len
+  result.lsmrIsolations = svc.switch.peerStore[LsmrIsolationBook].len
+  result.lsmrLocalCertReady = localCoordinateRecord(svc.switch).isSome()
+  let known = svc.knownSyncPeers()
+  let desired = svc.desiredOverlayPeers()
+  result.lsmrKnownSyncPeers = known.len
+  result.lsmrOverlayDesiredPeers = desired.len
+  result.lsmrOverlayDesiredPeerIds = peerIdTexts(desired)
+  for peerId in known:
+    if svc.hasDialableRoute(peerId):
+      inc result.lsmrDialableSyncPeers
+    else:
+      result.lsmrUndialableSyncPeers.add($peerId)
 
 proc witnessIssuersForPrefix*(
     svc: LsmrService, targetPrefix: LsmrPath, nowMs = 0'i64
@@ -2532,6 +2638,7 @@ proc new*(
     refreshPublishPeers: initTable[string, PeerId](),
     refreshRunner: nil,
     nearFieldRecords: initTable[PeerId, NearFieldHandshakeRecord](),
+    lastRefreshReason: "",
     controlSessions: initTable[string, LsmrControlSession](),
     dayanSessions: initTable[string, LsmrControlSession](),
     connectFlights: initTable[string, Future[bool]](),
@@ -2657,71 +2764,73 @@ proc buildWitnessProtocol(svc: LsmrService): LPProtocol =
 proc buildControlProtocol(svc: LsmrService): LPProtocol =
   proc handleControl(conn: Connection, proto: string) {.async: (raises: [CancelledError]).} =
     try:
-      let payload = await conn.readLp(256 * 1024)
-      if payload.len == 0:
-        return
-      let request = parseJson(bytesToString(payload))
-      if request.kind != JObject:
-        return
-      let op =
-        if request.hasKey("op"):
-          request["op"].getStr()
-        else:
-          ""
-      case op
-      of "coordinate_sync":
-        let response = svc.buildCoordinateSyncResponse()
-        when defined(lsmr_diag):
-          let coordsNode = response.getOrDefault("coordinateRecords")
-          let migrationsNode = response.getOrDefault("migrationRecords")
-          let isolationsNode = response.getOrDefault("isolationEvidence")
-          echo "lsmr sync response self=", $svc.switch.peerInfo.peerId,
-            " peer=", $conn.peerId,
-            " coords=", (if coordsNode.kind == JArray: coordsNode.len else: 0),
-            " migrations=", (if migrationsNode.kind == JArray: migrationsNode.len else: 0),
-            " isolations=", (if isolationsNode.kind == JArray: isolationsNode.len else: 0)
-        await conn.writeLp(stringToBytes($response))
-      of "coordinate_publish":
-        when defined(lsmr_diag):
-          let coordsNode = request.getOrDefault("coordinateRecords")
-          let migrationsNode = request.getOrDefault("migrationRecords")
-          let isolationsNode = request.getOrDefault("isolationEvidence")
-          echo "lsmr publish request self=", $svc.switch.peerInfo.peerId,
-            " peer=", $conn.peerId,
-            " coords=", (if coordsNode.kind == JArray: coordsNode.len else: 0),
-            " migrations=", (if migrationsNode.kind == JArray: migrationsNode.len else: 0),
-            " isolations=", (if isolationsNode.kind == JArray: isolationsNode.len else: 0)
-        svc.scheduleControlApply(lcakPublish, conn.peerId, request)
-        await conn.writeLp(stringToBytes($(%*{"ok": true})))
-      of "dayan_publish":
-        let envelopeOpt = jsonToDaYanEnvelope(request)
-        if envelopeOpt.isNone():
-          await conn.writeLp(stringToBytes($(%*{"ok": false})))
-        else:
-          let accepted = await svc.acceptDaYanEnvelope(conn.peerId, envelopeOpt.get())
-          await conn.writeLp(stringToBytes($(%*{"ok": accepted})))
-      of "migration_request":
-        let targetPrefix =
-          if request.hasKey("targetPrefix"):
-            jsonToPath(request["targetPrefix"])
+      while not conn.closed and not conn.atEof:
+        let payload = await conn.readLp(256 * 1024)
+        if payload.len == 0:
+          break
+        let request = parseJson(bytesToString(payload))
+        if request.kind != JObject:
+          break
+        let op =
+          if request.hasKey("op"):
+            request["op"].getStr()
           else:
-            @[]
-        if not svc.canWitnessPrefix(targetPrefix):
-          await conn.writeLp(stringToBytes($(%*{"ok": false})))
+            ""
+        case op
+        of "coordinate_sync":
+          let response = svc.buildCoordinateSyncResponse()
+          when defined(lsmr_diag):
+            let coordsNode = response.getOrDefault("coordinateRecords")
+            let migrationsNode = response.getOrDefault("migrationRecords")
+            let isolationsNode = response.getOrDefault("isolationEvidence")
+            echo "lsmr sync response self=", $svc.switch.peerInfo.peerId,
+              " peer=", $conn.peerId,
+              " coords=", (if coordsNode.kind == JArray: coordsNode.len else: 0),
+              " migrations=", (if migrationsNode.kind == JArray: migrationsNode.len else: 0),
+              " isolations=", (if isolationsNode.kind == JArray: isolationsNode.len else: 0)
+          await conn.writeLp(stringToBytes($response))
+        of "coordinate_publish":
+          when defined(lsmr_diag):
+            let coordsNode = request.getOrDefault("coordinateRecords")
+            let migrationsNode = request.getOrDefault("migrationRecords")
+            let isolationsNode = request.getOrDefault("isolationEvidence")
+            echo "lsmr publish request self=", $svc.switch.peerInfo.peerId,
+              " peer=", $conn.peerId,
+              " coords=", (if coordsNode.kind == JArray: coordsNode.len else: 0),
+              " migrations=", (if migrationsNode.kind == JArray: migrationsNode.len else: 0),
+              " isolations=", (if isolationsNode.kind == JArray: isolationsNode.len else: 0)
+          svc.scheduleControlApply(lcakPublish, conn.peerId, request)
+          await conn.writeLp(stringToBytes($(%*{"ok": true})))
+        of "dayan_publish":
+          let envelopeOpt = jsonToDaYanEnvelope(request)
+          if envelopeOpt.isNone():
+            await conn.writeLp(stringToBytes($(%*{"ok": false})))
+          else:
+            let accepted = await svc.acceptDaYanEnvelope(conn.peerId, envelopeOpt.get())
+            await conn.writeLp(stringToBytes($(%*{"ok": accepted})))
+        of "migration_request":
+          let targetPrefix =
+            if request.hasKey("targetPrefix"):
+              jsonToPath(request["targetPrefix"])
+            else:
+              @[]
+          if not svc.canWitnessPrefix(targetPrefix):
+            await conn.writeLp(stringToBytes($(%*{"ok": false})))
+          else:
+            let epochId = svc.config.currentEpoch()
+            let parentDigest =
+              computeExpectedParentDigest(svc.config.networkId, targetPrefix, epochId)
+            await conn.writeLp(stringToBytes($(%*{
+              "ok": true,
+              "parentDigest": parentDigest,
+            })))
+        of "isolation_broadcast":
+          if request.hasKey("evidence"):
+            decodeSignedIsolation(request["evidence"].getStr()).withValue(evidence):
+              discard installIsolationEvidence(svc.switch, evidence)
+          await conn.writeLp(stringToBytes($(%*{"ok": true})))
         else:
-          let epochId = svc.config.currentEpoch()
-          let parentDigest = computeExpectedParentDigest(svc.config.networkId, targetPrefix, epochId)
-          await conn.writeLp(stringToBytes($(%*{
-            "ok": true,
-            "parentDigest": parentDigest,
-          })))
-      of "isolation_broadcast":
-        if request.hasKey("evidence"):
-          decodeSignedIsolation(request["evidence"].getStr()).withValue(evidence):
-            discard installIsolationEvidence(svc.switch, evidence)
-        await conn.writeLp(stringToBytes($(%*{"ok": true})))
-      else:
-        await conn.writeLp(stringToBytes($(%*{"ok": false})))
+          await conn.writeLp(stringToBytes($(%*{"ok": false})))
     except CancelledError as exc:
       raise exc
     except CatchableError as exc:
@@ -2938,6 +3047,84 @@ proc shouldAutoConnectPeer(svc: LsmrService, peerId: PeerId): bool {.gcsafe.} =
       return true
   false
 
+proc queuePeerControlHandoff(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or peerId.data.len == 0:
+    return
+  let selfPeerId =
+    if svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  if peerId == selfPeerId:
+    return
+  svc.downgradePendingFullPublish(peerId)
+  svc.queueControlSync(peerId)
+  if selfPeerId.data.len > 0 and svc.preferIncrementalPublish(peerId):
+    svc.queueControlPublishDelta(peerId, [selfPeerId])
+  else:
+    svc.queueControlPublish(peerId)
+  svc.scheduleOverlayMaintenance()
+
+proc hasIdentifySnapshot(svc: LsmrService, peerId: PeerId): bool {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or peerId.data.len == 0:
+    return false
+  let peerStore = svc.switch.peerStore
+  try:
+    if peerStore[ProtoBook].contains(peerId) and peerStore[ProtoBook][peerId].len > 0:
+      return true
+    if peerStore[AgentBook].contains(peerId) and peerStore[AgentBook][peerId].len > 0:
+      return true
+    if peerStore[ProtoVersionBook].contains(peerId) and peerStore[ProtoVersionBook][peerId].len > 0:
+      return true
+  except CatchableError:
+    discard
+  false
+
+proc ensurePeerIdentifySnapshot(
+    svc: LsmrService,
+    peerId: PeerId,
+    timeout: Duration = LsmrProtocolDialTimeout,
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or svc.switch.peerStore.isNil or peerId.data.len == 0:
+    return false
+  if svc.hasIdentifySnapshot(peerId):
+    return true
+  if not svc.switch.isConnected(peerId) or timeout <= 0.milliseconds:
+    return false
+  let muxer = svc.switch.connManager.selectMuxer(peerId)
+  if muxer.isNil:
+    return false
+  let identifyFuture = svc.switch.peerStore.identify(muxer)
+  let completed = await awaitCompletionWithin(identifyFuture, timeout)
+  if not completed:
+    return false
+  let resolvedPeerId =
+    if muxer.connection.isNil:
+      peerId
+    elif muxer.connection.peerId.data.len > 0:
+      muxer.connection.peerId
+    else:
+      peerId
+  svc.hasIdentifySnapshot(peerId) or svc.hasIdentifySnapshot(resolvedPeerId)
+
+proc handleConnectedSyncPeer(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].} =
+  discard
+
+proc handleIdentifiedSyncPeer(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or peerId.data.len == 0:
+    return
+  let selfPeerId =
+    if svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  if peerId == selfPeerId:
+    return
+  if localCoordinateRecord(svc.switch).isNone():
+    svc.scheduleImmediateRefreshHint()
+  else:
+    svc.queuePeerControlHandoff(peerId)
+
 proc performOverlayConnect(
     svc: LsmrService, peerId: PeerId
 ): Future[bool] {.async: (raises: [CancelledError]).} =
@@ -2970,13 +3157,22 @@ proc performOverlayConnect(
         " peer=", $peerId,
         " addrs=", addrs.mapIt($it).join(","),
         " ts=", startedAt
-    await svc.switch.connect(
+    let connectFuture = svc.switch.connect(
       peerId,
       addrs,
       forceDial = false,
       reuseConnection = true,
       dir = Direction.Out,
+      options = lsmrControlDialOptions(),
     )
+    let connected = await awaitCompletionWithin(connectFuture, LsmrProtocolDialTimeout)
+    if not connected:
+      when defined(lsmr_diag):
+        echo "lsmr overlay-connect-timeout self=", $svc.switch.peerInfo.peerId,
+          " peer=", $peerId,
+          " ts=", nowMillis(),
+          " elapsedMs=", nowMillis() - startedAt
+      return false
     when defined(lsmr_diag):
       echo "lsmr overlay-connect-ok self=", $svc.switch.peerInfo.peerId,
         " peer=", $peerId,
@@ -3047,11 +3243,24 @@ proc connectOverlayPeer(
         svc.connectFlights.del(key)
 
 proc dialProtocolPeer(
-    svc: LsmrService, peerId: PeerId, proto: string
+    svc: LsmrService, peerId: PeerId, proto: string,
+    timeout: Duration = LsmrProtocolDialTimeout,
 ): Future[Connection] {.gcsafe, async: (raises: [CancelledError]).} =
   if svc.isNil or svc.switch.isNil or peerId.data.len == 0:
     return nil
   let startedAt = nowMillis()
+  if timeout <= 0.milliseconds:
+    return nil
+  var addrs: seq[MultiAddress] = @[]
+  if not svc.switch.peerStore.isNil:
+    addrs = svc.switch.peerStore.getAddresses(peerId)
+  if addrs.len == 0:
+    let anchor = svc.findEffectiveAnchor(peerId)
+    if anchor.isSome():
+      addrs = anchor.get().addrs
+  let wasConnected = svc.switch.isConnected(peerId)
+  if not wasConnected and addrs.len == 0:
+    return nil
   let dialLock = svc.getOrCreateDialLock(peerId)
   try:
     await dialLock.acquire()
@@ -3061,32 +3270,33 @@ proc dialProtocolPeer(
           " peer=", $peerId,
           " proto=", proto,
           " ts=", startedAt
-      if not svc.switch.isConnected(peerId):
-        when defined(lsmr_diag):
-          echo "lsmr proto-dial-connect-begin self=", $svc.switch.peerInfo.peerId,
-            " peer=", $peerId,
-            " proto=", proto,
-            " ts=", nowMillis()
-        if not await svc.connectOverlayPeer(peerId):
-          when defined(lsmr_diag):
-            echo "lsmr proto-dial-connect-miss self=", $svc.switch.peerInfo.peerId,
-              " peer=", $peerId,
-              " proto=", proto,
-              " ts=", nowMillis(),
-              " elapsedMs=", nowMillis() - startedAt
-          return nil
-        when defined(lsmr_diag):
-          echo "lsmr proto-dial-connect-ok self=", $svc.switch.peerInfo.peerId,
-            " peer=", $peerId,
-            " proto=", proto,
-            " ts=", nowMillis(),
-            " elapsedMs=", nowMillis() - startedAt
       when defined(lsmr_diag):
         echo "lsmr proto-dial-stream-begin self=", $svc.switch.peerInfo.peerId,
           " peer=", $peerId,
           " proto=", proto,
           " ts=", nowMillis()
-      let conn = await svc.switch.dial(peerId, @[proto])
+      let streamFuture =
+        if svc.switch.isConnected(peerId):
+          svc.switch.dial(peerId, @[proto])
+        elif addrs.len > 0:
+          svc.switch.dial(
+            peerId,
+            addrs,
+            @[proto],
+            forceDial = false,
+            reuseConnection = true,
+            options = lsmrControlDialOptions(),
+          )
+        else:
+          nil
+      if streamFuture.isNil:
+        return nil
+      let connOpt = await awaitFutureWithin(streamFuture, timeout)
+      let conn =
+        if connOpt.isSome():
+          connOpt.get()
+        else:
+          nil
       when defined(lsmr_diag):
         echo "lsmr proto-dial-", (if conn.isNil: "miss" else: "ok"),
           " self=", $svc.switch.peerInfo.peerId,
@@ -3243,11 +3453,10 @@ proc sendControlRequest(
     conn: Connection,
     request: JsonNode,
     maxBytes: int,
-    timeout: Duration = 500.milliseconds,
+    timeout: Duration = LsmrControlRequestTimeout,
 ): Future[Option[JsonNode]] {.gcsafe, async: (raises: [CancelledError]).} =
   if conn.isNil:
     return none(JsonNode)
-  discard timeout
   let op =
     if request.kind == JObject:
       request.getOrDefault("op").getStr()
@@ -3258,7 +3467,13 @@ proc sendControlRequest(
       echo "lsmr control-send-write-begin self=", $svc.switch.peerInfo.peerId,
         " peer=", $conn.peerId,
         " op=", op
-    await conn.writeLp(stringToBytes($request))
+    let wrote = await awaitCompletionWithin(conn.writeLp(stringToBytes($request)), timeout)
+    if not wrote:
+      when defined(lsmr_diag):
+        echo "lsmr control-send-write-timeout self=", $svc.switch.peerInfo.peerId,
+          " peer=", $conn.peerId,
+          " op=", op
+      return none(JsonNode)
     when defined(lsmr_diag):
       echo "lsmr control-send-write-done self=", $svc.switch.peerInfo.peerId,
         " peer=", $conn.peerId,
@@ -3266,7 +3481,14 @@ proc sendControlRequest(
       echo "lsmr control-send-read-begin self=", $svc.switch.peerInfo.peerId,
         " peer=", $conn.peerId,
         " op=", op
-    let payload = await conn.readLp(maxBytes)
+    let payloadOpt = await awaitFutureWithin(conn.readLp(maxBytes), timeout)
+    if payloadOpt.isNone():
+      when defined(lsmr_diag):
+        echo "lsmr control-send-read-timeout self=", $svc.switch.peerInfo.peerId,
+          " peer=", $conn.peerId,
+          " op=", op
+      return none(JsonNode)
+    let payload = payloadOpt.get()
     when defined(lsmr_diag):
       echo "lsmr control-send-read-done self=", $svc.switch.peerInfo.peerId,
         " peer=", $conn.peerId,
@@ -3594,6 +3816,7 @@ proc requestWitnessFromPeer*(
   if svc.isNil or svc.switch.isNil or targetPrefix.len == 0:
     return none(SignedLsmrWitness)
   let startedAt = nowMillis()
+  let deadlineMs = startedAt + durationToMillis(LsmrWitnessRequestTimeout)
   inc svc.witnessRequests
   if peerId == svc.switch.peerInfo.peerId:
     let localWitness = svc.buildLocalWitness(peerId, targetPrefix)
@@ -3612,18 +3835,24 @@ proc requestWitnessFromPeer*(
         svc.switch.peerStore.getAddresses(peerId)
     if knownAddrs.len == 0 and svc.findEffectiveAnchor(peerId).isNone() and
         not svc.switch.isConnected(peerId):
+      svc.lastRefreshReason = "witness_peer_unreachable"
       when defined(lsmr_diag):
         echo "lsmr witness no addrs requester=", $svc.switch.peerInfo.peerId,
           " issuer=", $peerId,
           " prefix=", targetPrefix,
           " ts=", startedAt
       return none(SignedLsmrWitness)
+    let dialTimeout = remainingDuration(deadlineMs)
+    if dialTimeout <= 0.milliseconds:
+      svc.lastRefreshReason = "witness_request_timeout"
+      return none(SignedLsmrWitness)
+    let wasConnected = svc.switch.isConnected(peerId)
     when defined(lsmr_diag):
       echo "lsmr witness dial-begin requester=", $svc.switch.peerInfo.peerId,
         " issuer=", $peerId,
         " prefix=", targetPrefix,
         " ts=", startedAt
-    let conn = await svc.dialProtocolPeer(peerId, svc.config.witnessCodec)
+    let conn = await svc.dialProtocolPeer(peerId, svc.config.witnessCodec, dialTimeout)
     when defined(lsmr_diag):
       echo "lsmr witness dial-", (if conn.isNil: "miss" else: "ok"),
         " requester=", $svc.switch.peerInfo.peerId,
@@ -3632,9 +3861,13 @@ proc requestWitnessFromPeer*(
         " ts=", nowMillis(),
         " elapsedMs=", nowMillis() - startedAt
     if conn.isNil:
+      if not wasConnected and not svc.switch.isConnected(peerId):
+        svc.lastRefreshReason = "witness_connect_timeout"
+      else:
+        svc.lastRefreshReason = "witness_stream_timeout"
       return none(SignedLsmrWitness)
     defer:
-      await conn.close()
+      await closeConnectionWithin(conn)
     let req = %*{
       "op": "witness",
       "networkId": svc.config.networkId,
@@ -3646,14 +3879,33 @@ proc requestWitnessFromPeer*(
         " prefix=", targetPrefix,
         " ts=", nowMillis(),
         " elapsedMs=", nowMillis() - startedAt
-    await conn.writeLp(stringToBytes($req))
+    let writeTimeout = remainingDuration(deadlineMs)
+    if writeTimeout <= 0.milliseconds:
+      svc.lastRefreshReason = "witness_request_timeout"
+      return none(SignedLsmrWitness)
+    let wrote =
+      await awaitCompletionWithin(
+        conn.writeLp(stringToBytes($req)),
+        writeTimeout,
+      )
+    if not wrote:
+      svc.lastRefreshReason = "witness_request_write_timeout"
+      return none(SignedLsmrWitness)
     when defined(lsmr_diag):
       echo "lsmr witness read-challenge requester=", $svc.switch.peerInfo.peerId,
         " issuer=", $peerId,
         " prefix=", targetPrefix,
         " ts=", nowMillis(),
         " elapsedMs=", nowMillis() - startedAt
-    let challenge = await conn.readLp(128)
+    let challengeTimeout = remainingDuration(deadlineMs)
+    if challengeTimeout <= 0.milliseconds:
+      svc.lastRefreshReason = "witness_request_timeout"
+      return none(SignedLsmrWitness)
+    let challengeOpt = await awaitFutureWithin(conn.readLp(128), challengeTimeout)
+    if challengeOpt.isNone():
+      svc.lastRefreshReason = "witness_challenge_timeout"
+      return none(SignedLsmrWitness)
+    let challenge = challengeOpt.get()
     when defined(lsmr_diag):
       echo "lsmr witness challenge-bytes requester=", $svc.switch.peerInfo.peerId,
         " issuer=", $peerId,
@@ -3669,14 +3921,37 @@ proc requestWitnessFromPeer*(
         " prefix=", targetPrefix,
         " ts=", nowMillis(),
         " elapsedMs=", nowMillis() - startedAt
-    await conn.writeLp(challenge)
+    let echoTimeout = remainingDuration(deadlineMs)
+    if echoTimeout <= 0.milliseconds:
+      svc.lastRefreshReason = "witness_request_timeout"
+      return none(SignedLsmrWitness)
+    let echoed =
+      await awaitCompletionWithin(
+        conn.writeLp(challenge),
+        echoTimeout,
+      )
+    if not echoed:
+      svc.lastRefreshReason = "witness_echo_timeout"
+      return none(SignedLsmrWitness)
     when defined(lsmr_diag):
       echo "lsmr witness read-response requester=", $svc.switch.peerInfo.peerId,
         " issuer=", $peerId,
         " prefix=", targetPrefix,
         " ts=", nowMillis(),
         " elapsedMs=", nowMillis() - startedAt
-    let payload = await conn.readLp(16 * 1024)
+    let responseTimeout = remainingDuration(deadlineMs)
+    if responseTimeout <= 0.milliseconds:
+      svc.lastRefreshReason = "witness_request_timeout"
+      return none(SignedLsmrWitness)
+    let payloadOpt =
+      await awaitFutureWithin(
+        conn.readLp(16 * 1024),
+        responseTimeout,
+      )
+    if payloadOpt.isNone():
+      svc.lastRefreshReason = "witness_response_timeout"
+      return none(SignedLsmrWitness)
+    let payload = payloadOpt.get()
     when defined(lsmr_diag):
       echo "lsmr witness response-bytes requester=", $svc.switch.peerInfo.peerId,
         " issuer=", $peerId,
@@ -3686,9 +3961,11 @@ proc requestWitnessFromPeer*(
         " elapsedMs=", nowMillis() - startedAt
     let response = parseJson(bytesToString(payload))
     if response.kind != JObject or not response.hasKey("witness"):
+      svc.lastRefreshReason = "witness_invalid_response"
       return none(SignedLsmrWitness)
     let decoded = stringToBytes(base64.decode(response["witness"].getStr()))
     let witness = SignedLsmrWitness.decode(decoded).valueOr:
+      svc.lastRefreshReason = "witness_decode_failed"
       return none(SignedLsmrWitness)
     inc svc.witnessSuccess
     when defined(lsmr_diag):
@@ -3701,6 +3978,8 @@ proc requestWitnessFromPeer*(
   except CancelledError as exc:
     raise exc
   except CatchableError as exc:
+    if svc.lastRefreshReason.len == 0 or svc.lastRefreshReason == "refresh_in_progress":
+      svc.lastRefreshReason = "witness_request_failed"
     when defined(lsmr_diag):
       echo "lsmr witness request failed requester=", $svc.switch.peerInfo.peerId,
         " issuer=", $peerId,
@@ -3786,6 +4065,53 @@ proc publishLocalStateOnConn(
         " isolations=", (if isolationsNode.kind == JArray: isolationsNode.len else: 0)
   ok
 
+proc runControlSession(
+    svc: LsmrService, peerId: PeerId
+): Future[void] {.async: (raises: [CancelledError]).}
+
+proc drainQueuedControlWorkOnConn(
+    svc: LsmrService,
+    conn: Connection,
+    session: LsmrControlSession,
+    peerId: PeerId,
+) {.async: (raises: [CancelledError]).} =
+  if svc.isNil or session.isNil or conn.isNil:
+    return
+  while svc.running and (session.syncPending or session.publishPending):
+    let doPublish = session.publishPending
+    let doSync = session.syncPending
+    let publishIsDelta =
+      doPublish and not session.publishAllKnown and session.publishPeers.len > 0
+    session.publishPending = false
+    session.syncPending = false
+    var syncOk = not doSync
+    var publishOk = not doPublish
+    if publishIsDelta:
+      publishOk = await svc.publishLocalStateOnConn(conn, session, peerId)
+      if not publishOk:
+        session.publishPending = true
+      if doSync and not session.publishPending:
+        syncOk = await svc.syncCoordinatesOnConn(conn, session, peerId)
+        if not syncOk:
+          session.syncPending = true
+    else:
+      if doSync:
+        syncOk = await svc.syncCoordinatesOnConn(conn, session, peerId)
+        if not syncOk:
+          session.syncPending = true
+      if doPublish and session.syncPending:
+        session.publishPending = true
+        continue
+      if doPublish:
+        publishOk = await svc.publishLocalStateOnConn(conn, session, peerId)
+        if not publishOk:
+          session.publishPending = true
+    if not syncOk or not publishOk:
+      break
+  if (session.syncPending or session.publishPending) and
+      (session.runner.isNil or session.runner.finished()):
+    session.runner = svc.runControlSession(peerId)
+
 proc syncCoordinatesFromPeer*(
     svc: LsmrService, peerId: PeerId
 ): Future[bool] {.async: (raises: [CancelledError]).} =
@@ -3803,6 +4129,11 @@ proc syncCoordinatesFromPeer*(
       defer:
         await svc.closeControlSession(session)
       let ok = await svc.syncCoordinatesOnConn(conn, session, peerId)
+      if ok:
+        await svc.drainQueuedControlWorkOnConn(conn, session, peerId)
+      elif (session.syncPending or session.publishPending) and
+          (session.runner.isNil or session.runner.finished()):
+        session.runner = svc.runControlSession(peerId)
       return ok
     finally:
       releaseSessionLock(session)
@@ -3829,6 +4160,11 @@ proc publishLocalStateToPeer*(
       defer:
         await svc.closeControlSession(session)
       let ok = await svc.publishLocalStateOnConn(conn, session, peerId)
+      if ok:
+        await svc.drainQueuedControlWorkOnConn(conn, session, peerId)
+      elif (session.syncPending or session.publishPending) and
+          (session.runner.isNil or session.runner.finished()):
+        session.runner = svc.runControlSession(peerId)
       return ok
     finally:
       releaseSessionLock(session)
@@ -3934,7 +4270,8 @@ proc queueControlSync(svc: LsmrService, peerId: PeerId) {.gcsafe.} =
       " kind=sync",
       " runnerNil=", session.runner.isNil,
       " runnerFinished=", (if session.runner.isNil: true else: session.runner.finished())
-  if session.runner.isNil or session.runner.finished():
+  if (session.runner.isNil or session.runner.finished()) and
+      (session.lock.isNil or not session.lock.locked()):
     session.runner = svc.runControlSession(peerId)
 
 proc preferIncrementalPublish(
@@ -3983,7 +4320,8 @@ proc queueControlPublish(svc: LsmrService, peerId: PeerId) {.gcsafe.} =
       " kind=publish",
       " runnerNil=", session.runner.isNil,
       " runnerFinished=", (if session.runner.isNil: true else: session.runner.finished())
-  if session.runner.isNil or session.runner.finished():
+  if (session.runner.isNil or session.runner.finished()) and
+      (session.lock.isNil or not session.lock.locked()):
     session.runner = svc.runControlSession(peerId)
 
 proc queueControlPublishDelta(
@@ -4010,7 +4348,8 @@ proc queueControlPublishDelta(
       " full=", session.publishAllKnown,
       " runnerNil=", session.runner.isNil,
       " runnerFinished=", (if session.runner.isNil: true else: session.runner.finished())
-  if session.runner.isNil or session.runner.finished():
+  if (session.runner.isNil or session.runner.finished()) and
+      (session.lock.isNil or not session.lock.locked()):
     session.runner = svc.runControlSession(peerId)
 
 proc queueCoordinateDelta(
@@ -4096,6 +4435,14 @@ proc runRefreshQueue(svc: LsmrService): Future[void] {.async: (raises: []).} =
       debug "lsmr queued refresh failed", err = exc.msg
   svc.refreshRunner = nil
 
+proc scheduleImmediateRefreshHint(svc: LsmrService) {.gcsafe, raises: [].} =
+  if svc.isNil or not svc.running:
+    return
+  svc.refreshPending = true
+  if svc.refreshRunner.isNil or svc.refreshRunner.finished():
+    svc.refreshRunner = svc.runRefreshQueue()
+    asyncSpawn svc.refreshRunner
+
 proc scheduleImmediateRefresh(
     svc: LsmrService, publishPeer: Option[PeerId] = none(PeerId)
 ) {.gcsafe, raises: [].} =
@@ -4111,6 +4458,27 @@ proc scheduleImmediateRefresh(
   if svc.refreshRunner.isNil or svc.refreshRunner.finished():
     svc.refreshRunner = svc.runRefreshQueue()
     asyncSpawn svc.refreshRunner
+
+proc bootstrapConnectedHandoff*(
+    svc: LsmrService, peerId: PeerId
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or not svc.running:
+    return false
+  if localCoordinateRecord(svc.switch).isNone():
+    if not await svc.ensurePeerIdentifySnapshot(peerId):
+      svc.lastRefreshReason = "bootstrap_peer_identify_not_ready"
+      return false
+    discard await svc.refreshCoordinateRecord()
+  if localCoordinateRecord(svc.switch).isNone():
+    return false
+  let selfPeerId =
+    if svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  if peerId.data.len > 0 and peerId != selfPeerId and svc.hasDialableRoute(peerId):
+    svc.queuePeerControlHandoff(peerId)
+  true
 
 proc requestMigrationParentDigest*(
     svc: LsmrService, peerId: PeerId, targetPrefix: LsmrPath
@@ -4170,7 +4538,7 @@ proc broadcastIsolationEvidence*(
     try:
       let conn = await svc.switch.dial(peerId, @[svc.config.controlCodec])
       defer:
-        await conn.close()
+        await closeConnectionWithin(conn)
       await conn.writeLp(stringToBytes($payload))
       discard await conn.readLp(8 * 1024)
       inc result
@@ -4186,9 +4554,11 @@ proc refreshCoordinateRecord*(
     return false
   await svc.refreshLock.acquire()
   try:
+    svc.lastRefreshReason = "refresh_in_progress"
     let anchors = svc.effectiveAnchors()
     let targetPrefixes = svc.desiredCertifiedPrefixes()
     if targetPrefixes.len == 0:
+      svc.lastRefreshReason = "missing_target_prefixes"
       return false
     var current = localCoordinateRecord(svc.switch)
     when defined(lsmr_diag):
@@ -4267,6 +4637,10 @@ proc refreshCoordinateRecord*(
           " coverage=", derived.coverageMask
       if derived.trust != trusted:
         inc svc.witnessQuorumFailure
+        if witnesses.len == 0 and svc.lastRefreshReason.startsWith("witness_"):
+          discard
+        else:
+          svc.lastRefreshReason = derived.reason
         return false
 
       let issuedAt = nowMillis()
@@ -4290,6 +4664,7 @@ proc refreshCoordinateRecord*(
           )
           if migration.isNone():
             inc svc.witnessQuorumFailure
+            svc.lastRefreshReason = "migration_build_failed"
             return false
           discard installMigrationRecord(svc.switch, migration.get())
           migrationDigest = migration.get().data.migrationDigest
@@ -4324,6 +4699,7 @@ proc refreshCoordinateRecord*(
       record.recordDigest = computeRecordDigest(record)
       let signed = SignedLsmrCoordinateRecord.init(svc.switch.peerInfo.privateKey, record).valueOr:
         inc svc.witnessQuorumFailure
+        svc.lastRefreshReason = "coordinate_sign_failed"
         return false
       svc.installLocalCoordinateRecord(signed)
       when defined(lsmr_diag):
@@ -4335,9 +4711,11 @@ proc refreshCoordinateRecord*(
       refreshed = true
 
     if not refreshed:
+      svc.lastRefreshReason = (if current.isSome(): "already_certified" else: "missing_witnesses")
       return current.isSome()
 
     svc.queueCoordinateDelta([svc.switch.peerInfo.peerId])
+    svc.lastRefreshReason = "ok"
     return true
   finally:
     svc.releaseRefreshLock()
@@ -4387,38 +4765,39 @@ method setup*(
     svc.connectedHandler = proc(
         peerId: PeerId, event: ConnEvent
     ): Future[void] {.async: (raises: [CancelledError]).} =
-      if svc.isNil or svc.switch.isNil:
+      if svc.isNil or svc.switch.isNil or event.kind != ConnEventKind.Connected:
         return
-      if event.kind == ConnEventKind.Connected:
-        if localCoordinateRecord(svc.switch).isSome():
-          svc.downgradePendingFullPublish(peerId)
-          svc.queueControlSync(peerId)
-          let selfPeerId =
-            if svc.switch.peerInfo.isNil:
-              PeerId()
-            else:
-              svc.switch.peerInfo.peerId
-          if selfPeerId.data.len > 0 and svc.preferIncrementalPublish(peerId):
-            svc.queueControlPublishDelta(peerId, [selfPeerId])
-          else:
-            svc.queueControlPublish(peerId)
-          svc.scheduleOverlayMaintenance()
-        else:
-          scheduleImmediateRefresh(svc, some(peerId))
+      svc.handleConnectedSyncPeer(peerId)
       when defined(lsmr_diag):
         echo "lsmr connected self=", $svc.switch.peerInfo.peerId,
           " peer=", $peerId,
           " knownCoord=", knowsCoordinatePeer(svc, peerId),
           " localCoord=", localCoordinateRecord(svc.switch).isSome()
+    svc.identifiedHandler = proc(
+        peerId: PeerId, event: PeerEvent
+    ): Future[void] {.async: (raises: [CancelledError]).} =
+      if svc.isNil or svc.switch.isNil or event.kind != PeerEventKind.Identified:
+        return
+      svc.handleIdentifiedSyncPeer(peerId)
+      when defined(lsmr_diag):
+        echo "lsmr identified self=", $svc.switch.peerInfo.peerId,
+          " peer=", $peerId,
+          " knownCoord=", knowsCoordinatePeer(svc, peerId),
+          " localCoord=", localCoordinateRecord(svc.switch).isSome()
     switch.addConnEventHandler(svc.connectedHandler, ConnEventKind.Connected)
+    switch.addPeerEventHandler(svc.identifiedHandler, PeerEventKind.Identified)
     await svc.run(switch)
+    let hasLocalCoord = localCoordinateRecord(svc.switch).isSome()
     for peerId in svc.knownSyncPeers():
       if svc.hasDialableRoute(peerId):
         svc.schedulePeerConnect(peerId)
-    if localCoordinateRecord(svc.switch).isSome():
-      for peerId in svc.knownSyncPeers():
-        svc.schedulePeerConnect(peerId)
-    scheduleImmediateRefresh(svc)
+    if hasLocalCoord:
+      scheduleImmediateRefresh(svc)
+    else:
+      for peerId in svc.connectedPeerIds():
+        if peerId != svc.switch.peerInfo.peerId:
+          scheduleImmediateRefreshHint(svc)
+          break
   hasBeenSetup
 
 method run*(
@@ -4486,6 +4865,9 @@ method stop*(
     if not svc.connectedHandler.isNil and not switch.isNil:
       switch.removeConnEventHandler(svc.connectedHandler, ConnEventKind.Connected)
       svc.connectedHandler = nil
+    if not svc.identifiedHandler.isNil and not switch.isNil:
+      switch.removePeerEventHandler(svc.identifiedHandler, PeerEventKind.Identified)
+      svc.identifiedHandler = nil
     if not svc.witnessProtocol.isNil and svc.witnessProtocol.started:
       await svc.witnessProtocol.stop()
     if not svc.controlProtocol.isNil and svc.controlProtocol.started:

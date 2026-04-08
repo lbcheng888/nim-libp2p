@@ -118,7 +118,7 @@ proc publicKeyCombine(keys: openArray[secp.SkPublicKey]): CoinJoinResult[secp.Sk
 proc scalarAdd(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
   var acc = a
   var tweak = b
-  if secp256k1_ec_privkey_tweak_add(secp256k1_context_no_precomp, addr acc[0], addr tweak[0]) != 1:
+  if secp256k1_ec_seckey_tweak_add(secp256k1_context_no_precomp, addr acc[0], addr tweak[0]) != 1:
     err(newCoinJoinError(cjInvalidInput, "blind addition overflows"))
   else:
     ok(acc)
@@ -126,14 +126,14 @@ proc scalarAdd(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
 proc scalarMul*(a, b: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
   var acc = a
   var tweak = b
-  if secp256k1_ec_privkey_tweak_mul(secp256k1_context_no_precomp, addr acc[0], addr tweak[0]) != 1:
+  if secp256k1_ec_seckey_tweak_mul(secp256k1_context_no_precomp, addr acc[0], addr tweak[0]) != 1:
     err(newCoinJoinError(cjInvalidInput, "blind multiplication failed"))
   else:
     ok(acc)
 
 proc scalarNegate(value: CoinJoinBlind): CoinJoinResult[CoinJoinBlind] =
   var data = value
-  if secp256k1_ec_privkey_negate(secp256k1_context_no_precomp, addr data[0]) != 1:
+  if secp256k1_ec_seckey_negate(secp256k1_context_no_precomp, addr data[0]) != 1:
     err(newCoinJoinError(cjInternal, "blind negate failed"))
   else:
     ok(data)

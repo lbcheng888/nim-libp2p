@@ -623,6 +623,8 @@ proc reindexMuxerPeerId*(
 
   c.refreshPeerPlanes(previousPeerId)
   c.refreshPeerPlanes(currentPeerId)
+  for stream in muxer.getStreams():
+    stream.syncConnectionIdentity(muxer.connection)
 
   libp2p_peers.set(c.muxed.len.int64)
   trace "Reindexed muxer peer id",

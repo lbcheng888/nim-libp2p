@@ -329,6 +329,7 @@ proc newMsQuicChannel(
     if not session.bandwidthManager.isNil:
       channel.bandwidthManager = session.bandwidthManager
       stream.setBandwidthManager(session.bandwidthManager)
+    channel.inheritInboundProtocolSelectionState(session)
     channel.initStream()
     channel
   except CatchableError as exc:

@@ -1461,6 +1461,8 @@ proc handle*(
         await MultistreamSelect.handle(conn, protos, matchers, active)
       finally:
         conn.endProtocolNegotiation()
+    if not active and ms.len > 0:
+      await conn.handleFirstInboundProtocolSelected(ms)
     for h in m.handlers:
       if (h.match != nil and h.match(ms)) or h.protos.contains(ms):
         trace "found handler", conn, protocol = ms

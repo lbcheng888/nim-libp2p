@@ -535,6 +535,7 @@ proc createStream(
   stream.localAddr = m.connection.localAddr
   stream.relayPath = m.connection.relayPath
   stream.transportDir = m.connection.transportDir
+  stream.inheritInboundProtocolSelectionState(m.connection)
   when defined(libp2p_agents_metrics):
     stream.shortAgent = m.connection.shortAgent
   m.channels[id] = stream

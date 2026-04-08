@@ -34,6 +34,13 @@ type
     msv2
 
   TimeoutHandler* = proc(): Future[void] {.async: (raises: []).}
+  InboundProtocolSelectedHandler* = proc(
+    conn: Connection, protocol: string
+  ): Future[void] {.async: (raises: []).}
+
+  InboundProtocolSelectionState = ref object
+    handler: InboundProtocolSelectedHandler
+    triggered: bool
 
   Connection* = ref object of LPStream
     activity*: bool # reset every time data is sent or received
@@ -50,6 +57,7 @@ type
     bandwidthManager*: BandwidthManager
     memoryManager*: MemoryManager
     multistreamVersion*: MultistreamVersion
+    inboundProtocolSelection: InboundProtocolSelectionState
     pendingReadReplay*: seq[byte]
     pendingLpReplayDrop*: seq[byte]
     when defined(libp2p_agents_metrics):
@@ -214,6 +222,54 @@ proc clearNegotiatedMuxer*(conn: Connection) =
   if conn.isNil:
     return
   conn.negotiatedMuxer = ""
+
+proc setInboundProtocolSelectedHandler*(
+    conn: Connection,
+    handler: InboundProtocolSelectedHandler,
+) =
+  if conn.isNil:
+    return
+  if handler.isNil:
+    conn.inboundProtocolSelection = nil
+    return
+  if conn.inboundProtocolSelection.isNil:
+    conn.inboundProtocolSelection = InboundProtocolSelectionState()
+  conn.inboundProtocolSelection.handler = handler
+  conn.inboundProtocolSelection.triggered = false
+
+proc inheritInboundProtocolSelectionState*(
+    conn: Connection,
+    source: Connection,
+) =
+  if conn.isNil or source.isNil or source.inboundProtocolSelection.isNil:
+    return
+  conn.inboundProtocolSelection = source.inboundProtocolSelection
+
+proc syncConnectionIdentity*(
+    conn: Connection,
+    source: Connection,
+) =
+  if conn.isNil or source.isNil:
+    return
+  conn.peerId = source.peerId
+  conn.observedAddr = source.observedAddr
+  conn.localAddr = source.localAddr
+  conn.transportDir = source.transportDir
+  conn.relayPath = source.relayPath
+
+proc handleFirstInboundProtocolSelected*(
+    conn: Connection,
+    protocol: string,
+) {.async: (raises: [CancelledError]).} =
+  if conn.isNil or protocol.len == 0:
+    return
+  let state = conn.inboundProtocolSelection
+  if state.isNil or state.triggered or state.handler.isNil:
+    return
+  state.triggered = true
+  let handler = state.handler
+  state.handler = nil
+  await handler(conn, protocol)
 
 proc connectionReadLpAsync(
     s: Connection, maxSize: int

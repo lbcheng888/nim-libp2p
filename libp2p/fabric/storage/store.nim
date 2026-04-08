@@ -1,4 +1,4 @@
-import std/[options, os, strutils]
+import std/[json, jsonutils, options, os, strutils]
 
 import pebble/kv
 
@@ -39,6 +39,36 @@ proc stringOf(data: openArray[byte]): string {.gcsafe.} =
   result = newString(data.len)
   if data.len > 0:
     copyMem(addr result[0], unsafeAddr data[0], data.len)
+
+proc checkpointIdFromStoreKey(key: string): string =
+  let splitAt = key.rfind(':')
+  if splitAt >= 0 and splitAt + 1 < key.len:
+    key[splitAt + 1 .. ^1]
+  else:
+    ""
+
+proc decodeCheckpointCertificate(
+    payload: string, checkpointId = ""
+): Option[CheckpointCertificate] =
+  var node = parseJson(payload)
+  if node.kind != JObject:
+    return none(CheckpointCertificate)
+  if not node.hasKey("candidate") and node.hasKey("era"):
+    let candidate = jsonTo(node, CheckpointCandidate)
+    return some(CheckpointCertificate(
+      checkpointId: checkpointId,
+      candidate: candidate,
+      votes: @[],
+      quorumWeight: 0,
+      createdAt: candidate.createdAt,
+    ))
+  if not node.hasKey("candidate"):
+    return none(CheckpointCertificate)
+  if not node.hasKey("checkpointId"):
+    let inferredId = checkpointId
+    if inferredId.len > 0:
+      node["checkpointId"] = %inferredId
+  some(jsonTo(node, CheckpointCertificate))
 
 proc keyHeight(height: uint64): string =
   align($height, 20, '0')
@@ -311,10 +341,17 @@ proc loadLatestCheckpoint*(store: FabricStore): Option[CheckpointCertificate] =
   let latest = store.kv.get(ksIndex, "checkpoint:latest")
   if latest.isNone():
     return none(CheckpointCertificate)
-  getJson[CheckpointCertificate](store, ksTask, "checkpoint:" & latest.get())
+  let checkpointId = latest.get()
+  let payload = store.kv.get(ksTask, "checkpoint:" & checkpointId)
+  if payload.isNone():
+    return none(CheckpointCertificate)
+  decodeCheckpointCertificate(payload.get(), checkpointId)
 
 proc loadCheckpoint*(store: FabricStore, checkpointId: string): Option[CheckpointCertificate] =
-  getJson[CheckpointCertificate](store, ksTask, "checkpoint:" & checkpointId)
+  let payload = store.kv.get(ksTask, "checkpoint:" & checkpointId)
+  if payload.isNone():
+    return none(CheckpointCertificate)
+  decodeCheckpointCertificate(payload.get(), checkpointId)
 
 proc loadCheckpointSnapshot*(store: FabricStore, checkpointId: string): Option[ChainStateSnapshot] =
   let payload = store.kv.getBytes(ksTask, "snapshot:" & checkpointId)
@@ -431,7 +468,11 @@ proc loadAllCheckpointVotes*(store: FabricStore): seq[CheckpointVote] =
   scanPrefix[CheckpointVote](store, ksEvent, "checkpoint_vote:")
 
 proc loadAllCheckpoints*(store: FabricStore): seq[CheckpointCertificate] =
-  scanPrefix[CheckpointCertificate](store, ksEvent, "checkpoint:")
+  let page = store.kv.scanPrefix(ksEvent, prefix = "checkpoint:", limit = 0)
+  for item in page.entries:
+    let cert = decodeCheckpointCertificate(item.value, checkpointIdFromStoreKey(item.id))
+    if cert.isSome():
+      result.add(cert.get())
 
 proc loadAllAvoProposals*(store: FabricStore): seq[AvoProposal] =
   scanPrefix[AvoProposal](store, ksTask, "avo_proposal:")

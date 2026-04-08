@@ -341,6 +341,11 @@ proc init*(p: IdentifyPush) =
       identInfo.pubkey.withValue(pubkey):
         let receivedPeerId = PeerId.init(pubkey).tryGet()
         if receivedPeerId != conn.peerId:
+          warn "identify push peer mismatch",
+            connPeerId = conn.peerId,
+            receivedPeerId = receivedPeerId,
+            protocol = conn.protocol,
+            negotiated = conn.negotiatedMuxer
           raise newException(IdentityNoMatchError, "Peer ids don't match")
         identInfo.peerId = receivedPeerId
 
@@ -367,6 +372,11 @@ proc push*(
   if not peerInfo.isNil:
     for key, value in peerInfo.metadata.pairs:
       metadata.add((key, value))
+  warn "identify push write begin",
+    payloadPeerId = (if peerInfo.isNil: default(PeerId) else: peerInfo.peerId),
+    connPeerId = (if conn.isNil: default(PeerId) else: conn.peerId),
+    protocol = (if conn.isNil: "" else: conn.protocol),
+    negotiated = (if conn.isNil: "" else: conn.negotiatedMuxer)
   var pb = encodeMsg(peerInfo, conn.observedAddr, true, metadata)
   await conn.writeLp(pb.buffer)
 

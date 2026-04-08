@@ -23,16 +23,16 @@ case "${TARGET}" in
     DATA_DIR="${ROOT}/build/prod-64/fabric"
     IDENTITY_PATH="${DATA_DIR}/identity.json"
     LISTEN_ADDRS="/ip4/0.0.0.0/tcp/40111"
-    BOOTSTRAP_ADDRS="/ip4/154.26.191.226/tcp/40112"
+    BOOTSTRAP_ADDRS="/ip4/154.26.191.226/tcp/40112/p2p/12D3KooWCeZk2pCQe6rHJ8hZasEnZB6S5VMkemtaGJYDCkk3V1bA"
     LSMR_PATH="5"
     ;;
   dmit)
-    RPC_HOST="127.0.0.1"
+    RPC_HOST="0.0.0.0"
     RPC_PORT="19112"
     DATA_DIR="${ROOT}/build/prod-dmit/fabric"
     IDENTITY_PATH="${DATA_DIR}/identity.json"
     LISTEN_ADDRS="/ip4/0.0.0.0/tcp/40112"
-    BOOTSTRAP_ADDRS="/ip4/64.176.84.12/tcp/40111"
+    BOOTSTRAP_ADDRS="/ip4/64.176.84.12/tcp/40111/p2p/12D3KooWNE1E71rdMeQfqMoMDLpkVcJzPs4GJHsVuPj9ZGgFH333"
     LSMR_PATH="3"
     ;;
   mac)
@@ -41,7 +41,7 @@ case "${TARGET}" in
     DATA_DIR="${ROOT}/build/prod-mac/fabric"
     IDENTITY_PATH="${DATA_DIR}/identity.json"
     LISTEN_ADDRS="/ip4/0.0.0.0/tcp/40113"
-    BOOTSTRAP_ADDRS="/ip4/64.176.84.12/tcp/40111,/ip4/154.26.191.226/tcp/40112"
+    BOOTSTRAP_ADDRS="/ip4/64.176.84.12/tcp/40111/p2p/12D3KooWNE1E71rdMeQfqMoMDLpkVcJzPs4GJHsVuPj9ZGgFH333,/ip4/154.26.191.226/tcp/40112/p2p/12D3KooWCeZk2pCQe6rHJ8hZasEnZB6S5VMkemtaGJYDCkk3V1bA"
     LSMR_PATH="9"
     ;;
   *)

@@ -98,6 +98,7 @@ proc newStreamInternal*(
   result.localAddr = m.connection.localAddr
   result.relayPath = m.connection.relayPath
   result.transportDir = m.connection.transportDir
+  result.inheritInboundProtocolSelectionState(m.connection)
   when defined(libp2p_agents_metrics):
     result.shortAgent = m.connection.shortAgent
 

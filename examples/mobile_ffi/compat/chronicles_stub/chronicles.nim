@@ -108,10 +108,13 @@ proc chroniclesPlatformLog(level: LogLevel, line: string) =
       discard
 
 template chroniclesToString(x: untyped): string =
-  when compiles($x):
-    $x
+  when compiles(x):
+    when compiles($x):
+      $x
+    else:
+      repr(x)
   else:
-    repr(x)
+    "<unavailable>"
 
 template safeEvalToString(expr: untyped): string =
   ## Evaluate and stringify `expr` without leaking exceptions into callers that

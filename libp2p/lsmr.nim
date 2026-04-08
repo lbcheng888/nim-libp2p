@@ -32,9 +32,20 @@ type
     shadowMode*: bool
     legacyCandidates*: int
     legacyTrusted*: int
+    lsmrMinWitnessQuorum*: int
     lsmrActiveCertificates*: int
     lsmrIsolations*: int
     lsmrMigrations*: int
+    lsmrWitnessRequests*: int64
+    lsmrWitnessSuccess*: int64
+    lsmrWitnessQuorumFailure*: int64
+    lsmrKnownSyncPeers*: int
+    lsmrDialableSyncPeers*: int
+    lsmrOverlayDesiredPeers*: int
+    lsmrLocalCertReady*: bool
+    lsmrLastRefreshReason*: string
+    lsmrUndialableSyncPeers*: seq[string]
+    lsmrOverlayDesiredPeerIds*: seq[string]
 
   NearFieldBootstrapProvider* {.pure.} = enum
     nfbpNfc

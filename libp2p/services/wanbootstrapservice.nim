@@ -257,6 +257,7 @@ type
     lastSnapshotError: string
     joinInProgress: bool
     joinFuture: Future[WanBootstrapJoinResult].Raising([CancelledError])
+    connectedSyncFuture: Future[void].Raising([CancelledError])
 
   WanBootstrapDialOutcome = object
     connected: bool
@@ -338,6 +339,10 @@ proc lsmrDiscoveryActive(config: WanBootstrapConfig): bool =
 proc legacyDiscoveryActive(config: WanBootstrapConfig): bool =
   config.legacyDiscoveryEnabled and config.routingMode != RoutingPlaneMode.lsmrOnly
 
+proc handoffConnectedBootstrapPeerToLsmr(
+    svc: WanBootstrapService, peerId: PeerId
+): Future[void] {.async: (raises: [CancelledError]).}
+
 proc shadowMode(config: WanBootstrapConfig): bool =
   config.routingMode == RoutingPlaneMode.dualStack
 
@@ -391,6 +396,13 @@ proc relayCapableFromAddrs(addrs: openArray[MultiAddress]): bool =
     if "/p2p-circuit" in $addr:
       return true
   false
+
+proc bootstrapConnectDialOptions(svc: WanBootstrapService): DialOptions =
+  if svc.isNil:
+    return DialOptions()
+  if svc.config.lsmrDiscoveryActive():
+    return DialOptions(skipAutoIdentify: true)
+  DialOptions()
 
 proc isExactPeerMultiaddr(address: MultiAddress): bool =
   let text = $address
@@ -1169,6 +1181,8 @@ proc bootstrapAutoJoinNeedsConnectedSync(
 ): bool {.gcsafe, raises: [].} =
   if svc.isNil or svc.switch.isNil:
     return false
+  if not svc.connectedSyncFuture.isNil and not svc.connectedSyncFuture.finished():
+    return false
   let connected = svc.connectedPeerIds()
   connected.len > 0 and (
     (not svc.hasLastJoinResult) or
@@ -1695,9 +1709,23 @@ proc routingPlaneStatus*(svc: WanBootstrapService): RoutingPlaneStatus =
   for candidate in svc.collectBootstrapCandidates():
     if candidate.trust == WanBootstrapTrust.trusted:
       inc result.legacyTrusted
-  result.lsmrActiveCertificates = svc.switch.peerStore[ActiveLsmrBook].len
-  result.lsmrMigrations = svc.switch.peerStore[LsmrMigrationBook].len
-  result.lsmrIsolations = svc.switch.peerStore[LsmrIsolationBook].len
+  let lsmrStatus = lsmrsvc.routingPlaneStatus(lsmrsvc.getLsmrService(svc.switch))
+  result.lsmrMinWitnessQuorum = lsmrStatus.lsmrMinWitnessQuorum
+  result.lsmrActiveCertificates = lsmrStatus.lsmrActiveCertificates
+  result.lsmrMigrations = lsmrStatus.lsmrMigrations
+  result.lsmrIsolations = lsmrStatus.lsmrIsolations
+  result.lsmrWitnessRequests = lsmrStatus.lsmrWitnessRequests
+  result.lsmrWitnessSuccess = lsmrStatus.lsmrWitnessSuccess
+  result.lsmrWitnessQuorumFailure = lsmrStatus.lsmrWitnessQuorumFailure
+  result.lsmrKnownSyncPeers = lsmrStatus.lsmrKnownSyncPeers
+  result.lsmrDialableSyncPeers = lsmrStatus.lsmrDialableSyncPeers
+  result.lsmrOverlayDesiredPeers = lsmrStatus.lsmrOverlayDesiredPeers
+  result.lsmrLocalCertReady = lsmrStatus.lsmrLocalCertReady
+  result.lsmrLastRefreshReason = lsmrStatus.lsmrLastRefreshReason
+  result.lsmrUndialableSyncPeers = lsmrStatus.lsmrUndialableSyncPeers
+  result.lsmrOverlayDesiredPeerIds = lsmrStatus.lsmrOverlayDesiredPeerIds
+  if result.lsmrMinWitnessQuorum == 0 and svc.config.lsmrConfig.isSome():
+    result.lsmrMinWitnessQuorum = max(1, svc.config.lsmrConfig.get().minWitnessQuorum)
 
 proc routingPlaneStatus*(switch: Switch): RoutingPlaneStatus =
   let svc = getWanBootstrapService(switch)
@@ -1817,6 +1845,14 @@ proc bootstrapStateJson*(
   result["lsmrStaleRecords"] = %snapshot.metrics.lsmrStaleRecords
   result["lsmrForgedRecords"] = %snapshot.metrics.lsmrForgedRecords
   result["lsmrBiasReorders"] = %snapshot.metrics.lsmrBiasReorders
+  result["lsmrMinWitnessQuorum"] = %snapshot.routingStatus.lsmrMinWitnessQuorum
+  result["lsmrKnownSyncPeers"] = %snapshot.routingStatus.lsmrKnownSyncPeers
+  result["lsmrDialableSyncPeers"] = %snapshot.routingStatus.lsmrDialableSyncPeers
+  result["lsmrOverlayDesiredPeers"] = %snapshot.routingStatus.lsmrOverlayDesiredPeers
+  result["lsmrLocalCertReady"] = %snapshot.routingStatus.lsmrLocalCertReady
+  result["lsmrLastRefreshReason"] = %snapshot.routingStatus.lsmrLastRefreshReason
+  result["lsmrUndialableSyncPeers"] = %snapshot.routingStatus.lsmrUndialableSyncPeers
+  result["lsmrOverlayDesiredPeerIds"] = %snapshot.routingStatus.lsmrOverlayDesiredPeerIds
   if snapshot.lastRendezvousAdvertiseError.len > 0:
     result["lastRendezvousAdvertiseError"] = %snapshot.lastRendezvousAdvertiseError
   if snapshot.lastRendezvousRequestError.len > 0:
@@ -1829,9 +1865,20 @@ proc bootstrapStateJson*(
     "shadowMode": snapshot.routingStatus.shadowMode,
     "legacyCandidates": snapshot.routingStatus.legacyCandidates,
     "legacyTrusted": snapshot.routingStatus.legacyTrusted,
+    "lsmrMinWitnessQuorum": snapshot.routingStatus.lsmrMinWitnessQuorum,
     "lsmrActiveCertificates": snapshot.routingStatus.lsmrActiveCertificates,
     "lsmrIsolations": snapshot.routingStatus.lsmrIsolations,
     "lsmrMigrations": snapshot.routingStatus.lsmrMigrations,
+    "lsmrWitnessRequests": snapshot.routingStatus.lsmrWitnessRequests,
+    "lsmrWitnessSuccess": snapshot.routingStatus.lsmrWitnessSuccess,
+    "lsmrWitnessQuorumFailure": snapshot.routingStatus.lsmrWitnessQuorumFailure,
+    "lsmrKnownSyncPeers": snapshot.routingStatus.lsmrKnownSyncPeers,
+    "lsmrDialableSyncPeers": snapshot.routingStatus.lsmrDialableSyncPeers,
+    "lsmrOverlayDesiredPeers": snapshot.routingStatus.lsmrOverlayDesiredPeers,
+    "lsmrLocalCertReady": snapshot.routingStatus.lsmrLocalCertReady,
+    "lsmrLastRefreshReason": snapshot.routingStatus.lsmrLastRefreshReason,
+    "lsmrUndialableSyncPeers": snapshot.routingStatus.lsmrUndialableSyncPeers,
+    "lsmrOverlayDesiredPeerIds": snapshot.routingStatus.lsmrOverlayDesiredPeerIds,
   }
   result["hasLastJoinResult"] = %snapshot.hasLastJoinResult
   if snapshot.hasLastJoinResult:
@@ -2040,7 +2087,7 @@ proc waitOngoingJoin(
     return completedJoinResultFuture(svc.lastJoinResult)
   completedJoinResultFuture(defaultJoinResult())
 
-proc advertiseRendezvousNamespaces*(
+proc advertiseRendezvousNamespacesImpl(
     svc: WanBootstrapService
 ): Future[int] {.async: (raises: [CancelledError]).} =
   if svc.isNil or not svc.config.enableRendezvous or svc.rendezvous.isNil:
@@ -2059,14 +2106,19 @@ proc advertiseRendezvousNamespaces*(
   svc.recordRefreshRun("rendezvous_advertise", result)
 
 proc advertiseRendezvousNamespaces*(
+    svc: WanBootstrapService
+): Future[int] {.async: (raises: [CancelledError]).} =
+  await advertiseRendezvousNamespacesImpl(svc)
+
+proc advertiseRendezvousNamespaces*(
     switch: Switch
 ): Future[int] {.async: (raises: [CancelledError]).} =
   let svc = getWanBootstrapService(switch)
   if svc.isNil:
     return 0
-  await svc.advertiseRendezvousNamespaces()
+  await advertiseRendezvousNamespacesImpl(svc)
 
-proc refreshFromRendezvousNamespaces*(
+proc refreshFromRendezvousNamespacesImpl(
     svc: WanBootstrapService
 ): Future[int] {.async: (raises: [CancelledError]).} =
   if svc.isNil or not svc.config.enableRendezvous or svc.rendezvous.isNil:
@@ -2112,12 +2164,17 @@ proc refreshFromRendezvousNamespaces*(
   svc.updateObservability()
 
 proc refreshFromRendezvousNamespaces*(
+    svc: WanBootstrapService
+): Future[int] {.async: (raises: [CancelledError]).} =
+  await refreshFromRendezvousNamespacesImpl(svc)
+
+proc refreshFromRendezvousNamespaces*(
     switch: Switch
 ): Future[int] {.async: (raises: [CancelledError]).} =
   let svc = getWanBootstrapService(switch)
   if svc.isNil:
     return 0
-  await svc.refreshFromRendezvousNamespaces()
+  await refreshFromRendezvousNamespacesImpl(svc)
 
 proc buildSnapshotResponse(svc: WanBootstrapService, limit: int): JsonNode =
   result = newJObject()
@@ -2208,7 +2265,7 @@ proc requestBootstrapSnapshot*(
     return @[]
   await svc.requestBootstrapSnapshot(peerId, limit)
 
-proc refreshFromBootstrapSnapshots*(
+proc refreshFromBootstrapSnapshotsImpl(
     svc: WanBootstrapService
 ): Future[int] {.async: (raises: [CancelledError]).} =
   if svc.isNil or not svc.config.enableSnapshotProtocol:
@@ -2256,8 +2313,15 @@ proc refreshFromBootstrapSnapshots*(
             entry.trust,
           )
         inc result
+    if svc.config.lsmrDiscoveryActive():
+      await svc.handoffConnectedBootstrapPeerToLsmr(peerId)
   svc.recordRefreshRun("snapshot", result)
   svc.updateObservability()
+
+proc refreshFromBootstrapSnapshots*(
+    svc: WanBootstrapService
+): Future[int] {.async: (raises: [CancelledError]).} =
+  await refreshFromBootstrapSnapshotsImpl(svc)
 
 proc refreshFromBootstrapSnapshots*(
     switch: Switch
@@ -2265,7 +2329,7 @@ proc refreshFromBootstrapSnapshots*(
   let svc = getWanBootstrapService(switch)
   if svc.isNil:
     return 0
-  await svc.refreshFromBootstrapSnapshots()
+  await refreshFromBootstrapSnapshotsImpl(svc)
 
 proc refreshBootstrapState*(
     svc: WanBootstrapService
@@ -2276,6 +2340,9 @@ proc refreshBootstrapState*(
   let lsmrService = lsmrsvc.getLsmrService(svc.switch)
   if not lsmrService.isNil and svc.config.lsmrDiscoveryActive():
     discard await lsmrService.refreshCoordinateRecord()
+    if lsmrsvc.localCoordinateRecord(svc.switch).isSome():
+      for peerId in svc.connectedPeerIds():
+        await svc.handoffConnectedBootstrapPeerToLsmr(peerId)
   if not svc.journalLoaded:
     discard svc.loadBootstrapJournal()
   if not svc.switch.isNil and svc.connectedPeerIds().len == 0 and svc.config.enableDnsaddrFallback and
@@ -2384,6 +2451,53 @@ proc bootstrapMountedKadDHTs(
   svc.recordKadBootstrapResult(kads.len, successful == kads.len)
   successful
 
+proc scheduleConnectedBootstrapSync(
+    svc: WanBootstrapService
+) {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil:
+    return
+  if not svc.connectedSyncFuture.isNil and not svc.connectedSyncFuture.finished():
+    return
+
+  var fut: Future[void].Raising([CancelledError])
+  proc runConnectedSync() {.async: (raises: [CancelledError]).} =
+    try:
+      if svc.connectedPeerIds().len == 0:
+        return
+      if svc.config.lsmrDiscoveryActive():
+        let lsmrService = lsmrsvc.getLsmrService(svc.switch)
+        if not lsmrService.isNil:
+          for peerId in svc.connectedPeerIds():
+            discard await lsmrService.bootstrapConnectedHandoff(peerId)
+      discard await svc.advertiseRendezvousNamespaces()
+      discard await svc.refreshFromRendezvousNamespaces()
+      discard await svc.refreshFromBootstrapSnapshots()
+      discard await svc.bootstrapMountedKadDHTs()
+      if svc.journalDirty:
+        discard svc.saveBootstrapJournal()
+      svc.updateObservability()
+    except CancelledError as exc:
+      raise exc
+    except CatchableError as exc:
+      debug "wan bootstrap connected sync failed", err = exc.msg
+    finally:
+      if svc.connectedSyncFuture == fut:
+        svc.connectedSyncFuture = nil
+
+  fut = cast[Future[void].Raising([CancelledError])](runConnectedSync())
+  svc.connectedSyncFuture = fut
+
+proc handoffConnectedBootstrapPeerToLsmr(
+    svc: WanBootstrapService, peerId: PeerId
+): Future[void] {.async: (raises: [CancelledError]).} =
+  if svc.isNil or svc.switch.isNil or peerId.data.len == 0 or
+      not svc.config.lsmrDiscoveryActive():
+    return
+  let lsmrService = lsmrsvc.getLsmrService(svc.switch)
+  if lsmrService.isNil:
+    return
+  discard await lsmrService.bootstrapConnectedHandoff(peerId)
+
 proc finalizeBootstrapConnectedCandidate(
     svc: WanBootstrapService,
     candidate: WanBootstrapCandidate,
@@ -2449,7 +2563,13 @@ proc connectBootstrapCandidate(
   var attemptedAddr = ""
   for addr in ordered:
     attemptedAddr = $addr
-    let fut = svc.switch.connect(candidate.peerId, @[addr], forceDial = true)
+    let fut =
+      svc.switch.connect(
+        candidate.peerId,
+        @[addr],
+        forceDial = true,
+        options = svc.bootstrapConnectDialOptions(),
+      )
     let waitRes = await svc.awaitConnectFutureOrPeerConnected(
       fut,
       candidate.peerId,
@@ -2516,7 +2636,13 @@ proc dialBootstrapCandidateExactAddr(
     except CatchableError:
       hadOriginalAddrs = false
       originalAddrs = @[]
-  let fut = svc.switch.connect(candidate.peerId, @[connectAddr], forceDial = true)
+  let fut =
+    svc.switch.connect(
+      candidate.peerId,
+      @[connectAddr],
+      forceDial = true,
+      options = svc.bootstrapConnectDialOptions(),
+    )
   let waitRes = await svc.awaitConnectFutureOrPeerConnected(
     fut,
     candidate.peerId,
@@ -2721,19 +2847,33 @@ proc joinViaSeedBootstrapImpl(
   if outcome.connected:
     result.connectedCount = 1
     result.ok = true
-
-  if syncConnectedState and svc.connectedPeerIds().len > 0:
-    discard await svc.advertiseRendezvousNamespaces()
-    discard await svc.refreshFromRendezvousNamespaces()
-    discard await svc.refreshFromBootstrapSnapshots()
-
-  if result.ok and syncConnectedState:
-    discard await svc.bootstrapMountedKadDHTs()
+  elif svc.peerCurrentlyConnected(peerId):
+    let followupOutcome = await svc.finalizeBootstrapConnectedCandidate(
+      candidate,
+      "seeded_direct_connected_followup",
+      outcome.attemptedAddr,
+    )
+    result.attempts.add(
+      WanBootstrapJoinAttempt(
+        stage: "seeded_direct_connected_followup",
+        candidate: candidate,
+        connected: followupOutcome.connected,
+        attemptedAddr: outcome.attemptedAddr,
+        error: followupOutcome.error,
+      )
+    )
+    result.attemptedCount = result.attempts.len
+    if followupOutcome.connected:
+      result.connectedCount = 1
+      result.ok = true
 
   svc.recordJoinResult(result)
   if result.ok and svc.journalDirty:
     discard svc.saveBootstrapJournal()
   svc.updateObservability()
+  if syncConnectedState and svc.peerCurrentlyConnected(peerId):
+    await svc.handoffConnectedBootstrapPeerToLsmr(peerId)
+    svc.scheduleConnectedBootstrapSync()
 
 proc promoteConnectedBootstrapPeerImpl(
     svc: WanBootstrapService,
@@ -2803,11 +2943,6 @@ proc promoteConnectedBootstrapPeerImpl(
     svc.updateObservability()
     return
 
-  discard await svc.advertiseRendezvousNamespaces()
-  discard await svc.refreshFromRendezvousNamespaces()
-  discard await svc.refreshFromBootstrapSnapshots()
-  discard await svc.bootstrapMountedKadDHTs()
-
   result = WanBootstrapJoinResult(
     attempts: @[
       WanBootstrapJoinAttempt(
@@ -2827,6 +2962,8 @@ proc promoteConnectedBootstrapPeerImpl(
   if svc.journalDirty:
     discard svc.saveBootstrapJournal()
   svc.updateObservability()
+  await svc.handoffConnectedBootstrapPeerToLsmr(peerId)
+  svc.scheduleConnectedBootstrapSync()
 
 proc promoteConnectedBootstrapPeer*(
     svc: WanBootstrapService,
@@ -2836,10 +2973,18 @@ proc promoteConnectedBootstrapPeer*(
 ): Future[WanBootstrapJoinResult] {.async: (raises: [CancelledError]).} =
   if svc.isNil:
     return defaultJoinResult()
-  if svc.hasLastJoinResult and svc.lastJoinResult.ok and svc.hasImportedBootstrapPeers():
+  if svc.hasLastJoinResult and svc.lastJoinResult.ok and (
+      svc.hasImportedBootstrapPeers() or
+      (not svc.connectedSyncFuture.isNil and not svc.connectedSyncFuture.finished())
+    ):
     return svc.lastJoinResult
   if svc.joinInProgress:
-    return await svc.waitOngoingJoin()
+    let ongoing = await svc.waitOngoingJoin()
+    if ongoing.ok:
+      return ongoing
+    if svc.peerCurrentlyConnected(peerId):
+      return await svc.promoteConnectedBootstrapPeerImpl(peerId, addrs, source)
+    return ongoing
   let joinFuture = cast[Future[WanBootstrapJoinResult].Raising([CancelledError])](
     svc.promoteConnectedBootstrapPeerImpl(peerId, addrs, source)
   )
@@ -3273,6 +3418,8 @@ method setup*(
     svc.switch = switch
     if not svc.journalLoaded:
       discard svc.loadBootstrapJournal()
+    if svc.config.lsmrDiscoveryActive() and svc.config.lsmrConfig.isSome():
+      discard await lsmrsvc.startLsmrService(switch, svc.config.lsmrConfig.get())
 
     if svc.config.enableSnapshotProtocol and svc.snapshotProtocol.isNil:
       svc.snapshotProtocol = svc.buildSnapshotProtocol()
@@ -3343,6 +3490,9 @@ method stop*(
     if not svc.runner.isNil:
       await svc.runner.cancelAndWait()
       svc.runner = nil
+    if not svc.connectedSyncFuture.isNil:
+      await svc.connectedSyncFuture.cancelAndWait()
+      svc.connectedSyncFuture = nil
     if not svc.connectedHandler.isNil and not switch.isNil:
       switch.removeConnEventHandler(svc.connectedHandler, ConnEventKind.Connected)
       svc.connectedHandler = nil

@@ -151,10 +151,13 @@ proc cmdRun(cfg: CliConfig) =
     dataDir: cfg.dataDir,
     identityPath: cfg.identityPath,
     genesisPath: cfg.genesisPath,
+    listenAddrs: cfg.listenAddrs,
+    bootstrapAddrs: cfg.bootstrapAddrs,
     lsmrPath: cfg.lsmrPath,
   ))
   let rpc = newFabricRpcServer(node, cfg.rpcHost, cfg.rpcPort)
   proc serve() {.async: (raises: [CancelledError, Exception]).} =
+    await node.start()
     await rpc.start()
     let peerId = peerIdString(node.identity.peerId)
     echo $(%{
