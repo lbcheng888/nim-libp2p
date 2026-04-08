@@ -253,6 +253,20 @@ proc routingPlaneStatus*(network: RwadNetwork): RoutingPlaneStatus =
   result.lsmrActiveCertificates = network.switch.peerStore[ActiveLsmrBook].len
   result.lsmrMigrations = network.switch.peerStore[LsmrMigrationBook].len
   result.lsmrIsolations = network.switch.peerStore[LsmrIsolationBook].len
+  let lsmrSvc = getLsmrService(network.switch)
+  if not lsmrSvc.isNil:
+    let lsmrStatus = lsmrSvc.routingPlaneStatus()
+    result.lsmrMinWitnessQuorum = lsmrStatus.lsmrMinWitnessQuorum
+    result.lsmrWitnessRequests = lsmrStatus.lsmrWitnessRequests
+    result.lsmrWitnessSuccess = lsmrStatus.lsmrWitnessSuccess
+    result.lsmrWitnessQuorumFailure = lsmrStatus.lsmrWitnessQuorumFailure
+    result.lsmrKnownSyncPeers = lsmrStatus.lsmrKnownSyncPeers
+    result.lsmrDialableSyncPeers = lsmrStatus.lsmrDialableSyncPeers
+    result.lsmrOverlayDesiredPeers = lsmrStatus.lsmrOverlayDesiredPeers
+    result.lsmrLocalCertReady = lsmrStatus.lsmrLocalCertReady
+    result.lsmrLastRefreshReason = lsmrStatus.lsmrLastRefreshReason
+    result.lsmrUndialableSyncPeers = lsmrStatus.lsmrUndialableSyncPeers
+    result.lsmrOverlayDesiredPeerIds = lsmrStatus.lsmrOverlayDesiredPeerIds
 
 proc newRwadNetwork*(
     identity: NodeIdentity,
