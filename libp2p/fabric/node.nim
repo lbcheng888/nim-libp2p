@@ -7201,18 +7201,6 @@ proc eventLiveWitnessRoutes(
     if result == 0:
       result = cmp(a.account, b.account)
   )
-  let reachableWitnesses = result.len
-  let witnessThreshold = max(1, (reachableWitnesses + 1) div 2)
-  if result.len > witnessThreshold:
-    let startIndex =
-      if result.len > 0:
-        int((if event.legacyTx.nonce > 0: event.legacyTx.nonce - 1 else: 0'u64) mod uint64(result.len))
-      else:
-        0
-    var selected: seq[RoutingPeer] = @[]
-    for offset in 0 ..< witnessThreshold:
-      selected.add(result[(startIndex + offset) mod result.len])
-    result = selected
 
 proc eventTargetPaths(node: FabricNode, event: FabricEvent): seq[LsmrPath] =
   result = routingPaths(event.participantRoutes)
@@ -9802,8 +9790,6 @@ proc antiEntropySummaryTask(
       if enqueuedAny:
         node.scheduleStateMaintenance()
         break
-      if not node.antiEntropyNeedsSync():
-        break
       if peerIdText notin node.antiEntropySummaryTargetPeers():
         break
       node.antiEntropySummaryNextRefreshAtMs[peerIdText] =
@@ -9819,10 +9805,6 @@ proc antiEntropySummaryTask(
 
 proc refreshAntiEntropySummarySync(node: FabricNode) {.gcsafe, raises: [].} =
   if node.isNil or not node.running or node.network.isNil or not node.usesLsmrPrimary():
-    return
-  if not node.antiEntropyNeedsSync():
-    for peerIdText in node.antiEntropySummaryRunners.keys.toSeq():
-      node.clearAntiEntropySummarySync(peerIdText)
     return
   let targetPeers = node.antiEntropySummaryTargetPeers()
   let targetSet = targetPeers.toHashSet()
