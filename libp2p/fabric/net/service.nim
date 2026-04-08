@@ -5211,7 +5211,6 @@ proc start*(network: FabricNetwork) {.async.} =
       network.switch.peerStore.setAddresses(network.switch.peerInfo.peerId, localAddrs)
   if network.routingMode == RoutingPlaneMode.lsmrOnly:
     network.importLsmrBootstrapHints()
-    return
   for raw in network.effectiveBootstrapAddrs():
     let parsed = MultiAddress.init(raw)
     if parsed.isErr():

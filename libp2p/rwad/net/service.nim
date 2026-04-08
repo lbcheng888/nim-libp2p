@@ -372,7 +372,6 @@ proc start*(network: RwadNetwork) {.async.} =
   await network.switch.start()
   if network.routingMode == RoutingPlaneMode.lsmrOnly:
     network.importLsmrBootstrapHints()
-    return
   for raw in network.effectiveBootstrapAddrs():
     let parsed = MultiAddress.init(raw)
     if parsed.isErr():
