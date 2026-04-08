@@ -1,0 +1,191 @@
+# lessons
+
+- 仓库里已经 vendored 的依赖不能继续同时声明成外部 nimble 必装包；像 `nim-pebble` 这种本地路径真相，应先在 `.nimble` 里按仓库内依赖处理，再看外部环境。
+- 远端部署只用 `git push/pull` 和单文件二进制同步，禁止再传整仓大包；大包会直接把对端服务和 SSH 拖死。
+- mobile FFI 的链上桥接协议必须和实际 product node 服务协议完全一致；一旦产品节点落的是 HTTP JSON-RPC，就不能再在桥接侧偷偷切成自定义 framed TCP。
+- 部署脚本不能假设远端有 `/bin/zsh`，也不能把仓库内源文件 install 回同一路径；shebang 和 install 语义都必须做成可重入、可跨 Linux/Mac 执行。
+- 收敛链优化不能先靠证伪试切口；必须先把 owner、accept/ack、完成语义和不变量写成单一状态机，再落实现，日志只做验收。
+- 被动反熵不能以“本地已知 debt”为前提；空或落后的 follower 也必须持续跑 `summary:head/root`，先发现远端 frontier 差异，再形成缺失债。
+- `shared-live-plane` 不能被当成 control fetch 的永久禁令；真正该拦的是 live inflight 和 hot accept。否则单连接 peer 会被永远饿死，summary 永远补不回来。
+- 同一 peer 已有多条 live muxer 时，control fetch 必须确定性让开 live owner；不能默认复用首选 muxer 去抢最新 head 的热路。
+- Android 只要改了会进 APK 的 Kotlin 或 native 代码，就必须重新安装调试包后再下结论。
+- 生产路径只用产品节点和产品 UI，不再引入文件交换或单独编排程序。
+- 单机内服务优先收成单进程异步循环，避免短命请求进程和多进程状态漂移。
+- 关键路径先收协议和状态机，再改实现，不靠超时和试错猜问题。
+- Kotlin 同步 `prepare_route` 是错层；connectivity 和 identify 必须放进 native 异步任务里。
+- 主要问题不在 `tsnet` 线协议时，不要继续改协议；先收 JNI 并发模型和 native 调用 ownership。
+- 全局 native 锁不是协议锁；长耗时调用必须退出全局锁，收进单拥有线程异步任务队列。
+- UI 真实发送入口必须进入交互关键窗口，不能只保护自动化入口。
+- 消息页不能等待后台 preconnect job；这会白白损失几秒。
+- 发送链不能等待后台 `prepare_route/preconnect`；地址要直接带进 native `send_with_ack` 任务。
+- seed addrs 不能只注册 hints；最短正确路径是把地址直接带进 `send_with_ack` 任务。
+- 后台只读刷新和错误读取也会拖死发送；状态查询必须优先走快照。
+- 失败后的错误详情读取也不能再抢全局锁。
+- `proxyListenersReady` 不能信本地缓存，必须以 gateway 当前发布态为准。
+- 远端产品节点操作必须统一走结构化 Nim 工具，不能再手写 `ssh + JSON`。
+- 远端 Nim 路径固定是 `/root/Nim/bin/nim`，不能再假设 `nim` 在 `PATH` 里。
+- `connect_exact_missing_state` 只是 kickoff 初期状态未落表，不是网络失败。
+- identify 必须拆开看：缺 muxer、`beginProtocolNegotiation` 卡住、`MultistreamSelect.select` 卡住，不能只看总超时。
+- 产品结果一旦已经收窄到 identify，就不要再回头改地址和 relay 发布逻辑。
+- `idleWakeLoop` 不该每秒构整份 `tailnetStatus`；后台自修只需要轻量 listener 判定。
+- `mgetOrPut` 的返回值不能接局部变量后再改，否则只会改到副本。
+- `/tsnet` 对外地址不能按 `tailnetIPs` 伪造，必须优先发真实 `relayListeners.route`。
+- `local_info` 必须是便宜读路径；只要已有 `relay_listeners/runtime` 快照，就不能在热路径里再跑 discovery 或网络快照。
+- 本地和远端必须跑同版地址发布逻辑后再下结论；一边还在旧发布逻辑上时，任何 route 结论都不可信。
+- 地址问题一旦被排除，就别再怀疑 `tailnetIPs` 合成地址，主线直接前推到 DM 发送链。
+- 长期控制流写操作必须有硬超时，超时后要立刻判定控制流失效并重建。
+- 预序列化 DM envelope 不能假设字段齐全，`from/mid/timestamp/ackRequested` 必须补齐。
+- `wait_dm` 不能做第一判定；先看 `send_dm_status + dm_rows`，避免把“已收到但被消费”误判成“没收到”。
+- 单机单进程不等于只有一个状态源；只要还有网关进程和产品节点进程，就必须显式对齐权威状态。
+- `send_dm_kickoff` 在外层 `connect_exact` 已成功后，绝不能再自己重拨一次。
+- listener 自修不能只盯 `failed/dropped/stopped`；只要本地还在 `awaiting/incoming/ready`，但 gateway 已经把 route 下架，也必须重建 listener。
+- `tailnetControlRefreshLoop` 不能每秒无脑重跑 `syncAdvertisedPeerInfo`；只有地址真变化时才允许触发。
+- `spawnTailnetWarmAdvertisedPeerInfo` 必须带单任务并发门，绝不能让慢同步任务无限叠加。
+- 远端还没吃到新产品二进制前，重新出现的 `route_not_registered` 不能直接当成本地修复失败。
+- `send_with_ack_kickoff` 一旦用了外层 `requestKey` 状态机，内层真正执行发送的命令也必须继承同一个 `streamKey/requestKey`，否则任务在跑，状态却会永远停在 `kickoff`。
+- Android 生产 UI 自动操作不能写死旧坐标；每次重装或布局变化后，必须先按当前页面真实输入框和发送按钮位置更新动作，再看发送日志。
+- Android 的 deep link 真入口是 `intent.data`，不能只读 `route` extra；否则 App 会启动，但不会导航到目标页面。
+- `configureNativeConnectivity` 必须自己做单飞和冷却，不能把限流责任分散到几十个调用点。
+- tsnet 模式下 published peer info 只能保留 `/tsnet` 地址，不能再把宿主机 `10.x/192.168.x` 地址混回去。
+- Android 主包安装统一用 `adb install -r`，不要再走 `./gradlew :app:installDebug`；测试包如需重装也优先用 `adb install -r -t`，避免设备侧反复弹安装确认或密码输入。
+- 一旦 Android 生产 UI 已经能直达目标会话并真发出消息，后续若仍失败，就不要再怀疑导航、draft 或假点击，直接收 native `send_with_ack` 内层发送链。
+- `send_begin` 不是可用的最终定位粒度；DM 发送链必须继续细分成 `fresh_dial/write/ack_wait/ack_done` 这类内层阶段，并回写到 kickoff 状态机。
+- Android 的 interactive native priority window 不能只给 12 秒；只要 tsnet 发送还没结束，后台 `connectedPeers/discoveredPeers` 轮询就必须继续让路，否则会重新撞上 `FD_SET >= 1024` 崩溃。
+- Android 消息页不能再同步跑 `prepareDirectRoutePeer`；seed `/tsnet` 地址一旦已经交给 `send_with_ack`，UI 层再做 `connectPeer/socialConnectPeer/connectMultiaddr` 预连接就是错层。
+- tsnet 的发送超时必须覆盖完整 `connect + identify + send + ack`；删掉同步预连接后，不能继续沿用只给发送尾段的短预算。
+- `proxy.nim` 的 shared key 判定不能直接假设字符串对象有效；真流量下会出现 nil/悬空访问，判空必须走底层指针。
+- `send_with_ack` 复用 live connection 时不能无限等；复用路径必须有硬超时，超时后立刻放弃旧 live 连接并转 fresh dial。
+- Android 生产 UI 已经把消息写入本地库但 Mac 仍未见新 DM 流时，不要再怀疑“没点发送”；直接收 native 发送链和 live 连接复用。
+- `cmdConnectedPeersInfo` 这类后台只读快照绝不能顺手做实时 latency probe；它会把 Android 单线程命令队列卡住，导致发送先死在 `queued`，再把真问题盖住。
+- 怀疑 builtin QUIC 长连接/拥塞实现前，先用本地 relay gateway 做“accept 长流 idle 10 秒以上 + 连续 route_status 探测”回归；本地稳住了，就别再把远端现场掉 route 先甩锅给客户端基础件。
+- `route_status false` 只是结果，不一定是主因；如果远端 gateway 日志已经出现 `incoming_write_done` 但 30 秒等不到 `ready`，主线就该转到 listener 侧为什么没读到 `incoming`。
+- 远端 gateway 运维也必须收进结构化 Nim 工具；只要要看 `route_status false/detach/unpublished`，就直接走 `deploy-gateway/journal-gateway`，不要退回手写远端命令。
+- Android 的 `tailnet ready` 不能只看 `providerReady + proxyListenersReady + tailnetIPs`；只要 bootstrap 配了 `deferAutoJoinUntilRelayReady`，就还必须等 `startupRelayReady`，否则 UI 会过早放行到一个“看着 ready、其实还没拿到 relay gate”的假就绪状态。
+- 主动拨 seed `/tsnet` 地址发 DM 时，发送前只需要本机 `providerReady`；`proxyListenersReady` 属于入站 listener 健康度，不能再被硬绑成发送前置 gate。
+- tsnet 的长活 registry/state 不能直接保存外部字符串引用，也不要跨 `safe` 包装返回 `ref handle`；这类路径要么存 owned copy，要么只回纯值（如 `routeId`），否则真流量下会炸在 `sharedKey/asgnRef/decRef`。
+- 修“explicit route 下又 fresh dial 一次”时，不能全局恢复 live reuse；必须只在“本请求已经把 peer ready 验过”的条件下打开复用，否则会把旧的显式地址约束语义一起改坏。
+- Android 10 秒硬限制下，如果日志已经出现 `connect_done ok=true`、随后停在 `peer_ready_wait_start`，而最终 UI 只报 `connect_exact ... send_with_ack_timeout`，就说明问题已经前移成“exact connect 后半段没按时完成”，不要再回头把主因看成旧的 fresh dial 直接炸连接。
+- `send_with_ack_kickoff` 的 10 秒预算起点必须和 UI 用同一把尺子，从 FFI 入队那一刻开始扣；不能等后台任务真正开跑后再算，否则 UI 会先超时，native 还在继续发，最后把真成功误判成失败。
+- exact-connect 有多个 seed 地址时，单次 connect 超时不能先给未来尝试预扣整份名义预算；应按“剩余总预算 / 剩余尝试数”动态均分，否则前几个地址会被压成几百毫秒的假超时。
+- exact-connect 成功后，如果发送层要复用“本次已经验证过”的连接，就必须把真实 outbound `verifiedMuxer` 一起往下传；只传 `reuseVerifiedLiveConnection=true` 不够，拿不到 muxer 时发送层还是会掉回 `dm_fresh_dial_begin`。
+- exact-connect 成功后挑 `verifiedMuxer` 不能再死拿 `Direction.Out`；QUIC exact-connect 会先断旧 live 连接，必须按当前 peer 的真实 live muxer 取值，否则发送层还是会掉回 fresh dial。
+- instrumentation 一旦报 `Process crashed`，主线就立刻转去抓 `adb logcat -b crash`；不要继续把它混同成网络超时或 UI 假失败。
+- 长跑验证时要复用同一个 exec 会话，别不停新开 PTY；否则很容易把 unified exec 会话数顶满，旧现场会被自动 prune 掉。
+- 如果活实例日志还在持续 `published=true`，但 `tailnet_status/local_info` 已掉成 `relayListeners=[]/runtime`，先怀疑状态读路径或 owner 状态不同步，不要第一反应就把它当成 listener 真掉线。
+- `nim-tsnet-relay-quic` 现场一旦出现 `listener register ack err=not_found`，先用最小 relay probe 直连同一个 endpoint 做隔离；如果 probe 也回 `not_found` 或 `ping rejected`，主因就在远端 relay 服务，不在 Android 或本地产品节点业务层。
+- 远端 relay 明确回 `not_found` 时，本地 listener 不能继续无限重试把节点拖崩；这类确定性注册拒绝要直接停掉 listener task，保留失败态，而不是靠重连风暴去“赌下一次成功”。
+- `quicRelayEndpoint()` 不能因为 control URL 显式带了 `9444` 就把 relay 也打到 `9444`；只有显式 relay URL 才能保留端口，否则必须派生到 relay 默认口 `9446`。
+- 接收入站连接时不该依赖全局 `raw->advertised` reverse registry 去改写本地地址；当前 transport 自己的 `listenerMappings` 才是这条连接的真 owner，全局长活 reverse 表只会重新引入 ownership/悬空崩溃。
+- 命令队列这类跨线程长活结构，不能只保住旧 queue tail；只要完成命令对象或 drain future 还可能被 lock-free 队列/异步回调短暂碰到，就也必须由 node 持有到生命周期结束，否则 receiver 一真正收流就会炸在 `processCommandQueue -> GC prepareDealloc`。
+- receiver 真正活下来后，如果日志开始出现 `incoming upgrader identify failed ... MultistreamSelect handshake response1 read timeout`，主线就该回到 inbound identify / verified muxer 复用，不要再把主因继续看成前一条 GC 崩溃。
+- `scheduleWarm()` 不能只直接跑 `getOrStartWarmAttempt()/tailnetStartKickoff`；runtime 还没起来时它只会长期停在 `stage=deferred`，把 4 秒多启动成本拖进发送窗口。后台预热必须先 `ensureRuntimeReady`，再 `ensureTailnetReady`。
+- `nim-msquic` 的 owned datagram transport 不能只 `close()` 然后异步丢一个 `closeWait()`；只要回调闭包还在引用 `ConnectionState/ListenerState`，就必须把 owner `GC_ref` 到 `closeWait()` 真结束，否则 relay listener 真流量下会炸进 `eventLoop.poll -> readDatagramLoop -> SIGBUS`。
+- `relayOwnerTasks` 里装的 task handle 不能再把 `TsnetRelayTaskHandle` 收成值对象直接 `add(handle)`；listener 自修路径会在 `relayStoreTask` 上炸 `SIGSEGV`，这类持有 `Future/string` 的长活 handle 要保持稳定引用形态。
+- 本地产品节点和 Android 生产链路一律只走纯 Nim `nim_quic` 控制/relay 启动；排障时也不能再切去 Go bridge 或重建 `libtsnetbridge` 当现场依据。
+- `nim-msquic` 的 long header parser 不能直接对 `dcid/scid` 做裸切片；零长度或脏包命中这条路径时，要先走显式长度校验和安全拷贝，否则本地纯 Nim 节点会炸进 `parseUnprotectedHeader -> newSeq/SIGSEGV`。
+- `proxy`/`relay` 这类长活注册表不能再在读路径里遍历 live 可变集合；要改成“写时整体替换，读时只看快照”。锁只能防并发进入，保不住 live `seq`/表在异步修复链里被边读边改后的悬空访问。
+- transport 外层的 listener repair 不能把 `ready < expected` 这种粗告警直接当成“provider route 注册表丢了”；只有 provider 侧 proxy routes 真空了，才允许 transport 用自己的 `listenerMappings` 重激活一次。
+- 并发共享状态里，`seq` 只适合单 owner 缓冲；凡是“按 routeId/route/key 管对象”的长活注册表，一律收成 `Table/OrderedTable`，读侧只拿 snapshot，不能再靠锁包着 live `seq` 顶着用。
+- `tailnetControlRefreshLoop` 这种后台热路径只需要 cheap readiness 时，绝不能再去构整份 `tailnetStatusPayload`；live DM 窗口里它自己就会变成新的崩溃面。
+- `TsnetRelayTaskHandle` 这种里面挂着 `Future/string` 的长活句柄，不能再作为值对象塞进 `Table` 里来回复制；必须保持稳定引用形态，否则 listener repair 一重入就会重新炸回 `relayStoreTask/routeId` 附近。
+- 如果本地产品节点已经持续存活，而 instrumentation 只报 `Process crashed`，就别再盯网络层；直接看 `adb logcat -b crash`，先把 Android 进程自己的 crash 拎出来。
+- Compose 顶部诊断文案给 UIAutomator 做判定时，优先盯 `contentDescription`，不要只依赖 `testTag -> By.res(...)`；否则状态已经变了，自动化也可能看不见。
+- relay/proxy 这类诊断对象的字符串字段即使理论上应当非空，读路径也不能先碰 `.len`；先做底层指针判空，再复制文本。
+- 如果 `incoming -> ready -> bridge_attached` 已经发生，本地 relay listener 就是真 published；这时再因为 ready cache 掉空去触发 `listenerNeedsRepair`，一定是状态结构设计错了，不是“该重建 listener”。
+- Android 发送链里只要 `adb logcat -b crash` 还出现 `MatcherNative_free/RegexMatcher`，就先把会走到发送链的 Kotlin `Regex` 清掉；不要先把锅甩给 Huawei 输入法，因为输入法自己的 Room 异常可以共存，但 app 进程的 crash 不能共存。
+- 会话输入条不能用窗口级 `FLAG_ALT_FOCUSABLE_IM` 去控键盘；这是 Activity 全局开关，会把同进程里的别的输入框也一起锁死。
+- 显式 `/tsnet` seed 发送前只需要本机 `providerReady + tailnetIPs`；Android UI 层不能再把 `proxyListenersReady` 硬绑成 sender 出站 gate，否则会凭空制造 `runtime_prepare ... tailnet_not_ready` 假失败。
+- 长跑验证里，本地产品节点不要再误绑到会被回收的旧 exec 会话上；先确认 `19125` 还活着，再判断是真崩还是现场被工具清掉。
+- `relayListenerStates` 这种诊断 stage 表不能再进 readiness/repair 热路径；`proxyListenerReadiness/listenerNeedsRepair` 只该看 `relayReadyRoutes` 和真正在跑的 task，不该在心跳里回读诊断状态。
+- `reason=active_task` 只能认“真正在跑的 listener task”；如果只剩僵尸 active 标记而没有活 task，就必须先清旧标记再重建，否则 listener reconcile 会永远自锁在 `start skipped ... active_task`。
+- 如果本地 `19125` 端口还在监听，但 `tailnet_status/local_info` 两秒内只报 `recv timed out`，先采样进程；这次现场已坐实主线程卡在 `statusPayload -> proxyListenerReadiness` 等锁，事件循环线程卡在 `listenerNeedsRepair -> relayListenerStage`，不要再先怀疑网络或 RPC 客户端。
+- keyed 长活状态表只要需要频繁删键，就不能用 `OrderedTable`；这次 `route -> epoch` / `route -> routeId` 在 `relayRegistryLock` 下删键，已经把 `tailnet_status/local_info` 真实卡死，热路径 keyed 状态必须收成普通 `Table`。
+- `ConversationInputBar` 这类输入组件不能在 `AndroidView(EditText)` 创建或每次 update 时自动 `requestFocus + showSoftInput`；deep link 预填 draft 也会被当成“要弹键盘”，在 Huawei 现场会把输入法一起拉起来，进而把主包拖进 crash 噪音。
+- `processCommandQueue` 这种 future 调度点不要直接把字段表达式喂给 `asyncSpawn`；先落局部强引用，再写字段和调度。`asyncSpawn(n.commandDrainTask)` 这类写法在真流量下已经再次打回 `GC prepareDealloc`。
+- `reconcileProxyListeners` 不能再把 `proxyRouteSnapshots()` 当 listener repair 的 expected 全集；expected 真相只能是 runtime 自己的 `tcpListenerRoutes/udpListenerRoutes`，修复时只能增量补建缺失 route，不能因为 proxy 快照瞬时缩水就整批停掉现有活 route。
+- `relayOwnerEpoch` 不能默认拿 `0` 参与 active/running 判定；否则缺失 route 会被 `getOrDefault(..., 0) == ownerEpoch` 误判成 active，直接把 `allRoutesActive=true` 和 `reason=active_task` 搞成假阳性。
+- 如果生产 UI 是冷启动刚进 deep link 就 `Process crashed`，而 `wait_dm` 还是空的，就先把它当成 Android 主进程启动崩溃，不要继续往 DM 网络层上套；这轮真实主因已经坐实在 `com.unimaker.native.debug` 的 `libart/Compose` 启动路径。
+- Android 冷启动不能再在 `Application`、`MainActivity`、`NativeAppViewModel.init` 三路同时抢跑 native warm；这轮已坐实 Huawei 现场会把主包拖回 `Process crashed`/`ReferenceQueueDaemon`，首帧之后单路 bootstrap 才是对的启动边界。
+- listener repair 不能再回查全局 `proxyRouteSnapshots()`；repair 真相源必须是 runtime 自己持有的 `advertised -> raw` 映射，而且临时 repair 队列里不要再存 `MultiAddress` 对象，等真正启动 listener 那一刻再从字符串解析。
+- 即使 Android -> Mac 生产 UI token 已经真实送达，本地节点赛后仍可能继续在 `processCommandQueue -> decRef` 崩；消息成功不等于本地生命周期已经稳住，后续要继续收这条 command drain GC 尾部崩点。
+- 显式 `/tsnet` seed 的 Android 发送入口，不能在 `bridge.sendDirectText()` 前再跑一整轮 `ensureTailnetReady()`；这会先把 10 秒预算烧在 UI 层，native 真进 `cmdSendDirect` 时只剩 1 秒左右。
+- repair 后再次发布本地 tsnet peer info 时，不能再遍历 live `peerInfo.listenAddrs: seq[MultiAddress]`；发布路径必须优先只读 `peerInfoListenAddrTexts` 这类字符串快照，不然又会炸回 `publishTsnetLocalPeerInfo -> safeMultiaddrText -> MultiAddress.$ -> decRef`。
+- `relayOwnerHasRunningRouteTask` 这类 repair 热路径不能再直接读 live `Future.finished()/state`；running 真相只能来自 owner 私有的纯表状态，listener task 正常退出时也要同步摘掉 `routeId/active/task handle`。
+- receiver 侧 authoritative LP ack 不能挂在 `handleDirectMessageNode()` 的 social state、conversation append、notification、event 这些重尾处理之后；消息一旦已经 `recordReceivedDm`，就该先让 `dmservice` 回 ack，再异步做后处理，不然 sender 会稳定卡在 `dm_ack_wait`。
+- `ConversationRouteSendTest` 不能拿整条 diagnostics 文案是否变化来判“本次发送结果变了”；`libp2p/tailnet/latency/updated` 这些字段也会变，测试只能提取并比较真正的 `sendStatus` 子串。
+- listener validation 明确返回 `published=false` 时，idle `awaiting` route 不能继续走“preserve locally serving route”；只有 `incoming/ready/bridge_attached` 这种当前真在服务流量的 route 才允许保留，避免本地长期假 `awaiting`、远端其实早已 unpublished。
+- repair 入口不能把已经存成字符串的 listener route 再 parse 成 live `MultiAddress` 后传回 `startUdpRelayListener`；这次真实现场已经重新炸回 `rawSocketFromAddress -> familyFromAddress -> splitAddressParts -> decRef`，repair 入口必须直接吃字符串。
+- persistent accept stream 一旦开始 `incoming_payload_wait_begin`，stage 就必须立刻切到 `incoming`；否则 validation/repair 会把正在收流量的 route 当成 idle `awaiting`，又去起第二个 listener。
+- 即使 repair 不再误起第二个 listener，本地 relay client 的 close 路径也还会单独炸；`safeCloseConnection()` 这类包装层必须显式根住 `connState`，不能裸把 live state 传进 `closeConnection()`。
+- 本地节点赛后不掉线，不代表 UI 结果一定成功；这轮已经再次坐实 `wait_dm` 收到同名消息、但 Android 仍报 `dm_ack_wait send_with_ack_timeout`，所以后续要直接收 authoritative ack 返回 sender 的时延，而不是再回头怀疑本地 receiver 是否收到。 
+- 不能用“ACK 先 flush 几十毫秒再关流”修 direct message；`mplex/yamux` 的 `closeWrite` 本来就不是可靠 half-close，生产级方案必须把 authoritative ACK 建模成确定性独立路径，而不是时间窗补丁。
+- 如果 direct message 要做生产级 authoritative ACK，最稳的边界不是“短流里一发一回再赌 close 语义”，而是长活双向 session；`dm/ack` 都要在同一 session 里帧化，同时协议 `stop()` 必须先取消 reader、关 session，再让外层 muxer 收尾，避免 `closeWithEOF` 和 live `readLp` 并发抢读。
+- DM session 状态机不能拿一个标量硬装所有真相；至少要把“生命周期”和“活动计数”分开，尤其 `awaiting_ack` 可以并发存在，不能再靠隐式布尔和日志猜状态。
+- `relayUrl/controlUrl` 这类长活 listener/dial task 的输入，不能在循环里每轮都重新 parse 原始字符串；任务创建边界就要解析成稳定 endpoint 对象，后面的 retry/reconnect 只拿这个对象，不再碰可能已漂掉的 raw 字符串。
+- 赛后 idle reconcile 不能再去遍历 live `listenAddrs: seq[MultiAddress]` 拼 peer info；发布路径也必须优先只读字符串快照，否则消息虽然已经成功送达，节点还是会在 `safeMultiaddrText -> MultiAddress.$ -> newSeq` 这条尾部路径重新炸掉。
+- `relayListenerStates` 这类纯诊断表如果 payload 已经完全能从 `relayKnownRoutes/relay*Routes` 推出来，就不要再在 listener 热路径里额外写一份字符串键控表；这轮 `markRelayListenerStageIfCurrent -> Table[]=` 已经再次证明，冗余状态写入本身就会变成新的崩点。
+- native QUIC fresh exact-connect 上，`dialer` 和 `ensurePeerIdentified` 都不能再在发送热路径里强跑 eager `/ipfs/id/1.0.0`；secure channel 已经验证 peerId，DM 发送只该复用这条 live muxer，把 identify 元数据交换延后到非关键路径。
+- 显式 `/tsnet` seed 发送不能再先 `peer_ready_deferred_to_dm_dial`，再让 `dmservice` 自己 fresh dial 第二次；同一请求里必须先 `ensurePeerReadyViaExplicitAddresses`，拿到 `verifiedMuxer` 后直接走 `verified_live_muxer` 发消息。
+- listener `repair` 不能再由 `ready < expected` 这种轮询猜测触发；生产级边界只能是“route task 退出后显式请求 repair”，`serving/incoming/ready/bridge_attached` 窗口必须硬禁止 idle loop 误 repair。
+- `proxy` 里的 `resolved remote` 不能再同时把 `sharedKey` 和 GC `string` 都当真相源；热路径和 snapshot 查找只认固定 `sharedKey`，`rawText/advertisedText` 最多留给调试，不准再参与 `valid/lookup`。
+- 如果生产 UI 复跑里本地节点已经活着、`verified_live_muxer` 也命中了，但 instrumentation 却直接变成 `Process crashed`，就先把 blocker 切回 Android 主进程 native crash；不要再回头怀疑 Nim 侧 ACK 或 relay bridge。
+- builtin QUIC 的标准 builder 不能再表面挂一层 `mplex/yamux` 或隐式 secure default；`MsQuicTransport` 会直接 upgrade 成 `MsQuicMuxer`，QUIC-only 构型必须把“传输多流”和“TCP 上层 mux”明确分层。
+- `quicrelay` 的 listener generation 不是本地私有实现细节，而是 relay 控制协议字段；只改本地客户端会稳定卡成 `listener generation missing`，远端 `nim-tsnet-gateway.service` 必须和本地一起发版。
+- 显式 `/tsnet` seed 发送里，`peer_ready` 不能再等同于“拿到 verified live muxer”；生产级真相必须是“这次请求已经建好 DM session”，并用 `sessionConnKey` 从 warm 一直贯穿到 send，避免 sender 再对第一条业务流做一次 live protocol select。
+- truth route 的 `prepareTruthScene()` 是路由真相准备，不是 UI 副作用；它必须在 `MainActivity.onCreate/onNewIntent` 直接执行，不能继续绑在 Compose `LaunchedEffect` 里等重组。
+- Android 的 direct session warm attempt 不能只按 `peerId` 复用；至少要带 seed key 和活 job 一起判断，否则旧 attempt 会静默吞掉新 truth route，而且从日志上看不出来。
+- `send_with_ack_kickoff` 这类外层 request 不能等包装层最后再统一写终态；只要内层已经拿到确定失败，必须立刻把 requestKey 对应状态写成 `done`，否则真实 `connect_exact_failed/...` 会被 UI 误读成假 `send_with_ack_timeout`。
+- `send_with_ack_kickoff` 的诊断状态不能再混读全局 `queuePending/runningKind`；正确边界是“每个 request 一份无锁 latest snapshot”，UI timeout 只读这份 request-local 真相。
+- Android 在 `send_with_ack` deadline 那一拍如果马上读状态，常会撞上 native 还没把 terminal state 原子发布出去；超时诊断要给 request-local 状态一个极短 settle 窗口，避免把真实 `connect_exact_failed/...` 误读成旧的 `running/envelope_ready`。
+- 显式 `/tsnet` seed 的正确 primitive 不是“先 generic connect，再补 DM warm”；理论正确的边界是“直接精确地址建立 DM session”，让 `sessionConnKey` 成为唯一真相源，把“精确地址”和“DM session”合成一个权威步骤。
+- 发送主线再次成功后，如果本地节点没死但 `tailnet_status.relayListeners=[]`、`local_info.listenAddrSource=synthesized`，就别再回头查 sender；这时新的主线已经是 success 之后的 listener published 稳态漂移。 
+- bootstrap/connect 这类长活任务不能再按 `peerId` 单键复用；只要输入里包含显式 seed/addrs，任务所有权就必须至少提升到 `peerId + exact selectedAddrs`，否则同一 peer 上的旧 warm/bootstrap job 会把本次发送错误拦成 `bootstrap direct session not warmed`。
+- sender 判断 bootstrap 是否可复用，不能再拿 task `future.finished()` 当真相；真正的完成条件只能是 live `sessionConnKey` 已存在且仍可用，future 只表示任务壳子有没有收尾。
+- success 之后如果 `local_info` 还能保住 `listenAddrSource=relay_listeners` 和单条 published `/ip4`，但 `tailnet_status.proxyListenersReady=false`、`relayListeners` 退成单条 `stage=known`，说明问题已经缩成 published listener 投影/ready 计数偏移，不是发送链或 bootstrap 归属语义。 
+- qrelay/runtime 的 published listener 投影不能继续每次现读多张 live 集合再当最终真相；没有显式 `dropped` 或 clear routes，就不允许因为瞬时读空把 published route 从状态里抹掉，正确边界是“qrelay 记录最后确定 stage，runtime 持有 owner 级投影缓存”。 
+- direct session warm 任务的“已完成”不能再靠 join 到旧 bootstrap task 或 `future.finished()` 猜；显式 seed 发送必须只认 live `sessionConnKey` 或已收口的 warm result，不然同一 peer 上的旧 bootstrap job 会再次把真发送拦成 `bootstrap direct session not warmed`。 
+- bootstrap task 的归属不能再靠 `source` 字符串隐式猜；前台发送和后台 warm 必须是显式意图，后台未完成 task 不能劫持前台发送，跨意图最多只能复用“已经 live 的 session 结果”。
+- truth route 里的 `draftText` 只是预填输入，不是“不要预热”的信号；只要 seed 地址已知，就应该照常 warm direct session，否则自动化/深链预填草稿会把预热整条关掉，白白把发送时延拖回点击后。
+- social state 不能继续把磁盘 JSON 文本当运行真相；receiver 后处理如果每条 DM 都整份 `parseJson(social_state.json)`，就会在 `Table.enlarge/prepareDealloc` 这类分配路径上把 ACK 后半段一起拖死。正确边界是“内存已解析快照是真相，读取拿 clone，写入后原子发布新快照并落盘”。
+- Android UI 不能在发送前再 `await()` 一份平行 direct-session warm 结果；这会制造第二份 readiness 真相，还会把“先等 warm 再开始 send”的局部时间误当成发送性能。生产级边界是：后台 warm 只负责预热，真正发送只认 native `sessionConnKey/path=warmed_session_conn` 这一份真相。 
+- `cmdBootstrapSeedConnectExactKickoff` 是 interactive direct session bootstrap 的一部分，不是普通后台命令；它必须进 priority queue，否则再正确的 session 架构也会先死在命令队列排序上。
+- `warmSessionDetailed()` 的完成条件不能再绑定 reader fully ready；对 sender 来说，warm 只该表示“DM session 已建立且可复用”，reader attach 由真实 send path 在首条写入后启动。
+- `hostNetworkStatus` 这类本地运行态不能再用 `JsonNode` 充当真相源；idle/public-ip-probe/side-effects 热路径只该读值对象快照，JSON 只能在 FFI/status/event 出参边界物化，否则又会在 `%* -> Table.enlarge/newSeq` 这种分配路径上把本地节点拖死。
+- macOS 本地资源采集不能再让 `NodeResourceService` 走 `osproc.execProcess` 的 `poUsePath + 继承环境` 默认边界；这轮 fresh 节点已经坐实会直接炸进 `envToCStringArray`。对固定系统命令，执行边界必须收成“绝对路径 + 显式空环境”，不要再把当前进程环境复制带进热路径子进程。
+- Android warm 结果要想成为可消费真相，不能继续只挂在 `CompletableDeferred` 生命周期上；ready 后必须进一张稳定快照表，发送链只读这张 `peerId + seedKey + ownerKey -> sessionConnKey` 快照，不再读 task 完成态。
+- Android direct warm 的网络真相不能再绑 `ownerKey`；`ownerKey` 只属于 UI 生命周期，ready/active warm 的可复用判定必须只认 `peerId + seedKey`，否则发送会因为 owner 漂移白白丢掉已建立好的 session。
+- relay accept stream 一旦已经进入 `incoming/ready/bridge_attached/serving`，published 真相就只能来自 accept stream 自己和 keepalive；`awaitPersistentIncomingWithRouteValidation()` 不能再继续跑 `route_status` probe，否则就是第二真相源，赛后还会把本地节点重新炸回 `probeRoutePublishedOnValidationClient -> relayRouteStatus`。
+- `LsmrControlSession` 这类复用型 control stream，两端语义必须完全一致；只要 client 侧会在同一条 stream 上连续 `sync -> publish`，server handler 就必须循环处理多次 request/response，不能回一笔就 `close()`，否则一定会先超时再补拨号，把连接生命周期打乱。
+- bootstrap exact-connect 任务不能再无视调用方 budget 自己跑更久；前台发送和 bootstrap task 必须共用同一份 deadline，否则 sender 的 10 秒 SLA 和底层 warm 根本不是同一套状态机，最后就会假死在 `bootstrap direct session not warmed`。
+- `bootstrapSeedConnectCanJoinUnfinishedTask()` 不能再默认“有 task 就 join”；跨意图未完成 task 不是可复用结果，前台发送最多只能复用 live `sessionConnKey`，不能继承后台 warm 的中间态。
+- `adb install -r` 只要已经返回 `Success`，就不要再机械多等 30 秒；后续直接继续，以真实安装返回和包时间戳为准。
+- `receivedDmLog` 这种跨线程接收日志不能继续保存 live `JsonNode`；一边从原 `seq` 删除，一边把同一批 ref 节点塞进新数组，会把 `wait_dm/dmSnapshot` 这类本地观测 RPC 自己炸进 `parseJson/newStringStream/prepareDealloc`。正确边界是值对象快照，读取时再物化新 JSON。
+- `socialStateParsedSnapshot` 不能继续在 `loadSocialStateUnsafe/persistSocialStateUnsafe` 里整份 `cloneJson`；`socialStateMemLock` 下必须只有一棵 live tree，文本快照只负责落盘和出参，否则 receiver 会在消息后处理里把自己炸进 `cloneJson/Table.enlarge`，再把 sender 误拖成 `dm_ack_wait`。
+- truth-route direct target 不能在 relay fallback 时被 sender 自己 `clear`；direct 和 relay 必须是两条独立状态机。send 只读当前 ready 路径，fallback 只能转 relay，不能反过来把后台 direct warm 打断。
+- truth-route direct warm 不能是一发即忘的 `declareNativeDirectSessionTarget()`；页面进入后必须有常驻 reconcile loop，持续重试到 native 真正接受 target，否则“路由已准备、runtime 还没起来”这段时间会把 direct warm 静默丢掉。
+- 显式 truth-route send 里，`direct` 和 `relay` 必须是并行状态机，send 只消费当前 ready 的 `sessionConnKey`。如果 `direct` 没 ready，就等待 `relay_ready_session`；send 本身不能再把 explicit `/tsnet` 路径打回 `dm_fresh_dial_begin`。
+- `relayOnly` 这种旧字段名不能再代表 UI 先拍板的路径结论；真正该传给 DM 层的是“这次实际选中的 send path”。direct ready 时就按 direct 发，只有实际走 relay session 时才给 `relayOnly=true`。
+- `networkDiscoverySnapshot`、节点列表、诊断页这类观测线程不能再直接读 live `bootstrapSeedConnectTasks/directSessionTargets`；观测必须只读稳定快照，否则后台状态刷新会把主进程炸进 `libp2p_network_discovery_snapshot`，再把真实发送结果一起盖住。
+- DM 层的拨号锁不能只按 `peer + intent` 分桶；`direct` 和 `relay` 是两条独立状态机，后台 direct warm 和前台 relay route warm 必须分开锁域，否则 sender 会假死在 `direct message dial lock timeout`。
+- 显式 `/tsnet` send 不能先看一次 `direct`，再单向等 `relay`；正确边界是同时观察 `direct` 和 `relay` 两张 ready 快照，谁先 ready 就用谁，但 `direct` 与 `relay` 同时 ready 时必须优先 `direct`。
+- direct path 的“打洞成功率”不能从单次发送成败或 relay fallback 倒推；必须由 direct target owner 在 published 状态迁移上稳定计数，外部只读 `attempt/success/failure/lastReady/lastFailure` 快照。
+- `buildPeerPathProjection()` 新增了路径统计字段还不够；connectedPeers、networkDiscovery、节点列表这些二级输出链也必须把这些字段原样拷出去，否则 UI 和发送看到的仍不是同一份路径真相。
+- `/tsnet` exact QUIC target 不能偷换成“exact 就只许 relay”；对已经学到的 direct route，exact 路径也必须能直接消费。正确顺序是 `local -> direct -> relay`，而不是旧的 `local -> relay`。
+- `TsnetProxyDialTarget` 这种路径选择结果不能再把直连和本地都压成 `Local`；至少要显式区分 `Local / DirectRoute / RelayBridge`，否则 exact 路径和观测链永远看不见 direct 真相。
+- `social_state` 这种 owner 运行态不能 lazy load，更不能在第一条业务消息的后处理里 parse 整份持久化 JSON；正确边界是 `cmdStart` 一次预热 owner 内存态，热路径只做增量写，跨线程观测统一走 owner 命令或发布快照。否则即使 JSON 文件本身合法，也会在 `parseJson -> newObjNoInit` 上把节点炸死。
+- direct send 已经稳定走 `direct_ready_session` 时，fresh dial payload pipeline 不会再落到点击热路径；要继续压点击时延，正确边界是 warm 完成后异步启动 session reader，但不要把 reader fully ready 绑成 warm 完成条件。
+- nim-msquic 的 `HQUIC` fast path 不能直接把裸指针 raw cast 成 `StreamState/ConnectionState`；注册表才是句柄活性真相，已 release 的 handle 必须先过 `gHandleRegistry` 判活，否则 `quicrelay` 这类热路会在 stale stream 上炸进 `msquicStreamSend/pendingChunks.add`。
+- `ackRequested=true` 的 direct send 不能再把整份 SLA 全让给 `ready/connect`；receiver 侧 authoritative ACK 本来就有固定发送窗口，sender 必须先从总预算里预留这段 post-ready budget，再去等 `direct/relay ready`，否则就会出现“消息已经送达，结果因为 ACK 只剩几百毫秒而被误判成 `ack timeout`”。
+- `runtime_bridge` 里的 MsQuic callback context 不能再让 `Table/seq[ref]` 持有或扫描；handle 索引只能存 raw pointer，owner 生命周期要用 `GC_ref/GC_unref` 手动 root/unroot，callback 入口再临时 root 一次，否则 fresh 节点会在 `store/drop/enlarge/find` 的 RC 路径上直接炸掉。
+- direct/relay warm worker 如果要在 task 内继续等待 `provider/route ready`，owner 侧 task 状态就不能先切成非 `running`；`future` 还活着但状态先掉成 `pending`，owner 就会重复起同 peer 的 warm task，直接把现场打成 `dm_dial_lock_wait` 和伪 `dm_transport_connect_begin` 拥塞。
+- relay route task 退出时不能只删 `taskId/active`；同一 route 的 `incoming/ready/pending/awaiting/serving/known/dropped` 这些 owner set 也必须同步清掉，否则 stale route 会继续被 `listenerNeedsRepair/publishedListenerRoutes` 当成活状态。
+- `published route` 热读不能再把 `relayListenerStates` 当权威；只要 `relayKnownRoutes/relayPendingRoutes/relayAwaitingRoutes/relayIncomingRoutes/relayReadyRoutes/relayBridgeAttachedRoutes/relayServingRoutes/relayDroppedRoutes` 已经能表达 published stage，就必须直接从 owner set 投影，避免赛后又炸回 `relayRoutePublishedStage -> Table.getOrDefault`。
+- runtime listener 注册真相不能再混成 `seq[route target object]`；发布和 repair 只该读稳定的 route 列表与 `route->raw` 映射。只要读侧还在 `listenerRouteTargetSnapshot -> newSeqOfCap[object]` 上现拷对象数组，赛后 repair 热路迟早会重新炸进 `nimNewSeqOfCap/decRef`。
+- `hostNetworkStatus/publicIpv6` 的“本地已探测”不能再当成“对端已交换到公网 IPv6 候选”。当前 tsnet 生产链里，`syncAdvertisedPeerInfo()` 在 `tsnetOnly` 分支不会把 WAN 直连种子发进 peerInfo，`mergeBridgeExtraJson()` 也只补 `peerId/listenAddrs`；如果 `quicrelay.relayCandidatesForRaw()` 要拿到公网 IPv6 候选，就必须把 `publicIpv6/publicIpv4` 或显式 `directCandidates` 真正写进 bridge-extra 并随 relay candidate 通道交换，否则 `/tsnet` published `/ip4 100.x` 仍然只是中继发布，不是直连真相。
+- `/ip4/100.x.x.x/.../tsnet/p2p/...` 不是直连，只是 tailnet/relay 发布。直连真相只认“公网 IPv6 直连”或“真实打洞直连”；统计和 UI 也必须按这条语义收口，不能再把 `/tsnet` 地址当 direct 成功。
+- `bridgePublicIpv4` 这种公网反射值也不能直接当“直连地址真相”。如果产品语义锁定为“公网 IPv6 直连或打洞直连”，那 bridge/export/statistics 必须优先导出和消费 `publicIpv6` 与打洞候选，不能再把公网 IPv4 反射值本身当成 direct 成功。
+- bridge-extra 的公网 IPv6 真相必须直接来自本机非 VPN 接口的全局 IPv6，不要再靠 `publicIpv6` 反射探测成功与否决定是否导出；像产品节点这种本地 Mac 进程，启动时就该从 `en*/eth*/wlan*` 接口探测全局 IPv6 写进 `localIpv6/preferredIpv6/publicIpv6`，同时 `relayCandidatesForRaw()` 也不能再自动合成 `publicIpv4` 候选。
+- relay bridge dial 热路不能去拉整份 `statusPayload()` 再从 JSON 里找 `tailnetIPs`；`providerTailnetIp()` 这种内层 exact dial 规划只能读轻量值快照，否则 relay benchmark 一把就会重新炸回 `statusPayload -> udpDialStatesPayload -> %* -> Table.enlarge/newSeq`。
+- relay session 的 desired 不能借 direct desired 表存活；如果 `relay_session_prepare` 不进独立 desired 真相，reconcile loop 下一拍就会把它当 stale task 清掉，永远只剩 `status=missing`。
+- `tsnetOnly` 的 published/repair 热路不能再做“文本 -> MultiAddress -> 再赋值整段 `peerInfo.listenAddrs/addrs`”这类对象级复制；published 真相应该是文本缓存，`MultiAddress` 只在真正需要时按需物化，否则 self relay benchmark 会继续炸在 `parseMultiaddrsFromTexts/genericSeqAssign/nimNewSeqOfCap`。
+- `msquic` 的 ACK 热路不能复制 `seq[StreamState]` 快照；`applyAckFrame -> flushAllConnectionStreams` 这种内层路径里，正确边界是“关闭只标记，flush 循环结束后再统一 prune closed stream”，否则仅仅为了防重入而复制 `seq[ref]` 就会把节点炸进 `asgnRef/incRef`。
