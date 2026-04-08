@@ -2,9 +2,12 @@ import std/[json, options, os, parseopt, strutils]
 
 import chronos
 
-import ../libp2p/fabric
 import ../libp2p/lsmr
+import ../libp2p/fabric/node
+import ../libp2p/fabric/rpc/server
+import ../libp2p/fabric/types
 import ../libp2p/multiaddress
+import ../libp2p/rwad/codec
 import ../libp2p/rwad/identity
 import ../libp2p/rwad/types
 
