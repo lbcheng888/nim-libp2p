@@ -37,17 +37,6 @@
       "jailed": false,
       "slashedAmount": 0,
       "lastUpdatedAt": 0
-    },
-    {
-      "address": "F82691A035096DE0DA973DA15F3204C6039F74B4",
-      "peerId": "12D3KooWKtRs4hvJ5584z6yJA8FXXZvTfzdZe72AjeRUM8JEkVWY",
-      "publicKey": "08011220959F5EE2E3C5A6E5DFC93A850C26E36738EDA60389ACB739E6D63197B08E1189",
-      "stake": 10000,
-      "delegatedStake": 0,
-      "active": true,
-      "jailed": false,
-      "slashedAmount": 0,
-      "lastUpdatedAt": 0
     }
   ],
   "balances": [
