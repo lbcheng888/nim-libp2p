@@ -125,6 +125,7 @@ type
     controlSessions: Table[string, LsmrControlSession]
     dayanSessions: Table[string, LsmrControlSession]
     connectFlights: Table[string, Future[bool]]
+    bootstrapHandoffFlights: Table[string, Future[bool]]
     dialLocks: Table[string, AsyncLock]
     topologyChangeSeq: uint64
     topologyChangedHook: proc() {.gcsafe, raises: [].}
@@ -255,6 +256,9 @@ proc buildPeerAddressEntry(peerId: PeerId, addrs: seq[MultiAddress]): JsonNode =
 proc localCoordinateRecord*(
     switch: Switch
 ): Option[SignedLsmrCoordinateRecord] {.gcsafe.}
+proc triggerBootstrapConnectedHandoff*(
+    svc: LsmrService, peerId: PeerId
+) {.gcsafe, raises: [].}
 proc shouldAutoConnectPeer(svc: LsmrService, peerId: PeerId): bool {.gcsafe.}
 proc schedulePeerConnect(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].}
 proc desiredOverlayPeers(svc: LsmrService): seq[PeerId] {.gcsafe.}
@@ -3108,7 +3112,16 @@ proc ensurePeerIdentifySnapshot(
   svc.hasIdentifySnapshot(peerId) or svc.hasIdentifySnapshot(resolvedPeerId)
 
 proc handleConnectedSyncPeer(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].} =
-  discard
+  if svc.isNil or svc.switch.isNil or peerId.data.len == 0:
+    return
+  let selfPeerId =
+    if svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  if peerId == selfPeerId or not svc.switch.isConnected(peerId):
+    return
+  svc.triggerBootstrapConnectedHandoff(peerId)
 
 proc handleIdentifiedSyncPeer(svc: LsmrService, peerId: PeerId) {.gcsafe, raises: [].} =
   if svc.isNil or svc.switch.isNil or peerId.data.len == 0:
@@ -3121,7 +3134,7 @@ proc handleIdentifiedSyncPeer(svc: LsmrService, peerId: PeerId) {.gcsafe, raises
   if peerId == selfPeerId:
     return
   if localCoordinateRecord(svc.switch).isNone():
-    svc.scheduleImmediateRefreshHint()
+    svc.scheduleImmediateRefresh(some(peerId))
   else:
     svc.queuePeerControlHandoff(peerId)
 
@@ -4465,10 +4478,12 @@ proc bootstrapConnectedHandoff*(
   if svc.isNil or svc.switch.isNil or not svc.running:
     return false
   if localCoordinateRecord(svc.switch).isNone():
-    if not await svc.ensurePeerIdentifySnapshot(peerId):
-      svc.lastRefreshReason = "bootstrap_peer_identify_not_ready"
+    discard await svc.ensurePeerIdentifySnapshot(peerId)
+    let refreshed = await svc.refreshCoordinateRecord()
+    if not refreshed and localCoordinateRecord(svc.switch).isNone():
+      if svc.lastRefreshReason.len == 0:
+        svc.lastRefreshReason = "bootstrap_handoff_refresh_failed"
       return false
-    discard await svc.refreshCoordinateRecord()
   if localCoordinateRecord(svc.switch).isNone():
     return false
   let selfPeerId =
@@ -4479,6 +4494,44 @@ proc bootstrapConnectedHandoff*(
   if peerId.data.len > 0 and peerId != selfPeerId and svc.hasDialableRoute(peerId):
     svc.queuePeerControlHandoff(peerId)
   true
+
+proc triggerBootstrapConnectedHandoff*(
+    svc: LsmrService, peerId: PeerId
+) {.gcsafe, raises: [].} =
+  if svc.isNil or svc.switch.isNil or not svc.running or peerId.data.len == 0:
+    return
+  let selfPeerId =
+    if svc.switch.peerInfo.isNil:
+      PeerId()
+    else:
+      svc.switch.peerInfo.peerId
+  if peerId == selfPeerId:
+    return
+  if localCoordinateRecord(svc.switch).isSome():
+    if svc.hasDialableRoute(peerId):
+      svc.queuePeerControlHandoff(peerId)
+    return
+  let peerKey = $peerId
+  if svc.bootstrapHandoffFlights.hasKey(peerKey):
+    let existing = svc.bootstrapHandoffFlights.getOrDefault(peerKey, nil)
+    if not existing.isNil and not existing.finished():
+      return
+    svc.bootstrapHandoffFlights.del(peerKey)
+  let handoffFuture = svc.bootstrapConnectedHandoff(peerId)
+  svc.bootstrapHandoffFlights[peerKey] = handoffFuture
+  proc runHandoff() {.async: (raises: []).} =
+    try:
+      discard await handoffFuture
+    except CancelledError:
+      discard
+    except CatchableError as exc:
+      debug "lsmr bootstrap handoff failed", peerId = peerId, err = exc.msg
+    finally:
+      let currentHandoff = svc.bootstrapHandoffFlights.getOrDefault(peerKey, nil)
+      if currentHandoff == handoffFuture:
+        svc.bootstrapHandoffFlights.del(peerKey)
+
+  asyncSpawn runHandoff()
 
 proc requestMigrationParentDigest*(
     svc: LsmrService, peerId: PeerId, targetPrefix: LsmrPath
@@ -4807,7 +4860,8 @@ method run*(
   if svc.running:
     return
   svc.running = true
-  svc.runner = nil
+  svc.runner = svc.syncLoop()
+  asyncSpawn svc.runner
 
 method stop*(
     svc: LsmrService, switch: Switch
@@ -4848,6 +4902,14 @@ method stop*(
       if not future.finished():
         await future.cancelAndWait()
     svc.connectFlights.clear()
+    var bootstrapHandoffFlights: seq[Future[bool]] = @[]
+    for _, future in svc.bootstrapHandoffFlights.pairs:
+      if not future.isNil:
+        bootstrapHandoffFlights.add(future)
+    for future in bootstrapHandoffFlights:
+      if not future.finished():
+        await future.cancelAndWait()
+    svc.bootstrapHandoffFlights.clear()
     var sessions: seq[LsmrControlSession] = @[]
     for _, session in svc.controlSessions.pairs:
       sessions.add(session)
