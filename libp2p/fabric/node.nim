@@ -9285,7 +9285,7 @@ proc antiEntropyDomainNeeded(
     return false
   case domain
   of aedEvent:
-    node.antiEntropyMissingEventNeeded()
+    true
   of aedAttParticipant, aedAttWitness, aedEventCert:
     for queue in node.pendingWitnessPullsByPeer.values:
       for item in queue:
@@ -9299,8 +9299,7 @@ proc antiEntropyDomainNeeded(
       if item.domain == domain:
         return true
     if domain == aedEventCert:
-      return node.antiEntropyMissingEventNeeded() and
-        node.missingEventCertificatePulls().len > 0
+      return true
     for eventId in node.pendingCertificationEvents:
       if not node.certificationEventTracked(eventId):
         continue
