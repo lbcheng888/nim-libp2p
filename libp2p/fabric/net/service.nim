@@ -419,9 +419,10 @@ proc controlFetchPeerMustYield*(
 proc controlFetchSharedLiveSummaryMustYield(
     network: FabricNetwork, peerId: PeerId, key: string
 ): bool {.gcsafe, raises: [].} =
-  if network.isNil or network.switch.isNil or not key.startsWith("summary:"):
-    return false
-  network.switch.connManager.planeSharedWithLive(peerId, ppkControl)
+  discard network
+  discard peerId
+  discard key
+  false
 
 proc controlFetchTargetSummaryMustYield(
     network: FabricNetwork, peerId: PeerId, key: string
